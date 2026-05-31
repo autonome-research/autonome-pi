@@ -65,6 +65,10 @@ function runtimePid(run: RunSummary): number | undefined {
 	return typeof pid === "number" ? pid : undefined;
 }
 
+function isRunningCancellable(run: RunSummary | undefined): boolean {
+	return Boolean(run?.normalizedStatus === STATUSES.RUNNING && runtimePid(run));
+}
+
 class ThreadPhaseMonitorComponent {
 	private mode: Mode = "list";
 	private selected = 0;
@@ -86,7 +90,7 @@ class ThreadPhaseMonitorComponent {
 		}
 		if (data === "x") {
 			const run = monitorRuns(this.cwd)[this.selected];
-			if (run?.normalizedStatus === STATUSES.RUNNING) this.onCancelRun(run);
+			if (isRunningCancellable(run)) this.onCancelRun(run);
 			this.invalidate();
 			return;
 		}
@@ -132,7 +136,9 @@ class ThreadPhaseMonitorComponent {
 	private renderList(width: number, runs: RunSummary[]): string[] {
 		const t = this.theme;
 		const lines: string[] = [];
-		lines.push(truncateToWidth(t.fg("accent", t.bold("Thread-phase monitor")) + t.fg("dim", "  ↑↓ select • enter detail • x cancel • q close"), width));
+		const selectedRun = runs[this.selected];
+		const cancelHint = isRunningCancellable(selectedRun) ? " • x cancel" : "";
+		lines.push(truncateToWidth(t.fg("accent", t.bold("Thread-phase monitor")) + t.fg("dim", `  ↑↓ select • enter detail${cancelHint} • q close`), width));
 		lines.push(truncateToWidth(t.fg("borderMuted", "─".repeat(Math.max(0, width))), width));
 		if (runs.length === 0) {
 			lines.push(truncateToWidth(t.fg("dim", "No runs for this working directory."), width));
@@ -189,7 +195,7 @@ class ThreadPhaseMonitorComponent {
 		const bodyHeight = 22;
 		this.scroll = Math.min(this.scroll, Math.max(0, all.length - bodyHeight));
 		const visible = all.slice(this.scroll, this.scroll + bodyHeight).map((line) => truncateToWidth(line, width));
-		visible.unshift(truncateToWidth(t.fg("dim", `←/b back • ↑↓ scroll${run.normalizedStatus === STATUSES.RUNNING ? " • x cancel" : ""} • q close`), width));
+		visible.unshift(truncateToWidth(t.fg("dim", `←/b back • ↑↓ scroll${isRunningCancellable(run) ? " • x cancel" : ""} • q close`), width));
 		return visible;
 	}
 }

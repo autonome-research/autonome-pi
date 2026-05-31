@@ -161,7 +161,6 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		if (!directoryExists(next)) return;
 		previousCwd = base;
 		activeCwd = next;
-		if (ctx.hasUI) ctx.ui.setStatus("thread-phase-cwd", path.relative(ctx.cwd, activeCwd) || ".");
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -172,7 +171,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 			if (!ctx.hasUI) return;
 			const runs = mergeMonitorRuns(activeCwd);
 			const running = runs.filter((run: AnyEvent) => run.normalizedStatus === STATUSES.RUNNING).length;
-			ctx.ui.setStatus("thread-phase", running > 0 ? `${running} workflow(s) running` : "watching");
+			ctx.ui.setStatus("thread-phase", running > 0 ? `${running} workflow(s) running` : undefined);
 			const widgetLines = activeRunWidgetLines(runs);
 			ctx.ui.setWidget("thread-phase", widgetLines.length > 0 ? widgetLines : undefined, { placement: "belowEditor" });
 		};
@@ -208,6 +207,10 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	pi.on("session_shutdown", (_event, ctx) => {
 		watcher?.close();
 		watcher = undefined;
-		if (ctx.hasUI) ctx.ui.setWidget("thread-phase", undefined);
+		if (ctx.hasUI) {
+			ctx.ui.setStatus("thread-phase", undefined);
+			ctx.ui.setStatus("thread-phase-cwd", undefined);
+			ctx.ui.setWidget("thread-phase", undefined);
+		}
 	});
 }

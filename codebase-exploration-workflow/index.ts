@@ -69,9 +69,11 @@ function commandUsage() {
 		"  /codebase-explore --dirs src,tests,docs --concurrency 2",
 		"  /codebase-explore --agent mock --dirs src,tests,docs --delay 1000",
 		"  /codebase-explore --cwd /repo --maxDirs 8",
+		"  /codebase-explore --foreground --dirs src",
 		"",
-		"Defaults: --agent pi --concurrency 3 --maxDirs 8",
+		"Defaults: --agent pi --concurrency 3 --maxDirs 8 and background execution.",
 		"Default cwd follows simple user-bash cd commands in this Pi session.",
+		"Use --foreground only when you want the slash command to block until completion.",
 	].join("\n");
 }
 
@@ -117,6 +119,7 @@ export default function codebaseExplorationWorkflow(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		activeCwd = ctx.cwd;
 		previousCwd = ctx.cwd;
+		if (ctx.hasUI) ctx.ui.setStatus("codebase-cwd", undefined);
 	});
 
 	pi.on("user_bash", (event, ctx) => {
@@ -126,8 +129,12 @@ export default function codebaseExplorationWorkflow(pi: ExtensionAPI) {
 		if (!directoryExists(next)) return;
 		previousCwd = activeCwd || event.cwd || ctx.cwd;
 		activeCwd = next;
-		if (ctx.hasUI) ctx.ui.setStatus("codebase-cwd", path.relative(ctx.cwd, activeCwd) || ".");
 	});
+
+	pi.on("session_shutdown", (_event, ctx) => {
+		if (ctx.hasUI) ctx.ui.setStatus("codebase-cwd", undefined);
+	});
+
 	pi.registerTool({
 		name: "codebase_exploration_workflow",
 		label: "Codebase Exploration Workflow",
@@ -176,7 +183,8 @@ export default function codebaseExplorationWorkflow(pi: ExtensionAPI) {
 				return;
 			}
 			const cwd = resolveAgainstActive(activeCwd || ctx.cwd, optionAfter(parts, "--cwd"));
-			ctx.ui.setStatus("codebase-explore", "running...");
+			const foreground = parts.includes("--foreground");
+			ctx.ui.setStatus("codebase-explore", foreground ? "running..." : "starting...");
 			try {
 				const result = await runScript(buildArgs({
 					cwd,
@@ -186,9 +194,14 @@ export default function codebaseExplorationWorkflow(pi: ExtensionAPI) {
 					maxDirs: optionAfter(parts, "--maxDirs") ? Number(optionAfter(parts, "--maxDirs")) : undefined,
 					delay: optionAfter(parts, "--delay") ? Number(optionAfter(parts, "--delay")) : undefined,
 					model: optionAfter(parts, "--model"),
+					background: !foreground,
 				}), cwd, ctx.signal);
 				if (result.code !== 0) ctx.ui.notify(result.stderr || result.stdout || "Codebase exploration failed", "warning");
-				else ctx.ui.notify("Codebase exploration workflow emitted", "info");
+				else {
+					let details: any;
+					try { details = JSON.parse(result.stdout); } catch { details = undefined; }
+					ctx.ui.notify(details?.background ? `Codebase exploration started in background (pid ${details.pid})` : "Codebase exploration workflow emitted", "info");
+				}
 			} finally {
 				ctx.ui.setStatus("codebase-explore", undefined);
 			}
