@@ -188,4 +188,20 @@ Or from inside Pi:
 - Command: `/thread-phase run <runId>`
 - Command: `/thread-phase demo`
 
-Current UI is deliberately minimal. The abstraction is the stable part; richer TUI components can be layered on top later by reading the same store.
+## Current UI components
+
+The first UI layer is implemented as generic custom message renderers:
+
+- `thread-phase-run`: collapsed one-line workflow status; expand with Pi's tool/message expansion key to show phases, errors, and artifact content.
+- `thread-phase-runs`: compact list of recent runs; expand to show more entries.
+
+Component files:
+
+```text
+components/
+├── artifact-view.ts
+├── phase-timeline.ts
+└── run-message-renderer.ts
+```
+
+The renderer intentionally stays workflow-agnostic and consumes projected summaries from `lib/store.mjs`.

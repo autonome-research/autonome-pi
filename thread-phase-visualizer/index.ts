@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { registerThreadPhaseMessageRenderers } from "./components/run-message-renderer.ts";
 import {
 	EVENT_TYPES,
 	INDEX_FILE,
@@ -96,6 +97,8 @@ function runDemo(cwd: string, options: { fail?: boolean; workflow?: string; dela
 }
 
 export default function threadPhaseVisualizer(pi: ExtensionAPI) {
+	registerThreadPhaseMessageRenderers(pi);
+
 	let watcher: fs.FSWatcher | undefined;
 	const seen = new Set<string>();
 
