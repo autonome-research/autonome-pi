@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -10,9 +10,7 @@ import {
   completeRun,
   createRun,
   failRun,
-  phaseEnd,
-  phaseEvent,
-  phaseStart,
+  wrapPhases,
 } from "../../thread-phase-visualizer/lib/store.mjs";
 
 const DEFAULT_PI = existsSync(join(homedir(), ".npm-global", "bin", "pi"))
@@ -20,20 +18,23 @@ const DEFAULT_PI = existsSync(join(homedir(), ".npm-global", "bin", "pi"))
   : "pi";
 
 const DEFAULT_DIR_CANDIDATES = [
-  "src",
-  "app",
-  "lib",
-  "packages",
-  "tests",
-  "test",
-  "docs",
-  "scripts",
-  "bin",
-  "server",
-  "client",
-  "components",
-  "api",
+  "src", "app", "lib", "packages", "tests", "test", "docs", "scripts", "bin",
+  "server", "client", "components", "api",
 ];
+
+async function loadThreadPhaseCore() {
+  try {
+    return await import("@autonome-research/thread-phase");
+  } catch {
+    const globalPath = process.env.THREAD_PHASE_CORE_PATH || join(
+      homedir(), ".npm-global", "lib", "node_modules", "@autonome-research", "thread-phase-cli",
+      "node_modules", "@autonome-research", "thread-phase", "dist", "index.js",
+    );
+    return await import(globalPath);
+  }
+}
+
+const { PipelineCache, requireCtx, runPipeline } = await loadThreadPhaseCore();
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -139,15 +140,8 @@ async function runPiExplorer({ cwd, dir, model, timeoutMs }) {
     "5. Suggested next exploration targets.",
   ].join("\n");
   const args = [
-    "--mode", "json",
-    "--no-session",
-    "--no-extensions",
-    "--no-skills",
-    "--no-prompt-templates",
-    "--no-context-files",
-    "--tools", "read,grep,find,ls",
-    "-p",
-    prompt,
+    "--mode", "json", "--no-session", "--no-extensions", "--no-skills",
+    "--no-prompt-templates", "--no-context-files", "--tools", "read,grep,find,ls", "-p", prompt,
   ];
   if (model) args.unshift("--model", model);
 
@@ -222,6 +216,97 @@ async function mapWithConcurrency(items, concurrency, fn) {
   return results;
 }
 
+const discoverSubdirectories = {
+  name: "discover-subdirectories",
+  async *run(ctx) {
+    const explicitDirs = splitList(ctx.args.dirs);
+    const dirs = (explicitDirs.length ? explicitDirs : listDefaultDirs(ctx.cwd, ctx.maxDirs))
+      .filter((dir) => existsSync(join(ctx.cwd, dir)) && statSync(join(ctx.cwd, dir)).isDirectory())
+      .slice(0, ctx.maxDirs);
+    ctx.dirs = dirs;
+    yield { type: "data", kind: "data", key: "dirs", value: dirs, message: `Selected ${dirs.length} subdirectories` };
+    if (dirs.length === 0) throw new Error(`No matching subdirectories found in ${ctx.cwd}`);
+  },
+};
+
+const exploreSubdirectories = {
+  name: "explore-subdirectories",
+  async *run(ctx) {
+    const dirs = requireCtx(ctx, "dirs", "explore-subdirectories");
+    mkdirSync(ctx.artifactsDir, { recursive: true });
+    yield { type: "fanout", kind: "fanout_start", total: dirs.length, label: "subdirectories" };
+
+    let completed = 0;
+    let failed = 0;
+    const queue = [];
+    const push = (event) => queue.push(event);
+
+    const worker = mapWithConcurrency(dirs, ctx.concurrency, async (dir, index) => {
+      const itemId = dir;
+      push({ type: "fanout", kind: "fanout_item_start", itemId, label: dir, index, total: dirs.length, message: `Exploring ${dir}` });
+      const startedAt = Date.now();
+      const result = ctx.agent === "pi"
+        ? await runPiExplorer({ cwd: ctx.cwd, dir, model: ctx.model, timeoutMs: ctx.timeoutMs })
+        : await exploreMock({ cwd: ctx.cwd, dir, delayMs: ctx.delayMs });
+      const durationMs = Date.now() - startedAt;
+      const reportPath = join(ctx.artifactsDir, `${safeName(dir)}.md`);
+      const report = result.ok
+        ? result.text
+        : `# ${dir} exploration failed\n\n${result.error || "Unknown error"}\n\n## stderr\n\n\`\`\`\n${result.stderr || ""}\n\`\`\``;
+      writeFileSync(reportPath, report, "utf8");
+      artifact(ctx.visualizerRun, { kind: "markdown", title: `Exploration: ${dir}`, path: reportPath, metadata: { dir, agent: result.model || ctx.agent } });
+      if (result.ok) completed++; else failed++;
+      push({
+        type: "fanout",
+        kind: "fanout_item_end",
+        itemId,
+        label: dir,
+        index,
+        status: result.ok ? STATUSES.SUCCESS : STATUSES.FAILED,
+        message: result.ok ? `Explored ${dir}` : `Failed ${dir}`,
+        error: result.ok ? undefined : result.error,
+        durationMs,
+      });
+      push({ type: "progress", kind: "progress", completed, total: dirs.length, message: `${completed}/${dirs.length} explored` });
+      return { dir, ok: result.ok, reportPath, text: report, model: result.model, durationMs, error: result.error };
+    });
+
+    while (true) {
+      while (queue.length) yield queue.shift();
+      const done = await Promise.race([worker.then(() => true), sleep(100).then(() => false)]);
+      if (done) break;
+    }
+    ctx.results = await worker;
+    ctx.completed = completed;
+    ctx.failed = failed;
+    while (queue.length) yield queue.shift();
+    if (failed > 0) throw new Error(`${failed}/${dirs.length} subdirectory explorations failed`);
+  },
+};
+
+const synthesizeMap = {
+  name: "synthesize-map",
+  async *run(ctx) {
+    const dirs = requireCtx(ctx, "dirs", "synthesize-map");
+    const results = requireCtx(ctx, "results", "synthesize-map");
+    const summaryPath = join(ctx.artifactsDir, "codebase-exploration-summary.md");
+    const summary = [
+      "# Codebase exploration summary",
+      "",
+      `Repository: \`${ctx.cwd}\``,
+      `Agent: \`${ctx.agent}\``,
+      `Subdirectories: ${dirs.map((dir) => `\`${dir}\``).join(", ")}`,
+      "",
+      "## Subdirectory reports",
+      ...results.map((result) => [`### ${result.ok ? "✓" : "✗"} ${result.dir}`, "", `Report: \`${relative(ctx.cwd, result.reportPath)}\``, "", result.text.split(/\r?\n/).slice(0, 20).join("\n")].join("\n")),
+    ].join("\n\n");
+    writeFileSync(summaryPath, summary, "utf8");
+    ctx.summaryPath = summaryPath;
+    artifact(ctx.visualizerRun, { kind: "markdown", title: "Codebase exploration summary", path: summaryPath, metadata: { dirs, agent: ctx.agent } });
+    yield { type: "data", kind: "data", key: "summaryPath", value: summaryPath, message: "Wrote codebase exploration summary" };
+  },
+};
+
 function maybeBackground(rawArgv, opts) {
   if (!opts.background) return false;
   const nextArgs = rawArgv.filter((arg) => arg !== "--background");
@@ -251,88 +336,45 @@ async function main() {
   const maxDirs = Number.parseInt(String(args.maxDirs || "8"), 10);
   const delayMs = Number.parseInt(String(args.delay || "750"), 10);
   const timeoutMs = Number.parseInt(String(args.timeout || `${10 * 60 * 1000}`), 10);
-  const explicitDirs = splitList(args.dirs);
-  const dirs = (explicitDirs.length ? explicitDirs : listDefaultDirs(cwd, maxDirs))
-    .filter((dir) => existsSync(join(cwd, dir)) && statSync(join(cwd, dir)).isDirectory())
-    .slice(0, maxDirs);
 
-  const run = createRun({
+  const visualizerRun = createRun({
     workflow: "codebase-exploration",
     cwd,
-    trigger: { kind: "manual", agent, concurrency },
-    input: { dirs, agent, concurrency },
+    trigger: { kind: process.env.PI_CODEBASE_EXPLORATION_BACKGROUND ? "background" : "manual", agent, concurrency },
+    input: { dirs: splitList(args.dirs), agent, concurrency },
     message: "codebase-exploration started",
   });
 
+  const ctx = {
+    cache: new PipelineCache(),
+    visualizerRun,
+    cwd,
+    args,
+    agent,
+    concurrency,
+    maxDirs,
+    delayMs,
+    timeoutMs,
+    model: args.model ? String(args.model) : undefined,
+    artifactsDir: join(ARTIFACTS_DIR, visualizerRun.runId),
+  };
+
   try {
-    phaseStart(run, "discover-subdirectories", { explicitDirs, maxDirs });
-    phaseEvent(run, "discover-subdirectories", { kind: "data", key: "dirs", value: dirs, message: `Selected ${dirs.length} subdirectories` });
-    phaseEnd(run, "discover-subdirectories", STATUSES.SUCCESS, { dirs });
-
-    if (dirs.length === 0) throw new Error(`No matching subdirectories found in ${cwd}`);
-
-    const artifactsDir = join(ARTIFACTS_DIR, run.runId);
-    mkdirSync(artifactsDir, { recursive: true });
-
-    phaseStart(run, "explore-subdirectories", { dirs, agent, concurrency });
-    phaseEvent(run, "explore-subdirectories", { kind: "fanout_start", total: dirs.length, label: "subdirectories" });
-    let completed = 0;
-    let failed = 0;
-
-    const results = await mapWithConcurrency(dirs, concurrency, async (dir, index) => {
-      const itemId = dir;
-      phaseEvent(run, "explore-subdirectories", { kind: "fanout_item_start", itemId, label: dir, index, total: dirs.length, message: `Exploring ${dir}` });
-      const startedAt = Date.now();
-      const result = agent === "pi"
-        ? await runPiExplorer({ cwd, dir, model: args.model ? String(args.model) : undefined, timeoutMs })
-        : await exploreMock({ cwd, dir, delayMs });
-      const durationMs = Date.now() - startedAt;
-      const reportPath = join(artifactsDir, `${safeName(dir)}.md`);
-      const report = result.ok
-        ? result.text
-        : `# ${dir} exploration failed\n\n${result.error || "Unknown error"}\n\n## stderr\n\n\`\`\`\n${result.stderr || ""}\n\`\`\``;
-      writeFileSync(reportPath, report, "utf8");
-      artifact(run, { kind: "markdown", title: `Exploration: ${dir}`, path: reportPath, metadata: { dir, agent: result.model || agent } });
-      if (result.ok) completed++; else failed++;
-      phaseEvent(run, "explore-subdirectories", {
-        kind: "fanout_item_end",
-        itemId,
-        label: dir,
-        index,
-        status: result.ok ? STATUSES.SUCCESS : STATUSES.FAILED,
-        message: result.ok ? `Explored ${dir}` : `Failed ${dir}`,
-        error: result.ok ? undefined : result.error,
-        durationMs,
-      });
-      phaseEvent(run, "explore-subdirectories", { kind: "progress", completed, total: dirs.length, message: `${completed}/${dirs.length} explored` });
-      return { dir, ok: result.ok, reportPath, text: report, model: result.model, durationMs, error: result.error };
+    const phases = wrapPhases([discoverSubdirectories, exploreSubdirectories, synthesizeMap], visualizerRun);
+    for await (const _event of runPipeline(phases, ctx)) {
+      // Events are mirrored to the visualizer by wrapPhases.
+    }
+    completeRun(visualizerRun, STATUSES.SUCCESS, {
+      ok: true,
+      completed: ctx.completed ?? ctx.dirs?.length ?? 0,
+      failed: ctx.failed ?? 0,
+      total: ctx.dirs?.length ?? 0,
+      summaryPath: ctx.summaryPath,
     });
-
-    phaseEnd(run, "explore-subdirectories", failed > 0 ? STATUSES.FAILED : STATUSES.SUCCESS, { completed, failed, total: dirs.length });
-
-    phaseStart(run, "synthesize-map");
-    const summaryPath = join(artifactsDir, "codebase-exploration-summary.md");
-    const summary = [
-      "# Codebase exploration summary",
-      "",
-      `Repository: \`${cwd}\``,
-      `Agent: \`${agent}\``,
-      `Subdirectories: ${dirs.map((dir) => `\`${dir}\``).join(", ")}`,
-      "",
-      "## Subdirectory reports",
-      ...results.map((result) => [`### ${result.ok ? "✓" : "✗"} ${result.dir}`, "", `Report: \`${relative(cwd, result.reportPath)}\``, "", result.text.split(/\r?\n/).slice(0, 20).join("\n")].join("\n")),
-    ].join("\n\n");
-    writeFileSync(summaryPath, summary, "utf8");
-    artifact(run, { kind: "markdown", title: "Codebase exploration summary", path: summaryPath, metadata: { dirs, agent } });
-    phaseEnd(run, "synthesize-map", STATUSES.SUCCESS, { summaryPath });
-
-    const status = failed > 0 ? STATUSES.FAILED : STATUSES.SUCCESS;
-    completeRun(run, status, { ok: failed === 0, completed, failed, total: dirs.length, summaryPath });
-    console.log(JSON.stringify({ ok: failed === 0, runId: run.runId, workflow: run.workflow, cwd, dirs, agent, summaryPath }, null, 2));
-    process.exitCode = failed > 0 ? 2 : 0;
+    console.log(JSON.stringify({ ok: true, runId: visualizerRun.runId, workflow: visualizerRun.workflow, cwd, dirs: ctx.dirs, agent, summaryPath: ctx.summaryPath }, null, 2));
   } catch (error) {
-    failRun(run, error);
-    console.log(JSON.stringify({ ok: false, runId: run.runId, workflow: run.workflow, cwd, error: error.message }, null, 2));
+    failRun(visualizerRun, error, { completed: ctx.completed, failed: ctx.failed, total: ctx.dirs?.length, summaryPath: ctx.summaryPath });
+    console.log(JSON.stringify({ ok: false, runId: visualizerRun.runId, workflow: visualizerRun.workflow, cwd, error: error.message }, null, 2));
     process.exitCode = 1;
   }
 }
