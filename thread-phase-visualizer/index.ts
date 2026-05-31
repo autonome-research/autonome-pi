@@ -1,12 +1,8 @@
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { showThreadPhaseMonitor } from "./components/monitor.ts";
-import { showRunBrowser } from "./components/run-browser.ts";
-import { showRunDetailOverlay } from "./components/run-detail.ts";
 import { registerThreadPhaseMessageRenderers } from "./components/run-message-renderer.ts";
 import { activeRunWidgetLines } from "./components/status-widget.ts";
 import {
@@ -20,8 +16,6 @@ import {
 	readRun,
 } from "./lib/store.mjs";
 
-const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const DEMO_SCRIPT = path.join(EXT_DIR, "bin", "demo-workflow.mjs");
 const MAX_MESSAGE_BYTES = 20_000;
 
 type AnyEvent = Record<string, any>;
@@ -79,36 +73,6 @@ function formatCompletion(event: AnyEvent): string {
 	return formatRunDetail(run);
 }
 
-function runWorkflowScript(script: string, args: string[], cwd: string, signal?: AbortSignal) {
-	return new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
-		const proc = spawn(process.execPath, [script, ...args], { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env });
-		let stdout = "";
-		let stderr = "";
-		proc.stdout.on("data", (d) => (stdout += d.toString()));
-		proc.stderr.on("data", (d) => (stderr += d.toString()));
-		proc.on("error", (error) => resolve({ code: 1, stdout, stderr: error.message }));
-		proc.on("close", (code) => resolve({ code: code ?? 0, stdout, stderr }));
-		if (signal) {
-			const abort = () => proc.kill("SIGTERM");
-			if (signal.aborted) abort();
-			else signal.addEventListener("abort", abort, { once: true });
-		}
-	});
-}
-
-function runDemo(cwd: string, options: { fail?: boolean; workflow?: string; delay?: string }, signal?: AbortSignal) {
-	const args = ["--cwd", cwd];
-	if (options.workflow) args.push("--workflow", options.workflow);
-	if (options.delay) args.push("--delay", options.delay);
-	if (options.fail) args.push("--fail");
-	return runWorkflowScript(DEMO_SCRIPT, args, cwd, signal);
-}
-
-function optionAfter(parts: string[], name: string): string | undefined {
-	const index = parts.indexOf(name);
-	return index >= 0 ? parts[index + 1] : undefined;
-}
-
 export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	registerThreadPhaseMessageRenderers(pi);
 
@@ -147,50 +111,10 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("thread-phase", {
-		description: "Open the live thread-phase monitor; use 'browser' for history, 'demo' to emit a sample run, or 'list' for a message list",
-		handler: async (args, ctx) => {
+		description: "Open the live thread-phase monitor",
+		handler: async (_args, ctx) => {
 			ensureStore();
-			const parts = args.trim().split(/\s+/).filter(Boolean);
-			if ((parts.length === 0 || parts[0] === "monitor") && ctx.hasUI) {
-				await showThreadPhaseMonitor(ctx, path.resolve(ctx.cwd));
-				return;
-			}
-			if (parts[0] === "browser" && ctx.hasUI) {
-				await showRunBrowser(ctx);
-				return;
-			}
-			if (parts[0] === "demo") {
-				const result = await runDemo(ctx.cwd, {
-					fail: parts.includes("--fail") || parts.includes("fail"),
-					workflow: optionAfter(parts, "--workflow"),
-					delay: optionAfter(parts, "--delay"),
-				}, ctx.signal);
-				if (result.code !== 0) ctx.ui.notify(result.stderr || result.stdout || "Demo workflow failed", "warning");
-				else ctx.ui.notify("Demo thread-phase workflow emitted", "info");
-				return;
-			}
-			if (parts[0] === "run" && parts[1]) {
-				const events = readRun(parts[1]);
-				const summary = getRunSummary(parts[1]);
-				if (ctx.hasUI && !parts.includes("--message")) {
-					await showRunDetailOverlay(ctx, summary);
-				} else {
-					pi.sendMessage({
-						customType: "thread-phase-run",
-						content: formatRunDetail(summary),
-						display: true,
-						details: { runId: parts[1], summary, events },
-					});
-				}
-				return;
-			}
-			const runs = latestRunSummaries({ limit: 20, cwd: ctx.cwd });
-			pi.sendMessage({
-				customType: "thread-phase-runs",
-				content: runs.length ? runs.map(formatRunSummary).join("\n\n") : "No thread-phase runs found for this directory.",
-				display: true,
-				details: { runs },
-			});
+			await showThreadPhaseMonitor(ctx, path.resolve(ctx.cwd));
 		},
 	});
 

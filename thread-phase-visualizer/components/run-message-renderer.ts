@@ -73,26 +73,6 @@ function renderRunMessage(message: any, expanded: boolean, theme: any) {
 	return box;
 }
 
-function renderRunsMessage(message: any, expanded: boolean, theme: any) {
-	const runs: RunSummary[] = message.details?.runs || [];
-	const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
-	const container = new Container();
-	container.addChild(new Text(theme.fg("toolTitle", theme.bold("Thread-phase runs")), 0, 0));
-	if (runs.length === 0) {
-		container.addChild(new Text(theme.fg("dim", "No runs found"), 0, 0));
-		box.addChild(container);
-		return box;
-	}
-	const visible = expanded ? runs : runs.slice(0, 8);
-	for (const run of visible) container.addChild(new Text(compactRunLine(run, theme), 0, 0));
-	if (!expanded && runs.length > visible.length) {
-		container.addChild(new Text(theme.fg("dim", `… ${runs.length - visible.length} more (${keyHint("app.tools.expand", "expand")})`), 0, 0));
-	}
-	box.addChild(container);
-	return box;
-}
-
 export function registerThreadPhaseMessageRenderers(pi: ExtensionAPI) {
 	pi.registerMessageRenderer("thread-phase-run", (message, { expanded }, theme) => renderRunMessage(message, expanded, theme));
-	pi.registerMessageRenderer("thread-phase-runs", (message, { expanded }, theme) => renderRunsMessage(message, expanded, theme));
 }
