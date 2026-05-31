@@ -198,7 +198,7 @@ The demo script is intentionally not exposed as a slash command. Larger workflow
 The first UI layer is implemented as generic custom message renderers:
 
 - `thread-phase-run`: collapsed one-line workflow status; expand with Pi's tool/message expansion key to show phases, errors, and summary artifact content.
-- live monitor overlay: keyboard-driven progress view with deterministic phase glyphs (`✓`, `…`, `✗`, `⊘`, `↷`) and arrow-key selection.
+- live monitor overlay: keyboard-driven progress view with workflow status glyphs (`✓`, `…`, `✗`, `⊘`, `↷`) and separate phase glyphs (`◆`, `◈`, `◇`) for quick visual scanning.
 
 Component files:
 

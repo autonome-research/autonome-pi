@@ -18,9 +18,18 @@ function shortRunId(runId: string | undefined): string {
 	return parts.length > 1 ? parts.slice(-1)[0] : runId.slice(0, 12);
 }
 
+function phaseStatusGlyph(status: string | undefined): string {
+	if (status === "running") return "◈";
+	if (status === "failed") return "⬢";
+	if (status === "cancelled") return "◇";
+	if (status === "skipped") return "◇";
+	if (status === "unknown") return "◇";
+	return "◆";
+}
+
 function phaseGlyph(phase: PhaseSummary, theme: any): string {
 	const status = phase.normalizedStatus || phase.status;
-	return theme.fg(statusColor(status), statusIcon(status));
+	return theme.fg(statusColor(status), phaseStatusGlyph(status));
 }
 
 function deterministicPhaseLine(run: RunSummary, theme: any): string {
@@ -115,7 +124,7 @@ class ThreadPhaseMonitorComponent {
 			const head = `${prefix} ${t.fg(statusColor(status), statusIcon(status))} ${selected ? t.fg("accent", run.workflow || "workflow") : run.workflow || "workflow"} ${t.fg("dim", `[${shortRunId(run.runId)}]`)}`;
 			const current = currentPhaseText(run);
 			lines.push(truncateToWidth(`${head}${current ? t.fg("muted", ` — ${current}`) : ""}`, width));
-			lines.push(truncateToWidth(`  ${deterministicPhaseLine(run, t)}`, width));
+			if (status === "running") lines.push(truncateToWidth(`  ${deterministicPhaseLine(run, t)}`, width));
 		}
 		if (runs.length > visible.length) lines.push(truncateToWidth(t.fg("dim", `… ${runs.length - visible.length} older run(s)`), width));
 		return lines;
@@ -134,7 +143,7 @@ class ThreadPhaseMonitorComponent {
 		for (const phase of run.phases || []) {
 			const pStatus = phase.normalizedStatus || phase.status;
 			const progress = phase.fanout ? formatFanout(phase.fanout) : formatProgress(phase.progress);
-			all.push(`${t.fg(statusColor(pStatus), statusIcon(pStatus))} ${t.fg("accent", phase.phase || "phase")}${t.fg("muted", progress)}${phase.lastMessage ? t.fg("dim", ` — ${phase.lastMessage}`) : ""}`);
+			all.push(`${t.fg(statusColor(pStatus), phaseStatusGlyph(pStatus))} ${t.fg("accent", phase.phase || "phase")}${t.fg("muted", progress)}${phase.lastMessage ? t.fg("dim", ` — ${phase.lastMessage}`) : ""}`);
 			if (phase.fanout?.items?.length) {
 				for (const item of phase.fanout.items.slice(0, MAX_DETAIL_PHASE_ITEMS)) {
 					const iStatus = item.normalizedStatus || item.status;
