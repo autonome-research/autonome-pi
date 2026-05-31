@@ -21,6 +21,7 @@ import {
 
 const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEMO_SCRIPT = path.join(EXT_DIR, "bin", "demo-workflow.mjs");
+const EXPLORATION_SCRIPT = path.join(EXT_DIR, "bin", "codebase-exploration-workflow.mjs");
 const MAX_MESSAGE_BYTES = 20_000;
 
 type AnyEvent = Record<string, any>;
@@ -78,13 +79,9 @@ function formatCompletion(event: AnyEvent): string {
 	return formatRunDetail(run);
 }
 
-function runDemo(cwd: string, options: { fail?: boolean; workflow?: string; delay?: string }, signal?: AbortSignal) {
+function runWorkflowScript(script: string, args: string[], cwd: string, signal?: AbortSignal) {
 	return new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
-		const args = [DEMO_SCRIPT, "--cwd", cwd];
-		if (options.workflow) args.push("--workflow", options.workflow);
-		if (options.delay) args.push("--delay", options.delay);
-		if (options.fail) args.push("--fail");
-		const proc = spawn(process.execPath, args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env });
+		const proc = spawn(process.execPath, [script, ...args], { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env });
 		let stdout = "";
 		let stderr = "";
 		proc.stdout.on("data", (d) => (stdout += d.toString()));
@@ -97,6 +94,30 @@ function runDemo(cwd: string, options: { fail?: boolean; workflow?: string; dela
 			else signal.addEventListener("abort", abort, { once: true });
 		}
 	});
+}
+
+function runDemo(cwd: string, options: { fail?: boolean; workflow?: string; delay?: string }, signal?: AbortSignal) {
+	const args = ["--cwd", cwd];
+	if (options.workflow) args.push("--workflow", options.workflow);
+	if (options.delay) args.push("--delay", options.delay);
+	if (options.fail) args.push("--fail");
+	return runWorkflowScript(DEMO_SCRIPT, args, cwd, signal);
+}
+
+function runExploration(cwd: string, options: { dirs?: string; agent?: string; concurrency?: string; maxDirs?: string; delay?: string; model?: string }, signal?: AbortSignal) {
+	const args = ["--cwd", cwd];
+	if (options.dirs) args.push("--dirs", options.dirs);
+	if (options.agent) args.push("--agent", options.agent);
+	if (options.concurrency) args.push("--concurrency", options.concurrency);
+	if (options.maxDirs) args.push("--maxDirs", options.maxDirs);
+	if (options.delay) args.push("--delay", options.delay);
+	if (options.model) args.push("--model", options.model);
+	return runWorkflowScript(EXPLORATION_SCRIPT, args, cwd, signal);
+}
+
+function optionAfter(parts: string[], name: string): string | undefined {
+	const index = parts.indexOf(name);
+	return index >= 0 ? parts[index + 1] : undefined;
 }
 
 export default function threadPhaseVisualizer(pi: ExtensionAPI) {
@@ -148,11 +169,25 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 			if (parts[0] === "demo") {
 				const result = await runDemo(ctx.cwd, {
 					fail: parts.includes("--fail") || parts.includes("fail"),
-					workflow: parts.includes("--workflow") ? parts[parts.indexOf("--workflow") + 1] : undefined,
-					delay: parts.includes("--delay") ? parts[parts.indexOf("--delay") + 1] : undefined,
+					workflow: optionAfter(parts, "--workflow"),
+					delay: optionAfter(parts, "--delay"),
 				}, ctx.signal);
 				if (result.code !== 0) ctx.ui.notify(result.stderr || result.stdout || "Demo workflow failed", "warning");
 				else ctx.ui.notify("Demo thread-phase workflow emitted", "info");
+				return;
+			}
+			if (parts[0] === "explore") {
+				const cwd = optionAfter(parts, "--cwd") ? path.resolve(ctx.cwd, optionAfter(parts, "--cwd")!) : ctx.cwd;
+				const result = await runExploration(cwd, {
+					dirs: optionAfter(parts, "--dirs"),
+					agent: optionAfter(parts, "--agent") || "mock",
+					concurrency: optionAfter(parts, "--concurrency"),
+					maxDirs: optionAfter(parts, "--maxDirs"),
+					delay: optionAfter(parts, "--delay"),
+					model: optionAfter(parts, "--model"),
+				}, ctx.signal);
+				if (result.code !== 0) ctx.ui.notify(result.stderr || result.stdout || "Codebase exploration failed", "warning");
+				else ctx.ui.notify("Codebase exploration workflow emitted", "info");
 				return;
 			}
 			if (parts[0] === "run" && parts[1]) {

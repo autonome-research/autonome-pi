@@ -176,7 +176,7 @@ The projected run shape includes:
 - `progress` by phase
 - raw `events[]` for advanced details
 
-## Demo workflow
+## Demo and test workflows
 
 Generate sample events without running a real workflow:
 
@@ -192,6 +192,22 @@ Or from inside Pi:
 /thread-phase demo --fail
 ```
 
+Generate a larger codebase-exploration workflow with fanout across subdirectories:
+
+```bash
+~/.pi/agent/extensions/thread-phase-visualizer/bin/codebase-exploration-workflow.mjs --cwd "$PWD" --agent mock --dirs src,tests,docs --concurrency 3
+~/.pi/agent/extensions/thread-phase-visualizer/bin/codebase-exploration-workflow.mjs --cwd "$PWD" --agent pi --dirs src,tests,docs --concurrency 2
+```
+
+From inside Pi:
+
+```text
+/thread-phase explore --agent mock --dirs src,tests,docs --delay 1000
+/thread-phase explore --agent pi --dirs src,tests,docs --concurrency 2
+```
+
+`--agent mock` is the default and is intended for UI testing. `--agent pi` launches read-only Pi subagents with `read,grep,find,ls` enabled.
+
 ## Pi usage
 
 - Tool: `thread_phase_runs`
@@ -200,6 +216,7 @@ Or from inside Pi:
 - Command: `/thread-phase run <runId>` opens the detail overlay in TUI mode
 - Command: `/thread-phase run <runId> --message` posts one run detail message
 - Command: `/thread-phase demo` emits a demo run
+- Command: `/thread-phase explore` emits a codebase exploration fanout run
 
 ## Current UI components
 
