@@ -197,7 +197,8 @@ Or from inside Pi:
 - Tool: `thread_phase_runs`
 - Command: `/thread-phase` opens the interactive browser in TUI mode
 - Command: `/thread-phase list` posts a compact message list
-- Command: `/thread-phase run <runId>` posts one run detail message
+- Command: `/thread-phase run <runId>` opens the detail overlay in TUI mode
+- Command: `/thread-phase run <runId> --message` posts one run detail message
 - Command: `/thread-phase demo` emits a demo run
 
 ## Current UI components

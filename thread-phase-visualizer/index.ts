@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { showRunBrowser } from "./components/run-browser.ts";
+import { showRunDetailOverlay } from "./components/run-detail.ts";
 import { registerThreadPhaseMessageRenderers } from "./components/run-message-renderer.ts";
 import { activeRunWidgetLines } from "./components/status-widget.ts";
 import {
@@ -157,12 +158,16 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 			if (parts[0] === "run" && parts[1]) {
 				const events = readRun(parts[1]);
 				const summary = getRunSummary(parts[1]);
-				pi.sendMessage({
-					customType: "thread-phase-run",
-					content: formatRunDetail(summary),
-					display: true,
-					details: { runId: parts[1], summary, events },
-				});
+				if (ctx.hasUI && !parts.includes("--message")) {
+					await showRunDetailOverlay(ctx, summary);
+				} else {
+					pi.sendMessage({
+						customType: "thread-phase-run",
+						content: formatRunDetail(summary),
+						display: true,
+						details: { runId: parts[1], summary, events },
+					});
+				}
 				return;
 			}
 			const runs = latestRunSummaries({ limit: 20, cwd: ctx.cwd });
