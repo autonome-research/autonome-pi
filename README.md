@@ -7,6 +7,7 @@ Private Pi package for thread-phase workflow visualization and example workflows
 - `thread-phase-visualizer` — generic TUI monitor and event store for `thread-phase-ui/v1` workflow events.
 - `codebase-exploration-workflow` — fanout codebase exploration workflow using Pi subagents.
 - `code-review-workflow` — git diff/commit code review workflow using Pi subagents.
+- `dynamic-thread-phase-workflow` — validated ad-hoc workflow runner for deterministic dynamic workflows planned in chat.
 
 ## Install
 
@@ -25,6 +26,7 @@ pi install git:git@github.com:Code4me2/pi-thread-phase-tools@main
 - `ctrl+shift+t` opens the thread-phase monitor.
 - `/codebase-explore` starts codebase exploration in the background by default.
 - `/code-review` runs code review workflows.
+- `dynamic_thread_phase_workflow` runs validated dynamic workflow specs from chat/tool calls.
 - Tool/API inspection remains available through `thread_phase_runs`.
 
 ## Notes
