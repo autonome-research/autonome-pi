@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { showRunBrowser } from "./components/run-browser.ts";
 import { registerThreadPhaseMessageRenderers } from "./components/run-message-renderer.ts";
 import { activeRunWidgetLines } from "./components/status-widget.ts";
 import {
@@ -135,10 +136,14 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("thread-phase", {
-		description: "Show recent generic thread-phase workflow runs; use 'demo' to emit a sample run",
+		description: "Open the thread-phase run browser; use 'demo' to emit a sample run or 'list' for a message list",
 		handler: async (args, ctx) => {
 			ensureStore();
 			const parts = args.trim().split(/\s+/).filter(Boolean);
+			if ((parts.length === 0 || parts[0] === "browser") && ctx.hasUI) {
+				await showRunBrowser(ctx);
+				return;
+			}
 			if (parts[0] === "demo") {
 				const result = await runDemo(ctx.cwd, {
 					fail: parts.includes("--fail") || parts.includes("fail"),
