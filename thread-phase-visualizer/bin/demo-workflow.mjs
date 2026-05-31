@@ -50,9 +50,18 @@ try {
   phaseEnd(run, "prepare", STATUSES.SUCCESS);
 
   phaseStart(run, "process");
-  await sleep(delayMs);
-  if (shouldFail) throw new Error("Intentional demo failure");
-  phaseEvent(run, "process", { kind: "progress", completed: 3, total: 3, message: "Processed all demo items" });
+  phaseEvent(run, "process", { kind: "fanout_start", total: 3, label: "demo items" });
+  for (let i = 0; i < 3; i++) {
+    const itemId = `item-${i + 1}`;
+    phaseEvent(run, "process", { kind: "fanout_item_start", itemId, label: `demo item ${i + 1}`, index: i, total: 3 });
+    await sleep(delayMs);
+    if (shouldFail && i === 1) {
+      phaseEvent(run, "process", { kind: "fanout_item_end", itemId, label: `demo item ${i + 1}`, index: i, status: STATUSES.FAILED, message: "Intentional demo item failure" });
+      throw new Error("Intentional demo failure");
+    }
+    phaseEvent(run, "process", { kind: "fanout_item_end", itemId, label: `demo item ${i + 1}`, index: i, status: STATUSES.SUCCESS, message: "Processed demo item" });
+    phaseEvent(run, "process", { kind: "progress", completed: i + 1, total: 3, message: `Processed ${i + 1}/3 demo items` });
+  }
   phaseEnd(run, "process", STATUSES.SUCCESS, { completed: 3 });
 
   artifact(run, {

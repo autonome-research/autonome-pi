@@ -79,6 +79,17 @@ STATUSES.UNKNOWN   // "unknown"
 
 Use `phaseEvent(..., { kind: "progress", completed, total })` for progress-like events. Keep workflow-specific detail inside `data`; avoid inventing new top-level event types until the UI needs them.
 
+Fanout phases use the same `phase_event` top-level type with a `data.kind` convention:
+
+```ts
+phaseEvent(run, "review", { kind: "fanout_start", total: files.length });
+phaseEvent(run, "review", { kind: "fanout_item_start", itemId: file, label: file, index });
+phaseEvent(run, "review", { kind: "fanout_item_end", itemId: file, status: STATUSES.SUCCESS });
+phaseEvent(run, "review", { kind: "progress", completed, total: files.length });
+```
+
+Projection helpers expose this as `phase.fanout`, with item summaries for expanded UI views.
+
 From a Node/TypeScript workflow runner:
 
 ```ts
@@ -184,9 +195,10 @@ Or from inside Pi:
 ## Pi usage
 
 - Tool: `thread_phase_runs`
-- Command: `/thread-phase`
-- Command: `/thread-phase run <runId>`
-- Command: `/thread-phase demo`
+- Command: `/thread-phase` opens the interactive browser in TUI mode
+- Command: `/thread-phase list` posts a compact message list
+- Command: `/thread-phase run <runId>` posts one run detail message
+- Command: `/thread-phase demo` emits a demo run
 
 ## Current UI components
 

@@ -48,6 +48,28 @@ export type ThreadPhaseUiEvent = {
   metadata?: unknown;
 };
 
+export type ThreadPhaseFanoutItemSummary = {
+  itemId: string;
+  label: string;
+  index?: number;
+  status?: ThreadPhaseUiStatus;
+  normalizedStatus: ThreadPhaseNormalizedStatus;
+  startedAt?: string;
+  updatedAt?: string;
+  endedAt?: string;
+  lastMessage?: string;
+  error?: unknown;
+};
+
+export type ThreadPhaseFanoutSummary = {
+  label?: string;
+  total?: number;
+  completed: number;
+  failed: number;
+  running: number;
+  items: ThreadPhaseFanoutItemSummary[];
+};
+
 export type ThreadPhasePhaseSummary = {
   phase: string;
   status?: ThreadPhaseUiStatus;
@@ -58,6 +80,7 @@ export type ThreadPhasePhaseSummary = {
   eventCount: number;
   lastMessage?: string;
   progress?: { current?: number; total?: number; percent?: number; message?: string };
+  fanout?: ThreadPhaseFanoutSummary;
 };
 
 export type ThreadPhaseRunSummary = {

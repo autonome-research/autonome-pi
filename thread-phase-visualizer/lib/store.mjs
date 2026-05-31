@@ -320,6 +320,7 @@ export function projectRun(events = []) {
         summary.progress[event.phase] = progress;
         phase.progress = progress;
       }
+      applyFanoutEvent(phase, event.data, event);
     }
     if (event.type === EVENT_TYPES.PHASE_END && event.phase) {
       const phase = upsertPhase(summary, event.phase, { phase: event.phase });
@@ -335,6 +336,7 @@ export function projectRun(events = []) {
     }
   }
 
+  for (const phase of Object.values(summary.phaseMap)) finalizeFanout(phase);
   summary.phases = Object.values(summary.phaseMap).sort((a, b) => String(a.startedAt || "").localeCompare(String(b.startedAt || "")));
   delete summary.phaseMap;
   if (summary.normalizedStatus !== STATUSES.FAILED && summary.errors.length > 0 && !sorted.some((e) => e.type === EVENT_TYPES.WORKFLOW_END)) {
@@ -431,6 +433,65 @@ function extractProgress(data) {
       ? current / total
       : undefined;
   return dropUndefined({ current, total, percent, message: data.message });
+}
+
+function applyFanoutEvent(phase, data, event) {
+  if (!data || typeof data !== "object") return;
+  const kind = data.kind || data.type;
+  if (!String(kind || "").startsWith("fanout")) return;
+
+  phase.fanout ||= { total: undefined, completed: 0, failed: 0, running: 0, items: [] };
+  phase._fanoutItemMap ||= {};
+
+  if (kind === "fanout_start") {
+    if (typeof data.total === "number") phase.fanout.total = data.total;
+    phase.fanout.label = data.label || phase.fanout.label;
+    return;
+  }
+
+  const itemId = String(data.itemId ?? data.id ?? data.label ?? data.index ?? "item");
+  const item = phase._fanoutItemMap[itemId] || {
+    itemId,
+    label: data.label || itemId,
+    index: data.index,
+    startedAt: event.timestamp,
+    status: STATUSES.RUNNING,
+    normalizedStatus: STATUSES.RUNNING,
+    lastMessage: data.message,
+  };
+  item.label = data.label || item.label;
+  item.index = data.index ?? item.index;
+  item.updatedAt = event.timestamp;
+  item.lastMessage = data.message || item.lastMessage;
+
+  if (kind === "fanout_item_start") {
+    item.startedAt ||= event.timestamp;
+    item.status = data.status || STATUSES.RUNNING;
+    item.normalizedStatus = normalizeStatus(item.status);
+  } else if (kind === "fanout_item_end") {
+    item.endedAt = event.timestamp;
+    item.status = data.status || STATUSES.SUCCESS;
+    item.normalizedStatus = normalizeStatus(item.status);
+    item.error = data.error;
+  }
+  phase._fanoutItemMap[itemId] = item;
+}
+
+function finalizeFanout(phase) {
+  if (!phase.fanout) return;
+  const items = Object.values(phase._fanoutItemMap || {}).sort((a, b) => {
+    if (typeof a.index === "number" && typeof b.index === "number") return a.index - b.index;
+    return String(a.startedAt || "").localeCompare(String(b.startedAt || ""));
+  });
+  const completed = items.filter((item) => item.normalizedStatus === STATUSES.SUCCESS || item.normalizedStatus === STATUSES.SKIPPED).length;
+  const failed = items.filter((item) => item.normalizedStatus === STATUSES.FAILED).length;
+  const running = items.filter((item) => item.normalizedStatus === STATUSES.RUNNING).length;
+  phase.fanout.items = items;
+  phase.fanout.completed = completed;
+  phase.fanout.failed = failed;
+  phase.fanout.running = running;
+  phase.fanout.total ||= items.length;
+  delete phase._fanoutItemMap;
 }
 
 function compactText(text, maxBytes) {
