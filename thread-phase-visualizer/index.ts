@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { showThreadPhaseMonitor } from "./components/monitor.ts";
 import { showRunBrowser } from "./components/run-browser.ts";
 import { showRunDetailOverlay } from "./components/run-detail.ts";
 import { registerThreadPhaseMessageRenderers } from "./components/run-message-renderer.ts";
@@ -146,11 +147,15 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("thread-phase", {
-		description: "Open the thread-phase run browser; use 'demo' to emit a sample run or 'list' for a message list",
+		description: "Open the live thread-phase monitor; use 'browser' for history, 'demo' to emit a sample run, or 'list' for a message list",
 		handler: async (args, ctx) => {
 			ensureStore();
 			const parts = args.trim().split(/\s+/).filter(Boolean);
-			if ((parts.length === 0 || parts[0] === "browser") && ctx.hasUI) {
+			if ((parts.length === 0 || parts[0] === "monitor") && ctx.hasUI) {
+				await showThreadPhaseMonitor(ctx, path.resolve(ctx.cwd));
+				return;
+			}
+			if (parts[0] === "browser" && ctx.hasUI) {
 				await showRunBrowser(ctx);
 				return;
 			}
@@ -186,6 +191,14 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				display: true,
 				details: { runs },
 			});
+		},
+	});
+
+	pi.registerShortcut("ctrl+shift+t", {
+		description: "Open live thread-phase monitor",
+		handler: async (ctx) => {
+			ensureStore();
+			await showThreadPhaseMonitor(ctx, path.resolve(ctx.cwd));
 		},
 	});
 

@@ -74,7 +74,7 @@ class RunDetailComponent {
 		if (run.artifacts?.length) {
 			container.addChild(new Spacer(1));
 			container.addChild(new Text(t.fg("toolTitle", t.bold("Artifacts")), 1, 0));
-			container.addChild(renderArtifactList(run, t, true));
+			container.addChild(renderArtifactList(run, t, true, { contentMode: "none" }));
 		}
 
 		container.addChild(new DynamicBorder((s: string) => t.fg(statusColor(status), s)));

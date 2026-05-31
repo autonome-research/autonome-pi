@@ -197,7 +197,9 @@ Larger workflow examples, such as codebase exploration, live in their own workfl
 ## Pi usage
 
 - Tool: `thread_phase_runs`
-- Command: `/thread-phase` opens the interactive browser in TUI mode
+- Command: `/thread-phase` opens the live monitor overlay in TUI mode
+- Shortcut: `ctrl+shift+t` opens the live monitor overlay
+- Command: `/thread-phase browser` opens the historical run browser
 - Command: `/thread-phase list` posts a compact message list
 - Command: `/thread-phase run <runId>` opens the detail overlay in TUI mode
 - Command: `/thread-phase run <runId> --message` posts one run detail message
@@ -207,16 +209,21 @@ Larger workflow examples, such as codebase exploration, live in their own workfl
 
 The first UI layer is implemented as generic custom message renderers:
 
-- `thread-phase-run`: collapsed one-line workflow status; expand with Pi's tool/message expansion key to show phases, errors, and artifact content.
+- `thread-phase-run`: collapsed one-line workflow status; expand with Pi's tool/message expansion key to show phases, errors, and summary artifact content.
 - `thread-phase-runs`: compact list of recent runs; expand to show more entries.
+- live monitor overlay: keyboard-driven progress view with deterministic phase glyphs (`✓`, `…`, `✗`, `⊘`, `↷`) and arrow-key selection.
 
 Component files:
 
 ```text
 components/
 ├── artifact-view.ts
+├── monitor.ts
 ├── phase-timeline.ts
-└── run-message-renderer.ts
+├── run-browser.ts
+├── run-detail.ts
+├── run-message-renderer.ts
+└── status-widget.ts
 ```
 
 The renderer intentionally stays workflow-agnostic and consumes projected summaries from `lib/store.mjs`.

@@ -66,7 +66,7 @@ function renderRunMessage(message: any, expanded: boolean, theme: any) {
 	if (run.artifacts?.length) {
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(theme.fg("toolTitle", theme.bold("Artifacts")), 0, 0));
-		container.addChild(renderArtifactList(run, theme, true));
+		container.addChild(renderArtifactList(run, theme, true, { contentMode: "summary" }));
 	}
 
 	box.addChild(container);

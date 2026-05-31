@@ -13,8 +13,9 @@ export function artifactSummaryText(run: RunSummary): string {
 	return `${artifacts.length} artifact${artifacts.length === 1 ? "" : "s"}`;
 }
 
-export function renderArtifactList(run: RunSummary, theme: Theme, expanded: boolean) {
+export function renderArtifactList(run: RunSummary, theme: Theme, expanded: boolean, options: { contentMode?: "none" | "summary" | "all" } = {}) {
 	const artifacts: Artifact[] = run.artifacts || [];
+	const contentMode = options.contentMode ?? "none";
 	const container = new Container();
 	if (artifacts.length === 0) {
 		container.addChild(new Text(theme.fg("dim", "No artifacts"), 0, 0));
@@ -25,7 +26,9 @@ export function renderArtifactList(run: RunSummary, theme: Theme, expanded: bool
 		const title = artifact.title || artifact.kind || "artifact";
 		const target = artifact.path || artifact.preview || (artifact.content ? "(inline)" : "");
 		container.addChild(new Text(`${theme.fg("success", "◉")} ${theme.fg("accent", title)}${target ? theme.fg("dim", ` — ${target}`) : ""}`, 0, 0));
-		if (expanded) {
+		const isSummary = /summary/i.test(String(title));
+		const shouldRenderContent = expanded && (contentMode === "all" || (contentMode === "summary" && isSummary));
+		if (shouldRenderContent) {
 			const rendered = renderArtifactContent(artifact, theme);
 			if (rendered) {
 				container.addChild(new Spacer(1));
