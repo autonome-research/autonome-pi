@@ -1,3 +1,12 @@
 node_modules/
-*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 .DS_Store
+.env
+.env.*
+
+# Generated workflow data lives outside this package by default, but ignore it
+# if someone points a store inside the repo during testing.
+thread-phase/
+*.tmp
