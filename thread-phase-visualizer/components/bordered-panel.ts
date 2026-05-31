@@ -19,14 +19,15 @@ function fitVisible(text: string, targetWidth: number): string {
 
 export function framePanel(lines: string[], width: number, theme: any, options: BorderedPanelOptions = {}): string[] {
 	const panelWidth = Math.max(8, width);
-	const innerWidth = Math.max(0, panelWidth - 4); // border + space on each side
+	const contentWidth = Math.max(0, panelWidth - 4); // left border + space + content + space + right border
+	const horizontalWidth = Math.max(0, panelWidth - 2); // width between top/bottom corners
 	const borderColor = options.borderColor || "borderAccent";
 	const titleColor = options.titleColor || "accent";
 	const border = (s: string) => theme.fg(borderColor, s);
 	const titleText = options.title ? ` ${options.title} ` : "";
-	const fittedTitle = truncateToWidth(titleText, Math.max(0, innerWidth), "");
+	const fittedTitle = truncateToWidth(titleText, horizontalWidth, "");
 	const titleVisible = visibleWidth(fittedTitle);
-	const remaining = Math.max(0, innerWidth - titleVisible);
+	const remaining = Math.max(0, horizontalWidth - titleVisible);
 	const left = Math.floor(remaining / 2);
 	const right = remaining - left;
 
@@ -37,7 +38,7 @@ export function framePanel(lines: string[], width: number, theme: any, options: 
 		border("─".repeat(right)),
 		border("╮"),
 	].join("");
-	const bottom = `${border("╰")}${border("─".repeat(innerWidth))}${border("╯")}`;
-	const body = lines.map((line) => `${border("│")} ${fitVisible(line, innerWidth)} ${border("│")}`);
+	const bottom = `${border("╰")}${border("─".repeat(horizontalWidth))}${border("╯")}`;
+	const body = lines.map((line) => `${border("│")} ${fitVisible(line, contentWidth)} ${border("│")}`);
 	return [top, ...body, bottom];
 }
