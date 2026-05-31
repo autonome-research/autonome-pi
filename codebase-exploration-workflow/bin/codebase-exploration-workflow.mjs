@@ -326,12 +326,12 @@ async function main() {
   const args = parseArgs(rawArgv);
   if (maybeBackground(rawArgv, args)) return;
   if (args.help || args.h) {
-    console.log(`Usage: codebase-exploration-workflow.mjs --cwd REPO [--dirs src,tests,docs] [--agent mock|pi] [--concurrency 3] [--model MODEL]\n\nDefault agent is mock. Use --agent pi for real read-only Pi subagents.`);
+    console.log(`Usage: codebase-exploration-workflow.mjs --cwd REPO [--dirs src,tests,docs] [--agent mock|pi] [--concurrency 3] [--model MODEL]\n\nDefault agent is pi (real read-only Pi subagents). Use --agent mock only for UI testing.`);
     return;
   }
 
   const cwd = resolve(String(args.cwd || process.cwd()));
-  const agent = String(args.agent || "mock");
+  const agent = String(args.agent || "pi");
   const concurrency = Number.parseInt(String(args.concurrency || "3"), 10);
   const maxDirs = Number.parseInt(String(args.maxDirs || "8"), 10);
   const delayMs = Number.parseInt(String(args.delay || "750"), 10);

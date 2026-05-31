@@ -64,11 +64,11 @@ function buildArgs(params: {
 function commandUsage() {
 	return [
 		"Usage:",
+		"  /codebase-explore --dirs src,tests,docs --concurrency 2",
 		"  /codebase-explore --agent mock --dirs src,tests,docs --delay 1000",
-		"  /codebase-explore --agent pi --dirs src,tests,docs --concurrency 2",
 		"  /codebase-explore --cwd /repo --maxDirs 8",
 		"",
-		"Defaults: --agent mock --concurrency 3 --maxDirs 8",
+		"Defaults: --agent pi --concurrency 3 --maxDirs 8",
 	].join("\n");
 }
 
@@ -80,12 +80,12 @@ export default function codebaseExplorationWorkflow(pi: ExtensionAPI) {
 		promptSnippet: "Run codebase exploration fanout across project subdirectories",
 		promptGuidelines: [
 			"Use codebase_exploration_workflow when the user asks to explore or map a codebase with fanout over subdirectories.",
-			"codebase_exploration_workflow is read-only. Use agent='mock' for UI testing and agent='pi' for real read-only Pi subagents.",
+			"codebase_exploration_workflow is read-only and defaults to real Pi subagents. Use agent='mock' only for UI testing.",
 		],
 		parameters: Type.Object({
 			cwd: Type.Optional(Type.String({ description: "Repository/project directory. Defaults to Pi's cwd." })),
 			dirs: Type.Optional(Type.String({ description: "Comma-separated subdirectories to explore, e.g. src,tests,docs." })),
-			agent: Type.Optional(StringEnum(["mock", "pi"] as const, { default: "mock", description: "mock for UI testing; pi for real read-only Pi subagents." })),
+			agent: Type.Optional(StringEnum(["mock", "pi"] as const, { default: "pi", description: "pi for real read-only Pi subagents; mock for UI testing." })),
 			concurrency: Type.Optional(Type.Number({ description: "Fanout concurrency. Default 3." })),
 			maxDirs: Type.Optional(Type.Number({ description: "Max auto-discovered directories. Default 8." })),
 			delay: Type.Optional(Type.Number({ description: "Mock-agent delay per item in milliseconds." })),
@@ -98,7 +98,7 @@ export default function codebaseExplorationWorkflow(pi: ExtensionAPI) {
 			const result = await runScript(buildArgs({
 				cwd,
 				dirs: params.dirs,
-				agent: (params.agent || "mock") as AgentMode,
+				agent: (params.agent || "pi") as AgentMode,
 				concurrency: params.concurrency,
 				maxDirs: params.maxDirs,
 				delay: params.delay,
@@ -126,7 +126,7 @@ export default function codebaseExplorationWorkflow(pi: ExtensionAPI) {
 				const result = await runScript(buildArgs({
 					cwd,
 					dirs: optionAfter(parts, "--dirs"),
-					agent: (optionAfter(parts, "--agent") || "mock") as AgentMode,
+					agent: (optionAfter(parts, "--agent") || "pi") as AgentMode,
 					concurrency: optionAfter(parts, "--concurrency") ? Number(optionAfter(parts, "--concurrency")) : undefined,
 					maxDirs: optionAfter(parts, "--maxDirs") ? Number(optionAfter(parts, "--maxDirs")) : undefined,
 					delay: optionAfter(parts, "--delay") ? Number(optionAfter(parts, "--delay")) : undefined,

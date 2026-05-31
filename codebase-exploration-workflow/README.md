@@ -10,24 +10,24 @@ A read-only fanout workflow for exploring a project by subdirectory. It emits ge
 Examples:
 
 ```text
-/codebase-explore --agent mock --dirs src,tests,docs --delay 1000
-/codebase-explore --agent pi --dirs src,tests,docs --concurrency 2
+/codebase-explore --dirs src,tests,docs --concurrency 2
 /codebase-explore --cwd /repo --maxDirs 8
+/codebase-explore --agent mock --dirs src,tests,docs --delay 1000
 ```
 
 Defaults:
 
-- `--agent mock` for UI testing
+- `--agent pi` for real read-only Pi subagents
 - `--concurrency 3`
 - `--maxDirs 8`
 
-`--agent pi` launches read-only Pi subagents with `read,grep,find,ls` enabled.
+Use `--agent mock` only for fast UI testing. `--agent pi` launches read-only Pi subagents with `read,grep,find,ls` enabled.
 
 ## Direct CLI
 
 ```bash
+~/.pi/agent/extensions/codebase-exploration-workflow/bin/codebase-exploration-workflow.mjs --cwd "$PWD" --dirs src,tests,docs --concurrency 2
 ~/.pi/agent/extensions/codebase-exploration-workflow/bin/codebase-exploration-workflow.mjs --cwd "$PWD" --agent mock --dirs src,tests,docs
-~/.pi/agent/extensions/codebase-exploration-workflow/bin/codebase-exploration-workflow.mjs --cwd "$PWD" --agent pi --dirs src,tests,docs --concurrency 2
 ```
 
 ## Visualizer output
