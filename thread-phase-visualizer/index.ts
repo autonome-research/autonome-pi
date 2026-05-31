@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { registerThreadPhaseMessageRenderers } from "./components/run-message-renderer.ts";
+import { activeRunWidgetLines } from "./components/status-widget.ts";
 import {
 	EVENT_TYPES,
 	INDEX_FILE,
@@ -174,8 +175,11 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		const cwd = path.resolve(ctx.cwd);
 		const updateStatus = () => {
 			if (!ctx.hasUI) return;
-			const running = latestRunSummaries({ limit: 100, cwd }).filter((run: AnyEvent) => run.normalizedStatus === STATUSES.RUNNING).length;
+			const runs = latestRunSummaries({ limit: 100, cwd });
+			const running = runs.filter((run: AnyEvent) => run.normalizedStatus === STATUSES.RUNNING).length;
 			ctx.ui.setStatus("thread-phase", running > 0 ? `${running} workflow(s) running` : "watching");
+			const widgetLines = activeRunWidgetLines(runs);
+			ctx.ui.setWidget("thread-phase", widgetLines.length > 0 ? widgetLines : undefined, { placement: "belowEditor" });
 		};
 		// Prime the seen set so reloading Pi does not replay old completed workflow messages.
 		for (const event of readIndex({ limit: 5000 })) seen.add(eventKey(event));
@@ -206,8 +210,9 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		watcher = fs.watch(INDEX_FILE, { persistent: false }, () => processNewEvents());
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (_event, ctx) => {
 		watcher?.close();
 		watcher = undefined;
+		if (ctx.hasUI) ctx.ui.setWidget("thread-phase", undefined);
 	});
 }
