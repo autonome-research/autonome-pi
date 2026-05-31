@@ -7,6 +7,8 @@ A read-only fanout workflow for exploring a project by subdirectory. It emits ge
 - Tool: `codebase_exploration_workflow`
 - Command: `/codebase-explore`
 
+The default directory follows simple `cd <dir>` user-bash commands issued inside the Pi session. If you start Pi in `~/`, run `cd chiya-library/`, then run `/codebase-explore`, it explores `~/chiya-library`. Use `--cwd /path` to override.
+
 Examples:
 
 ```text

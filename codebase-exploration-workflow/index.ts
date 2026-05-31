@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { existsSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -69,10 +71,63 @@ function commandUsage() {
 		"  /codebase-explore --cwd /repo --maxDirs 8",
 		"",
 		"Defaults: --agent pi --concurrency 3 --maxDirs 8",
+		"Default cwd follows simple user-bash cd commands in this Pi session.",
 	].join("\n");
 }
 
+function shellUnquote(value: string): string {
+	const trimmed = value.trim();
+	if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+		return trimmed.slice(1, -1);
+	}
+	return trimmed.replace(/\\ /g, " ");
+}
+
+function expandHome(input: string): string {
+	if (input === "~") return homedir();
+	if (input.startsWith("~/")) return path.join(homedir(), input.slice(2));
+	return input;
+}
+
+function directoryExists(candidate: string): boolean {
+	try {
+		return existsSync(candidate) && statSync(candidate).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+function resolveAgainstActive(activeCwd: string, maybePath?: string): string {
+	if (!maybePath) return activeCwd;
+	const expanded = expandHome(maybePath);
+	return path.resolve(activeCwd, expanded);
+}
+
+function parseSimpleCd(command: string): string | undefined {
+	const trimmed = command.trim().replace(/;\s*$/, "");
+	const match = trimmed.match(/^cd(?:\s+(.+))?$/);
+	if (!match) return undefined;
+	return shellUnquote(match[1] || "~");
+}
+
 export default function codebaseExplorationWorkflow(pi: ExtensionAPI) {
+	let activeCwd = process.cwd();
+	let previousCwd = activeCwd;
+
+	pi.on("session_start", (_event, ctx) => {
+		activeCwd = ctx.cwd;
+		previousCwd = ctx.cwd;
+	});
+
+	pi.on("user_bash", (event, ctx) => {
+		const target = parseSimpleCd(event.command);
+		if (target === undefined) return;
+		const next = target === "-" ? previousCwd : resolveAgainstActive(activeCwd || event.cwd || ctx.cwd, target);
+		if (!directoryExists(next)) return;
+		previousCwd = activeCwd || event.cwd || ctx.cwd;
+		activeCwd = next;
+		if (ctx.hasUI) ctx.ui.setStatus("codebase-cwd", path.relative(ctx.cwd, activeCwd) || ".");
+	});
 	pi.registerTool({
 		name: "codebase_exploration_workflow",
 		label: "Codebase Exploration Workflow",
@@ -93,7 +148,7 @@ export default function codebaseExplorationWorkflow(pi: ExtensionAPI) {
 			background: Type.Optional(Type.Boolean({ description: "Start the workflow in the background and return immediately." })),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const cwd = path.resolve(ctx.cwd, params.cwd || ".");
+			const cwd = resolveAgainstActive(activeCwd || ctx.cwd, params.cwd);
 			onUpdate?.({ content: [{ type: "text", text: `Starting codebase exploration in ${cwd}...` }] });
 			const result = await runScript(buildArgs({
 				cwd,
@@ -113,14 +168,14 @@ export default function codebaseExplorationWorkflow(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("codebase-explore", {
-		description: "Run the codebase exploration fanout workflow",
+		description: "Run the codebase exploration fanout workflow from the active directory",
 		handler: async (args, ctx) => {
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			if (parts.includes("--help") || parts.includes("-h") || parts[0] === "help") {
 				ctx.ui.notify(commandUsage(), "info");
 				return;
 			}
-			const cwd = optionAfter(parts, "--cwd") ? path.resolve(ctx.cwd, optionAfter(parts, "--cwd")!) : ctx.cwd;
+			const cwd = resolveAgainstActive(activeCwd || ctx.cwd, optionAfter(parts, "--cwd"));
 			ctx.ui.setStatus("codebase-explore", "running...");
 			try {
 				const result = await runScript(buildArgs({
