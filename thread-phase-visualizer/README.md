@@ -190,15 +190,15 @@ The demo script is intentionally not exposed as a slash command. Larger workflow
 ## Pi usage
 
 - Tool: `thread_phase_runs` for agent/API inspection
-- Command: `/thread-phase` opens the live monitor overlay in TUI mode
 - Shortcut: `ctrl+shift+t` opens the live monitor overlay
+- In the monitor, press `x` on a running workflow to request cancellation.
 
 ## Current UI components
 
 The first UI layer is implemented as generic custom message renderers:
 
 - `thread-phase-run`: collapsed one-line workflow status; expand with Pi's tool/message expansion key to show phases, errors, and summary artifact content.
-- live monitor overlay: keyboard-driven progress view with workflow status glyphs (`✓`, `…`, `✗`, `⊘`, `↷`) and separate phase glyphs (`◆`, `◈`, `◇`) for quick visual scanning.
+- live monitor overlay: keyboard-driven progress view with workflow status glyphs (`✓`, `…`, `✗`, `⊘`, `↷`), cancellation (`x`), and separate phase glyphs (`◆`, `◈`, `◇`) for quick visual scanning.
 
 Component files:
 

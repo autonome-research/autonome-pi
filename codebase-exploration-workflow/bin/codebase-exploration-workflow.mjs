@@ -36,6 +36,25 @@ async function loadThreadPhaseCore() {
 
 const { PipelineCache, requireCtx, runPipeline } = await loadThreadPhaseCore();
 
+const activeChildren = new Set();
+let activeVisualizerRun;
+let cancellationRequested = false;
+
+function requestCancel(signalName = "SIGTERM") {
+  cancellationRequested = true;
+  for (const child of activeChildren) {
+    try { child.kill("SIGTERM"); } catch { /* ignore */ }
+  }
+  if (activeVisualizerRun) {
+    completeRun(activeVisualizerRun, STATUSES.CANCELLED, { cancelled: true, signal: signalName });
+    activeVisualizerRun = undefined;
+  }
+  setTimeout(() => process.exit(130), 50).unref();
+}
+
+process.once("SIGTERM", () => requestCancel("SIGTERM"));
+process.once("SIGINT", () => requestCancel("SIGINT"));
+
 function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -151,6 +170,7 @@ async function runPiExplorer({ cwd, dir, model, timeoutMs }) {
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
     });
+    activeChildren.add(proc);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -162,10 +182,12 @@ async function runPiExplorer({ cwd, dir, model, timeoutMs }) {
     proc.stdout.on("data", (data) => stdout += data.toString());
     proc.stderr.on("data", (data) => stderr += data.toString());
     proc.on("error", (error) => {
+      activeChildren.delete(proc);
       clearTimeout(timer);
       resolve({ ok: false, text: "", error: error.message, stdout, stderr, timedOut });
     });
     proc.on("close", (code) => {
+      activeChildren.delete(proc);
       clearTimeout(timer);
       const parsed = parsePiJsonLines(stdout);
       resolve({ ok: code === 0 && Boolean(parsed.text), code, stdout, stderr, timedOut, ...parsed, error: code === 0 ? undefined : stderr || `pi exited ${code}` });
@@ -342,8 +364,10 @@ async function main() {
     cwd,
     trigger: { kind: process.env.PI_CODEBASE_EXPLORATION_BACKGROUND ? "background" : "manual", agent, concurrency },
     input: { dirs: splitList(args.dirs), agent, concurrency },
+    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM" },
     message: "codebase-exploration started",
   });
+  activeVisualizerRun = visualizerRun;
 
   const ctx = {
     cache: new PipelineCache(),
@@ -371,11 +395,19 @@ async function main() {
       total: ctx.dirs?.length ?? 0,
       summaryPath: ctx.summaryPath,
     });
+    activeVisualizerRun = undefined;
     console.log(JSON.stringify({ ok: true, runId: visualizerRun.runId, workflow: visualizerRun.workflow, cwd, dirs: ctx.dirs, agent, summaryPath: ctx.summaryPath }, null, 2));
   } catch (error) {
-    failRun(visualizerRun, error, { completed: ctx.completed, failed: ctx.failed, total: ctx.dirs?.length, summaryPath: ctx.summaryPath });
-    console.log(JSON.stringify({ ok: false, runId: visualizerRun.runId, workflow: visualizerRun.workflow, cwd, error: error.message }, null, 2));
-    process.exitCode = 1;
+    if (cancellationRequested) {
+      if (activeVisualizerRun === visualizerRun) completeRun(visualizerRun, STATUSES.CANCELLED, { cancelled: true, completed: ctx.completed, failed: ctx.failed, total: ctx.dirs?.length, summaryPath: ctx.summaryPath });
+      console.log(JSON.stringify({ ok: false, cancelled: true, runId: visualizerRun.runId, workflow: visualizerRun.workflow, cwd }, null, 2));
+      process.exitCode = 130;
+    } else {
+      failRun(visualizerRun, error, { completed: ctx.completed, failed: ctx.failed, total: ctx.dirs?.length, summaryPath: ctx.summaryPath });
+      console.log(JSON.stringify({ ok: false, runId: visualizerRun.runId, workflow: visualizerRun.workflow, cwd, error: error.message }, null, 2));
+      process.exitCode = 1;
+    }
+    activeVisualizerRun = undefined;
   }
 }
 

@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -73,10 +74,44 @@ function formatCompletion(event: AnyEvent): string {
 	return formatRunDetail(run);
 }
 
+function shellUnquote(value: string): string {
+	const trimmed = value.trim();
+	if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) return trimmed.slice(1, -1);
+	return trimmed.replace(/\\ /g, " ");
+}
+
+function expandHome(input: string): string {
+	if (input === "~") return homedir();
+	if (input.startsWith("~/")) return path.join(homedir(), input.slice(2));
+	return input;
+}
+
+function parseSimpleCd(command: string): string | undefined {
+	const trimmed = command.trim().replace(/;\s*$/, "");
+	const match = trimmed.match(/^cd(?:\s+(.+))?$/);
+	if (!match) return undefined;
+	return shellUnquote(match[1] || "~");
+}
+
+function directoryExists(candidate: string): boolean {
+	try { return fs.existsSync(candidate) && fs.statSync(candidate).isDirectory(); }
+	catch { return false; }
+}
+
+function mergeMonitorRuns(cwd: string): AnyEvent[] {
+	const globalRunning = latestRunSummaries({ limit: 100 }).filter((run: AnyEvent) => run.normalizedStatus === STATUSES.RUNNING);
+	const localRuns = latestRunSummaries({ limit: 100, cwd });
+	const byRun = new Map<string, AnyEvent>();
+	for (const run of [...globalRunning, ...localRuns]) if (run.runId) byRun.set(run.runId, run);
+	return Array.from(byRun.values()).sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+}
+
 export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	registerThreadPhaseMessageRenderers(pi);
 
 	let watcher: fs.FSWatcher | undefined;
+	let activeCwd = process.cwd();
+	let previousCwd = activeCwd;
 	const seen = new Set<string>();
 
 	pi.registerTool({
@@ -110,28 +145,32 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("thread-phase", {
-		description: "Open the live thread-phase monitor",
-		handler: async (_args, ctx) => {
-			ensureStore();
-			await showThreadPhaseMonitor(ctx, path.resolve(ctx.cwd));
-		},
-	});
-
 	pi.registerShortcut("ctrl+shift+t", {
 		description: "Open live thread-phase monitor",
 		handler: async (ctx) => {
 			ensureStore();
-			await showThreadPhaseMonitor(ctx, path.resolve(ctx.cwd));
+			await showThreadPhaseMonitor(ctx, path.resolve(activeCwd || ctx.cwd));
 		},
+	});
+
+	pi.on("user_bash", (event, ctx) => {
+		const target = parseSimpleCd(event.command);
+		if (target === undefined) return;
+		const base = activeCwd || event.cwd || ctx.cwd;
+		const next = target === "-" ? previousCwd : path.resolve(base, expandHome(target));
+		if (!directoryExists(next)) return;
+		previousCwd = base;
+		activeCwd = next;
+		if (ctx.hasUI) ctx.ui.setStatus("thread-phase-cwd", path.relative(ctx.cwd, activeCwd) || ".");
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		ensureStore();
-		const cwd = path.resolve(ctx.cwd);
+		activeCwd = path.resolve(ctx.cwd);
+		previousCwd = activeCwd;
 		const updateStatus = () => {
 			if (!ctx.hasUI) return;
-			const runs = latestRunSummaries({ limit: 100, cwd });
+			const runs = mergeMonitorRuns(activeCwd);
 			const running = runs.filter((run: AnyEvent) => run.normalizedStatus === STATUSES.RUNNING).length;
 			ctx.ui.setStatus("thread-phase", running > 0 ? `${running} workflow(s) running` : "watching");
 			const widgetLines = activeRunWidgetLines(runs);
@@ -147,7 +186,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				const key = eventKey(event);
 				if (seen.has(key)) continue;
 				seen.add(key);
-				if (event.cwd !== cwd) continue;
+				if (event.cwd !== activeCwd) continue;
 				if (event.type === EVENT_TYPES.WORKFLOW_END) {
 					const summary = getRunSummary(event.runId);
 					pi.sendMessage({

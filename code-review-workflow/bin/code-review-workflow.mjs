@@ -25,6 +25,23 @@ const DEFAULT_PI = existsSync(join(homedir(), ".npm-global", "bin", "pi"))
 const REVIEW_MARKER_START = "# >>> pi-code-review-workflow >>>";
 const REVIEW_MARKER_END = "# <<< pi-code-review-workflow <<<";
 
+const activeChildren = new Set();
+let activeTpRun;
+
+function requestCancel(signalName = "SIGTERM") {
+  for (const child of activeChildren) {
+    try { child.kill("SIGTERM"); } catch { /* ignore */ }
+  }
+  if (activeTpRun) {
+    completeRun(activeTpRun, STATUSES.CANCELLED, { cancelled: true, signal: signalName });
+    activeTpRun = undefined;
+  }
+  setTimeout(() => process.exit(130), 50).unref();
+}
+
+process.once("SIGTERM", () => requestCancel("SIGTERM"));
+process.once("SIGINT", () => requestCancel("SIGINT"));
+
 function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -216,6 +233,7 @@ async function runPiReview(root, request, options) {
 
   return await new Promise((resolve) => {
     const proc = spawn(piBin, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    activeChildren.add(proc);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -227,10 +245,12 @@ async function runPiReview(root, request, options) {
     proc.stdout.on("data", (d) => stdout += d.toString());
     proc.stderr.on("data", (d) => stderr += d.toString());
     proc.on("error", (error) => {
+      activeChildren.delete(proc);
       clearTimeout(timer);
       resolve({ ok: false, error: error.message, stdout, stderr, timedOut });
     });
     proc.on("close", (code) => {
+      activeChildren.delete(proc);
       clearTimeout(timer);
       const parsed = parsePiJsonLines(stdout);
       if (timedOut) resolve({ ok: false, error: "review timed out", code, stdout, stderr, ...parsed, timedOut });
@@ -271,8 +291,9 @@ async function reviewCommand(opts) {
     cwd: root,
     trigger: { kind: process.env.PI_CODE_REVIEW_BACKGROUND ? "post-commit" : "manual", mode, ref: ref || "HEAD" },
     input: { mode, ref: ref || "HEAD", commit },
-    metadata: { commit },
+    metadata: { commit, pid: process.pid, cancellable: true, cancelSignal: "SIGTERM" },
   });
+  activeTpRun = tpRun;
 
   try {
     const diffLimit = opts.diffLimit ? Number.parseInt(String(opts.diffLimit), 10) : DEFAULT_DIFF_LIMIT;
@@ -323,11 +344,15 @@ async function reviewCommand(opts) {
       threadPhaseIndexFile: THREAD_PHASE_INDEX_FILE,
     };
     completeRun(tpRun, event.ok ? STATUSES.SUCCESS : STATUSES.FAILED, event);
+    activeTpRun = undefined;
     if (opts.json) console.log(JSON.stringify(event, null, 2));
     else console.log(`Code review ${event.ok ? "complete" : "failed"}: ${reportPath}\n\n${report}`);
     return event.ok ? 0 : 2;
   } catch (error) {
-    failRun(tpRun, error);
+    if (activeTpRun === tpRun) {
+      failRun(tpRun, error);
+      activeTpRun = undefined;
+    }
     throw error;
   }
 }

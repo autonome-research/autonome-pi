@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
-import { latestRunSummaries } from "../lib/store.mjs";
+import { STATUSES, latestRunSummaries } from "../lib/store.mjs";
 import { framePanel } from "./bordered-panel.ts";
 import { formatFanout, formatProgress, statusColor, statusIcon } from "./phase-timeline.ts";
 
@@ -42,10 +42,27 @@ function deterministicPhaseLine(run: RunSummary, theme: any): string {
 
 function currentPhaseText(run: RunSummary): string {
 	const phases: PhaseSummary[] = run.phases || [];
-	const phase = [...phases].reverse().find((p) => p.normalizedStatus === "running") || phases[phases.length - 1];
+	const phase = [...phases].reverse().find((p) => p.normalizedStatus === STATUSES.RUNNING) || phases[phases.length - 1];
 	if (!phase) return "";
 	const progress = phase.fanout ? formatFanout(phase.fanout) : formatProgress(phase.progress);
 	return `${phase.phase || "phase"}${progress}`;
+}
+
+function monitorRuns(cwd: string): RunSummary[] {
+	const globalRunning = latestRunSummaries({ limit: 100 }).filter((run: RunSummary) => run.normalizedStatus === STATUSES.RUNNING);
+	const localRuns = latestRunSummaries({ cwd, limit: 50 });
+	const byRun = new Map<string, RunSummary>();
+	for (const run of [...globalRunning, ...localRuns]) if (run.runId) byRun.set(run.runId, run);
+	return Array.from(byRun.values()).sort((a, b) => {
+		if (a.normalizedStatus === STATUSES.RUNNING && b.normalizedStatus !== STATUSES.RUNNING) return -1;
+		if (b.normalizedStatus === STATUSES.RUNNING && a.normalizedStatus !== STATUSES.RUNNING) return 1;
+		return String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""));
+	});
+}
+
+function runtimePid(run: RunSummary): number | undefined {
+	const pid = run.metadata?.pid;
+	return typeof pid === "number" ? pid : undefined;
 }
 
 class ThreadPhaseMonitorComponent {
@@ -55,7 +72,7 @@ class ThreadPhaseMonitorComponent {
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 
-	constructor(private cwd: string, private theme: any, private onClose: () => void) {}
+	constructor(private cwd: string, private theme: any, private onClose: () => void, private onCancelRun: (run: RunSummary) => void) {}
 
 	handleInput(data: string): void {
 		if (matchesKey(data, Key.escape) || matchesKey(data, "q") || matchesKey(data, Key.ctrl("c"))) {
@@ -64,6 +81,12 @@ class ThreadPhaseMonitorComponent {
 		}
 		if (this.mode === "detail" && (matchesKey(data, "b") || matchesKey(data, Key.left))) {
 			this.mode = "list";
+			this.invalidate();
+			return;
+		}
+		if (data === "x") {
+			const run = monitorRuns(this.cwd)[this.selected];
+			if (run?.normalizedStatus === STATUSES.RUNNING) this.onCancelRun(run);
 			this.invalidate();
 			return;
 		}
@@ -77,7 +100,7 @@ class ThreadPhaseMonitorComponent {
 
 	render(width: number): string[] {
 		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
-		const runs = latestRunSummaries({ cwd: this.cwd, limit: 50 });
+		const runs = monitorRuns(this.cwd);
 		this.selected = Math.max(0, Math.min(this.selected, Math.max(0, runs.length - 1)));
 		const innerWidth = Math.max(20, width - 4);
 		const content = this.mode === "detail" ? this.renderDetail(innerWidth, runs) : this.renderList(innerWidth, runs);
@@ -96,7 +119,7 @@ class ThreadPhaseMonitorComponent {
 		if (this.mode === "detail") {
 			this.scroll = Math.max(0, this.scroll + delta);
 		} else {
-			const runs = latestRunSummaries({ cwd: this.cwd, limit: 50 });
+			const runs = monitorRuns(this.cwd);
 			this.selected = Math.max(0, Math.min(this.selected + delta, Math.max(0, runs.length - 1)));
 		}
 		this.invalidate();
@@ -109,7 +132,7 @@ class ThreadPhaseMonitorComponent {
 	private renderList(width: number, runs: RunSummary[]): string[] {
 		const t = this.theme;
 		const lines: string[] = [];
-		lines.push(truncateToWidth(t.fg("accent", t.bold("Thread-phase monitor")) + t.fg("dim", "  ↑↓ select • enter detail • q close"), width));
+		lines.push(truncateToWidth(t.fg("accent", t.bold("Thread-phase monitor")) + t.fg("dim", "  ↑↓ select • enter detail • x cancel • q close"), width));
 		lines.push(truncateToWidth(t.fg("borderMuted", "─".repeat(Math.max(0, width))), width));
 		if (runs.length === 0) {
 			lines.push(truncateToWidth(t.fg("dim", "No runs for this working directory."), width));
@@ -124,7 +147,7 @@ class ThreadPhaseMonitorComponent {
 			const head = `${prefix} ${t.fg(statusColor(status), statusIcon(status))} ${selected ? t.fg("accent", run.workflow || "workflow") : run.workflow || "workflow"} ${t.fg("dim", `[${shortRunId(run.runId)}]`)}`;
 			const current = currentPhaseText(run);
 			lines.push(truncateToWidth(`${head}${current ? t.fg("muted", ` — ${current}`) : ""}`, width));
-			if (status === "running") lines.push(truncateToWidth(`  ${deterministicPhaseLine(run, t)}`, width));
+			if (status === STATUSES.RUNNING) lines.push(truncateToWidth(`  ${deterministicPhaseLine(run, t)}`, width));
 		}
 		if (runs.length > visible.length) lines.push(truncateToWidth(t.fg("dim", `… ${runs.length - visible.length} older run(s)`), width));
 		return lines;
@@ -137,7 +160,8 @@ class ThreadPhaseMonitorComponent {
 		const status = run.normalizedStatus || run.status;
 		const all: string[] = [];
 		all.push(t.fg("accent", t.bold(`${statusIcon(status)} ${run.workflow || "workflow"}`)) + t.fg("dim", ` [${run.runId || "unknown"}]`));
-		all.push(t.fg("dim", `status: ${run.status || status}  updated: ${run.updatedAt || "?"}`));
+		const pid = runtimePid(run);
+		all.push(t.fg("dim", `status: ${run.status || status}  updated: ${run.updatedAt || "?"}${pid ? `  pid: ${pid}` : ""}`));
 		all.push("");
 		all.push(t.fg("toolTitle", t.bold("Phases")));
 		for (const phase of run.phases || []) {
@@ -165,7 +189,7 @@ class ThreadPhaseMonitorComponent {
 		const bodyHeight = 22;
 		this.scroll = Math.min(this.scroll, Math.max(0, all.length - bodyHeight));
 		const visible = all.slice(this.scroll, this.scroll + bodyHeight).map((line) => truncateToWidth(line, width));
-		visible.unshift(truncateToWidth(t.fg("dim", "←/b back • ↑↓ scroll • q close"), width));
+		visible.unshift(truncateToWidth(t.fg("dim", `←/b back • ↑↓ scroll${run.normalizedStatus === STATUSES.RUNNING ? " • x cancel" : ""} • q close`), width));
 		return visible;
 	}
 }
@@ -178,7 +202,19 @@ export async function showThreadPhaseMonitor(ctx: ExtensionContext, cwd: string)
 	let timer: NodeJS.Timeout | undefined;
 	try {
 		await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-			const component = new ThreadPhaseMonitorComponent(cwd, theme, () => done());
+			const component = new ThreadPhaseMonitorComponent(cwd, theme, () => done(), (run) => {
+				const pid = runtimePid(run);
+				if (!pid) {
+					ctx.ui.notify("Selected workflow is not cancellable (no pid recorded).", "warning");
+					return;
+				}
+				try {
+					process.kill(pid, "SIGTERM");
+					ctx.ui.notify(`Cancellation requested for ${run.workflow || "workflow"} (${pid})`, "warning");
+				} catch (error: any) {
+					ctx.ui.notify(`Could not cancel workflow: ${error?.message || error}`, "error");
+				}
+			});
 			timer = setInterval(() => {
 				component.invalidate();
 				tui.requestRender();

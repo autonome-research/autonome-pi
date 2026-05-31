@@ -106,6 +106,7 @@ export function createRun(options = {}) {
     status: STATUSES.RUNNING,
     message: options.message || `${workflow} started`,
     data: compactValue(options.input),
+    metadata: options.metadata,
   });
   return run;
 }
@@ -255,6 +256,7 @@ export function projectRun(events = []) {
     workflow: first.workflow,
     cwd: first.cwd,
     trigger: first.trigger,
+    metadata: first.metadata,
     startedAt: first.timestamp,
     updatedAt: first.timestamp,
     status: STATUSES.RUNNING,
@@ -274,6 +276,7 @@ export function projectRun(events = []) {
     summary.workflow ||= event.workflow;
     summary.cwd ||= event.cwd;
     summary.trigger ||= event.trigger;
+    summary.metadata ||= event.metadata;
     summary.startedAt ||= event.timestamp;
     summary.updatedAt = event.timestamp || summary.updatedAt;
     summary.lastMessage = event.message || summary.lastMessage;

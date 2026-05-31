@@ -88,6 +88,7 @@ export type ThreadPhaseRunSummary = {
   workflow?: string;
   cwd?: string;
   trigger?: unknown;
+  metadata?: unknown;
   startedAt?: string;
   updatedAt?: string;
   status: ThreadPhaseUiStatus;
