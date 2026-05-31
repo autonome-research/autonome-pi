@@ -1,6 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { latestRunSummaries } from "../lib/store.mjs";
+import { framePanel } from "./bordered-panel.ts";
 import { formatFanout, formatProgress, statusColor, statusIcon } from "./phase-timeline.ts";
 
 type RunSummary = Record<string, any>;
@@ -93,17 +94,7 @@ class ThreadPhaseMonitorComponent {
 	}
 
 	private withBorder(content: string[], width: number): string[] {
-		const t = this.theme;
-		const innerWidth = Math.max(0, width - 4);
-		const title = " Thread-phase ";
-		const titleWidth = title.length;
-		const remaining = Math.max(0, innerWidth - titleWidth);
-		const left = Math.floor(remaining / 2);
-		const right = remaining - left;
-		const top = t.fg("borderAccent", `╭${"─".repeat(left)}`) + t.fg("accent", t.bold(title)) + t.fg("borderAccent", `${"─".repeat(right)}╮`);
-		const bottom = t.fg("borderAccent", `╰${"─".repeat(innerWidth)}╯`);
-		const body = content.map((line) => `${t.fg("borderAccent", "│")} ${truncateToWidth(line, innerWidth, "").padEnd(innerWidth)} ${t.fg("borderAccent", "│")}`);
-		return [truncateToWidth(top, width), ...body, truncateToWidth(bottom, width)];
+		return framePanel(content, width, this.theme, { title: "Thread-phase" });
 	}
 
 	private renderList(width: number, runs: RunSummary[]): string[] {
