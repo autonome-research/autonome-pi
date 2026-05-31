@@ -1,10 +1,12 @@
-export type ThreadPhaseUiStatus = "running" | "success" | "failed" | "cancelled" | "skipped" | string;
+export type ThreadPhaseUiStatus = "running" | "success" | "failed" | "cancelled" | "skipped" | "unknown" | string;
+export type ThreadPhaseNormalizedStatus = "running" | "success" | "failed" | "cancelled" | "skipped" | "unknown";
 
 export type ThreadPhaseArtifact = {
   kind: "markdown" | "file" | "url" | "json" | string;
   title: string;
   path?: string;
   content?: string;
+  preview?: string;
   data?: unknown;
   metadata?: Record<string, unknown>;
 };
@@ -46,6 +48,36 @@ export type ThreadPhaseUiEvent = {
   metadata?: unknown;
 };
 
+export type ThreadPhasePhaseSummary = {
+  phase: string;
+  status?: ThreadPhaseUiStatus;
+  normalizedStatus: ThreadPhaseNormalizedStatus;
+  startedAt?: string;
+  updatedAt?: string;
+  endedAt?: string;
+  eventCount: number;
+  lastMessage?: string;
+  progress?: { current?: number; total?: number; percent?: number; message?: string };
+};
+
+export type ThreadPhaseRunSummary = {
+  runId?: string;
+  workflow?: string;
+  cwd?: string;
+  trigger?: unknown;
+  startedAt?: string;
+  updatedAt?: string;
+  status: ThreadPhaseUiStatus;
+  normalizedStatus: ThreadPhaseNormalizedStatus;
+  phases: ThreadPhasePhaseSummary[];
+  artifacts: Array<ThreadPhaseArtifact & { eventId?: string; timestamp?: string }>;
+  errors: Array<{ timestamp?: string; phase?: string; message?: string; error?: unknown }>;
+  progress: Record<string, { current?: number; total?: number; percent?: number; message?: string }>;
+  lastMessage?: string;
+  eventCount: number;
+  events: ThreadPhaseUiEvent[];
+};
+
 export const SCHEMA_VERSION: "thread-phase-ui/v1";
 export const EVENT_TYPES: Readonly<{
   WORKFLOW_START: "workflow_start";
@@ -63,6 +95,7 @@ export const STATUSES: Readonly<{
   FAILED: "failed";
   CANCELLED: "cancelled";
   SKIPPED: "skipped";
+  UNKNOWN: "unknown";
 }>;
 export const AGENT_DIR: string;
 export const STORE_DIR: string;
@@ -104,4 +137,10 @@ export function wrapPhases<TPhase extends { name?: string; run(ctx: any, ...args
 ): TPhase[];
 export function readRun(runId: string): ThreadPhaseUiEvent[];
 export function readIndex(options?: { limit?: number; workflow?: string; cwd?: string }): ThreadPhaseUiEvent[];
-export function latestRuns(options?: { limit?: number; workflow?: string; cwd?: string }): Array<Record<string, unknown>>;
+export function projectRun(events?: ThreadPhaseUiEvent[]): ThreadPhaseRunSummary;
+export function projectRuns(events?: ThreadPhaseUiEvent[]): ThreadPhaseRunSummary[];
+export function getRunSummary(runId: string): ThreadPhaseRunSummary;
+export function latestRunSummaries(options?: { limit?: number; workflow?: string; cwd?: string; readLimit?: number }): ThreadPhaseRunSummary[];
+export function latestRuns(options?: { limit?: number; workflow?: string; cwd?: string; readLimit?: number }): ThreadPhaseRunSummary[];
+export function readArtifactContent(artifact: ThreadPhaseArtifact, options?: { maxBytes?: number }): { content: string; truncated: boolean; bytes?: number } | undefined;
+export function normalizeStatus(status?: unknown): ThreadPhaseNormalizedStatus;

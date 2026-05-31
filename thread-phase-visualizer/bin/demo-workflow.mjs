@@ -46,13 +46,13 @@ const run = createRun({
 try {
   phaseStart(run, "prepare", { cwd });
   await sleep(delayMs);
-  phaseEvent(run, "prepare", { type: "data", key: "items", value: 3, message: "Prepared 3 demo items" });
+  phaseEvent(run, "prepare", { kind: "data", key: "items", value: 3, message: "Prepared 3 demo items" });
   phaseEnd(run, "prepare", STATUSES.SUCCESS);
 
   phaseStart(run, "process");
   await sleep(delayMs);
   if (shouldFail) throw new Error("Intentional demo failure");
-  phaseEvent(run, "process", { type: "progress", completed: 3, total: 3, message: "Processed all demo items" });
+  phaseEvent(run, "process", { kind: "progress", completed: 3, total: 3, message: "Processed all demo items" });
   phaseEnd(run, "process", STATUSES.SUCCESS, { completed: 3 });
 
   artifact(run, {

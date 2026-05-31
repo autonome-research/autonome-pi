@@ -20,12 +20,33 @@ export const STATUSES = Object.freeze({
   FAILED: "failed",
   CANCELLED: "cancelled",
   SKIPPED: "skipped",
+  UNKNOWN: "unknown",
 });
 export const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 export const STORE_DIR = process.env.PI_THREAD_PHASE_STORE_DIR || join(AGENT_DIR, "thread-phase");
 export const RUNS_DIR = join(STORE_DIR, "runs");
 export const ARTIFACTS_DIR = join(STORE_DIR, "artifacts");
 export const INDEX_FILE = join(STORE_DIR, "index.jsonl");
+
+const KNOWN_STATUSES = new Set(Object.values(STATUSES));
+const STATUS_ALIASES = new Map([
+  ["ok", STATUSES.SUCCESS],
+  ["done", STATUSES.SUCCESS],
+  ["complete", STATUSES.SUCCESS],
+  ["completed", STATUSES.SUCCESS],
+  ["pass", STATUSES.SUCCESS],
+  ["passed", STATUSES.SUCCESS],
+  ["error", STATUSES.FAILED],
+  ["fail", STATUSES.FAILED],
+  ["failure", STATUSES.FAILED],
+  ["aborted", STATUSES.CANCELLED],
+  ["abort", STATUSES.CANCELLED],
+  ["canceled", STATUSES.CANCELLED],
+  ["cancelled", STATUSES.CANCELLED],
+  ["pending", STATUSES.RUNNING],
+  ["in_progress", STATUSES.RUNNING],
+  ["in-progress", STATUSES.RUNNING],
+]);
 
 export function ensureStore() {
   mkdirSync(RUNS_DIR, { recursive: true });
@@ -102,7 +123,9 @@ export function emit(runContext, event = {}) {
     trigger: run.trigger,
     type: normalizeEventType(event.type || EVENT_TYPES.PHASE_EVENT),
     phase: event.phase ? String(event.phase) : undefined,
-    status: event.status ? normalizeStatus(event.status) : undefined,
+    // Preserve workflow-specific statuses as strings in the event log. Projection helpers
+    // expose normalizedStatus for UI decisions.
+    status: event.status ? normalizeStatusValue(event.status) : undefined,
     level: event.level,
     message: event.message,
     data: compactValue(event.data),
@@ -224,31 +247,142 @@ export function readIndex({ limit = 200, workflow, cwd } = {}) {
   return events.slice(-limit);
 }
 
-export function latestRuns({ limit = 20, cwd, workflow } = {}) {
-  const events = readIndex({ limit: 5000, cwd, workflow });
+export function projectRun(events = []) {
+  const sorted = [...events].filter(Boolean).sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));
+  const first = sorted[0] || {};
+  const summary = {
+    runId: first.runId,
+    workflow: first.workflow,
+    cwd: first.cwd,
+    trigger: first.trigger,
+    startedAt: first.timestamp,
+    updatedAt: first.timestamp,
+    status: STATUSES.RUNNING,
+    normalizedStatus: STATUSES.RUNNING,
+    phases: [],
+    phaseMap: {},
+    artifacts: [],
+    errors: [],
+    progress: {},
+    lastMessage: first.message,
+    eventCount: sorted.length,
+    events: sorted,
+  };
+
+  for (const event of sorted) {
+    summary.runId ||= event.runId;
+    summary.workflow ||= event.workflow;
+    summary.cwd ||= event.cwd;
+    summary.trigger ||= event.trigger;
+    summary.startedAt ||= event.timestamp;
+    summary.updatedAt = event.timestamp || summary.updatedAt;
+    summary.lastMessage = event.message || summary.lastMessage;
+
+    if (event.type === EVENT_TYPES.WORKFLOW_START) {
+      summary.status = event.status || STATUSES.RUNNING;
+      summary.normalizedStatus = normalizeStatus(event.status);
+    }
+    if (event.type === EVENT_TYPES.WORKFLOW_END) {
+      summary.status = event.status || STATUSES.SUCCESS;
+      summary.normalizedStatus = normalizeStatus(event.status || STATUSES.SUCCESS);
+    }
+    if (event.type === EVENT_TYPES.ERROR || event.error) {
+      summary.errors.push({
+        timestamp: event.timestamp,
+        phase: event.phase,
+        message: event.message || event.error?.message,
+        error: event.error,
+      });
+    }
+    if (event.type === EVENT_TYPES.PHASE_START && event.phase) {
+      upsertPhase(summary, event.phase, {
+        phase: event.phase,
+        status: event.status || STATUSES.RUNNING,
+        normalizedStatus: normalizeStatus(event.status || STATUSES.RUNNING),
+        startedAt: event.timestamp,
+        updatedAt: event.timestamp,
+        eventCount: 0,
+        lastMessage: event.message,
+      });
+    }
+    if (event.type === EVENT_TYPES.PHASE_EVENT && event.phase) {
+      const phase = upsertPhase(summary, event.phase, {
+        phase: event.phase,
+        status: STATUSES.RUNNING,
+        normalizedStatus: STATUSES.RUNNING,
+        startedAt: event.timestamp,
+      });
+      phase.updatedAt = event.timestamp || phase.updatedAt;
+      phase.lastMessage = event.message || phase.lastMessage;
+      phase.eventCount = (phase.eventCount || 0) + 1;
+      const progress = extractProgress(event.data);
+      if (progress) {
+        summary.progress[event.phase] = progress;
+        phase.progress = progress;
+      }
+    }
+    if (event.type === EVENT_TYPES.PHASE_END && event.phase) {
+      const phase = upsertPhase(summary, event.phase, { phase: event.phase });
+      phase.status = event.status || STATUSES.SUCCESS;
+      phase.normalizedStatus = normalizeStatus(event.status || STATUSES.SUCCESS);
+      phase.endedAt = event.timestamp;
+      phase.updatedAt = event.timestamp || phase.updatedAt;
+      phase.lastMessage = event.message || phase.lastMessage;
+      if (!phase.startedAt) phase.startedAt = event.timestamp;
+    }
+    if (event.type === EVENT_TYPES.ARTIFACT && event.artifact) {
+      summary.artifacts.push({ ...event.artifact, eventId: event.eventId, timestamp: event.timestamp });
+    }
+  }
+
+  summary.phases = Object.values(summary.phaseMap).sort((a, b) => String(a.startedAt || "").localeCompare(String(b.startedAt || "")));
+  delete summary.phaseMap;
+  if (summary.normalizedStatus !== STATUSES.FAILED && summary.errors.length > 0 && !sorted.some((e) => e.type === EVENT_TYPES.WORKFLOW_END)) {
+    summary.status = STATUSES.FAILED;
+    summary.normalizedStatus = STATUSES.FAILED;
+  }
+  return summary;
+}
+
+export function projectRuns(events = []) {
   const byRun = new Map();
   for (const event of events) {
-    const current = byRun.get(event.runId) || {
-      runId: event.runId,
-      workflow: event.workflow,
-      cwd: event.cwd,
-      trigger: event.trigger,
-      startedAt: event.timestamp,
-      updatedAt: event.timestamp,
-      status: STATUSES.RUNNING,
-      phases: {},
-      artifacts: [],
-      lastMessage: event.message,
-    };
-    current.updatedAt = event.timestamp;
-    current.lastMessage = event.message || current.lastMessage;
-    if (event.type === EVENT_TYPES.WORKFLOW_END) current.status = event.status || STATUSES.SUCCESS;
-    if (event.type === EVENT_TYPES.PHASE_START && event.phase) current.phases[event.phase] = STATUSES.RUNNING;
-    if (event.type === EVENT_TYPES.PHASE_END && event.phase) current.phases[event.phase] = event.status || STATUSES.SUCCESS;
-    if (event.type === EVENT_TYPES.ARTIFACT && event.artifact) current.artifacts.push(event.artifact);
-    byRun.set(event.runId, current);
+    if (!event?.runId) continue;
+    const bucket = byRun.get(event.runId) || [];
+    bucket.push(event);
+    byRun.set(event.runId, bucket);
   }
-  return Array.from(byRun.values()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, limit);
+  return Array.from(byRun.values())
+    .map((runEvents) => projectRun(runEvents))
+    .sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+}
+
+export function getRunSummary(runId) {
+  return projectRun(readRun(runId));
+}
+
+export function latestRunSummaries({ limit = 20, cwd, workflow, readLimit = 5000 } = {}) {
+  return projectRuns(readIndex({ limit: readLimit, cwd, workflow })).slice(0, limit);
+}
+
+// Backward-compatible alias for the original projected run helper.
+export function latestRuns(options = {}) {
+  return latestRunSummaries(options);
+}
+
+export function readArtifactContent(artifact, { maxBytes = 500_000 } = {}) {
+  if (!artifact) return undefined;
+  if (typeof artifact.content === "string") return compactText(artifact.content, maxBytes);
+  if (!artifact.path) return undefined;
+  const content = readFileSync(artifact.path, "utf8");
+  return compactText(content, maxBytes);
+}
+
+export function normalizeStatus(status) {
+  const value = normalizeStatusValue(status);
+  if (!value) return STATUSES.UNKNOWN;
+  if (KNOWN_STATUSES.has(value)) return value;
+  return STATUS_ALIASES.get(value) || STATUSES.UNKNOWN;
 }
 
 function readJsonl(file) {
@@ -273,9 +407,37 @@ function normalizeEventType(type) {
   return value.replace(/[^a-zA-Z0-9_.:-]+/g, "_");
 }
 
-function normalizeStatus(status) {
+function normalizeStatusValue(status) {
   const value = String(status || "").trim().toLowerCase();
   return value.replace(/[^a-zA-Z0-9_.:-]+/g, "_") || undefined;
+}
+
+function upsertPhase(summary, phaseName, patch) {
+  const existing = summary.phaseMap[phaseName] || { phase: phaseName, eventCount: 0 };
+  Object.assign(existing, patch);
+  summary.phaseMap[phaseName] = existing;
+  return existing;
+}
+
+function extractProgress(data) {
+  if (!data || typeof data !== "object") return undefined;
+  const kind = data.kind || data.type;
+  if (kind !== "progress") return undefined;
+  const current = data.current ?? data.completed ?? data.done;
+  const total = data.total;
+  const percent = typeof data.percent === "number"
+    ? data.percent
+    : typeof current === "number" && typeof total === "number" && total > 0
+      ? current / total
+      : undefined;
+  return dropUndefined({ current, total, percent, message: data.message });
+}
+
+function compactText(text, maxBytes) {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return { content: text, truncated: false };
+  let out = text.slice(0, maxBytes);
+  while (Buffer.byteLength(out, "utf8") > maxBytes) out = out.slice(0, -1);
+  return { content: out, truncated: true, bytes: Buffer.byteLength(text, "utf8") };
 }
 
 function dropUndefined(value) {

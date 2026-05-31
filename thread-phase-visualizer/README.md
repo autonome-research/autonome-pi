@@ -45,7 +45,9 @@ type ThreadPhaseUiEvent = {
     | "artifact"
     | "error";
   phase?: string;
-  status?: "running" | "success" | "failed" | "cancelled" | string;
+  // Raw event statuses are preserved as open strings. Projection helpers expose
+  // normalizedStatus for UI decisions.
+  status?: "running" | "success" | "failed" | "cancelled" | "skipped" | string;
   level?: "debug" | "info" | "warning" | "error" | string;
   message?: string;
   data?: unknown;
@@ -54,6 +56,7 @@ type ThreadPhaseUiEvent = {
     title: string;
     path?: string;
     content?: string;
+    preview?: string;
     data?: unknown;
   };
 };
@@ -71,7 +74,10 @@ STATUSES.SUCCESS   // "success"
 STATUSES.FAILED    // "failed"
 STATUSES.CANCELLED // "cancelled"
 STATUSES.SKIPPED   // "skipped"
+STATUSES.UNKNOWN   // "unknown"
 ```
+
+Use `phaseEvent(..., { kind: "progress", completed, total })` for progress-like events. Keep workflow-specific detail inside `data`; avoid inventing new top-level event types until the UI needs them.
 
 From a Node/TypeScript workflow runner:
 
@@ -132,6 +138,33 @@ for await (const event of runPipeline(visualizedPhases, ctx)) {
 }
 ```
 
+## Projection/read APIs
+
+UI code should consume projected summaries rather than reconstructing state itself:
+
+```ts
+import {
+  projectRun,
+  projectRuns,
+  getRunSummary,
+  latestRunSummaries,
+  normalizeStatus,
+  readArtifactContent,
+} from "~/.pi/agent/extensions/thread-phase-visualizer/lib/store.mjs";
+
+const runs = latestRunSummaries({ cwd: process.cwd(), limit: 20 });
+const detail = getRunSummary(runs[0].runId);
+```
+
+The projected run shape includes:
+
+- `normalizedStatus` for icon/color decisions
+- ordered `phases[]`
+- `artifacts[]`
+- `errors[]`
+- `progress` by phase
+- raw `events[]` for advanced details
+
 ## Demo workflow
 
 Generate sample events without running a real workflow:
@@ -141,10 +174,18 @@ Generate sample events without running a real workflow:
 ~/.pi/agent/extensions/thread-phase-visualizer/bin/demo-workflow.mjs --cwd "$PWD" --fail
 ```
 
+Or from inside Pi:
+
+```text
+/thread-phase demo
+/thread-phase demo --fail
+```
+
 ## Pi usage
 
 - Tool: `thread_phase_runs`
 - Command: `/thread-phase`
 - Command: `/thread-phase run <runId>`
+- Command: `/thread-phase demo`
 
 Current UI is deliberately minimal. The abstraction is the stable part; richer TUI components can be layered on top later by reading the same store.
