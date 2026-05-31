@@ -13,7 +13,7 @@ import {
   phaseEnd,
   phaseEvent,
   phaseStart,
-} from "../lib/store.mjs";
+} from "../../thread-phase-visualizer/lib/store.mjs";
 
 const DEFAULT_PI = existsSync(join(homedir(), ".npm-global", "bin", "pi"))
   ? join(homedir(), ".npm-global", "bin", "pi")
@@ -222,8 +222,24 @@ async function mapWithConcurrency(items, concurrency, fn) {
   return results;
 }
 
+function maybeBackground(rawArgv, opts) {
+  if (!opts.background) return false;
+  const nextArgs = rawArgv.filter((arg) => arg !== "--background");
+  const child = spawn(process.execPath, [process.argv[1], ...nextArgs], {
+    cwd: opts.cwd ? resolve(String(opts.cwd)) : process.cwd(),
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env, PI_CODEBASE_EXPLORATION_BACKGROUND: "1" },
+  });
+  child.unref();
+  console.log(JSON.stringify({ ok: true, background: true, pid: child.pid }, null, 2));
+  return true;
+}
+
 async function main() {
-  const args = parseArgs(process.argv.slice(2));
+  const rawArgv = process.argv.slice(2);
+  const args = parseArgs(rawArgv);
+  if (maybeBackground(rawArgv, args)) return;
   if (args.help || args.h) {
     console.log(`Usage: codebase-exploration-workflow.mjs --cwd REPO [--dirs src,tests,docs] [--agent mock|pi] [--concurrency 3] [--model MODEL]\n\nDefault agent is mock. Use --agent pi for real read-only Pi subagents.`);
     return;

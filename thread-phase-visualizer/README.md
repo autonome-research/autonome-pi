@@ -192,21 +192,7 @@ Or from inside Pi:
 /thread-phase demo --fail
 ```
 
-Generate a larger codebase-exploration workflow with fanout across subdirectories:
-
-```bash
-~/.pi/agent/extensions/thread-phase-visualizer/bin/codebase-exploration-workflow.mjs --cwd "$PWD" --agent mock --dirs src,tests,docs --concurrency 3
-~/.pi/agent/extensions/thread-phase-visualizer/bin/codebase-exploration-workflow.mjs --cwd "$PWD" --agent pi --dirs src,tests,docs --concurrency 2
-```
-
-From inside Pi:
-
-```text
-/thread-phase explore --agent mock --dirs src,tests,docs --delay 1000
-/thread-phase explore --agent pi --dirs src,tests,docs --concurrency 2
-```
-
-`--agent mock` is the default and is intended for UI testing. `--agent pi` launches read-only Pi subagents with `read,grep,find,ls` enabled.
+Larger workflow examples, such as codebase exploration, live in their own workflow extensions and emit into this same visualizer store.
 
 ## Pi usage
 
@@ -216,7 +202,6 @@ From inside Pi:
 - Command: `/thread-phase run <runId>` opens the detail overlay in TUI mode
 - Command: `/thread-phase run <runId> --message` posts one run detail message
 - Command: `/thread-phase demo` emits a demo run
-- Command: `/thread-phase explore` emits a codebase exploration fanout run
 
 ## Current UI components
 
