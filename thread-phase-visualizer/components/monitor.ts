@@ -69,7 +69,9 @@ class ThreadPhaseMonitorComponent {
 		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
 		const runs = latestRunSummaries({ cwd: this.cwd, limit: 50 });
 		this.selected = Math.max(0, Math.min(this.selected, Math.max(0, runs.length - 1)));
-		const lines = this.mode === "detail" ? this.renderDetail(width, runs) : this.renderList(width, runs);
+		const innerWidth = Math.max(20, width - 4);
+		const content = this.mode === "detail" ? this.renderDetail(innerWidth, runs) : this.renderList(innerWidth, runs);
+		const lines = this.withBorder(content, width);
 		this.cachedWidth = width;
 		this.cachedLines = lines;
 		return lines;
@@ -88,6 +90,20 @@ class ThreadPhaseMonitorComponent {
 			this.selected = Math.max(0, Math.min(this.selected + delta, Math.max(0, runs.length - 1)));
 		}
 		this.invalidate();
+	}
+
+	private withBorder(content: string[], width: number): string[] {
+		const t = this.theme;
+		const innerWidth = Math.max(0, width - 4);
+		const title = " Thread-phase ";
+		const titleWidth = title.length;
+		const remaining = Math.max(0, innerWidth - titleWidth);
+		const left = Math.floor(remaining / 2);
+		const right = remaining - left;
+		const top = t.fg("borderAccent", `╭${"─".repeat(left)}`) + t.fg("accent", t.bold(title)) + t.fg("borderAccent", `${"─".repeat(right)}╮`);
+		const bottom = t.fg("borderAccent", `╰${"─".repeat(innerWidth)}╯`);
+		const body = content.map((line) => `${t.fg("borderAccent", "│")} ${truncateToWidth(line, innerWidth, "").padEnd(innerWidth)} ${t.fg("borderAccent", "│")}`);
+		return [truncateToWidth(top, width), ...body, truncateToWidth(bottom, width)];
 	}
 
 	private renderList(width: number, runs: RunSummary[]): string[] {
