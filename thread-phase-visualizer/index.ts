@@ -98,11 +98,22 @@ function directoryExists(candidate: string): boolean {
 	catch { return false; }
 }
 
-function mergeMonitorRuns(cwd: string): AnyEvent[] {
-	const globalRunning = latestRunSummaries({ limit: 100 }).filter((run: AnyEvent) => run.normalizedStatus === STATUSES.RUNNING);
-	const localRuns = latestRunSummaries({ limit: 100, cwd });
+function runSessionId(run: AnyEvent | undefined): string | undefined {
+	const sessionId = run?.metadata?.sessionId;
+	return typeof sessionId === "string" && sessionId ? sessionId : undefined;
+}
+
+function belongsToSession(run: AnyEvent, sessionId?: string, cwd?: string): boolean {
+	if (sessionId) return runSessionId(run) === sessionId;
+	return !cwd || run.cwd === cwd;
+}
+
+function mergeMonitorRuns(cwd: string, sessionId?: string): AnyEvent[] {
+	const allRecent = latestRunSummaries({ limit: 150, readLimit: 8000 });
+	const scopedRuns = allRecent.filter((run: AnyEvent) => belongsToSession(run, sessionId, cwd));
+	const localUnscopedRunning = allRecent.filter((run: AnyEvent) => !runSessionId(run) && run.cwd === cwd && run.normalizedStatus === STATUSES.RUNNING);
 	const byRun = new Map<string, AnyEvent>();
-	for (const run of [...globalRunning, ...localRuns]) if (run.runId) byRun.set(run.runId, run);
+	for (const run of [...scopedRuns, ...localUnscopedRunning]) if (run.runId) byRun.set(run.runId, run);
 	return Array.from(byRun.values()).sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
 }
 
@@ -169,12 +180,13 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		previousCwd = activeCwd;
 		const updateStatus = () => {
 			if (!ctx.hasUI) return;
-			const runs = mergeMonitorRuns(activeCwd);
+			const runs = mergeMonitorRuns(activeCwd, currentSessionId);
 			const running = runs.filter((run: AnyEvent) => run.normalizedStatus === STATUSES.RUNNING).length;
 			ctx.ui.setStatus("thread-phase", running > 0 ? `${running} workflow(s) running` : undefined);
 			const widgetLines = activeRunWidgetLines(runs);
 			ctx.ui.setWidget("thread-phase", widgetLines.length > 0 ? widgetLines : undefined, { placement: "belowEditor" });
 		};
+		const currentSessionId = ctx.sessionManager.getSessionId();
 		// Prime the seen set so reloading Pi does not replay old completed workflow messages.
 		for (const event of readIndex({ limit: 5000 })) seen.add(eventKey(event));
 		updateStatus();
@@ -185,9 +197,9 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				const key = eventKey(event);
 				if (seen.has(key)) continue;
 				seen.add(key);
-				if (event.cwd !== activeCwd) continue;
 				if (event.type === EVENT_TYPES.WORKFLOW_END) {
 					const summary = getRunSummary(event.runId);
+					if (!belongsToSession(summary, currentSessionId, activeCwd)) continue;
 					pi.sendMessage({
 						customType: "thread-phase-run",
 						content: formatCompletion(event),

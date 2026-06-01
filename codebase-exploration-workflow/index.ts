@@ -42,6 +42,14 @@ function optionAfter(parts: string[], name: string): string | undefined {
 	return index >= 0 ? parts[index + 1] : undefined;
 }
 
+function addSessionArgs(args: string[], ctx: any): string[] {
+	const sessionId = ctx.sessionManager?.getSessionId?.();
+	const sessionFile = ctx.sessionManager?.getSessionFile?.();
+	if (sessionId) args.push("--session-id", sessionId);
+	if (sessionFile) args.push("--session-file", sessionFile);
+	return args;
+}
+
 function buildArgs(params: {
 	cwd: string;
 	dirs?: string;
@@ -51,6 +59,7 @@ function buildArgs(params: {
 	delay?: number;
 	model?: string;
 	background?: boolean;
+	ctx?: any;
 }) {
 	const args = ["--cwd", params.cwd];
 	if (params.dirs) args.push("--dirs", params.dirs);
@@ -60,7 +69,7 @@ function buildArgs(params: {
 	if (params.delay !== undefined) args.push("--delay", String(params.delay));
 	if (params.model) args.push("--model", params.model);
 	if (params.background) args.push("--background");
-	return args;
+	return params.ctx ? addSessionArgs(args, params.ctx) : args;
 }
 
 function commandUsage() {
@@ -166,6 +175,7 @@ export default function codebaseExplorationWorkflow(pi: ExtensionAPI) {
 				delay: params.delay,
 				model: params.model,
 				background: params.background,
+				ctx,
 			}), cwd, signal);
 			if (result.code !== 0 && !params.background) throw new Error(result.stderr || result.stdout || `codebase exploration exited ${result.code}`);
 			let details: any;
@@ -195,6 +205,7 @@ export default function codebaseExplorationWorkflow(pi: ExtensionAPI) {
 					delay: optionAfter(parts, "--delay") ? Number(optionAfter(parts, "--delay")) : undefined,
 					model: optionAfter(parts, "--model"),
 					background: !foreground,
+					ctx,
 				}), cwd, ctx.signal);
 				if (result.code !== 0) ctx.ui.notify(result.stderr || result.stdout || "Codebase exploration failed", "warning");
 				else {

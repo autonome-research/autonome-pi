@@ -291,7 +291,7 @@ async function reviewCommand(opts) {
     cwd: root,
     trigger: { kind: process.env.PI_CODE_REVIEW_BACKGROUND ? "post-commit" : "manual", mode, ref: ref || "HEAD" },
     input: { mode, ref: ref || "HEAD", commit },
-    metadata: { commit, pid: process.pid, cancellable: true, cancelSignal: "SIGTERM" },
+    metadata: { commit, pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", sessionId: opts["session-id"], sessionFile: opts["session-file"] },
   });
   activeTpRun = tpRun;
 

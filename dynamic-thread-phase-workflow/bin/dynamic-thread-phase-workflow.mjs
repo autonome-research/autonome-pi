@@ -436,7 +436,7 @@ async function main() {
     cwd,
     trigger: { kind: process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND ? "background" : "manual", dynamic: true },
     input: spec,
-    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS },
+    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, sessionId: args["session-id"], sessionFile: args["session-file"] },
     message: `${workflow} started`,
   });
   activeRun = visualizerRun;

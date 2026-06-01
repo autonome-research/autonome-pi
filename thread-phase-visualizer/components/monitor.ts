@@ -56,11 +56,22 @@ function currentPhaseText(run: RunSummary): string {
 	return `${phase.phase || "phase"}${progress}`;
 }
 
-function monitorRuns(cwd: string): RunSummary[] {
-	const globalRunning = latestRunSummaries({ limit: 100 }).filter((run: RunSummary) => run.normalizedStatus === STATUSES.RUNNING);
-	const localRuns = latestRunSummaries({ cwd, limit: 50 });
+function runSessionId(run: RunSummary | undefined): string | undefined {
+	const sessionId = run?.metadata?.sessionId;
+	return typeof sessionId === "string" && sessionId ? sessionId : undefined;
+}
+
+function belongsToSession(run: RunSummary, sessionId?: string, cwd?: string): boolean {
+	if (sessionId) return runSessionId(run) === sessionId;
+	return !cwd || run.cwd === cwd;
+}
+
+function monitorRuns(cwd: string, sessionId?: string): RunSummary[] {
+	const allRecent = latestRunSummaries({ limit: 150, readLimit: 8000 });
+	const scopedRuns = allRecent.filter((run: RunSummary) => belongsToSession(run, sessionId, cwd));
+	const localUnscopedRunning = allRecent.filter((run: RunSummary) => !runSessionId(run) && run.cwd === cwd && run.normalizedStatus === STATUSES.RUNNING);
 	const byRun = new Map<string, RunSummary>();
-	for (const run of [...globalRunning, ...localRuns]) if (run.runId) byRun.set(run.runId, run);
+	for (const run of [...scopedRuns, ...localUnscopedRunning]) if (run.runId) byRun.set(run.runId, run);
 	return Array.from(byRun.values()).sort((a, b) => {
 		if (a.normalizedStatus === STATUSES.RUNNING && b.normalizedStatus !== STATUSES.RUNNING) return -1;
 		if (b.normalizedStatus === STATUSES.RUNNING && a.normalizedStatus !== STATUSES.RUNNING) return 1;
@@ -111,7 +122,7 @@ class ThreadPhaseMonitorComponent {
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 
-	constructor(private cwd: string, private theme: any, private onClose: () => void, private onCancelRun: (run: RunSummary) => void) {}
+	constructor(private cwd: string, private sessionId: string | undefined, private theme: any, private onClose: () => void, private onCancelRun: (run: RunSummary) => void) {}
 
 	handleInput(data: string): void {
 		if (matchesKey(data, Key.escape) || matchesKey(data, "q") || matchesKey(data, Key.ctrl("c"))) {
@@ -119,7 +130,7 @@ class ThreadPhaseMonitorComponent {
 			return;
 		}
 
-		const runs = monitorRuns(this.cwd);
+		const runs = monitorRuns(this.cwd, this.sessionId);
 		const run = runs[this.selected];
 		const items = detailItems(run);
 
@@ -144,7 +155,7 @@ class ThreadPhaseMonitorComponent {
 
 	render(width: number): string[] {
 		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
-		const runs = monitorRuns(this.cwd);
+		const runs = monitorRuns(this.cwd, this.sessionId);
 		this.selected = Math.max(0, Math.min(this.selected, Math.max(0, runs.length - 1)));
 		const innerWidth = Math.max(20, width - 4);
 		const content = this.mode === "artifact" ? this.renderArtifact(innerWidth, runs) : this.mode === "detail" ? this.renderDetail(innerWidth, runs) : this.renderList(innerWidth, runs);
@@ -161,7 +172,7 @@ class ThreadPhaseMonitorComponent {
 
 	private move(delta: number, run?: RunSummary, items: DetailItem[] = []): void {
 		if (this.mode === "list") {
-			const runs = monitorRuns(this.cwd);
+			const runs = monitorRuns(this.cwd, this.sessionId);
 			this.selected = Math.max(0, Math.min(this.selected + delta, Math.max(0, runs.length - 1)));
 			this.selectedDetail = 0;
 		} else if (this.mode === "detail") {
@@ -333,8 +344,9 @@ export async function showThreadPhaseMonitor(ctx: ExtensionContext, cwd: string)
 	}
 	let timer: NodeJS.Timeout | undefined;
 	try {
+		const sessionId = ctx.sessionManager.getSessionId();
 		await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-			const component = new ThreadPhaseMonitorComponent(cwd, theme, () => done(), (run) => {
+			const component = new ThreadPhaseMonitorComponent(cwd, sessionId, theme, () => done(), (run) => {
 				const pid = runtimePid(run);
 				if (!pid || run.normalizedStatus !== STATUSES.RUNNING) {
 					ctx.ui.notify("Selected workflow is not currently cancellable.", "warning");

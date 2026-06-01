@@ -44,6 +44,14 @@ function writeSpecFile(spec: unknown): string {
 	return file;
 }
 
+function addSessionArgs(args: string[], ctx: any): string[] {
+	const sessionId = ctx.sessionManager?.getSessionId?.();
+	const sessionFile = ctx.sessionManager?.getSessionFile?.();
+	if (sessionId) args.push("--session-id", sessionId);
+	if (sessionFile) args.push("--session-file", sessionFile);
+	return args;
+}
+
 function parseJsonObject(stdout: string): any {
 	const trimmed = stdout.trim();
 	if (!trimmed) return undefined;
@@ -77,6 +85,7 @@ export default function dynamicThreadPhaseWorkflow(pi: ExtensionAPI) {
 			if (params.model) args.push("--model", params.model);
 			if (params.timeout !== undefined) args.push("--timeout", String(params.timeout));
 			if (params.background) args.push("--background");
+			addSessionArgs(args, ctx);
 			onUpdate?.({ content: [{ type: "text", text: `Starting dynamic thread-phase workflow in ${cwd}...` }] });
 			const result = await runScript(args, cwd, signal);
 			if (result.code !== 0 && !params.background) throw new Error(result.stderr || result.stdout || `dynamic_thread_phase_workflow exited ${result.code}`);

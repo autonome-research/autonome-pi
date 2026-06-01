@@ -364,7 +364,7 @@ async function main() {
     cwd,
     trigger: { kind: process.env.PI_CODEBASE_EXPLORATION_BACKGROUND ? "background" : "manual", agent, concurrency },
     input: { dirs: splitList(args.dirs), agent, concurrency },
-    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM" },
+    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", sessionId: args["session-id"], sessionFile: args["session-file"] },
     message: "codebase-exploration started",
   });
   activeVisualizerRun = visualizerRun;

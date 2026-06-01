@@ -50,12 +50,20 @@ function parseJsonObject(stdout: string): any {
 	return JSON.parse(trimmed);
 }
 
-function makeReviewArgs(params: { mode?: ReviewMode; ref?: string; cwd: string; background?: boolean; model?: string }) {
+function addSessionArgs(args: string[], ctx: any): string[] {
+	const sessionId = ctx.sessionManager?.getSessionId?.();
+	const sessionFile = ctx.sessionManager?.getSessionFile?.();
+	if (sessionId) args.push("--session-id", sessionId);
+	if (sessionFile) args.push("--session-file", sessionFile);
+	return args;
+}
+
+function makeReviewArgs(params: { mode?: ReviewMode; ref?: string; cwd: string; background?: boolean; model?: string; ctx?: any }) {
 	const args = ["review", "--cwd", params.cwd, "--mode", params.mode || "last_commit", "--json"];
 	if (params.ref) args.push("--ref", params.ref);
 	if (params.background) args.push("--background");
 	if (params.model) args.push("--model", params.model);
-	return args;
+	return params.ctx ? addSessionArgs(args, params.ctx) : args;
 }
 
 function readReportExcerpt(reportPath?: string): string | undefined {
@@ -115,9 +123,9 @@ export default function codeReviewWorkflow(pi: ExtensionAPI) {
 
 			let scriptArgs: string[];
 			if (action === "install_hook") {
-				scriptArgs = ["install-hook", "--cwd", cwd, "--json"];
+				scriptArgs = addSessionArgs(["install-hook", "--cwd", cwd, "--json"], ctx);
 			} else if (action === "status") {
-				scriptArgs = ["status", "--cwd", cwd, "--json"];
+				scriptArgs = addSessionArgs(["status", "--cwd", cwd, "--json"], ctx);
 			} else {
 				scriptArgs = makeReviewArgs({
 					cwd,
@@ -125,6 +133,7 @@ export default function codeReviewWorkflow(pi: ExtensionAPI) {
 					ref: params.ref,
 					background: Boolean(params.background),
 					model: params.model,
+					ctx,
 				});
 			}
 
@@ -159,10 +168,10 @@ export default function codeReviewWorkflow(pi: ExtensionAPI) {
 			ctx.ui.setStatus("code-review", `${action} running...`);
 			try {
 				const scriptArgs = action === "install_hook"
-					? ["install-hook", "--cwd", cwd, "--json"]
+					? addSessionArgs(["install-hook", "--cwd", cwd, "--json"], ctx)
 					: action === "status"
-						? ["status", "--cwd", cwd, "--json"]
-						: makeReviewArgs({ cwd, mode: parsed.mode, ref: parsed.ref });
+						? addSessionArgs(["status", "--cwd", cwd, "--json"], ctx)
+						: makeReviewArgs({ cwd, mode: parsed.mode, ref: parsed.ref, ctx });
 				const result = await runNodeScript(scriptArgs, cwd, ctx.signal);
 				if (result.code !== 0) {
 					ctx.ui.notify(result.stderr || result.stdout || `code-review exited ${result.code}`, "error");
