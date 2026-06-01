@@ -329,9 +329,35 @@ const synthesizeMap = {
   },
 };
 
+function isTruthyFlag(value) {
+  if (value === true) return true;
+  if (value === false || value === undefined || value === null) return false;
+  const normalized = String(value).trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(normalized);
+}
+
+function isBooleanLiteral(value) {
+  return ["1", "0", "true", "false", "yes", "no", "on", "off"].includes(String(value || "").trim().toLowerCase());
+}
+
+function stripBackgroundArgs(argv) {
+  const next = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--background") {
+      if (i + 1 < argv.length && isBooleanLiteral(argv[i + 1])) i++;
+      continue;
+    }
+    if (arg.startsWith("--background=")) continue;
+    next.push(arg);
+  }
+  return next;
+}
+
 function maybeBackground(rawArgv, opts) {
-  if (!opts.background) return false;
-  const nextArgs = rawArgv.filter((arg) => arg !== "--background");
+  if (process.env.PI_CODEBASE_EXPLORATION_BACKGROUND) return false;
+  if (!isTruthyFlag(opts.background)) return false;
+  const nextArgs = stripBackgroundArgs(rawArgv);
   const child = spawn(process.execPath, [process.argv[1], ...nextArgs], {
     cwd: opts.cwd ? resolve(String(opts.cwd)) : process.cwd(),
     detached: true,

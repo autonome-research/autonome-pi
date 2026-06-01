@@ -130,6 +130,19 @@ function belongsToSession(run: AnyEvent, sessionId?: string, cwd?: string): bool
 	return !cwd || run.cwd === cwd;
 }
 
+function canInspectRun(run: AnyEvent, sessionId?: string, fallbackCwd?: string): boolean {
+	const ownerSessionId = runSessionId(run);
+	if (ownerSessionId) return Boolean(sessionId && ownerSessionId === sessionId);
+	return Boolean(fallbackCwd && run.cwd === fallbackCwd);
+}
+
+function shouldAutoContinue(run: AnyEvent): boolean {
+	if (run.metadata?.autoContinue === false) return false;
+	if ([STATUSES.CANCELLED, STATUSES.SKIPPED].includes(run.normalizedStatus)) return false;
+	const triggerKind = String(run.trigger?.kind || "");
+	return triggerKind !== "manual";
+}
+
 function mergeMonitorRuns(cwd: string, sessionId?: string): AnyEvent[] {
 	const allRecent = latestRunSummaries({ limit: 150, readLimit: 8000 });
 	const scopedRuns = allRecent.filter((run: AnyEvent) => belongsToSession(run, sessionId, cwd));
@@ -162,18 +175,26 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			ensureStore();
+			const sessionId = ctx.sessionManager.getSessionId();
+			const cwd = params.cwd ? path.resolve(ctx.cwd, params.cwd) : undefined;
+			const fallbackCwd = cwd || path.resolve(ctx.cwd);
 			if (params.runId) {
-				const events = readRun(params.runId).slice(-(params.limit || 80));
 				const summary = getRunSummary(params.runId);
+				if (!canInspectRun(summary, sessionId, fallbackCwd)) {
+					return { content: [{ type: "text", text: "No thread-phase run found for this session." }], details: { summary: undefined, events: [] } };
+				}
+				const events = readRun(params.runId).slice(-(params.limit || 80));
 				return {
 					content: [{ type: "text", text: truncate(params.rawEvents ? JSON.stringify(events, null, 2) : formatRunDetail(summary)) }],
 					details: { summary, events },
 				};
 			}
-			const cwd = params.cwd ? path.resolve(ctx.cwd, params.cwd) : undefined;
-			const runs = latestRunSummaries({ limit: params.limit || 20, workflow: params.workflow, cwd });
+			const max = Math.max(1, Math.min(Number(params.limit || 20), 100));
+			const runs = latestRunSummaries({ limit: 200, workflow: params.workflow, readLimit: 8000 })
+				.filter((run: AnyEvent) => canInspectRun(run, sessionId, cwd))
+				.slice(0, max);
 			return {
-				content: [{ type: "text", text: runs.length ? runs.map(formatRunSummary).join("\n\n") : "No thread-phase runs found." }],
+				content: [{ type: "text", text: runs.length ? runs.map(formatRunSummary).join("\n\n") : "No thread-phase runs found for this session." }],
 				details: { runs },
 			};
 		},
@@ -229,7 +250,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 						display: true,
 						details: { event, summary, events: readRun(event.runId) },
 					});
-					if (event.runId && !continuedRuns.has(event.runId)) {
+					if (event.runId && shouldAutoContinue(summary) && !continuedRuns.has(event.runId)) {
 						continuedRuns.add(event.runId);
 						const prompt = formatContinuationPrompt(summary);
 						if (ctx.isIdle()) pi.sendUserMessage(prompt);
