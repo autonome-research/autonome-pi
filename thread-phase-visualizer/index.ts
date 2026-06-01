@@ -74,6 +74,28 @@ function formatCompletion(event: AnyEvent): string {
 	return formatRunDetail(run);
 }
 
+function formatContinuationPrompt(run: AnyEvent): string {
+	const artifacts = (run.artifacts || [])
+		.map((artifact: AnyEvent) => `- ${artifact.title || artifact.kind}: ${artifact.path || artifact.preview || (artifact.content ? "(inline)" : "")}`)
+		.join("\n");
+	const phases = (run.phases || [])
+		.map((phase: AnyEvent) => `- ${statusIcon(phase.normalizedStatus)} ${phase.phase}${phase.lastMessage ? ` — ${phase.lastMessage}` : ""}`)
+		.join("\n");
+	return [
+		`A thread-phase workflow completed in this Pi session.`,
+		``,
+		`Workflow: ${run.workflow || "workflow"}`,
+		`Status: ${run.status || run.normalizedStatus || "unknown"}`,
+		`Run: ${run.runId || "unknown"}`,
+		run.cwd ? `CWD: ${run.cwd}` : undefined,
+		phases ? `\nPhases:\n${phases}` : undefined,
+		artifacts ? `\nArtifacts:\n${artifacts}` : undefined,
+		run.errors?.length ? `\nErrors:\n${run.errors.map((e: AnyEvent) => `- ${e.phase ? `${e.phase}: ` : ""}${e.message || e.error?.message || "error"}`).join("\n")}` : undefined,
+		``,
+		`Please inspect the workflow result/artifacts as needed, summarize the outcome, and continue with the user's task.`,
+	].filter(Boolean).join("\n");
+}
+
 function shellUnquote(value: string): string {
 	const trimmed = value.trim();
 	if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) return trimmed.slice(1, -1);
@@ -124,6 +146,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	let activeCwd = process.cwd();
 	let previousCwd = activeCwd;
 	const seen = new Set<string>();
+	const continuedRuns = new Set<string>();
 
 	pi.registerTool({
 		name: "thread_phase_runs",
@@ -206,6 +229,12 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 						display: true,
 						details: { event, summary, events: readRun(event.runId) },
 					});
+					if (event.runId && !continuedRuns.has(event.runId)) {
+						continuedRuns.add(event.runId);
+						const prompt = formatContinuationPrompt(summary);
+						if (ctx.isIdle()) pi.sendUserMessage(prompt);
+						else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+					}
 					if (ctx.hasUI) ctx.ui.notify(`thread-phase ${event.workflow}: ${event.status || "done"}`, summary.normalizedStatus === STATUSES.FAILED ? "warning" : "info");
 				}
 			}
