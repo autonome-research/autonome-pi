@@ -10,32 +10,47 @@ This is the Pi/thread-phase equivalent of a dynamic workflow: the agent can prop
 
 Use `background: true` for long workflows. Runs emit generic `thread-phase-ui/v1` events, so `ctrl+shift+t` can monitor/cancel them.
 
-## Phase types
+## Permissions
+
+Dynamic workflows use compact `rwx` capability declarations. There is no per-run `permissionMode` field; the extension executes declared capabilities automatically, bounded by its configured max policy.
+
+```json
+{ "permissions": "rwx" }
+```
+
+Mapping:
+
+- `r` enables Pi `read`, `grep`, `find`, `ls`
+- `w` enables Pi `edit`, `write`
+- `x` enables shell phases and Pi `bash`
+
+Phase-level `permissions` can narrow or expand within the runner max policy. Defaults are controlled by environment:
+
+- `PI_DYNAMIC_THREAD_PHASE_DEFAULT_PERMISSIONS` default: `r`
+- `PI_DYNAMIC_THREAD_PHASE_MAX_PERMISSIONS` default: `rwx`
 
 ### `shell`
 
-Runs a shell command and stores stdout in `{{output:phase-name}}`.
+Runs a shell command and stores stdout in `{{output:phase-name}}`. Shell phases require `x`; commands that appear mutating also require `w`.
 
 ```json
-{ "type": "shell", "name": "list-files", "command": "find src -maxdepth 2 -type f", "artifact": true }
+{ "type": "shell", "name": "list-files", "permissions": "rx", "command": "find src -maxdepth 2 -type f", "artifact": true }
 ```
-
-Shell phases reject obviously mutating commands by default. Set `allowWrites: true` only after explicit user approval.
 
 ### `pi`
 
-Runs a read-only Pi subagent and stores assistant markdown output.
+Runs a Pi subagent and stores assistant markdown output.
 
 ```json
 {
   "type": "pi",
   "name": "summarize-src",
-  "tools": ["read", "grep", "find", "ls"],
+  "permissions": "r",
   "prompt": "Summarize the src directory. Files:\n{{output:list-files}}"
 }
 ```
 
-By default only `read`, `grep`, `find`, and `ls` tools are allowed unless `allowWrites` is set.
+If `tools` is omitted, the runner derives tools from `permissions`. If `tools` is present, each named tool must be allowed by the phase permissions.
 
 ### `fanout_pi`
 
@@ -73,6 +88,7 @@ Writes a final markdown/json artifact from literal content or a previous phase o
 ```json
 {
   "name": "repo-doc-audit",
+  "permissions": "rx",
   "phases": [
     {
       "type": "shell",
@@ -83,6 +99,7 @@ Writes a final markdown/json artifact from literal content or a previous phase o
     {
       "type": "pi",
       "name": "audit-docs",
+      "permissions": "r",
       "prompt": "Audit these docs for stale or missing setup instructions. Do not modify files.\n\n{{output:list-docs}}"
     },
     {

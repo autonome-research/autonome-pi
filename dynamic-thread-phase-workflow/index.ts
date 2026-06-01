@@ -58,8 +58,9 @@ export default function dynamicThreadPhaseWorkflow(pi: ExtensionAPI) {
 		promptSnippet: "Run a deterministic multi-phase workflow from a JSON spec",
 		promptGuidelines: [
 			"Use dynamic_thread_phase_workflow when the user wants an ad-hoc deterministic workflow planned in chat and then executed with thread-phase observability.",
-			"Build a concrete spec first. Prefer read-only phases unless the user explicitly approves writes.",
-			"Supported phase types are shell, pi, fanout_pi, and artifact. The runner validates the spec and rejects non-read-only Pi tools unless allowWrites is set.",
+			"Build a concrete spec first and declare compact rwx permissions at the workflow or phase level.",
+			"Permissions are capabilities, not tool names: r enables read/grep/find/ls, w enables edit/write, and x enables bash/shell execution.",
+			"Supported phase types are shell, pi, fanout_pi, and artifact. The runner validates the spec against its configured max permissions policy.",
 			"Use background: true for long workflows so normal Pi chat remains usable.",
 		],
 		parameters: Type.Object({

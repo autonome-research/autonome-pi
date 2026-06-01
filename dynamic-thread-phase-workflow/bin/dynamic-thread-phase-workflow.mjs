@@ -18,12 +18,17 @@ const DEFAULT_PI = existsSync(join(homedir(), ".npm-global", "bin", "pi"))
   ? join(homedir(), ".npm-global", "bin", "pi")
   : "pi";
 
-const READ_ONLY_PI_TOOLS = new Set(["read", "grep", "find", "ls"]);
-const DEFAULT_PI_TOOLS = ["read", "grep", "find", "ls"];
+const TOOLS_BY_PERMISSION = Object.freeze({
+  r: ["read", "grep", "find", "ls"],
+  w: ["edit", "write"],
+  x: ["bash"],
+});
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_FANOUT_CONCURRENCY = 3;
 const MAX_OUTPUT_BYTES = 250_000;
 const MUTATING_SHELL_RE = /(^|[;&|]\s*)(rm|mv|cp|chmod|chown|mkdir|rmdir|touch|truncate|tee|dd|ln|git\s+(?:add|commit|push|reset|checkout|switch|merge|rebase|clean|apply|am)|npm\s+(?:install|i|uninstall|remove|publish)|pnpm\s+(?:install|add|remove|publish)|yarn\s+(?:add|remove|install|publish))\b|>\s*[^&]|>>|\b(?:sed|perl)\s+-i\b/;
+const DEFAULT_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_THREAD_PHASE_DEFAULT_PERMISSIONS || "r", "PI_DYNAMIC_THREAD_PHASE_DEFAULT_PERMISSIONS");
+const MAX_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_THREAD_PHASE_MAX_PERMISSIONS || "rwx", "PI_DYNAMIC_THREAD_PHASE_MAX_PERMISSIONS");
 
 async function loadThreadPhaseCore() {
   try {
@@ -123,7 +128,10 @@ function validateSpec(spec) {
       if (!Array.isArray(phase.items) && typeof phase.itemsFrom !== "string") throw new Error(`${phase.name} must provide items array or itemsFrom phase name`);
     }
     if (phase.type === "artifact" && typeof phase.content !== "string" && typeof phase.from !== "string") throw new Error(`${phase.name} must provide content or from`);
+    if (phase.permissions !== undefined) normalizePermissions(phase.permissions, `${phase.name}.permissions`);
   }
+  if (spec.permissions !== undefined) normalizePermissions(spec.permissions, "spec.permissions");
+  if (spec.permissionMode !== undefined) throw new Error("permissionMode is not part of the dynamic workflow spec; declare rwx capabilities with permissions instead");
   return spec;
 }
 
@@ -184,11 +192,42 @@ function parsePiJsonLines(stdout) {
   return { text, messages, usage, model, stopReason };
 }
 
-function normalizePiTools(tools, allowWrites) {
-  const requested = asArray(tools).length ? asArray(tools).map(String) : DEFAULT_PI_TOOLS;
-  if (allowWrites) return requested;
-  const rejected = requested.filter((tool) => !READ_ONLY_PI_TOOLS.has(tool));
-  if (rejected.length) throw new Error(`read-only pi phase rejected non-read-only tools: ${rejected.join(", ")}`);
+function normalizePermissions(value, label = "permissions") {
+  if (value === undefined || value === null || value === "") return "";
+  if (typeof value !== "string") throw new Error(`${label} must be a string containing any of r, w, x`);
+  const raw = String(value).trim().toLowerCase();
+  if (!/^[rwx]+$/.test(raw)) throw new Error(`${label} must contain only r, w, and x characters`);
+  const chars = new Set(raw.split(""));
+  return ["r", "w", "x"].filter((ch) => chars.has(ch)).join("");
+}
+
+function hasPermission(permissions, permission) {
+  return String(permissions || "").includes(permission);
+}
+
+function assertWithinMaxPermissions(requested, label) {
+  const rejected = [...String(requested || "")].filter((permission) => !hasPermission(MAX_PERMISSIONS, permission));
+  if (rejected.length) throw new Error(`${label} requested permissions outside runner max policy (${MAX_PERMISSIONS || "none"}): ${rejected.join("")}`);
+}
+
+function permissionsForPhase(ctx, phase) {
+  const requested = normalizePermissions(phase.permissions ?? ctx.spec.permissions ?? DEFAULT_PERMISSIONS, `${phase.name}.permissions`);
+  assertWithinMaxPermissions(requested, `${phase.name}.permissions`);
+  return requested;
+}
+
+function toolsForPermissions(permissions) {
+  const out = [];
+  for (const permission of ["r", "w", "x"]) if (hasPermission(permissions, permission)) out.push(...TOOLS_BY_PERMISSION[permission]);
+  return [...new Set(out)];
+}
+
+function normalizePiTools(tools, permissions, label) {
+  const allowed = new Set(toolsForPermissions(permissions));
+  const requested = asArray(tools).length ? asArray(tools).map(String) : [...allowed];
+  const rejected = requested.filter((tool) => !allowed.has(tool));
+  if (rejected.length) throw new Error(`${label} requested tools not allowed by permissions=${permissions || "none"}: ${rejected.join(", ")}`);
+  if (!requested.length) throw new Error(`${label} has no Pi tools available; set permissions to include r, w, or x`);
   return requested;
 }
 
@@ -295,9 +334,11 @@ function dynamicPhase(specPhase) {
 }
 
 async function* runShellPhase(ctx, phase) {
-  const allowWrites = Boolean(ctx.spec.allowWrites || phase.allowWrites);
+  const permissions = permissionsForPhase(ctx, phase);
   const command = renderTemplate(phase.command, ctx);
-  if (!allowWrites && MUTATING_SHELL_RE.test(command)) throw new Error(`shell phase ${phase.name} appears mutating; set allowWrites only after explicit user approval`);
+  if (!hasPermission(permissions, "x")) throw new Error(`shell phase ${phase.name} requires x permission`);
+  if (!hasPermission(permissions, "w") && MUTATING_SHELL_RE.test(command)) throw new Error(`shell phase ${phase.name} appears mutating; add w permission if mutation is intended`);
+  yield { type: "data", kind: "data", key: "permissions", value: permissions, message: `Running shell command with ${permissions} permissions` };
   yield { type: "data", kind: "data", key: "command", value: command, message: `Running shell command` };
   const result = await runProcess(command, [], { cwd: ctx.cwd, shell: true, timeoutMs: phase.timeoutMs || ctx.timeoutMs });
   const output = compactText(result.stdout || "");
@@ -310,7 +351,9 @@ async function* runShellPhase(ctx, phase) {
 
 async function* runPiPhase(ctx, phase) {
   const prompt = renderTemplate(phase.prompt, ctx);
-  const tools = normalizePiTools(phase.tools, Boolean(ctx.spec.allowWrites || phase.allowWrites));
+  const permissions = permissionsForPhase(ctx, phase);
+  const tools = normalizePiTools(phase.tools, permissions, phase.name);
+  yield { type: "data", kind: "data", key: "permissions", value: permissions, message: `Running pi agent with ${permissions} permissions` };
   yield { type: "data", kind: "data", key: "tools", value: tools, message: `Running pi agent` };
   const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs });
   ctx.outputs[phase.name] = compactText(result.text || "");
@@ -324,8 +367,10 @@ async function* runPiPhase(ctx, phase) {
 async function* runFanoutPiPhase(ctx, phase) {
   const items = phase.items ? asArray(phase.items).map(String) : outputToItems(ctx.outputs[phase.itemsFrom]);
   if (!items.length) throw new Error(`${phase.name} has no fanout items`);
-  const tools = normalizePiTools(phase.tools, Boolean(ctx.spec.allowWrites || phase.allowWrites));
+  const permissions = permissionsForPhase(ctx, phase);
+  const tools = normalizePiTools(phase.tools, permissions, phase.name);
   const concurrency = Number(phase.concurrency || ctx.spec.concurrency || DEFAULT_FANOUT_CONCURRENCY);
+  yield { type: "data", kind: "data", key: "permissions", value: permissions, message: `Running fanout with ${permissions} permissions` };
   yield { type: "fanout", kind: "fanout_start", total: items.length, label: phase.label || "items" };
   let completed = 0;
   let failed = 0;
@@ -391,7 +436,7 @@ async function main() {
     cwd,
     trigger: { kind: process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND ? "background" : "manual", dynamic: true },
     input: spec,
-    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", dynamic: true },
+    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS },
     message: `${workflow} started`,
   });
   activeRun = visualizerRun;
