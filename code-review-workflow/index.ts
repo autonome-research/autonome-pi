@@ -233,7 +233,6 @@ export default function codeReviewWorkflow(pi: ExtensionAPI) {
 				return;
 			}
 			const action = parsed.action;
-			const cwd = parsed.cwd;
 			ctx.ui.setStatus("code-review", `${action} running...`);
 			try {
 				const scriptArgs = action === "install_hook"
