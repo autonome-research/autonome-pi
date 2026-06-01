@@ -16,9 +16,12 @@ Examples:
 /code-review staged          # review staged changes
 /code-review working         # review unstaged diff
 /code-review range main..HEAD
+/code-review --cwd /repo staged
 /code-review install         # install post-commit hook for this repo
 /code-review status
 ```
+
+The default directory follows simple `cd <dir>` user-bash commands issued inside the Pi session. Use `--cwd /path` to override.
 
 ## Git hook behavior
 

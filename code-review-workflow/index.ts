@@ -80,9 +80,58 @@ function commandUsage(): string {
 		"  /code-review range A..B      Review a git range",
 		"  /code-review install         Install post-commit hook in this repo",
 		"  /code-review status          Show hook/report locations",
+		"  /code-review --cwd /repo staged",
 		"",
+		"Default cwd follows simple user-bash cd commands in this Pi session.",
 		"Workflow events are emitted to the generic thread-phase visualizer store.",
 	].join("\n");
+}
+
+function shellUnquote(value: string): string {
+	const trimmed = value.trim();
+	if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) return trimmed.slice(1, -1);
+	return trimmed.replace(/\\ /g, " ");
+}
+
+function expandHome(input: string): string {
+	if (input === "~") return process.env.HOME || "/";
+	if (input.startsWith("~/")) return path.join(process.env.HOME || "/", input.slice(2));
+	return input;
+}
+
+function directoryExists(candidate: string): boolean {
+	try { return fs.existsSync(candidate) && fs.statSync(candidate).isDirectory(); }
+	catch { return false; }
+}
+
+function resolveAgainstActive(activeCwd: string, maybePath?: string): string {
+	if (!maybePath) return activeCwd;
+	return path.resolve(activeCwd, expandHome(maybePath));
+}
+
+function parseSimpleCd(command: string): string | undefined {
+	const trimmed = command.trim().replace(/;\s*$/, "");
+	const match = trimmed.match(/^cd(?:\s+(.+))?$/);
+	if (!match) return undefined;
+	return shellUnquote(match[1] || "~");
+}
+
+function optionAfter(parts: string[], name: string): string | undefined {
+	const eq = parts.find((part) => part.startsWith(`${name}=`));
+	if (eq) return eq.slice(name.length + 1);
+	const index = parts.indexOf(name);
+	return index >= 0 ? parts[index + 1] : undefined;
+}
+
+function stripOption(parts: string[], name: string): string[] {
+	const out: string[] = [];
+	for (let i = 0; i < parts.length; i++) {
+		const part = parts[i];
+		if (part === name) { i++; continue; }
+		if (part.startsWith(`${name}=`)) continue;
+		out.push(part);
+	}
+	return out;
 }
 
 function parseCommandArgs(args: string, cwd: string): { action: ToolAction; mode?: ReviewMode; ref?: string; cwd: string } | { error: string } {
@@ -99,6 +148,24 @@ function parseCommandArgs(args: string, cwd: string): { action: ToolAction; mode
 }
 
 export default function codeReviewWorkflow(pi: ExtensionAPI) {
+	let activeCwd = process.cwd();
+	let previousCwd = activeCwd;
+
+	pi.on("session_start", (_event, ctx) => {
+		activeCwd = ctx.cwd;
+		previousCwd = ctx.cwd;
+	});
+
+	pi.on("user_bash", (event, ctx) => {
+		const target = parseSimpleCd(event.command);
+		if (target === undefined) return;
+		const base = activeCwd || event.cwd || ctx.cwd;
+		const next = target === "-" ? previousCwd : resolveAgainstActive(base, target);
+		if (!directoryExists(next)) return;
+		previousCwd = base;
+		activeCwd = next;
+	});
+
 	pi.registerTool({
 		name: "code_review_workflow",
 		label: "Code Review Workflow",
@@ -118,7 +185,7 @@ export default function codeReviewWorkflow(pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const action = (params.action || "review") as ToolAction;
-			const cwd = path.resolve(ctx.cwd, params.cwd || ".");
+			const cwd = resolveAgainstActive(activeCwd || ctx.cwd, params.cwd);
 			onUpdate?.({ content: [{ type: "text", text: `Running code_review_workflow ${action}...` }] });
 
 			let scriptArgs: string[];
@@ -158,7 +225,9 @@ export default function codeReviewWorkflow(pi: ExtensionAPI) {
 	pi.registerCommand("code-review", {
 		description: "Run/install/status for the post-commit code review workflow",
 		handler: async (args, ctx) => {
-			const parsed = parseCommandArgs(args, ctx.cwd);
+			const parts = args.trim().split(/\s+/).filter(Boolean);
+			const cwd = resolveAgainstActive(activeCwd || ctx.cwd, optionAfter(parts, "--cwd"));
+			const parsed = parseCommandArgs(stripOption(parts, "--cwd").join(" "), cwd);
 			if ("error" in parsed) {
 				ctx.ui.notify(parsed.error, "info");
 				return;

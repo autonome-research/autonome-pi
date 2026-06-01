@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -51,7 +51,8 @@ const STATUS_ALIASES = new Map([
 export function ensureStore() {
   mkdirSync(RUNS_DIR, { recursive: true });
   mkdirSync(ARTIFACTS_DIR, { recursive: true });
-  if (!existsSync(INDEX_FILE)) writeFileSync(INDEX_FILE, "", "utf8");
+  const fd = openSync(INDEX_FILE, "a");
+  closeSync(fd);
 }
 
 export function createRunId(workflow = "workflow") {
@@ -60,12 +61,27 @@ export function createRunId(workflow = "workflow") {
 }
 
 export function runFileFor(runId) {
-  return join(RUNS_DIR, `${runId}.jsonl`);
+  return join(RUNS_DIR, `${safeRunId(runId)}.jsonl`);
+}
+
+export function safeRunId(runId) {
+  const value = String(runId || "").trim();
+  if (!/^[a-zA-Z0-9_.:-]+$/.test(value)) throw new Error(`Invalid thread-phase runId: ${value || "(empty)"}`);
+  return value;
+}
+
+function stringifyValue(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, (_key, nested) => typeof nested === "bigint" ? nested.toString() : nested);
+  } catch (error) {
+    return JSON.stringify({ unserializable: true, message: error?.message || String(error), preview: String(value) });
+  }
 }
 
 function compactValue(value, maxBytes = 200_000) {
   if (value === undefined) return undefined;
-  const text = typeof value === "string" ? value : JSON.stringify(value);
+  const text = stringifyValue(value);
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return value;
   let out = text.slice(0, maxBytes);
   while (Buffer.byteLength(out, "utf8") > maxBytes) out = out.slice(0, -1);
@@ -94,7 +110,7 @@ export function createRun(options = {}) {
   ensureStore();
   const workflow = normalizeWorkflowName(options.workflow || "workflow");
   const run = {
-    runId: options.runId || createRunId(workflow),
+    runId: safeRunId(options.runId || createRunId(workflow)),
     workflow,
     cwd: options.cwd,
     trigger: options.trigger,
@@ -379,8 +395,17 @@ export function readArtifactContent(artifact, { maxBytes = 500_000 } = {}) {
   if (!artifact) return undefined;
   if (typeof artifact.content === "string") return compactText(artifact.content, maxBytes);
   if (!artifact.path) return undefined;
-  const content = readFileSync(artifact.path, "utf8");
-  return compactText(content, maxBytes);
+  const fd = openSync(artifact.path, "r");
+  try {
+    const size = fstatSync(fd).size;
+    const bytesToRead = Math.min(size, maxBytes + 1);
+    const buffer = Buffer.alloc(bytesToRead);
+    const bytesRead = readSync(fd, buffer, 0, bytesToRead, 0);
+    const content = buffer.subarray(0, Math.min(bytesRead, maxBytes)).toString("utf8");
+    return { content, truncated: size > maxBytes || bytesRead > maxBytes, bytes: size };
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export function normalizeStatus(status) {

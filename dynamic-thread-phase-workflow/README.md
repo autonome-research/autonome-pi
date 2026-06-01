@@ -22,7 +22,7 @@ Mapping:
 
 - `r` enables Pi `read`, `grep`, `find`, `ls`
 - `w` enables Pi `edit`, `write`
-- `x` enables shell phases and Pi `bash`
+- `x` participates in execution privileges; shell phases and Pi `bash` require full `rwx` because command execution is not sandboxed
 
 Phase-level `permissions` can narrow or expand within the runner max policy. Defaults are controlled by environment:
 
@@ -31,10 +31,10 @@ Phase-level `permissions` can narrow or expand within the runner max policy. Def
 
 ### `shell`
 
-Runs a shell command and stores stdout in `{{output:phase-name}}`. Shell phases require `x`; commands that appear mutating also require `w`.
+Runs a shell command and stores stdout in `{{output:phase-name}}`. Shell execution is not sandboxed, so shell phases require full `rwx` even for read-looking commands.
 
 ```json
-{ "type": "shell", "name": "list-files", "permissions": "rx", "command": "find src -maxdepth 2 -type f", "artifact": true }
+{ "type": "shell", "name": "list-files", "permissions": "rwx", "command": "find src -maxdepth 2 -type f", "artifact": true }
 ```
 
 ### `pi`
@@ -88,7 +88,7 @@ Writes a final markdown/json artifact from literal content or a previous phase o
 ```json
 {
   "name": "repo-doc-audit",
-  "permissions": "rx",
+  "permissions": "rwx",
   "phases": [
     {
       "type": "shell",

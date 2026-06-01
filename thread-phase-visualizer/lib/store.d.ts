@@ -129,6 +129,7 @@ export const INDEX_FILE: string;
 
 export function ensureStore(): void;
 export function createRunId(workflow?: string): string;
+export function safeRunId(runId: string): string;
 export function runFileFor(runId: string): string;
 export function createRun(options?: {
   workflow?: string;

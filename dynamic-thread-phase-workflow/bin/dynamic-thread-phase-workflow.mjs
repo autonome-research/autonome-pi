@@ -18,15 +18,18 @@ const DEFAULT_PI = existsSync(join(homedir(), ".npm-global", "bin", "pi"))
   ? join(homedir(), ".npm-global", "bin", "pi")
   : "pi";
 
-const TOOLS_BY_PERMISSION = Object.freeze({
-  r: ["read", "grep", "find", "ls"],
-  w: ["edit", "write"],
-  x: ["bash"],
+const PI_TOOL_REQUIREMENTS = Object.freeze({
+  read: "r",
+  grep: "r",
+  find: "r",
+  ls: "r",
+  edit: "w",
+  write: "w",
+  bash: "rwx",
 });
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_FANOUT_CONCURRENCY = 3;
 const MAX_OUTPUT_BYTES = 250_000;
-const MUTATING_SHELL_RE = /(^|[;&|]\s*)(rm|mv|cp|chmod|chown|mkdir|rmdir|touch|truncate|tee|dd|ln|git\s+(?:add|commit|push|reset|checkout|switch|merge|rebase|clean|apply|am)|npm\s+(?:install|i|uninstall|remove|publish)|pnpm\s+(?:install|add|remove|publish)|yarn\s+(?:add|remove|install|publish))\b|>\s*[^&]|>>|\b(?:sed|perl)\s+-i\b/;
 const DEFAULT_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_THREAD_PHASE_DEFAULT_PERMISSIONS || "r", "PI_DYNAMIC_THREAD_PHASE_DEFAULT_PERMISSIONS");
 const MAX_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_THREAD_PHASE_MAX_PERMISSIONS || "rwx", "PI_DYNAMIC_THREAD_PHASE_MAX_PERMISSIONS");
 
@@ -242,15 +245,21 @@ function permissionsForPhase(ctx, phase) {
   return requested;
 }
 
+function permissionIncludesAll(permissions, required) {
+  return [...String(required || "")].every((permission) => hasPermission(permissions, permission));
+}
+
 function toolsForPermissions(permissions) {
-  const out = [];
-  for (const permission of ["r", "w", "x"]) if (hasPermission(permissions, permission)) out.push(...TOOLS_BY_PERMISSION[permission]);
-  return [...new Set(out)];
+  return Object.entries(PI_TOOL_REQUIREMENTS)
+    .filter(([, required]) => permissionIncludesAll(permissions, required))
+    .map(([tool]) => tool);
 }
 
 function normalizePiTools(tools, permissions, label) {
   const allowed = new Set(toolsForPermissions(permissions));
   const requested = asArray(tools).length ? asArray(tools).map(String) : [...allowed];
+  const unknown = requested.filter((tool) => !PI_TOOL_REQUIREMENTS[tool]);
+  if (unknown.length) throw new Error(`${label} requested unsupported Pi tools: ${unknown.join(", ")}`);
   const rejected = requested.filter((tool) => !allowed.has(tool));
   if (rejected.length) throw new Error(`${label} requested tools not allowed by permissions=${permissions || "none"}: ${rejected.join(", ")}`);
   if (!requested.length) throw new Error(`${label} has no Pi tools available; set permissions to include r, w, or x`);
@@ -362,8 +371,7 @@ function dynamicPhase(specPhase) {
 async function* runShellPhase(ctx, phase) {
   const permissions = permissionsForPhase(ctx, phase);
   const command = renderTemplate(phase.command, ctx);
-  if (!hasPermission(permissions, "x")) throw new Error(`shell phase ${phase.name} requires x permission`);
-  if (!hasPermission(permissions, "w") && MUTATING_SHELL_RE.test(command)) throw new Error(`shell phase ${phase.name} appears mutating; add w permission if mutation is intended`);
+  if (!permissionIncludesAll(permissions, "rwx")) throw new Error(`shell phase ${phase.name} requires rwx permissions because shell execution is not sandboxed`);
   yield { type: "data", kind: "data", key: "permissions", value: permissions, message: `Running shell command with ${permissions} permissions` };
   yield { type: "data", kind: "data", key: "command", value: command, message: `Running shell command` };
   const result = await runProcess(command, [], { cwd: ctx.cwd, shell: true, timeoutMs: phase.timeoutMs || ctx.timeoutMs });
