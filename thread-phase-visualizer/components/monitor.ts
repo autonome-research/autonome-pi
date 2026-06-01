@@ -1,5 +1,6 @@
 import { getMarkdownTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, Markdown, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { basename } from "node:path";
 import { STATUSES, latestRunSummaries, readArtifactContent } from "../lib/store.mjs";
 import { framePanel } from "./bordered-panel.ts";
 import { formatFanout, formatProgress, statusColor, statusIcon } from "./phase-timeline.ts";
@@ -54,6 +55,11 @@ function currentPhaseText(run: RunSummary): string {
 	if (!phase) return "";
 	const progress = phase.fanout ? formatFanout(phase.fanout) : formatProgress(phase.progress);
 	return `${phase.phase || "phase"}${progress}`;
+}
+
+function cwdLabel(cwd: string | undefined): string {
+	if (!cwd) return "unknown cwd";
+	return basename(cwd) || cwd;
 }
 
 function runSessionId(run: RunSummary | undefined): string | undefined {
@@ -226,7 +232,8 @@ class ThreadPhaseMonitorComponent {
 			const live = status === STATUSES.RUNNING ? t.fg("accent", " LIVE") : "";
 			const head = `${prefix} ${workflowGlyph(status, t)} ${selected ? t.fg("accent", run.workflow || "workflow") : run.workflow || "workflow"}${live} ${t.fg("dim", `[${shortRunId(run.runId)}]`)}`;
 			const current = status === STATUSES.RUNNING ? currentPhaseText(run) : "";
-			lines.push(truncateToWidth(`${head}${current ? t.fg("muted", ` — ${current}`) : ""}`, width));
+			const location = run.cwd ? t.fg("dim", ` @ ${cwdLabel(run.cwd)}`) : "";
+			lines.push(truncateToWidth(`${head}${location}${current ? t.fg("muted", ` — ${current}`) : ""}`, width));
 			if (status === STATUSES.RUNNING) lines.push(truncateToWidth(`  ${deterministicPhaseLine(run, t)}`, width));
 		}
 		const remaining = runs.length - start - visible.length;
@@ -256,6 +263,7 @@ class ThreadPhaseMonitorComponent {
 		add(t.fg("accent", t.bold(`${workflowGlyph(status, t)} ${run.workflow || "workflow"}`)) + t.fg("dim", ` [${run.runId || "unknown"}]`));
 		const pid = runtimePid(run);
 		add(t.fg("dim", `status: ${run.status || status}  updated: ${run.updatedAt || "?"}${pid && status === STATUSES.RUNNING ? `  pid: ${pid}` : ""}`));
+		if (run.cwd) add(t.fg("dim", `cwd: ${run.cwd}`));
 		add("");
 		add(t.fg("toolTitle", t.bold("Phases")) + t.fg("dim", ` (${(run.phases || []).length})`));
 		if (!(run.phases || []).length) add(t.fg("dim", "No phases recorded."));
