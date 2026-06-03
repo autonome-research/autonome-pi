@@ -18,7 +18,8 @@
       "thread-phase-visualizer/index.ts",
       "codebase-exploration-workflow/index.ts",
       "code-review-workflow/index.ts",
-      "dynamic-thread-phase-workflow/index.ts"
+      "dynamic-thread-phase-workflow/index.ts",
+      "mission-workflow/index.ts"
     ],
     "skills": [
       "skills"

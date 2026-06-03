@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -66,6 +66,26 @@ try {
   const shellSpec = join(tmp, 'shell-spec.json');
   writeFileSync(shellSpec, JSON.stringify({ name: 'shell-smoke', permissions: 'rwx', phases: [{ type: 'shell', name: 'hello', command: 'printf hello', artifact: true }] }, null, 2));
   expectExit('structured shell workflow succeeds', ['node', cli, '--spec-file', shellSpec, '--cwd', root], 0);
+
+  const missionCli = join(root, 'mission-workflow/bin/mission-workflow.mjs');
+  const missionRepo = join(tmp, 'mission-repo');
+  mkdirSync(missionRepo, { recursive: true });
+  expectExit('mission smoke repo git init', ['git', 'init', '-q'], 0, { cwd: missionRepo });
+  expectExit('mission smoke repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: missionRepo });
+  expectExit('mission smoke repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: missionRepo });
+  writeFileSync(join(missionRepo, 'README.md'), 'hello\n');
+  expectExit('mission smoke repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: missionRepo });
+  const missionPlan = expectExit('mission workflow mock plan succeeds', ['node', missionCli, 'plan', '--planner', 'mock', '--goal', 'No-op smoke mission', '--cwd', missionRepo], 0);
+  let missionPlanDetails;
+  try { missionPlanDetails = JSON.parse(missionPlan.stdout); } catch { missionPlanDetails = undefined; }
+  log(Boolean(missionPlanDetails?.planPath), 'mission workflow plan emits planPath');
+  const missionActivate = missionPlanDetails?.planPath
+    ? expectExit('mission workflow mock activate succeeds', ['node', missionCli, 'activate', '--approved', '--plan-path', missionPlanDetails.planPath, '--cwd', missionRepo], 0)
+    : undefined;
+  let missionActivateDetails;
+  try { missionActivateDetails = missionActivate?.stdout ? JSON.parse(missionActivate.stdout) : undefined; } catch { missionActivateDetails = undefined; }
+  log(Boolean(missionActivateDetails?.branch), 'mission workflow activation emits mission branch');
+  if (missionPlanDetails?.plan?.worktreeBaseDir) rmSync(missionPlanDetails.plan.worktreeBaseDir, { recursive: true, force: true });
 } finally {
   if (process.env.KEEP_PI_THREAD_PHASE_TEST_TMP !== '1') rmSync(tmp, { recursive: true, force: true });
 }
