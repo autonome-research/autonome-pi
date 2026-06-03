@@ -193,13 +193,20 @@ The demo script is intentionally not exposed as a slash command. Larger workflow
 - Shortcut: `ctrl+shift+t` opens the live monitor overlay
 - In the monitor, press `x` on a running workflow to request cancellation. Cancellation is requested through `~/.pi/agent/thread-phase/cancel/<runId>.json`; workflow runners cooperatively abort their thread-phase `AbortSignal` and terminate child subprocesses.
 
+## Remaining visualizer work
+
+- Aggregate and render usage events, e.g. `phaseEvent(run, phase, { kind: "usage", usage })`.
+- Replace full JSONL reads with bounded tail/offset reads for large stores.
+- Add formal workflow owner metadata (`sessionId`, `sessionFile`, launch source, cwd at launch) and use it consistently for monitor filtering, tool inspection, continuation, and cancellation.
+- Add tests for session scoping, once-only continuation, cancellation request files, large artifacts, and corrupt JSONL tolerance.
+
 ## Current UI components
 
 The first UI layer is implemented as generic custom message renderers:
 
 - `thread-phase-run`: collapsed one-line workflow status; expand with Pi's tool/message expansion key to show phases, errors, and summary artifact content.
 - live monitor overlay: session-scoped keyboard-driven progress view with animated live workflow glyphs, arrow/enter navigation across phases and artifacts in one detail view, cancellation (`x` for running workflows), markdown-rendered artifact content, and separate phase glyphs (`◆`, `◈`, `◇`) for quick visual scanning.
-- session continuations: background/session-launched workflows emit a normal follow-up user message for the current Pi session; if the main agent is still generating, the continuation is queued with Pi's follow-up delivery instead of interrupting the stream.
+- session continuations: successful background/session-launched workflows can emit a normal follow-up user message for the current Pi session; if the main agent is still generating, the continuation is queued with Pi's follow-up delivery instead of interrupting the stream. Dynamic workflows opt in with `autoContinue: true`.
 - `thread_phase_runs` is session-scoped by default; unscoped historical/direct-CLI runs are only inspectable through an explicit matching cwd.
 
 Component files:

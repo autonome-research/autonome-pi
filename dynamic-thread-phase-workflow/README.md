@@ -1,5 +1,7 @@
 # dynamic-workflows
 
+Status: experimental-but-usable as of `pi-thread-phase-tools@v0.7.1`.
+
 Executes dynamic workflows built live in chat. The implementation uses thread-phase internally for structured execution, cancellation, events, and artifacts, but the user-facing concept is a Pi dynamic workflow.
 
 ## Tools
@@ -81,6 +83,24 @@ Defaults are controlled by environment:
 - `PI_DYNAMIC_WORKFLOW_PI_BIN` optional Pi binary override
 
 Legacy `PI_DYNAMIC_THREAD_PHASE_*` environment variables remain supported as fallbacks.
+
+## Recent stabilization notes
+
+- Harness mode requires explicit `permissions: "rwx"`; omission fails before import.
+- Harness permissions are checked against `PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS` before importing generated JavaScript, so denied harnesses do not run top-level module side effects.
+- Structured tool-level `permissions` are merged into the spec when absent and rejected on conflict.
+- `phase.tools` must be an array of supported tool names.
+- Background launches validate before detaching and require a valid `{ ok: true, background: true, pid }` acknowledgement.
+- Dynamic workflows do not auto-continue by default; use `autoContinue: true`.
+
+## Remaining work
+
+- Add automated tests for extension load/tool registration, permission matrices, background validation, harness cancellation, and fanout terminal events.
+- Add saved workflow templates and a command/tool to list/run them.
+- Add resume/reuse semantics for structured workflows after interruption.
+- Add worktree isolation helpers for patch/eval workflows.
+- Add usage budgets once visualizer usage aggregation is implemented.
+- Consider moving implementation files/folder to `dynamic-workflows` after a compatibility window; current folder and legacy tool remain for backwards compatibility.
 
 ## Structured phase examples
 
