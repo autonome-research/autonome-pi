@@ -8,6 +8,7 @@ Private Pi package for thread-phase workflow visualization and example workflows
 - `codebase-exploration-workflow` — fanout codebase exploration workflow using Pi subagents.
 - `code-review-workflow` — git diff/commit code review workflow using Pi subagents.
 - `dynamic-workflows` — validated ad-hoc workflow runner for dynamic workflows planned in chat, with structured spec mode and advanced JavaScript harness mode.
+- `skills/dynamic-workflows` — on-demand Pi skill that teaches other sessions/configurations how to use the dynamic workflow tools safely.
 
 ## Install
 
@@ -29,6 +30,7 @@ pi install git:git@github.com:Code4me2/pi-thread-phase-tools@main
 - `/code-review` runs code review workflows.
 - `dynamic_workflow` runs validated dynamic workflows from structured specs or JavaScript harnesses. `dynamic_thread_phase_workflow` remains as a deprecated compatibility alias.
 - Tool/API inspection remains available through `thread_phase_runs`.
+- The `dynamic-workflows` skill is included in the package and should be loaded automatically by Pi when a task asks for dynamic workflows, structured workflow specs, JS harness workflows, or multi-phase dynamic execution.
 
 ## Current status
 
@@ -44,6 +46,7 @@ Recent changes:
 - Dynamic workflows do not auto-continue by default; pass `autoContinue: true` for successful-run follow-up.
 - Usage events are aggregated into run, phase, and fanout-item summaries and rendered in tools/monitor/completion cards.
 - `npm test` runs smoke coverage for extension load, permission denial before harness import, structured validation, JS harness mode, structured shell mode, and usage projection.
+- The package now ships a `dynamic-workflows` skill so fresh Pi sessions get progressive-disclosure guidance for structured specs, JS harnesses, permissions, background behavior, and remaining caveats.
 - Thread-phase dependency is `^4.0.0`.
 
 ## Remaining work

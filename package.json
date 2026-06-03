@@ -19,6 +19,9 @@
       "codebase-exploration-workflow/index.ts",
       "code-review-workflow/index.ts",
       "dynamic-thread-phase-workflow/index.ts"
+    ],
+    "skills": [
+      "skills"
     ]
   },
   "dependencies": {
