@@ -79,15 +79,20 @@ process.once("SIGINT", () => requestCancel("SIGINT"));
 
 function parseArgs(argv) {
   const out = { _: [] };
+  const setOption = (key, value) => {
+    if (out[key] === undefined) out[key] = value;
+    else if (Array.isArray(out[key])) out[key].push(value);
+    else out[key] = [out[key], value];
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--") { out._.push(...argv.slice(i + 1)); break; }
     if (arg.startsWith("--")) {
       const eq = arg.indexOf("=");
       const key = arg.slice(2, eq === -1 ? undefined : eq);
-      if (eq !== -1) out[key] = arg.slice(eq + 1);
-      else if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) out[key] = argv[++i];
-      else out[key] = true;
+      if (eq !== -1) setOption(key, arg.slice(eq + 1));
+      else if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) setOption(key, argv[++i]);
+      else setOption(key, true);
     } else out._.push(arg);
   }
   return out;
@@ -355,8 +360,9 @@ async function createPlan(args, cwd, run, ctx) {
     plan = defaultPlan({ goal, cwd, args, repoRoot });
   } else {
     const prompt = [
-      "You are a mission orchestrator. Create a concise JSON mission plan for a Droid/Missions-style software workflow.",
-      "Return ONLY JSON with: missionId, goal, maxRepairIterations, validationCommands, userTestCommand, milestones[], validationContract.assertions[].",
+      "You are a mission orchestrator. Inspect the repository before planning, especially files named specs.md, SPEC.md, requirements.md, README.md, or docs/*.md.",
+      "Create a JSON mission plan for a Droid/Missions-style software workflow. For large specs, decompose the whole spec into milestones and serial features rather than shrinking scope.",
+      "Return ONLY JSON with: missionId, goal, sourceDocs?, maxRepairIterations, validationCommands, userTestCommand, milestones[], validationContract.assertions[].",
       "Each milestone has id,title,features[]. Each feature has id,title,description,assertions[].",
       "Validation assertions must be written before implementation and independently define correctness.",
       `Goal: ${goal}`,
@@ -428,6 +434,8 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
       handoffRel,
       "The handoff JSON must include: featureId, completed, changedFiles, commandsRun[{command,exitCode}], assertionsAddressed, issuesDiscovered, leftUndone, notesForValidator.",
       "Mission goal:", plan.goal,
+      "Before implementing, inspect relevant repository source/spec documents, especially specs.md, SPEC.md, requirements.md, README.md, docs/*.md, and any plan sourceDocs.",
+      "Plan sourceDocs:", JSON.stringify(plan.sourceDocs || [], null, 2),
       "Milestone:", `${milestone.id}: ${milestone.title}`,
       "Feature:", JSON.stringify(feature, null, 2),
       "Validation contract:", JSON.stringify(plan.validationContract, null, 2),
