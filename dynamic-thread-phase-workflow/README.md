@@ -1,6 +1,6 @@
 # dynamic-workflows
 
-Status: experimental-but-usable as of `pi-thread-phase-tools@v0.7.2`.
+Status: experimental-but-usable as of `pi-thread-phase-tools@v0.8.0`.
 
 Executes dynamic workflows built live in chat. The implementation uses thread-phase internally for structured execution, cancellation, events, and artifacts, but the user-facing concept is a Pi dynamic workflow.
 
@@ -95,11 +95,11 @@ Legacy `PI_DYNAMIC_THREAD_PHASE_*` environment variables remain supported as fal
 
 ## Remaining work
 
-- Add automated tests for extension load/tool registration, permission matrices, background validation, harness cancellation, and fanout terminal events.
+- Expand automated tests for alias registration introspection, background validation, harness cancellation, broader permission matrices, and fanout terminal events.
 - Add saved workflow templates and a command/tool to list/run them.
 - Add resume/reuse semantics for structured workflows after interruption.
 - Add worktree isolation helpers for patch/eval workflows.
-- Add usage budgets once visualizer usage aggregation is implemented.
+- Add usage budgets using visualizer-projected usage summaries.
 - Consider moving implementation files/folder to `dynamic-workflows` after a compatibility window; current folder and legacy tool remain for backwards compatibility.
 
 ## Structured phase examples

@@ -195,7 +195,7 @@ The demo script is intentionally not exposed as a slash command. Larger workflow
 
 ## Remaining visualizer work
 
-- Aggregate and render usage events, e.g. `phaseEvent(run, phase, { kind: "usage", usage })`.
+- Add usage budgets/threshold warnings on top of projected usage summaries.
 - Replace full JSONL reads with bounded tail/offset reads for large stores.
 - Add formal workflow owner metadata (`sessionId`, `sessionFile`, launch source, cwd at launch) and use it consistently for monitor filtering, tool inspection, continuation, and cancellation.
 - Add tests for session scoping, once-only continuation, cancellation request files, large artifacts, and corrupt JSONL tolerance.

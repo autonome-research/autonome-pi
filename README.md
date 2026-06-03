@@ -12,7 +12,7 @@ Private Pi package for thread-phase workflow visualization and example workflows
 ## Install
 
 ```bash
-pi install git:git@github.com:Code4me2/pi-thread-phase-tools@v0.7.2
+pi install git:git@github.com:Code4me2/pi-thread-phase-tools@v0.8.0
 ```
 
 For active development:
@@ -32,7 +32,7 @@ pi install git:git@github.com:Code4me2/pi-thread-phase-tools@main
 
 ## Current status
 
-Latest release: `v0.7.2`.
+Latest release: `v0.8.0`.
 
 Recent changes:
 
@@ -42,15 +42,17 @@ Recent changes:
   - structured spec mode for validated/auditable workflows,
   - JavaScript harness mode for richer control flow. Harness mode requires explicit `permissions: "rwx"`.
 - Dynamic workflows do not auto-continue by default; pass `autoContinue: true` for successful-run follow-up.
+- Usage events are aggregated into run, phase, and fanout-item summaries and rendered in tools/monitor/completion cards.
+- `npm test` runs smoke coverage for extension load, permission denial before harness import, structured validation, JS harness mode, structured shell mode, and usage projection.
 - Thread-phase dependency is `^4.0.0`.
 
 ## Remaining work
 
 High-value follow-ups:
 
-- Usage accounting: aggregate `kind: "usage"` events into run/phase summaries and render compact usage in the monitor and completion messages.
 - Bounded JSONL reads: replace full-file index/run reads with tail/offset reads for large stores.
-- Dynamic workflow hardening: add tests for harness cancellation, background invalid specs, permission matrices, and fanout terminal states.
+- Dynamic workflow hardening: add tests for harness cancellation, background invalid specs, broader permission matrices, and fanout terminal states.
+- Usage budgets: optionally fail/stop workflows when projected token usage exceeds configured limits.
 - Saved workflow templates: support reusable specs/harnesses under a Pi workflow directory.
 - Resume support: allow structured workflows to resume/reuse completed phase artifacts after interruption.
 - Worktree isolation: optional per-phase/per-fanout worktrees for patch/eval workflows.

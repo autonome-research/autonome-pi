@@ -1,6 +1,6 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
-import { STATUSES } from "../lib/store.mjs";
+import { STATUSES, formatUsageSummary } from "../lib/store.mjs";
 
 type RunSummary = Record<string, any>;
 type PhaseSummary = Record<string, any>;
@@ -56,8 +56,9 @@ export function renderPhaseTimeline(run: RunSummary, theme: Theme, expanded: boo
 		const icon = theme.fg(statusColor(normalized), statusIcon(normalized));
 		const name = theme.fg("accent", phase.phase || "phase");
 		const progress = theme.fg("muted", phase.fanout ? formatFanout(phase.fanout) : formatProgress(phase.progress));
+		const usage = expanded && phase.usage ? theme.fg("muted", ` · ${formatUsageSummary(phase.usage)}`) : "";
 		const message = expanded && phase.lastMessage ? theme.fg("dim", ` — ${phase.lastMessage}`) : "";
-		container.addChild(new Text(`${icon} ${name}${progress}${message}`, 0, 0));
+		container.addChild(new Text(`${icon} ${name}${progress}${usage}${message}`, 0, 0));
 		if (expanded && phase.fanout?.items?.length) {
 			for (const item of phase.fanout.items.slice(0, 20)) {
 				const itemStatus = item.normalizedStatus || item.status;

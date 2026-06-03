@@ -48,6 +48,18 @@ export type ThreadPhaseUiEvent = {
   metadata?: unknown;
 };
 
+export type ThreadPhaseUsageSummary = {
+  entries: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cachedInputTokens: number;
+  cacheCreationInputTokens: number;
+  reasoningTokens: number;
+  fields: Record<string, number>;
+  models: Record<string, ThreadPhaseUsageSummary>;
+};
+
 export type ThreadPhaseFanoutItemSummary = {
   itemId: string;
   label: string;
@@ -59,6 +71,7 @@ export type ThreadPhaseFanoutItemSummary = {
   endedAt?: string;
   lastMessage?: string;
   error?: unknown;
+  usage?: ThreadPhaseUsageSummary;
 };
 
 export type ThreadPhaseFanoutSummary = {
@@ -81,6 +94,7 @@ export type ThreadPhasePhaseSummary = {
   lastMessage?: string;
   progress?: { current?: number; total?: number; percent?: number; message?: string };
   fanout?: ThreadPhaseFanoutSummary;
+  usage?: ThreadPhaseUsageSummary;
 };
 
 export type ThreadPhaseRunSummary = {
@@ -97,6 +111,7 @@ export type ThreadPhaseRunSummary = {
   artifacts: Array<ThreadPhaseArtifact & { eventId?: string; timestamp?: string }>;
   errors: Array<{ timestamp?: string; phase?: string; message?: string; error?: unknown }>;
   progress: Record<string, { current?: number; total?: number; percent?: number; message?: string }>;
+  usage: ThreadPhaseUsageSummary;
   lastMessage?: string;
   eventCount: number;
   events: ThreadPhaseUiEvent[];
@@ -171,5 +186,6 @@ export function projectRuns(events?: ThreadPhaseUiEvent[]): ThreadPhaseRunSummar
 export function getRunSummary(runId: string): ThreadPhaseRunSummary;
 export function latestRunSummaries(options?: { limit?: number; workflow?: string; cwd?: string; readLimit?: number }): ThreadPhaseRunSummary[];
 export function latestRuns(options?: { limit?: number; workflow?: string; cwd?: string; readLimit?: number }): ThreadPhaseRunSummary[];
+export function formatUsageSummary(usage: ThreadPhaseUsageSummary | undefined): string;
 export function readArtifactContent(artifact: ThreadPhaseArtifact, options?: { maxBytes?: number }): { content: string; truncated: boolean; bytes?: number } | undefined;
 export function normalizeStatus(status?: unknown): ThreadPhaseNormalizedStatus;

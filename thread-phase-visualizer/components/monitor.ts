@@ -1,7 +1,7 @@
 import { getMarkdownTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, Markdown, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { basename } from "node:path";
-import { STATUSES, latestRunSummaries, readArtifactContent, requestCancellation } from "../lib/store.mjs";
+import { STATUSES, formatUsageSummary, latestRunSummaries, readArtifactContent, requestCancellation } from "../lib/store.mjs";
 import { framePanel } from "./bordered-panel.ts";
 import { formatFanout, formatProgress, statusColor, statusIcon } from "./phase-timeline.ts";
 
@@ -264,6 +264,7 @@ class ThreadPhaseMonitorComponent {
 		const pid = runtimePid(run);
 		add(t.fg("dim", `status: ${run.status || status}  updated: ${run.updatedAt || "?"}${pid && status === STATUSES.RUNNING ? `  pid: ${pid}` : ""}`));
 		if (run.cwd) add(t.fg("dim", `cwd: ${run.cwd}`));
+		if (run.usage?.entries) add(t.fg("muted", `usage: ${formatUsageSummary(run.usage)}`));
 		add("");
 		add(t.fg("toolTitle", t.bold("Phases")) + t.fg("dim", ` (${(run.phases || []).length})`));
 		if (!(run.phases || []).length) add(t.fg("dim", "No phases recorded."));
@@ -296,11 +297,13 @@ class ThreadPhaseMonitorComponent {
 		if (phase.startedAt) lines.push(t.fg("dim", `    started: ${phase.startedAt}`));
 		if (phase.endedAt) lines.push(t.fg("dim", `    ended:   ${phase.endedAt}`));
 		if (phase.progress) lines.push(t.fg("muted", `    progress: ${compactJson(phase.progress)}`));
+		if (phase.usage?.entries) lines.push(t.fg("muted", `    usage: ${formatUsageSummary(phase.usage)}`));
 		if (!phase.fanout) return;
 		lines.push(t.fg("muted", `    fanout:${formatFanout(phase.fanout)} ${phase.fanout.label || ""}`));
 		for (const item of (phase.fanout.items || []).slice(0, MAX_DETAIL_PHASE_ITEMS)) {
 			const iStatus = item.normalizedStatus || item.status;
-			lines.push(truncateToWidth(`      ${t.fg(statusColor(iStatus), statusIcon(iStatus))} ${item.label || item.itemId}${item.lastMessage ? t.fg("dim", ` — ${item.lastMessage}`) : ""}`, width));
+			const usage = item.usage?.entries ? t.fg("muted", ` · ${formatUsageSummary(item.usage)}`) : "";
+			lines.push(truncateToWidth(`      ${t.fg(statusColor(iStatus), statusIcon(iStatus))} ${item.label || item.itemId}${usage}${item.lastMessage ? t.fg("dim", ` — ${item.lastMessage}`) : ""}`, width));
 		}
 		if ((phase.fanout.items || []).length > MAX_DETAIL_PHASE_ITEMS) lines.push(t.fg("dim", `      … ${phase.fanout.items.length - MAX_DETAIL_PHASE_ITEMS} more item(s)`));
 	}

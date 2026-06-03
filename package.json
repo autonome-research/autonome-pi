@@ -3,6 +3,10 @@
   "version": "0.7.3",
   "private": true,
   "description": "Thread-phase workflow visualizer and workflow examples for Pi.",
+  "scripts": {
+    "smoke": "node scripts/smoke-test.mjs",
+    "test": "node scripts/smoke-test.mjs"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",

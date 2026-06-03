@@ -1,6 +1,6 @@
 import { keyHint, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
-import { STATUSES } from "../lib/store.mjs";
+import { STATUSES, formatUsageSummary } from "../lib/store.mjs";
 import { artifactSummaryText, renderArtifactList } from "./artifact-view.ts";
 import { phaseSummaryText, renderPhaseTimeline, statusColor, statusIcon } from "./phase-timeline.ts";
 
@@ -17,7 +17,8 @@ function compactRunLine(run: RunSummary, theme: any): string {
 	const icon = theme.fg(statusColor(status), statusIcon(status));
 	const workflow = theme.fg("accent", run.workflow || "workflow");
 	const statusText = status === STATUSES.RUNNING ? "running" : status === STATUSES.FAILED ? "failed" : "completed";
-	const counts = theme.fg("muted", `${phaseSummaryText(run)} · ${artifactSummaryText(run)}`);
+	const usage = run.usage?.entries ? ` · ${formatUsageSummary(run.usage)}` : "";
+	const counts = theme.fg("muted", `${phaseSummaryText(run)} · ${artifactSummaryText(run)}${usage}`);
 	const id = theme.fg("dim", shortRunId(run.runId));
 	return `${icon} phased workflow ${statusText}: ${workflow} ${theme.fg("dim", "[")}${id}${theme.fg("dim", "]")} ${counts}`;
 }
@@ -49,6 +50,7 @@ function renderRunMessage(message: any, expanded: boolean, theme: any) {
 	if (run.startedAt || run.updatedAt) {
 		container.addChild(new Text(theme.fg("dim", `Started: ${run.startedAt || "?"}  Updated: ${run.updatedAt || "?"}`), 0, 0));
 	}
+	if (run.usage?.entries) container.addChild(new Text(theme.fg("muted", `Usage: ${formatUsageSummary(run.usage)}`), 0, 0));
 
 	container.addChild(new Spacer(1));
 	container.addChild(new Text(theme.fg("toolTitle", theme.bold("Phases")), 0, 0));

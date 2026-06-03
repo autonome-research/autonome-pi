@@ -308,6 +308,7 @@ export function projectRun(events = []) {
     artifacts: [],
     errors: [],
     progress: {},
+    usage: emptyUsageSummary(),
     lastMessage: first.message,
     eventCount: sorted.length,
     events: sorted,
@@ -366,6 +367,7 @@ export function projectRun(events = []) {
         phase.progress = progress;
       }
       applyFanoutEvent(phase, event.data, event);
+      applyUsageEvent(summary, phase, event.data, event);
     }
     if (event.type === EVENT_TYPES.PHASE_END && event.phase) {
       const phase = upsertPhase(summary, event.phase, { phase: event.phase });
@@ -415,6 +417,19 @@ export function latestRunSummaries({ limit = 20, cwd, workflow, readLimit = 5000
 // Backward-compatible alias for the original projected run helper.
 export function latestRuns(options = {}) {
   return latestRunSummaries(options);
+}
+
+export function formatUsageSummary(usage) {
+  if (!usage || typeof usage !== "object" || !usage.entries) return "";
+  const parts = [];
+  if (typeof usage.inputTokens === "number" && usage.inputTokens > 0) parts.push(`${formatNumber(usage.inputTokens)} in`);
+  if (typeof usage.outputTokens === "number" && usage.outputTokens > 0) parts.push(`${formatNumber(usage.outputTokens)} out`);
+  if (typeof usage.totalTokens === "number" && usage.totalTokens > 0 && parts.length === 0) parts.push(`${formatNumber(usage.totalTokens)} tok`);
+  if (typeof usage.reasoningTokens === "number" && usage.reasoningTokens > 0) parts.push(`${formatNumber(usage.reasoningTokens)} reasoning`);
+  if (typeof usage.cachedInputTokens === "number" && usage.cachedInputTokens > 0) parts.push(`${formatNumber(usage.cachedInputTokens)} cached`);
+  const models = usage.models && typeof usage.models === "object" ? Object.keys(usage.models).filter(Boolean) : [];
+  const modelPart = models.length === 1 ? ` · ${models[0]}` : models.length > 1 ? ` · ${models.length} models` : "";
+  return parts.length ? `${parts.join(" / ")}${modelPart}` : `${usage.entries} usage event${usage.entries === 1 ? "" : "s"}${modelPart}`;
 }
 
 export function readArtifactContent(artifact, { maxBytes = 500_000 } = {}) {
@@ -487,6 +502,101 @@ function extractProgress(data) {
       ? current / total
       : undefined;
   return dropUndefined({ current, total, percent, message: data.message });
+}
+
+function emptyUsageSummary() {
+  return {
+    entries: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    cachedInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    reasoningTokens: 0,
+    fields: {},
+    models: {},
+  };
+}
+
+function applyUsageEvent(summary, phase, data, event) {
+  const entries = extractUsageEntries(data);
+  if (!entries.length) return;
+  phase.usage ||= emptyUsageSummary();
+  for (const entry of entries) {
+    const model = entry.model || data.model || event.data?.model;
+    addUsage(summary.usage, entry.usage, model);
+    addUsage(phase.usage, entry.usage, model);
+    if (data.item !== undefined || data.itemId !== undefined || data.index !== undefined) {
+      applyFanoutUsage(phase, data, entry.usage, model);
+    }
+  }
+}
+
+function extractUsageEntries(data) {
+  if (!data || typeof data !== "object") return [];
+  const kind = data.kind || data.type;
+  if (kind !== "usage" && data.usage === undefined) return [];
+  const raw = data.usage ?? data;
+  const values = Array.isArray(raw) ? raw : [raw];
+  return values
+    .map((value) => value?.message?.usage ? { usage: value.message.usage, model: value.message.model || value.model } : { usage: value, model: value?.model })
+    .filter((entry) => entry.usage && typeof entry.usage === "object");
+}
+
+function addUsage(target, usage, model) {
+  target.entries += 1;
+  const input = numberFrom(usage.input_tokens, usage.inputTokens, usage.prompt_tokens, usage.promptTokens);
+  const output = numberFrom(usage.output_tokens, usage.outputTokens, usage.completion_tokens, usage.completionTokens);
+  const total = numberFrom(usage.total_tokens, usage.totalTokens) ?? ((input || 0) + (output || 0) || undefined);
+  const cached = numberFrom(usage.cache_read_input_tokens, usage.cached_input_tokens, usage.cachedInputTokens, usage.input_token_details?.cached_tokens, usage.prompt_tokens_details?.cached_tokens);
+  const cacheCreation = numberFrom(usage.cache_creation_input_tokens, usage.cacheCreationInputTokens);
+  const reasoning = numberFrom(usage.output_token_details?.reasoning_tokens, usage.completion_tokens_details?.reasoning_tokens, usage.reasoning_tokens, usage.reasoningTokens);
+  if (input) target.inputTokens += input;
+  if (output) target.outputTokens += output;
+  if (total) target.totalTokens += total;
+  if (cached) target.cachedInputTokens += cached;
+  if (cacheCreation) target.cacheCreationInputTokens += cacheCreation;
+  if (reasoning) target.reasoningTokens += reasoning;
+  addNumericFields(target.fields, usage);
+  if (model) {
+    const key = String(model);
+    target.models[key] ||= emptyUsageSummary();
+    addUsage(target.models[key], { ...usage, model: undefined }, undefined);
+  }
+}
+
+function applyFanoutUsage(phase, data, usage, model) {
+  const itemId = String(data.itemId ?? data.item ?? data.label ?? data.index ?? "item");
+  const item = phase._fanoutItemMap?.[itemId];
+  if (!item) return;
+  item.usage ||= emptyUsageSummary();
+  addUsage(item.usage, usage, model);
+}
+
+function addNumericFields(fields, value, prefix = "") {
+  if (!value || typeof value !== "object") return;
+  for (const [key, nested] of Object.entries(value)) {
+    if (key === "model") continue;
+    const name = normalizeFieldName(prefix ? `${prefix}.${key}` : key);
+    if (typeof nested === "number" && Number.isFinite(nested)) fields[name] = (fields[name] || 0) + nested;
+    else if (nested && typeof nested === "object" && !Array.isArray(nested)) addNumericFields(fields, nested, name);
+  }
+}
+
+function numberFrom(...values) {
+  for (const value of values) if (typeof value === "number" && Number.isFinite(value)) return value;
+  return undefined;
+}
+
+function normalizeFieldName(value) {
+  return String(value).replace(/[^a-zA-Z0-9_.:-]+/g, "_");
+}
+
+function formatNumber(value) {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}M`;
+  if (value >= 10_000) return `${Math.round(value / 1_000)}K`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  return String(value);
 }
 
 function applyFanoutEvent(phase, data, event) {
