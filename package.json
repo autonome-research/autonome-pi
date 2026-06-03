@@ -18,7 +18,7 @@
     ]
   },
   "dependencies": {
-    "@autonome-research/thread-phase": "^3.3.0"
+    "@autonome-research/thread-phase": "^4.0.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
