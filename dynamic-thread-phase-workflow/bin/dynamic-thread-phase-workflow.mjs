@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   ARTIFACTS_DIR,
   STATUSES,
@@ -10,14 +11,18 @@ import {
   completeRun,
   createRun,
   failRun,
+  phaseEnd,
   phaseEvent,
+  phaseStart,
   readCancellation,
   wrapPhases,
 } from "../../thread-phase-visualizer/lib/store.mjs";
 
-const DEFAULT_PI = existsSync(join(homedir(), ".npm-global", "bin", "pi"))
-  ? join(homedir(), ".npm-global", "bin", "pi")
-  : "pi";
+const DEFAULT_PI = process.env.PI_DYNAMIC_WORKFLOW_PI_BIN
+  || process.env.PI_DYNAMIC_THREAD_PHASE_PI_BIN
+  || (existsSync(join(homedir(), ".npm-global", "bin", "pi"))
+    ? join(homedir(), ".npm-global", "bin", "pi")
+    : "pi");
 
 const PI_TOOL_REQUIREMENTS = Object.freeze({
   read: "r",
@@ -31,8 +36,8 @@ const PI_TOOL_REQUIREMENTS = Object.freeze({
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_FANOUT_CONCURRENCY = 3;
 const MAX_OUTPUT_BYTES = 250_000;
-const DEFAULT_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_THREAD_PHASE_DEFAULT_PERMISSIONS || "r", "PI_DYNAMIC_THREAD_PHASE_DEFAULT_PERMISSIONS");
-const MAX_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_THREAD_PHASE_MAX_PERMISSIONS || "rwx", "PI_DYNAMIC_THREAD_PHASE_MAX_PERMISSIONS");
+const DEFAULT_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_WORKFLOW_DEFAULT_PERMISSIONS || process.env.PI_DYNAMIC_THREAD_PHASE_DEFAULT_PERMISSIONS || "r", "PI_DYNAMIC_WORKFLOW_DEFAULT_PERMISSIONS");
+const MAX_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_PERMISSIONS || "rwx", "PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS");
 
 async function loadThreadPhaseCore() {
   try {
@@ -168,7 +173,7 @@ function validateSpec(spec) {
 function loadSpec(args) {
   if (args["spec-file"]) return JSON.parse(readFileSync(String(args["spec-file"]), "utf8"));
   if (args.spec) return JSON.parse(String(args.spec));
-  throw new Error("Provide --spec-file PATH or --spec JSON");
+  throw new Error("Provide --spec-file PATH or --spec JSON, or --harness-file PATH");
 }
 
 function isTruthyFlag(value) {
@@ -197,14 +202,14 @@ function stripBackgroundArgs(argv) {
 }
 
 function maybeBackground(rawArgv, opts) {
-  if (process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND) return false;
+  if (process.env.PI_DYNAMIC_WORKFLOW_BACKGROUND || process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND) return false;
   if (!isTruthyFlag(opts.background)) return false;
   const nextArgs = stripBackgroundArgs(rawArgv);
   const child = spawn(process.execPath, [process.argv[1], ...nextArgs], {
     cwd: opts.cwd ? resolve(String(opts.cwd)) : process.cwd(),
     detached: true,
     stdio: "ignore",
-    env: { ...process.env, PI_DYNAMIC_THREAD_PHASE_BACKGROUND: "1" },
+    env: { ...process.env, PI_DYNAMIC_WORKFLOW_BACKGROUND: "1", PI_DYNAMIC_THREAD_PHASE_BACKGROUND: "1" },
   });
   child.unref();
   console.log(JSON.stringify({ ok: true, background: true, pid: child.pid }, null, 2));
@@ -347,7 +352,7 @@ async function runPi({ cwd, prompt, model, tools, timeoutMs, signal }) {
     "--no-prompt-templates", "--no-context-files", "--tools", tools.join(","), "-p", prompt,
   ];
   if (model) args.unshift("--model", model);
-  const result = await runProcess(process.env.PI_DYNAMIC_THREAD_PHASE_PI_BIN || DEFAULT_PI, args, { cwd, timeoutMs, signal });
+  const result = await runProcess(DEFAULT_PI, args, { cwd, timeoutMs, signal });
   const parsed = parsePiJsonLines(result.stdout || "");
   return { ...result, ...parsed, ok: result.ok && Boolean(parsed.text), error: result.ok && parsed.text ? undefined : result.error || "pi produced no assistant text" };
 }
@@ -502,24 +507,113 @@ async function* runArtifactPhase(ctx, phase) {
   yield { type: "data", kind: "data", key: "bytes", value: Buffer.byteLength(content, "utf8"), message: "Artifact written" };
 }
 
+async function runHarness(ctx, harnessFile) {
+  if (!permissionIncludesAll(ctx.spec.permissions || DEFAULT_PERMISSIONS, "rwx")) throw new Error("JavaScript harness mode requires workflow permissions=\"rwx\"");
+  const moduleUrl = `${pathToFileURL(resolve(harnessFile)).href}?t=${Date.now()}`;
+  const mod = await import(moduleUrl);
+  const entry = mod.default || mod.workflow || mod.run;
+  if (typeof entry !== "function") throw new Error("Harness module must export default async function(ctx), workflow(ctx), or run(ctx)");
+  let autoPhase = 0;
+  const harnessCtx = {
+    cwd: ctx.cwd,
+    runId: ctx.visualizerRun.runId,
+    signal: ctx.signal,
+    outputs: ctx.outputs,
+    results: ctx.results,
+    spec: ctx.spec,
+    cancelled: () => Boolean(ctx.signal?.aborted),
+    async phase(name, fn) {
+      validateName(name, "harness phase");
+      if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
+      phaseStart(ctx.visualizerRun, name, { mode: "harness" });
+      try {
+        const value = await fn();
+        if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
+        ctx.outputs[name] = typeof value === "string" ? value : value === undefined ? "" : JSON.stringify(value, null, 2);
+        ctx.results[name] = value;
+        phaseEnd(ctx.visualizerRun, name, STATUSES.SUCCESS, { outputBytes: Buffer.byteLength(String(ctx.outputs[name] || ""), "utf8") });
+        return value;
+      } catch (error) {
+        const cancelled = isAbortError(error) || ctx.signal?.aborted;
+        phaseEnd(ctx.visualizerRun, name, cancelled ? STATUSES.CANCELLED : STATUSES.FAILED, { error: { message: error?.message || String(error) } });
+        throw error;
+      }
+    },
+    async shell(command, options = {}) {
+      return await harnessCtx.phase(options.name || `shell-${++autoPhase}`, async () => {
+        const phase = { name: options.name || `shell-${autoPhase}`, permissions: options.permissions || ctx.spec.permissions || "rwx" };
+        const permissions = permissionsForPhase(ctx, phase);
+        if (!permissionIncludesAll(permissions, "rwx")) throw new Error(`shell helper requires rwx permissions because command execution is not sandboxed`);
+        phaseEvent(ctx.visualizerRun, phase.name, { kind: "data", key: "command", value: command, message: "Running shell command" });
+        const result = await runProcess(command, [], { cwd: options.cwd || ctx.cwd, shell: true, timeoutMs: options.timeoutMs || ctx.timeoutMs, signal: ctx.signal });
+        if (result.aborted) throw abortError(result.error || "cancelled");
+        if (!result.ok && options.reject !== false) throw new Error(result.error || `shell command exited ${result.code}`);
+        return compactText(result.stdout || "");
+      });
+    },
+    async pi(prompt, options = {}) {
+      return await harnessCtx.phase(options.name || `pi-${++autoPhase}`, async () => {
+        const phase = { name: options.name || `pi-${autoPhase}`, permissions: options.permissions || ctx.spec.permissions || DEFAULT_PERMISSIONS };
+        const permissions = permissionsForPhase(ctx, phase);
+        const tools = normalizePiTools(options.tools, permissions, phase.name);
+        const result = await runPi({ cwd: options.cwd || ctx.cwd, prompt, model: options.model || ctx.model, tools, timeoutMs: options.timeoutMs || ctx.timeoutMs, signal: ctx.signal });
+        if (result.aborted) throw abortError(result.error || "cancelled");
+        if (result.usage?.length) phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage: result.usage, model: result.model });
+        if (!result.ok && options.reject !== false) throw new Error(result.error || "pi helper failed");
+        return compactText(result.text || "");
+      });
+    },
+    async fanout(items, options = {}) {
+      const name = options.name || `fanout-${++autoPhase}`;
+      return await harnessCtx.phase(name, async () => {
+        const values = asArray(items);
+        phaseEvent(ctx.visualizerRun, name, { kind: "fanout_start", total: values.length, label: options.label || "items" });
+        let completed = 0;
+        const results = await mapWithConcurrency(values, Number(options.concurrency || DEFAULT_FANOUT_CONCURRENCY), async (item, index) => {
+          phaseEvent(ctx.visualizerRun, name, { kind: "fanout_item_start", itemId: String(item), label: String(item), index, total: values.length });
+          const result = options.run ? await options.run(item, index, harnessCtx) : await harnessCtx.pi(String(options.promptTemplate || options.prompt || "").replace(/\{\{\s*item\s*\}\}/g, String(item)), { ...(options.pi || {}), name: `${name}-${safeName(item)}` });
+          completed++;
+          phaseEvent(ctx.visualizerRun, name, { kind: "fanout_item_end", itemId: String(item), label: String(item), index, status: STATUSES.SUCCESS });
+          phaseEvent(ctx.visualizerRun, name, { kind: "progress", completed, total: values.length });
+          return result;
+        });
+        return results;
+      });
+    },
+    async artifact(title, content, options = {}) {
+      const phaseName = options.name || safeName(title || "artifact");
+      const text = typeof content === "string" ? content : JSON.stringify(content, null, 2);
+      const path = emitTextArtifact(ctx, { name: phaseName, type: "harness", artifact: { kind: options.kind || "markdown", title, fileName: options.fileName || `${phaseName}.${options.kind === "json" ? "json" : "md"}` } }, text, { title });
+      return path;
+    },
+    emit(kind, data) {
+      phaseEvent(ctx.visualizerRun, "harness", { kind, ...data });
+    },
+  };
+  return await entry(harnessCtx);
+}
+
 async function main() {
   const rawArgv = process.argv.slice(2);
   const args = parseArgs(rawArgv);
   if (args.help || args.h) {
-    console.log("Usage: dynamic-thread-phase-workflow.mjs --spec-file spec.json [--cwd REPO] [--background] [--model MODEL]");
+    console.log("Usage: dynamic-thread-phase-workflow.mjs --spec-file spec.json | --js-file workflow.mjs [--cwd REPO] [--background] [--model MODEL]");
     return;
   }
   if (maybeBackground(rawArgv, args)) return;
 
-  const spec = validateSpec(loadSpec(args));
+  const harnessFile = args["js-file"] || args["harness-file"] ? resolve(String(args["js-file"] || args["harness-file"])) : undefined;
+  const spec = harnessFile
+    ? { name: args.name ? String(args.name) : safeName(basename(harnessFile).replace(/\.[cm]?js$/, "")), mode: "harness", permissions: normalizePermissions(args.permissions || "rwx", "harness permissions"), harnessFile }
+    : validateSpec(loadSpec(args));
   const cwd = resolve(String(args.cwd || spec.cwd || process.cwd()));
-  const workflow = spec.name || "dynamic-thread-phase";
+  const workflow = spec.name || "dynamic-workflow";
   const visualizerRun = createRun({
     workflow,
     cwd,
-    trigger: { kind: process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND ? "background" : "manual", dynamic: true },
+    trigger: { kind: process.env.PI_DYNAMIC_WORKFLOW_BACKGROUND || process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND ? "background" : "manual", dynamic: true },
     input: spec,
-    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, sessionId: args["session-id"], sessionFile: args["session-file"] },
+    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, mode: harnessFile ? "javascript" : "spec", permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, sessionId: args["session-id"], sessionFile: args["session-file"] },
     message: `${workflow} started`,
   });
   activeRun = visualizerRun;
@@ -529,9 +623,10 @@ async function main() {
 
   const artifactsDir = join(ARTIFACTS_DIR, visualizerRun.runId);
   mkdirSync(artifactsDir, { recursive: true });
-  const specPath = join(artifactsDir, "workflow-spec.json");
+  const specPath = join(artifactsDir, harnessFile ? "workflow-harness-manifest.json" : "workflow-spec.json");
   writeFileSync(specPath, JSON.stringify(spec, null, 2), "utf8");
-  artifact(visualizerRun, { kind: "json", title: "Compiled workflow spec", path: specPath });
+  artifact(visualizerRun, { kind: "json", title: harnessFile ? "Workflow harness manifest" : "Compiled workflow spec", path: specPath });
+  if (harnessFile) artifact(visualizerRun, { kind: "file", title: "Workflow harness source", path: harnessFile });
 
   const ctx = {
     cache: new PipelineCache(),
@@ -546,14 +641,21 @@ async function main() {
   };
 
   try {
-    const phases = wrapPhases(spec.phases.map(dynamicPhase), visualizerRun);
-    for await (const _event of runPipeline(phases, ctx, { signal: controller.signal })) {
-      // wrapPhases mirrors phase lifecycle and yielded events to the visualizer.
+    if (harnessFile) {
+      const phases = [{ name: "run-harness", async *run(runCtx) { await runHarness(runCtx, harnessFile); yield { type: "data", kind: "data", key: "mode", value: "harness", message: "Harness complete" }; } }];
+      for await (const _event of runPipeline(wrapPhases(phases, visualizerRun), ctx, { signal: controller.signal })) {
+        // wrapPhases mirrors phase lifecycle and yielded events to the visualizer.
+      }
+    } else {
+      const phases = wrapPhases(spec.phases.map(dynamicPhase), visualizerRun);
+      for await (const _event of runPipeline(phases, ctx, { signal: controller.signal })) {
+        // wrapPhases mirrors phase lifecycle and yielded events to the visualizer.
+      }
     }
     const resultPath = join(artifactsDir, "workflow-result.json");
     writeFileSync(resultPath, JSON.stringify({ outputs: ctx.outputs, results: ctx.results }, null, 2), "utf8");
     artifact(visualizerRun, { kind: "json", title: "Workflow result", path: resultPath });
-    completeRun(visualizerRun, STATUSES.SUCCESS, { ok: true, phases: spec.phases.length, resultPath });
+    completeRun(visualizerRun, STATUSES.SUCCESS, { ok: true, phases: spec.phases?.length ?? 1, mode: harnessFile ? "harness" : "spec", resultPath });
     activeRun = undefined;
     console.log(JSON.stringify({ ok: true, runId: visualizerRun.runId, workflow, cwd, resultPath }, null, 2));
   } catch (error) {

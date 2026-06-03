@@ -37,10 +37,17 @@ function runScript(args: string[], cwd: string, signal?: AbortSignal): Promise<{
 	});
 }
 
-function writeSpecFile(spec: unknown): string {
-	const dir = mkdtempSync(path.join(tmpdir(), "pi-dynamic-thread-phase-"));
-	const file = path.join(dir, "workflow-spec.json");
-	writeFileSync(file, JSON.stringify(spec, null, 2), "utf8");
+function writeJsonFile(value: unknown, fileName = "workflow-spec.json"): string {
+	const dir = mkdtempSync(path.join(tmpdir(), "pi-dynamic-workflow-"));
+	const file = path.join(dir, fileName);
+	writeFileSync(file, JSON.stringify(value, null, 2), "utf8");
+	return file;
+}
+
+function writeHarnessFile(source: string): string {
+	const dir = mkdtempSync(path.join(tmpdir(), "pi-dynamic-workflow-"));
+	const file = path.join(dir, "workflow-harness.mjs");
+	writeFileSync(file, source, "utf8");
 	return file;
 }
 
@@ -58,43 +65,78 @@ function parseJsonObject(stdout: string): any {
 	return JSON.parse(trimmed);
 }
 
-export default function dynamicThreadPhaseWorkflow(pi: ExtensionAPI) {
+function parametersSchema() {
+	return Type.Object({
+		spec: Type.Optional(Type.Any({ description: "Structured workflow spec object. Required for spec mode. Supported phase types: shell, pi, fanout_pi, artifact." })),
+		harness: Type.Optional(Type.String({ description: "Advanced JavaScript harness source. Must export default async function(ctx). Requires rwx permissions." })),
+		harnessFile: Type.Optional(Type.String({ description: "Path to an advanced JavaScript harness module. Requires rwx permissions." })),
+		name: Type.Optional(Type.String({ description: "Optional workflow name for harness mode." })),
+		permissions: Type.Optional(Type.String({ description: "Workflow permissions, e.g. r, rw, rwx. Harness mode requires rwx." })),
+		cwd: Type.Optional(Type.String({ description: "Working directory for the workflow. Defaults to Pi's current cwd or spec.cwd." })),
+		model: Type.Optional(Type.String({ description: "Optional default Pi model pattern for pi/fanout_pi phases." })),
+		background: Type.Optional(Type.Boolean({ description: "Start the workflow in the background and return immediately." })),
+		timeout: Type.Optional(Type.Number({ description: "Default phase timeout in milliseconds." })),
+	});
+}
+
+async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any, legacyName: string) {
+	if (!params.spec && !params.harness && !params.harnessFile) throw new Error("Provide either spec, harness, or harnessFile.");
+	const cwd = path.resolve(ctx.cwd, params.cwd || params.spec?.cwd || ".");
+	const args = ["--cwd", cwd];
+	if (params.harness || params.harnessFile) {
+		const harnessFile = params.harnessFile ? path.resolve(ctx.cwd, params.harnessFile) : writeHarnessFile(params.harness);
+		args.push("--js-file", harnessFile);
+		if (params.name) args.push("--name", params.name);
+		if (params.permissions) args.push("--permissions", params.permissions);
+	} else {
+		args.push("--spec-file", writeJsonFile(params.spec));
+	}
+	if (params.model) args.push("--model", params.model);
+	if (params.timeout !== undefined) args.push("--timeout", String(params.timeout));
+	if (params.background) args.push("--background");
+	addSessionArgs(args, ctx);
+	onUpdate?.({ content: [{ type: "text", text: `Starting ${legacyName ? "dynamic thread-phase" : "dynamic"} workflow in ${cwd}...` }] });
+	const result = await runScript(args, cwd, signal);
+	if (result.code !== 0 && !params.background) throw new Error(result.stderr || result.stdout || `dynamic workflow exited ${result.code}`);
+	let details: any;
+	try { details = parseJsonObject(result.stdout); } catch { details = { stdout: result.stdout, stderr: result.stderr }; }
+	const text = details?.background
+		? `Started dynamic workflow in background (pid ${details.pid}). Open ctrl+shift+t to monitor it.`
+		: result.stdout || "Dynamic workflow started.";
+	return { content: [{ type: "text", text: truncate(text) }], details };
+}
+
+export default function dynamicWorkflows(pi: ExtensionAPI) {
+	const guidelines = [
+		"Use dynamic_workflow when the user wants an ad-hoc deterministic workflow planned in chat and then executed with workflow observability.",
+		"Default to structured spec mode for auditability. Use JavaScript harness mode only when loops, branching, tournaments, custom scoring, or other rich control flow are needed.",
+		"Build a concrete spec or harness first and declare compact rwx permissions at the workflow or phase level.",
+		"Permissions are capabilities, not tool names: r enables read/grep/find/ls, w enables edit/write, and shell or bash execution requires rwx because command execution is not sandboxed.",
+		"Structured phase types are shell, pi, fanout_pi, and artifact. Harness mode receives ctx.phase, ctx.shell, ctx.pi, ctx.fanout, and ctx.artifact helpers.",
+		"Use background: true for long workflows so normal Pi chat remains usable.",
+	];
+
+	pi.registerTool({
+		name: "dynamic_workflow",
+		label: "Dynamic Workflow",
+		description: "Execute a validated dynamic workflow from a structured spec or advanced JavaScript harness. Emits generic workflow events and artifacts."
+		promptSnippet: "Run a deterministic multi-phase workflow from a spec or JavaScript harness",
+		promptGuidelines: guidelines,
+		parameters: parametersSchema(),
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			return executeDynamicWorkflow(params, signal, onUpdate, ctx, "");
+		},
+	});
+
 	pi.registerTool({
 		name: "dynamic_thread_phase_workflow",
-		label: "Dynamic Thread-phase Workflow",
-		description: "Execute a validated deterministic thread-phase workflow spec constructed live in chat. Emits generic thread-phase visualizer events and artifacts.",
+		label: "Dynamic Workflow (deprecated alias)",
+		description: "Deprecated alias for dynamic_workflow. Execute a validated dynamic workflow spec or JavaScript harness."
 		promptSnippet: "Run a deterministic multi-phase workflow from a JSON spec",
-		promptGuidelines: [
-			"Use dynamic_thread_phase_workflow when the user wants an ad-hoc deterministic workflow planned in chat and then executed with thread-phase observability.",
-			"Build a concrete spec first and declare compact rwx permissions at the workflow or phase level.",
-			"Permissions are capabilities, not tool names: r enables read/grep/find/ls, w enables edit/write, and shell or bash execution requires rwx because command execution is not sandboxed.",
-			"Supported phase types are shell, pi, fanout_pi, and artifact. The runner validates the spec against its configured max permissions policy.",
-			"Use background: true for long workflows so normal Pi chat remains usable.",
-		],
-		parameters: Type.Object({
-			spec: Type.Any({ description: "Workflow spec object. Required fields: phases[]. Supported phase types: shell, pi, fanout_pi, artifact." }),
-			cwd: Type.Optional(Type.String({ description: "Working directory for the workflow. Defaults to Pi's current cwd or spec.cwd." })),
-			model: Type.Optional(Type.String({ description: "Optional default Pi model pattern for pi/fanout_pi phases." })),
-			background: Type.Optional(Type.Boolean({ description: "Start the workflow in the background and return immediately." })),
-			timeout: Type.Optional(Type.Number({ description: "Default phase timeout in milliseconds." })),
-		}),
+		promptGuidelines: ["Prefer dynamic_workflow. This tool remains for compatibility.", ...guidelines],
+		parameters: parametersSchema(),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const cwd = path.resolve(ctx.cwd, params.cwd || params.spec?.cwd || ".");
-			const specFile = writeSpecFile(params.spec);
-			const args = ["--spec-file", specFile, "--cwd", cwd];
-			if (params.model) args.push("--model", params.model);
-			if (params.timeout !== undefined) args.push("--timeout", String(params.timeout));
-			if (params.background) args.push("--background");
-			addSessionArgs(args, ctx);
-			onUpdate?.({ content: [{ type: "text", text: `Starting dynamic thread-phase workflow in ${cwd}...` }] });
-			const result = await runScript(args, cwd, signal);
-			if (result.code !== 0 && !params.background) throw new Error(result.stderr || result.stdout || `dynamic_thread_phase_workflow exited ${result.code}`);
-			let details: any;
-			try { details = parseJsonObject(result.stdout); } catch { details = { stdout: result.stdout, stderr: result.stderr }; }
-			const text = details?.background
-				? `Started dynamic thread-phase workflow in background (pid ${details.pid}). Open ctrl+shift+t to monitor it.`
-				: result.stdout || "Dynamic thread-phase workflow started.";
-			return { content: [{ type: "text", text: truncate(text) }], details };
+			return executeDynamicWorkflow(params, signal, onUpdate, ctx, "legacy");
 		},
 	});
 }

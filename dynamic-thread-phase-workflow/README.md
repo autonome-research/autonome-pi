@@ -1,14 +1,64 @@
-# dynamic-thread-phase-workflow
+# dynamic-workflows
 
-Executes deterministic thread-phase workflows from a constrained JSON spec built live in chat.
+Executes dynamic workflows built live in chat. The implementation uses thread-phase internally for structured execution, cancellation, events, and artifacts, but the user-facing concept is a Pi dynamic workflow.
 
-This is the Pi/thread-phase equivalent of a dynamic workflow: the agent can propose a workflow plan, but execution happens through a validated runner rather than generated/eval'd TypeScript.
+## Tools
 
-## Tool
+- `dynamic_workflow` — preferred tool.
+- `dynamic_thread_phase_workflow` — deprecated compatibility alias.
 
-- `dynamic_thread_phase_workflow`
+CLI entrypoints:
+
+```bash
+~/.pi/agent/extensions/dynamic-thread-phase-workflow/bin/dynamic-workflow.mjs --spec-file spec.json
+~/.pi/agent/extensions/dynamic-thread-phase-workflow/bin/dynamic-workflow.mjs --js-file workflow.mjs --permissions rwx
+```
+
+The older `dynamic-thread-phase-workflow.mjs` entrypoint remains available.
 
 Use `background: true` for long workflows. Runs emit generic `thread-phase-ui/v1` events, so `ctrl+shift+t` can monitor/cancel them.
+
+## Modes
+
+### Structured spec mode
+
+Default mode. The agent supplies a constrained JSON spec with phases. This is best for auditability, replay, permissions, and monitor visualization.
+
+Supported phase types:
+
+- `shell`
+- `pi`
+- `fanout_pi`
+- `artifact`
+
+### JavaScript harness mode
+
+Advanced mode. The agent supplies a JavaScript module for richer control flow: loops, branches, tournaments, custom scoring, or unusual orchestration.
+
+Harness mode requires workflow `permissions: "rwx"` because generated JavaScript executes as Node code. The harness should use the provided helpers so the monitor still sees phases, artifacts, cancellation, and fanout progress.
+
+```js
+export default async function workflow(ctx) {
+  const files = await ctx.shell("find src -type f | head -20", { name: "list-files" });
+  const reviews = await ctx.fanout(files.split(/\n/).filter(Boolean), {
+    name: "review-files",
+    concurrency: 3,
+    promptTemplate: "Review {{item}} for maintainability risks. Do not modify files.",
+    pi: { permissions: "r" }
+  });
+  await ctx.artifact("Review report", reviews.join("\n\n---\n\n"));
+}
+```
+
+Harness helpers:
+
+- `ctx.phase(name, fn)`
+- `ctx.shell(command, options)`
+- `ctx.pi(prompt, options)`
+- `ctx.fanout(items, options)`
+- `ctx.artifact(title, content, options)`
+- `ctx.emit(kind, data)`
+- `ctx.cancelled()` / `ctx.signal`
 
 ## Permissions
 
@@ -22,24 +72,25 @@ Mapping:
 
 - `r` enables Pi `read`, `grep`, `find`, `ls`
 - `w` enables Pi `edit`, `write`
-- `x` participates in execution privileges; shell phases and Pi `bash` require full `rwx` because command execution is not sandboxed
+- shell phases, Pi `bash`, and JavaScript harness mode require full `rwx` because command/code execution is not sandboxed
 
-Phase-level `permissions` can narrow or expand within the runner max policy. Defaults are controlled by environment:
+Defaults are controlled by environment:
 
-- `PI_DYNAMIC_THREAD_PHASE_DEFAULT_PERMISSIONS` default: `r`
-- `PI_DYNAMIC_THREAD_PHASE_MAX_PERMISSIONS` default: `rwx`
+- `PI_DYNAMIC_WORKFLOW_DEFAULT_PERMISSIONS` default: `r`
+- `PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS` default: `rwx`
+- `PI_DYNAMIC_WORKFLOW_PI_BIN` optional Pi binary override
+
+Legacy `PI_DYNAMIC_THREAD_PHASE_*` environment variables remain supported as fallbacks.
+
+## Structured phase examples
 
 ### `shell`
-
-Runs a shell command and stores stdout in `{{output:phase-name}}`. Shell execution is not sandboxed, so shell phases require full `rwx` even for read-looking commands.
 
 ```json
 { "type": "shell", "name": "list-files", "permissions": "rwx", "command": "find src -maxdepth 2 -type f", "artifact": true }
 ```
 
 ### `pi`
-
-Runs a Pi subagent and stores assistant markdown output.
 
 ```json
 {
@@ -50,11 +101,7 @@ Runs a Pi subagent and stores assistant markdown output.
 }
 ```
 
-If `tools` is omitted, the runner derives tools from `permissions`. If `tools` is present, each named tool must be allowed by the phase permissions.
-
 ### `fanout_pi`
-
-Runs Pi over a list of items with bounded concurrency.
 
 ```json
 {
@@ -68,46 +115,6 @@ Runs Pi over a list of items with bounded concurrency.
 
 ### `artifact`
 
-Writes a final markdown/json artifact from literal content or a previous phase output.
-
 ```json
 { "type": "artifact", "name": "final-report", "title": "Report", "from": "summarize-src" }
-```
-
-## Template variables
-
-- `{{cwd}}`
-- `{{runId}}`
-- `{{item}}` / `{{index}}` inside fanout phases
-- `{{output:phase-name}}`
-- `{{outputs.phase-name}}`
-- `{{spec.fieldName}}`
-
-## Example spec
-
-```json
-{
-  "name": "repo-doc-audit",
-  "permissions": "rwx",
-  "phases": [
-    {
-      "type": "shell",
-      "name": "list-docs",
-      "command": "find . -maxdepth 3 -type f \\( -name 'README*' -o -path './docs/*' \\)",
-      "artifact": true
-    },
-    {
-      "type": "pi",
-      "name": "audit-docs",
-      "permissions": "r",
-      "prompt": "Audit these docs for stale or missing setup instructions. Do not modify files.\n\n{{output:list-docs}}"
-    },
-    {
-      "type": "artifact",
-      "name": "doc-audit-report",
-      "title": "Documentation audit",
-      "from": "audit-docs"
-    }
-  ]
-}
 ```

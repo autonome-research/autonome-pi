@@ -7,7 +7,7 @@ Private Pi package for thread-phase workflow visualization and example workflows
 - `thread-phase-visualizer` — generic TUI monitor and event store for `thread-phase-ui/v1` workflow events.
 - `codebase-exploration-workflow` — fanout codebase exploration workflow using Pi subagents.
 - `code-review-workflow` — git diff/commit code review workflow using Pi subagents.
-- `dynamic-thread-phase-workflow` — validated ad-hoc workflow runner for deterministic dynamic workflows planned in chat.
+- `dynamic-workflows` — validated ad-hoc workflow runner for dynamic workflows planned in chat, with structured spec mode and advanced JavaScript harness mode.
 
 ## Install
 
@@ -27,7 +27,7 @@ pi install git:git@github.com:Code4me2/pi-thread-phase-tools@main
 - Background/session-launched workflows automatically queue a session follow-up so the assistant can summarize results and continue after the current generation finishes.
 - `/codebase-explore` starts codebase exploration in the background by default.
 - `/code-review` runs code review workflows.
-- `dynamic_thread_phase_workflow` runs validated dynamic workflow specs from chat/tool calls.
+- `dynamic_workflow` runs validated dynamic workflows from structured specs or JavaScript harnesses. `dynamic_thread_phase_workflow` remains as a deprecated compatibility alias.
 - Tool/API inspection remains available through `thread_phase_runs`.
 
 ## Notes
