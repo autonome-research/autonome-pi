@@ -191,7 +191,7 @@ The demo script is intentionally not exposed as a slash command. Larger workflow
 
 - Tool: `thread_phase_runs` for agent/API inspection
 - Shortcut: `ctrl+shift+t` opens the live monitor overlay
-- In the monitor, press `x` on a running workflow to request cancellation.
+- In the monitor, press `x` on a running workflow to request cancellation. Cancellation is requested through `~/.pi/agent/thread-phase/cancel/<runId>.json`; workflow runners cooperatively abort their thread-phase `AbortSignal` and terminate child subprocesses.
 
 ## Current UI components
 

@@ -14,6 +14,7 @@ import {
   phaseEnd,
   phaseEvent,
   phaseStart,
+  readCancellation,
 } from "../../thread-phase-visualizer/lib/store.mjs";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
@@ -27,16 +28,48 @@ const REVIEW_MARKER_END = "# <<< pi-code-review-workflow <<<";
 
 const activeChildren = new Set();
 let activeTpRun;
+let activeAbortController;
+let cancellationRequested = false;
+
+function abortError(reason = "cancelled") {
+  const error = new Error(String(reason));
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(error) {
+  return error?.name === "AbortError" || /aborted|cancelled/i.test(String(error?.message || error));
+}
+
+function terminateChild(child, signal = "SIGTERM") {
+  try {
+    if (process.platform !== "win32" && child.pid) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch {
+    try { child.kill(signal); } catch { /* ignore */ }
+  }
+}
 
 function requestCancel(signalName = "SIGTERM") {
-  for (const child of activeChildren) {
-    try { child.kill("SIGTERM"); } catch { /* ignore */ }
-  }
-  if (activeTpRun) {
-    completeRun(activeTpRun, STATUSES.CANCELLED, { cancelled: true, signal: signalName });
-    activeTpRun = undefined;
-  }
-  setTimeout(() => process.exit(130), 50).unref();
+  cancellationRequested = true;
+  if (activeAbortController && !activeAbortController.signal.aborted) activeAbortController.abort(signalName);
+  for (const child of activeChildren) terminateChild(child, "SIGTERM");
+}
+
+function watchCancellation(run, controller) {
+  const timer = setInterval(() => {
+    const request = readCancellation(run.runId);
+    if (!request) return;
+    cancellationRequested = true;
+    if (!controller.signal.aborted) controller.abort(request.reason || "cancelled from monitor");
+    for (const child of activeChildren) terminateChild(child, "SIGTERM");
+  }, 250);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+function throwIfCancelled(signal) {
+  if (signal?.aborted) throw abortError(signal.reason || "cancelled");
 }
 
 process.once("SIGTERM", () => requestCancel("SIGTERM"));
@@ -232,28 +265,41 @@ async function runPiReview(root, request, options) {
   if (options.model) args.unshift("--model", options.model);
 
   return await new Promise((resolve) => {
-    const proc = spawn(piBin, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    if (options.signal?.aborted) {
+      resolve({ ok: false, aborted: true, error: String(options.signal.reason || "cancelled"), stdout: "", stderr: "" });
+      return;
+    }
+    const proc = spawn(piBin, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"], env: process.env, detached: process.platform !== "win32" });
     activeChildren.add(proc);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let aborted = false;
+    const terminate = () => {
+      terminateChild(proc, "SIGTERM");
+      setTimeout(() => terminateChild(proc, "SIGKILL"), 5000).unref();
+    };
+    const onAbort = () => { aborted = true; terminate(); };
     const timer = setTimeout(() => {
       timedOut = true;
-      proc.kill("SIGTERM");
-      setTimeout(() => proc.kill("SIGKILL"), 5000).unref();
+      terminate();
     }, options.timeoutMs || DEFAULT_TIMEOUT_MS);
+    options.signal?.addEventListener("abort", onAbort, { once: true });
     proc.stdout.on("data", (d) => stdout += d.toString());
     proc.stderr.on("data", (d) => stderr += d.toString());
     proc.on("error", (error) => {
       activeChildren.delete(proc);
       clearTimeout(timer);
-      resolve({ ok: false, error: error.message, stdout, stderr, timedOut });
+      options.signal?.removeEventListener("abort", onAbort);
+      resolve({ ok: false, error: error.message, stdout, stderr, timedOut, aborted });
     });
     proc.on("close", (code) => {
       activeChildren.delete(proc);
       clearTimeout(timer);
+      options.signal?.removeEventListener("abort", onAbort);
       const parsed = parsePiJsonLines(stdout);
-      if (timedOut) resolve({ ok: false, error: "review timed out", code, stdout, stderr, ...parsed, timedOut });
+      if (aborted) resolve({ ok: false, aborted, error: String(options.signal?.reason || "cancelled"), code, stdout, stderr, ...parsed });
+      else if (timedOut) resolve({ ok: false, error: "review timed out", code, stdout, stderr, ...parsed, timedOut });
       else if (code !== 0) resolve({ ok: false, error: stderr || parsed.stderrEvent || `pi exited ${code}`, code, stdout, stderr, ...parsed });
       else resolve({ ok: true, code, stdout, stderr, ...parsed });
     });
@@ -294,9 +340,13 @@ async function reviewCommand(opts) {
     metadata: { commit, pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", sessionId: opts["session-id"], sessionFile: opts["session-file"] },
   });
   activeTpRun = tpRun;
+  const controller = new AbortController();
+  activeAbortController = controller;
+  const stopWatchingCancellation = watchCancellation(tpRun, controller);
 
   try {
     const diffLimit = opts.diffLimit ? Number.parseInt(String(opts.diffLimit), 10) : DEFAULT_DIFF_LIMIT;
+    throwIfCancelled(controller.signal);
     phaseStart(tpRun, "collect-diff", { mode, ref: ref || "HEAD" });
     const input = collectReviewInput(root, mode, ref, diffLimit);
     phaseEnd(tpRun, "collect-diff", STATUSES.SUCCESS, {
@@ -306,13 +356,16 @@ async function reviewCommand(opts) {
       diffTruncated: input.diff.truncated,
     });
 
+    throwIfCancelled(controller.signal);
     const request = buildReviewRequest(input);
     phaseStart(tpRun, "review", { model: opts.model ? String(opts.model) : undefined });
     const result = await runPiReview(root, request, {
       model: opts.model ? String(opts.model) : undefined,
       timeoutMs: opts.timeout ? Number.parseInt(String(opts.timeout), 10) : DEFAULT_TIMEOUT_MS,
       piBin: opts.piBin ? String(opts.piBin) : undefined,
+      signal: controller.signal,
     });
+    if (result.aborted) throw abortError(result.error || "cancelled");
     phaseEvent(tpRun, "review", { model: result.model, stopReason: result.stopReason, ok: result.ok });
     phaseEnd(tpRun, "review", result.ok && result.text ? STATUSES.SUCCESS : STATUSES.FAILED, {
       model: result.model,
@@ -320,6 +373,7 @@ async function reviewCommand(opts) {
       error: result.ok ? undefined : result.error,
     });
 
+    throwIfCancelled(controller.signal);
     const report = result.ok && result.text
       ? result.text
       : `# Code review failed\n\n${result.error || "No response text from pi."}\n\n## stderr\n\n\`\`\`\n${result.stderr || ""}\n\`\`\``;
@@ -350,10 +404,18 @@ async function reviewCommand(opts) {
     return event.ok ? 0 : 2;
   } catch (error) {
     if (activeTpRun === tpRun) {
-      failRun(tpRun, error);
+      if (cancellationRequested || isAbortError(error) || controller.signal.aborted) completeRun(tpRun, STATUSES.CANCELLED, { cancelled: true, reason: controller.signal.reason || error?.message });
+      else failRun(tpRun, error);
       activeTpRun = undefined;
     }
+    if (cancellationRequested || isAbortError(error) || controller.signal.aborted) {
+      if (opts.json) console.log(JSON.stringify({ ok: false, cancelled: true, runId: tpRun.runId, workflow: tpRun.workflow, cwd: root }, null, 2));
+      return 130;
+    }
     throw error;
+  } finally {
+    stopWatchingCancellation();
+    if (activeAbortController === controller) activeAbortController = undefined;
   }
 }
 

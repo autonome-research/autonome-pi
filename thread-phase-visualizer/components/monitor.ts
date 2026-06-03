@@ -1,7 +1,7 @@
 import { getMarkdownTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, Markdown, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { basename } from "node:path";
-import { STATUSES, latestRunSummaries, readArtifactContent } from "../lib/store.mjs";
+import { STATUSES, latestRunSummaries, readArtifactContent, requestCancellation } from "../lib/store.mjs";
 import { framePanel } from "./bordered-panel.ts";
 import { formatFanout, formatProgress, statusColor, statusIcon } from "./phase-timeline.ts";
 
@@ -91,7 +91,7 @@ function runtimePid(run: RunSummary): number | undefined {
 }
 
 function isRunningCancellable(run: RunSummary | undefined): boolean {
-	return Boolean(run?.normalizedStatus === STATUSES.RUNNING && runtimePid(run));
+	return Boolean(run?.normalizedStatus === STATUSES.RUNNING && run?.runId);
 }
 
 function artifactTitle(artifact: ArtifactSummary | undefined): string {
@@ -355,14 +355,13 @@ export async function showThreadPhaseMonitor(ctx: ExtensionContext, cwd: string)
 		const sessionId = ctx.sessionManager.getSessionId();
 		await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
 			const component = new ThreadPhaseMonitorComponent(cwd, sessionId, theme, () => done(), (run) => {
-				const pid = runtimePid(run);
-				if (!pid || run.normalizedStatus !== STATUSES.RUNNING) {
+				if (!run?.runId || run.normalizedStatus !== STATUSES.RUNNING) {
 					ctx.ui.notify("Selected workflow is not currently cancellable.", "warning");
 					return;
 				}
 				try {
-					process.kill(pid, "SIGTERM");
-					ctx.ui.notify(`Cancellation requested for ${run.workflow || "workflow"} (${pid})`, "warning");
+					requestCancellation(run.runId, { reason: "cancelled from thread-phase monitor" });
+					ctx.ui.notify(`Cancellation requested for ${run.workflow || "workflow"}`, "warning");
 				} catch (error: any) {
 					ctx.ui.notify(`Could not cancel workflow: ${error?.message || error}`, "error");
 				}

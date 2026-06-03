@@ -23,7 +23,7 @@ pi install git:git@github.com:Code4me2/pi-thread-phase-tools@main
 
 ## Usage
 
-- `ctrl+shift+t` opens the thread-phase monitor for workflows launched by the current Pi session.
+- `ctrl+shift+t` opens the thread-phase monitor for workflows launched by the current Pi session, including cooperative cancellation via `x`.
 - Background/session-launched workflows automatically queue a session follow-up so the assistant can summarize results and continue after the current generation finishes.
 - `/codebase-explore` starts codebase exploration in the background by default.
 - `/code-review` runs code review workflows.

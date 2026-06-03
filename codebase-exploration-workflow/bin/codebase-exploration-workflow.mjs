@@ -10,6 +10,7 @@ import {
   completeRun,
   createRun,
   failRun,
+  readCancellation,
   wrapPhases,
 } from "../../thread-phase-visualizer/lib/store.mjs";
 
@@ -38,18 +39,44 @@ const { PipelineCache, requireCtx, runPipeline } = await loadThreadPhaseCore();
 
 const activeChildren = new Set();
 let activeVisualizerRun;
+let activeAbortController;
 let cancellationRequested = false;
+
+function abortError(reason = "cancelled") {
+  const error = new Error(String(reason));
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(error) {
+  return error?.name === "AbortError" || /aborted|cancelled/i.test(String(error?.message || error));
+}
+
+function terminateChild(child, signal = "SIGTERM") {
+  try {
+    if (process.platform !== "win32" && child.pid) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch {
+    try { child.kill(signal); } catch { /* ignore */ }
+  }
+}
 
 function requestCancel(signalName = "SIGTERM") {
   cancellationRequested = true;
-  for (const child of activeChildren) {
-    try { child.kill("SIGTERM"); } catch { /* ignore */ }
-  }
-  if (activeVisualizerRun) {
-    completeRun(activeVisualizerRun, STATUSES.CANCELLED, { cancelled: true, signal: signalName });
-    activeVisualizerRun = undefined;
-  }
-  setTimeout(() => process.exit(130), 50).unref();
+  if (activeAbortController && !activeAbortController.signal.aborted) activeAbortController.abort(signalName);
+  for (const child of activeChildren) terminateChild(child, "SIGTERM");
+}
+
+function watchCancellation(run, controller) {
+  const timer = setInterval(() => {
+    const request = readCancellation(run.runId);
+    if (!request) return;
+    cancellationRequested = true;
+    if (!controller.signal.aborted) controller.abort(request.reason || "cancelled from monitor");
+    for (const child of activeChildren) terminateChild(child, "SIGTERM");
+  }, 250);
+  timer.unref?.();
+  return () => clearInterval(timer);
 }
 
 process.once("SIGTERM", () => requestCancel("SIGTERM"));
@@ -76,8 +103,19 @@ function parseArgs(argv) {
   return out;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError(signal.reason || "cancelled"));
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError(signal.reason || "cancelled"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function splitList(value) {
@@ -147,7 +185,7 @@ function parsePiJsonLines(stdout) {
   return { text, messages, model, stopReason };
 }
 
-async function runPiExplorer({ cwd, dir, model, timeoutMs }) {
+async function runPiExplorer({ cwd, dir, model, timeoutMs, signal }) {
   const prompt = [
     `Explore the subdirectory \`${dir}\` in this repository.`,
     "Use read/grep/find/ls as needed, but do not modify files.",
@@ -165,38 +203,51 @@ async function runPiExplorer({ cwd, dir, model, timeoutMs }) {
   if (model) args.unshift("--model", model);
 
   return await new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve({ ok: false, text: "", aborted: true, error: String(signal.reason || "cancelled"), stdout: "", stderr: "" });
+      return;
+    }
     const proc = spawn(process.env.PI_CODEBASE_EXPLORATION_PI_BIN || DEFAULT_PI, args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
+      detached: process.platform !== "win32",
     });
     activeChildren.add(proc);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let aborted = false;
+    const terminate = () => {
+      terminateChild(proc, "SIGTERM");
+      setTimeout(() => terminateChild(proc, "SIGKILL"), 5000).unref();
+    };
+    const onAbort = () => { aborted = true; terminate(); };
     const timer = setTimeout(() => {
       timedOut = true;
-      proc.kill("SIGTERM");
-      setTimeout(() => proc.kill("SIGKILL"), 5000).unref();
+      terminate();
     }, timeoutMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
     proc.stdout.on("data", (data) => stdout += data.toString());
     proc.stderr.on("data", (data) => stderr += data.toString());
     proc.on("error", (error) => {
       activeChildren.delete(proc);
       clearTimeout(timer);
-      resolve({ ok: false, text: "", error: error.message, stdout, stderr, timedOut });
+      signal?.removeEventListener("abort", onAbort);
+      resolve({ ok: false, text: "", error: error.message, stdout, stderr, timedOut, aborted });
     });
     proc.on("close", (code) => {
       activeChildren.delete(proc);
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       const parsed = parsePiJsonLines(stdout);
-      resolve({ ok: code === 0 && Boolean(parsed.text), code, stdout, stderr, timedOut, ...parsed, error: code === 0 ? undefined : stderr || `pi exited ${code}` });
+      resolve({ ok: code === 0 && Boolean(parsed.text) && !aborted, code, stdout, stderr, timedOut, aborted, ...parsed, error: aborted ? String(signal?.reason || "cancelled") : code === 0 ? undefined : stderr || `pi exited ${code}` });
     });
   });
 }
 
-async function exploreMock({ cwd, dir, delayMs }) {
-  await sleep(delayMs);
+async function exploreMock({ cwd, dir, delayMs, signal }) {
+  await sleep(delayMs, signal);
   const absolute = join(cwd, dir);
   const counts = countFiles(absolute);
   const entries = readdirSync(absolute, { withFileTypes: true })
@@ -267,9 +318,11 @@ const exploreSubdirectories = {
       const itemId = dir;
       push({ type: "fanout", kind: "fanout_item_start", itemId, label: dir, index, total: dirs.length, message: `Exploring ${dir}` });
       const startedAt = Date.now();
+      if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
       const result = ctx.agent === "pi"
-        ? await runPiExplorer({ cwd: ctx.cwd, dir, model: ctx.model, timeoutMs: ctx.timeoutMs })
-        : await exploreMock({ cwd: ctx.cwd, dir, delayMs: ctx.delayMs });
+        ? await runPiExplorer({ cwd: ctx.cwd, dir, model: ctx.model, timeoutMs: ctx.timeoutMs, signal: ctx.signal })
+        : await exploreMock({ cwd: ctx.cwd, dir, delayMs: ctx.delayMs, signal: ctx.signal });
+      if (result.aborted) throw abortError(result.error || "cancelled");
       const durationMs = Date.now() - startedAt;
       const reportPath = join(ctx.artifactsDir, `${safeName(dir)}.md`);
       const report = result.ok
@@ -394,6 +447,9 @@ async function main() {
     message: "codebase-exploration started",
   });
   activeVisualizerRun = visualizerRun;
+  const controller = new AbortController();
+  activeAbortController = controller;
+  const stopWatchingCancellation = watchCancellation(visualizerRun, controller);
 
   const ctx = {
     cache: new PipelineCache(),
@@ -407,11 +463,12 @@ async function main() {
     timeoutMs,
     model: args.model ? String(args.model) : undefined,
     artifactsDir: join(ARTIFACTS_DIR, visualizerRun.runId),
+    signal: controller.signal,
   };
 
   try {
     const phases = wrapPhases([discoverSubdirectories, exploreSubdirectories, synthesizeMap], visualizerRun);
-    for await (const _event of runPipeline(phases, ctx)) {
+    for await (const _event of runPipeline(phases, ctx, { signal: controller.signal })) {
       // Events are mirrored to the visualizer by wrapPhases.
     }
     completeRun(visualizerRun, STATUSES.SUCCESS, {
@@ -424,8 +481,8 @@ async function main() {
     activeVisualizerRun = undefined;
     console.log(JSON.stringify({ ok: true, runId: visualizerRun.runId, workflow: visualizerRun.workflow, cwd, dirs: ctx.dirs, agent, summaryPath: ctx.summaryPath }, null, 2));
   } catch (error) {
-    if (cancellationRequested) {
-      if (activeVisualizerRun === visualizerRun) completeRun(visualizerRun, STATUSES.CANCELLED, { cancelled: true, completed: ctx.completed, failed: ctx.failed, total: ctx.dirs?.length, summaryPath: ctx.summaryPath });
+    if (cancellationRequested || isAbortError(error) || controller.signal.aborted) {
+      if (activeVisualizerRun === visualizerRun) completeRun(visualizerRun, STATUSES.CANCELLED, { cancelled: true, reason: controller.signal.reason || error?.message, completed: ctx.completed, failed: ctx.failed, total: ctx.dirs?.length, summaryPath: ctx.summaryPath });
       console.log(JSON.stringify({ ok: false, cancelled: true, runId: visualizerRun.runId, workflow: visualizerRun.workflow, cwd }, null, 2));
       process.exitCode = 130;
     } else {
@@ -434,6 +491,9 @@ async function main() {
       process.exitCode = 1;
     }
     activeVisualizerRun = undefined;
+  } finally {
+    stopWatchingCancellation();
+    if (activeAbortController === controller) activeAbortController = undefined;
   }
 }
 

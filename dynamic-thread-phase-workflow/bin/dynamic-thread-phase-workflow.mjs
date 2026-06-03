@@ -11,6 +11,7 @@ import {
   createRun,
   failRun,
   phaseEvent,
+  readCancellation,
   wrapPhases,
 } from "../../thread-phase-visualizer/lib/store.mjs";
 
@@ -49,18 +50,44 @@ const { PipelineCache, runPipeline } = await loadThreadPhaseCore();
 
 const activeChildren = new Set();
 let activeRun;
+let activeAbortController;
 let cancellationRequested = false;
+
+function abortError(reason = "cancelled") {
+  const error = new Error(String(reason));
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(error) {
+  return error?.name === "AbortError" || /aborted|cancelled/i.test(String(error?.message || error));
+}
+
+function terminateChild(child, signal = "SIGTERM") {
+  try {
+    if (process.platform !== "win32" && child.pid) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch {
+    try { child.kill(signal); } catch { /* ignore */ }
+  }
+}
 
 function requestCancel(signalName = "SIGTERM") {
   cancellationRequested = true;
-  for (const child of activeChildren) {
-    try { child.kill("SIGTERM"); } catch { /* ignore */ }
-  }
-  if (activeRun) {
-    completeRun(activeRun, STATUSES.CANCELLED, { cancelled: true, signal: signalName });
-    activeRun = undefined;
-  }
-  setTimeout(() => process.exit(130), 50).unref();
+  if (activeAbortController && !activeAbortController.signal.aborted) activeAbortController.abort(signalName);
+  for (const child of activeChildren) terminateChild(child, "SIGTERM");
+}
+
+function watchCancellation(run, controller) {
+  const timer = setInterval(() => {
+    const request = readCancellation(run.runId);
+    if (!request) return;
+    cancellationRequested = true;
+    if (!controller.signal.aborted) controller.abort(request.reason || "cancelled from monitor");
+    for (const child of activeChildren) terminateChild(child, "SIGTERM");
+  }, 250);
+  timer.unref?.();
+  return () => clearInterval(timer);
 }
 
 process.once("SIGTERM", () => requestCancel("SIGTERM"));
@@ -268,43 +295,59 @@ function normalizePiTools(tools, permissions, label) {
 
 async function runProcess(command, args, options) {
   return await new Promise((resolve) => {
+    if (options.signal?.aborted) {
+      resolve({ ok: false, code: null, stdout: "", stderr: "", aborted: true, error: String(options.signal.reason || "cancelled") });
+      return;
+    }
     const proc = spawn(command, args, {
       cwd: options.cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: options.env || process.env,
       shell: Boolean(options.shell),
+      detached: process.platform !== "win32",
     });
     activeChildren.add(proc);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let aborted = false;
+    const terminate = (signal = "SIGTERM") => {
+      terminateChild(proc, signal);
+      setTimeout(() => terminateChild(proc, "SIGKILL"), 5000).unref();
+    };
+    const onAbort = () => {
+      aborted = true;
+      terminate("SIGTERM");
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      proc.kill("SIGTERM");
-      setTimeout(() => proc.kill("SIGKILL"), 5000).unref();
+      terminate("SIGTERM");
     }, options.timeoutMs || DEFAULT_TIMEOUT_MS);
+    options.signal?.addEventListener("abort", onAbort, { once: true });
     proc.stdout.on("data", (data) => stdout += data.toString());
     proc.stderr.on("data", (data) => stderr += data.toString());
     proc.on("error", (error) => {
       activeChildren.delete(proc);
       clearTimeout(timer);
-      resolve({ ok: false, code: 1, stdout, stderr, timedOut, error: error.message });
+      options.signal?.removeEventListener("abort", onAbort);
+      resolve({ ok: false, code: 1, stdout, stderr, timedOut, aborted, error: error.message });
     });
     proc.on("close", (code) => {
       activeChildren.delete(proc);
       clearTimeout(timer);
-      resolve({ ok: code === 0, code, stdout, stderr, timedOut, error: code === 0 ? undefined : stderr || `${command} exited ${code}` });
+      options.signal?.removeEventListener("abort", onAbort);
+      resolve({ ok: code === 0 && !aborted, code, stdout, stderr, timedOut, aborted, error: aborted ? String(options.signal?.reason || "cancelled") : code === 0 ? undefined : stderr || `${command} exited ${code}` });
     });
   });
 }
 
-async function runPi({ cwd, prompt, model, tools, timeoutMs }) {
+async function runPi({ cwd, prompt, model, tools, timeoutMs, signal }) {
   const args = [
     "--mode", "json", "--no-session", "--no-extensions", "--no-skills",
     "--no-prompt-templates", "--no-context-files", "--tools", tools.join(","), "-p", prompt,
   ];
   if (model) args.unshift("--model", model);
-  const result = await runProcess(process.env.PI_DYNAMIC_THREAD_PHASE_PI_BIN || DEFAULT_PI, args, { cwd, timeoutMs });
+  const result = await runProcess(process.env.PI_DYNAMIC_THREAD_PHASE_PI_BIN || DEFAULT_PI, args, { cwd, timeoutMs, signal });
   const parsed = parsePiJsonLines(result.stdout || "");
   return { ...result, ...parsed, ok: result.ok && Boolean(parsed.text), error: result.ok && parsed.text ? undefined : result.error || "pi produced no assistant text" };
 }
@@ -374,7 +417,9 @@ async function* runShellPhase(ctx, phase) {
   if (!permissionIncludesAll(permissions, "rwx")) throw new Error(`shell phase ${phase.name} requires rwx permissions because shell execution is not sandboxed`);
   yield { type: "data", kind: "data", key: "permissions", value: permissions, message: `Running shell command with ${permissions} permissions` };
   yield { type: "data", kind: "data", key: "command", value: command, message: `Running shell command` };
-  const result = await runProcess(command, [], { cwd: ctx.cwd, shell: true, timeoutMs: phase.timeoutMs || ctx.timeoutMs });
+  if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
+  const result = await runProcess(command, [], { cwd: ctx.cwd, shell: true, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: ctx.signal });
+  if (result.aborted) throw abortError(result.error || "cancelled");
   const output = compactText(result.stdout || "");
   ctx.outputs[phase.name] = output;
   ctx.results[phase.name] = { ...result, stdout: output, stderr: compactText(result.stderr || "") };
@@ -389,7 +434,9 @@ async function* runPiPhase(ctx, phase) {
   const tools = normalizePiTools(phase.tools, permissions, phase.name);
   yield { type: "data", kind: "data", key: "permissions", value: permissions, message: `Running pi agent with ${permissions} permissions` };
   yield { type: "data", kind: "data", key: "tools", value: tools, message: `Running pi agent` };
-  const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs });
+  if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
+  const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: ctx.signal });
+  if (result.aborted) throw abortError(result.error || "cancelled");
   ctx.outputs[phase.name] = compactText(result.text || "");
   ctx.results[phase.name] = { ok: result.ok, model: result.model, stopReason: result.stopReason, code: result.code, error: result.error };
   if (result.usage?.length) phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage: result.usage, model: result.model });
@@ -412,8 +459,10 @@ async function* runFanoutPiPhase(ctx, phase) {
   const push = (event) => queue.push(event);
   const worker = mapWithConcurrency(items, concurrency, async (item, index) => {
     push({ type: "fanout", kind: "fanout_item_start", itemId: item, label: item, index, total: items.length, message: `Running ${item}` });
+    if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
     const prompt = renderTemplate(phase.promptTemplate, ctx, { item, index });
-    const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs });
+    const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: ctx.signal });
+    if (result.aborted) throw abortError(result.error || "cancelled");
     const text = compactText(result.text || "");
     const fileNameTemplate = phase.artifact && typeof phase.artifact === "object" ? phase.artifact.fileNameTemplate : undefined;
     const titleTemplate = phase.artifact && typeof phase.artifact === "object" ? phase.artifact.titleTemplate : undefined;
@@ -474,6 +523,9 @@ async function main() {
     message: `${workflow} started`,
   });
   activeRun = visualizerRun;
+  const controller = new AbortController();
+  activeAbortController = controller;
+  const stopWatchingCancellation = watchCancellation(visualizerRun, controller);
 
   const artifactsDir = join(ARTIFACTS_DIR, visualizerRun.runId);
   mkdirSync(artifactsDir, { recursive: true });
@@ -490,11 +542,12 @@ async function main() {
     timeoutMs: args.timeout ? Number(args.timeout) : spec.timeoutMs || DEFAULT_TIMEOUT_MS,
     outputs: {},
     results: {},
+    signal: controller.signal,
   };
 
   try {
     const phases = wrapPhases(spec.phases.map(dynamicPhase), visualizerRun);
-    for await (const _event of runPipeline(phases, ctx)) {
+    for await (const _event of runPipeline(phases, ctx, { signal: controller.signal })) {
       // wrapPhases mirrors phase lifecycle and yielded events to the visualizer.
     }
     const resultPath = join(artifactsDir, "workflow-result.json");
@@ -504,8 +557,8 @@ async function main() {
     activeRun = undefined;
     console.log(JSON.stringify({ ok: true, runId: visualizerRun.runId, workflow, cwd, resultPath }, null, 2));
   } catch (error) {
-    if (cancellationRequested) {
-      if (activeRun === visualizerRun) completeRun(visualizerRun, STATUSES.CANCELLED, { cancelled: true });
+    if (cancellationRequested || isAbortError(error) || controller.signal.aborted) {
+      if (activeRun === visualizerRun) completeRun(visualizerRun, STATUSES.CANCELLED, { cancelled: true, reason: controller.signal.reason || error?.message });
       console.log(JSON.stringify({ ok: false, cancelled: true, runId: visualizerRun.runId, workflow, cwd }, null, 2));
       process.exitCode = 130;
     } else {
@@ -514,6 +567,9 @@ async function main() {
       process.exitCode = 1;
     }
     activeRun = undefined;
+  } finally {
+    stopWatchingCancellation();
+    if (activeAbortController === controller) activeAbortController = undefined;
   }
 }
 

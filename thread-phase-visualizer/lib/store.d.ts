@@ -125,12 +125,16 @@ export const AGENT_DIR: string;
 export const STORE_DIR: string;
 export const RUNS_DIR: string;
 export const ARTIFACTS_DIR: string;
+export const CANCEL_DIR: string;
 export const INDEX_FILE: string;
 
 export function ensureStore(): void;
 export function createRunId(workflow?: string): string;
 export function safeRunId(runId: string): string;
 export function runFileFor(runId: string): string;
+export function cancelFileFor(runId: string): string;
+export function requestCancellation(runId: string, options?: { reason?: string; source?: string }): { runId: string; requestedAt: string; reason: string; source: string };
+export function readCancellation(runId: string): { runId?: string; requestedAt?: string; reason?: string; source?: string } | undefined;
 export function createRun(options?: {
   workflow?: string;
   cwd?: string;

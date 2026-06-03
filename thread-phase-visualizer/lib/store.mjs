@@ -26,6 +26,7 @@ export const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi
 export const STORE_DIR = process.env.PI_THREAD_PHASE_STORE_DIR || join(AGENT_DIR, "thread-phase");
 export const RUNS_DIR = join(STORE_DIR, "runs");
 export const ARTIFACTS_DIR = join(STORE_DIR, "artifacts");
+export const CANCEL_DIR = join(STORE_DIR, "cancel");
 export const INDEX_FILE = join(STORE_DIR, "index.jsonl");
 
 const KNOWN_STATUSES = new Set(Object.values(STATUSES));
@@ -51,6 +52,7 @@ const STATUS_ALIASES = new Map([
 export function ensureStore() {
   mkdirSync(RUNS_DIR, { recursive: true });
   mkdirSync(ARTIFACTS_DIR, { recursive: true });
+  mkdirSync(CANCEL_DIR, { recursive: true });
   const fd = openSync(INDEX_FILE, "a");
   closeSync(fd);
 }
@@ -62,6 +64,29 @@ export function createRunId(workflow = "workflow") {
 
 export function runFileFor(runId) {
   return join(RUNS_DIR, `${safeRunId(runId)}.jsonl`);
+}
+
+export function cancelFileFor(runId) {
+  return join(CANCEL_DIR, `${safeRunId(runId)}.json`);
+}
+
+export function requestCancellation(runId, options = {}) {
+  ensureStore();
+  const request = {
+    runId: safeRunId(runId),
+    requestedAt: new Date().toISOString(),
+    reason: options.reason || "cancelled from thread-phase monitor",
+    source: options.source || "thread-phase-visualizer",
+  };
+  writeFileSync(cancelFileFor(runId), JSON.stringify(request, null, 2), "utf8");
+  return request;
+}
+
+export function readCancellation(runId) {
+  const file = cancelFileFor(runId);
+  if (!existsSync(file)) return undefined;
+  try { return JSON.parse(readFileSync(file, "utf8")); }
+  catch { return { runId: safeRunId(runId), reason: "cancel requested" }; }
 }
 
 export function safeRunId(runId) {
@@ -239,7 +264,8 @@ export function wrapPhase(phase, run, options = {}) {
         }
         phaseEnd(run, phaseName, ctx?.stop ? STATUSES.CANCELLED : STATUSES.SUCCESS, options.output?.(ctx));
       } catch (error) {
-        phaseEnd(run, phaseName, STATUSES.FAILED, { error: serializeError(error) });
+        const cancelled = error?.name === "AbortError" || /aborted|cancelled/i.test(String(error?.message || error));
+        phaseEnd(run, phaseName, cancelled ? STATUSES.CANCELLED : STATUSES.FAILED, { error: serializeError(error) });
         throw error;
       }
     },
