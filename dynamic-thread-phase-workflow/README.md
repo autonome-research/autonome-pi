@@ -1,6 +1,6 @@
 # dynamic-workflows
 
-Status: experimental-but-usable as of `pi-thread-phase-tools@v0.7.1`.
+Status: experimental-but-usable as of `pi-thread-phase-tools@v0.7.2`.
 
 Executes dynamic workflows built live in chat. The implementation uses thread-phase internally for structured execution, cancellation, events, and artifacts, but the user-facing concept is a Pi dynamic workflow.
 
