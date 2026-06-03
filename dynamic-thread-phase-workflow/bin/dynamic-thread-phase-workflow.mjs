@@ -164,6 +164,7 @@ function validateSpec(spec) {
     }
     if (phase.type === "artifact" && typeof phase.content !== "string" && typeof phase.from !== "string") throw new Error(`${phase.name} must provide content or from`);
     if (phase.permissions !== undefined) normalizePermissions(phase.permissions, `${phase.name}.permissions`);
+    if (phase.tools !== undefined && (!Array.isArray(phase.tools) || !phase.tools.every((tool) => typeof tool === "string"))) throw new Error(`${phase.name}.tools must be an array of strings`);
   }
   if (spec.permissions !== undefined) normalizePermissions(spec.permissions, "spec.permissions");
   if (spec.permissionMode !== undefined) throw new Error("permissionMode is not part of the dynamic workflow spec; declare rwx capabilities with permissions instead");
@@ -288,6 +289,7 @@ function toolsForPermissions(permissions) {
 }
 
 function normalizePiTools(tools, permissions, label) {
+  if (tools !== undefined && (!Array.isArray(tools) || !tools.every((tool) => typeof tool === "string"))) throw new Error(`${label}.tools must be an array of strings`);
   const allowed = new Set(toolsForPermissions(permissions));
   const requested = asArray(tools).length ? asArray(tools).map(String) : [...allowed];
   const unknown = requested.filter((tool) => !PI_TOOL_REQUIREMENTS[tool]);
@@ -329,6 +331,7 @@ async function runProcess(command, args, options) {
       terminate("SIGTERM");
     }, options.timeoutMs || DEFAULT_TIMEOUT_MS);
     options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
     proc.stdout.on("data", (data) => stdout += data.toString());
     proc.stderr.on("data", (data) => stderr += data.toString());
     proc.on("error", (error) => {
@@ -464,28 +467,35 @@ async function* runFanoutPiPhase(ctx, phase) {
   const push = (event) => queue.push(event);
   const worker = mapWithConcurrency(items, concurrency, async (item, index) => {
     push({ type: "fanout", kind: "fanout_item_start", itemId: item, label: item, index, total: items.length, message: `Running ${item}` });
-    if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
-    const prompt = renderTemplate(phase.promptTemplate, ctx, { item, index });
-    const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: ctx.signal });
-    if (result.aborted) throw abortError(result.error || "cancelled");
-    const text = compactText(result.text || "");
-    const fileNameTemplate = phase.artifact && typeof phase.artifact === "object" ? phase.artifact.fileNameTemplate : undefined;
-    const titleTemplate = phase.artifact && typeof phase.artifact === "object" ? phase.artifact.titleTemplate : undefined;
-    const artifactPhase = {
-      ...phase,
-      name: `${phase.name}-${safeName(item)}`,
-      artifact: phase.artifact === false ? false : {
-        ...(typeof phase.artifact === "object" ? phase.artifact : {}),
-        title: titleTemplate ? renderTemplate(titleTemplate, ctx, { item, index }) : `${phase.name}: ${item}`,
-        fileName: fileNameTemplate ? renderTemplate(fileNameTemplate, ctx, { item, index }) : `${phase.name}-${safeName(item)}.md`,
-      },
-    };
-    emitTextArtifact(ctx, artifactPhase, text, { title: `${phase.name}: ${item}` });
-    if (result.usage?.length) phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", item, index, usage: result.usage, model: result.model });
-    if (result.ok) completed++; else failed++;
-    push({ type: "fanout", kind: "fanout_item_end", itemId: item, label: item, index, status: result.ok ? STATUSES.SUCCESS : STATUSES.FAILED, message: result.ok ? `Complete ${item}` : `Failed ${item}`, error: result.error });
-    push({ type: "progress", kind: "progress", completed, total: items.length, message: `${completed}/${items.length} complete` });
-    return { item, index, ok: result.ok, text, model: result.model, stopReason: result.stopReason, error: result.error };
+    try {
+      if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
+      const prompt = renderTemplate(phase.promptTemplate, ctx, { item, index });
+      const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: ctx.signal });
+      if (result.aborted) throw abortError(result.error || "cancelled");
+      const text = compactText(result.text || "");
+      const fileNameTemplate = phase.artifact && typeof phase.artifact === "object" ? phase.artifact.fileNameTemplate : undefined;
+      const titleTemplate = phase.artifact && typeof phase.artifact === "object" ? phase.artifact.titleTemplate : undefined;
+      const artifactPhase = {
+        ...phase,
+        name: `${phase.name}-${safeName(item)}`,
+        artifact: phase.artifact === false ? false : {
+          ...(typeof phase.artifact === "object" ? phase.artifact : {}),
+          title: titleTemplate ? renderTemplate(titleTemplate, ctx, { item, index }) : `${phase.name}: ${item}`,
+          fileName: fileNameTemplate ? renderTemplate(fileNameTemplate, ctx, { item, index }) : `${phase.name}-${safeName(item)}.md`,
+        },
+      };
+      emitTextArtifact(ctx, artifactPhase, text, { title: `${phase.name}: ${item}` });
+      if (result.usage?.length) phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", item, index, usage: result.usage, model: result.model });
+      if (result.ok) completed++; else failed++;
+      push({ type: "fanout", kind: "fanout_item_end", itemId: item, label: item, index, status: result.ok ? STATUSES.SUCCESS : STATUSES.FAILED, message: result.ok ? `Complete ${item}` : `Failed ${item}`, error: result.error });
+      push({ type: "progress", kind: "progress", completed, total: items.length, message: `${completed}/${items.length} complete` });
+      return { item, index, ok: result.ok, text, model: result.model, stopReason: result.stopReason, error: result.error };
+    } catch (error) {
+      failed++;
+      const cancelled = isAbortError(error) || ctx.signal?.aborted;
+      push({ type: "fanout", kind: "fanout_item_end", itemId: item, label: item, index, status: cancelled ? STATUSES.CANCELLED : STATUSES.FAILED, message: cancelled ? `Cancelled ${item}` : `Failed ${item}`, error: error?.message || String(error) });
+      throw error;
+    }
   });
   while (true) {
     while (queue.length) yield queue.shift();
@@ -500,6 +510,7 @@ async function* runFanoutPiPhase(ctx, phase) {
 }
 
 async function* runArtifactPhase(ctx, phase) {
+  if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
   const base = phase.from ? String(ctx.outputs[phase.from] ?? "") : phase.content;
   const content = renderTemplate(base, ctx);
   ctx.outputs[phase.name] = content;
@@ -571,11 +582,17 @@ async function runHarness(ctx, harnessFile) {
         let completed = 0;
         const results = await mapWithConcurrency(values, Number(options.concurrency || DEFAULT_FANOUT_CONCURRENCY), async (item, index) => {
           phaseEvent(ctx.visualizerRun, name, { kind: "fanout_item_start", itemId: String(item), label: String(item), index, total: values.length });
-          const result = options.run ? await options.run(item, index, harnessCtx) : await harnessCtx.pi(String(options.promptTemplate || options.prompt || "").replace(/\{\{\s*item\s*\}\}/g, String(item)), { ...(options.pi || {}), name: `${name}-${safeName(item)}` });
-          completed++;
-          phaseEvent(ctx.visualizerRun, name, { kind: "fanout_item_end", itemId: String(item), label: String(item), index, status: STATUSES.SUCCESS });
-          phaseEvent(ctx.visualizerRun, name, { kind: "progress", completed, total: values.length });
-          return result;
+          try {
+            const result = options.run ? await options.run(item, index, harnessCtx) : await harnessCtx.pi(String(options.promptTemplate || options.prompt || "").replace(/\{\{\s*item\s*\}\}/g, String(item)), { ...(options.pi || {}), name: `${name}-${safeName(item)}` });
+            completed++;
+            phaseEvent(ctx.visualizerRun, name, { kind: "fanout_item_end", itemId: String(item), label: String(item), index, status: STATUSES.SUCCESS });
+            phaseEvent(ctx.visualizerRun, name, { kind: "progress", completed, total: values.length });
+            return result;
+          } catch (error) {
+            const cancelled = isAbortError(error) || ctx.signal?.aborted;
+            phaseEvent(ctx.visualizerRun, name, { kind: "fanout_item_end", itemId: String(item), label: String(item), index, status: cancelled ? STATUSES.CANCELLED : STATUSES.FAILED, error: error?.message || String(error) });
+            throw error;
+          }
         });
         return results;
       });
@@ -600,12 +617,19 @@ async function main() {
     console.log("Usage: dynamic-thread-phase-workflow.mjs --spec-file spec.json | --js-file workflow.mjs [--cwd REPO] [--background] [--model MODEL]");
     return;
   }
-  if (maybeBackground(rawArgv, args)) return;
 
   const harnessFile = args["js-file"] || args["harness-file"] ? resolve(String(args["js-file"] || args["harness-file"])) : undefined;
+  if (harnessFile && (args.spec || args["spec-file"])) throw new Error("Provide either spec input or --js-file, not both");
   const spec = harnessFile
-    ? { name: args.name ? String(args.name) : safeName(basename(harnessFile).replace(/\.[cm]?js$/, "")), mode: "harness", permissions: normalizePermissions(args.permissions || "rwx", "harness permissions"), harnessFile }
+    ? (() => {
+        if (!args.permissions) throw new Error("JavaScript harness mode requires explicit --permissions rwx");
+        const permissions = normalizePermissions(args.permissions, "harness permissions");
+        if (!permissionIncludesAll(permissions, "rwx")) throw new Error("JavaScript harness mode requires permissions=\"rwx\"");
+        assertWithinMaxPermissions(permissions, "harness permissions");
+        return { name: args.name ? String(args.name) : safeName(basename(harnessFile).replace(/\.[cm]?js$/, "")), mode: "harness", permissions, harnessFile };
+      })()
     : validateSpec(loadSpec(args));
+  if (maybeBackground(rawArgv, args)) return;
   const cwd = resolve(String(args.cwd || spec.cwd || process.cwd()));
   const workflow = spec.name || "dynamic-workflow";
   const visualizerRun = createRun({
@@ -613,7 +637,7 @@ async function main() {
     cwd,
     trigger: { kind: process.env.PI_DYNAMIC_WORKFLOW_BACKGROUND || process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND ? "background" : "manual", dynamic: true },
     input: spec,
-    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, mode: harnessFile ? "javascript" : "spec", permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, sessionId: args["session-id"], sessionFile: args["session-file"] },
+    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, mode: harnessFile ? "javascript" : "spec", permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, autoContinue: isTruthyFlag(args["auto-continue"] ?? spec.autoContinue), sessionId: args["session-id"], sessionFile: args["session-file"] },
     message: `${workflow} started`,
   });
   activeRun = visualizerRun;
@@ -652,6 +676,7 @@ async function main() {
         // wrapPhases mirrors phase lifecycle and yielded events to the visualizer.
       }
     }
+    if (controller.signal.aborted) throw abortError(controller.signal.reason || "cancelled");
     const resultPath = join(artifactsDir, "workflow-result.json");
     writeFileSync(resultPath, JSON.stringify({ outputs: ctx.outputs, results: ctx.results }, null, 2), "utf8");
     artifact(visualizerRun, { kind: "json", title: "Workflow result", path: resultPath });

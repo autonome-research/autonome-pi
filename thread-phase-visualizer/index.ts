@@ -93,7 +93,7 @@ function formatContinuationPrompt(run: AnyEvent): string {
 		run.errors?.length ? `\nErrors:\n${run.errors.map((e: AnyEvent) => `- ${e.phase ? `${e.phase}: ` : ""}${e.message || e.error?.message || "error"}`).join("\n")}` : undefined,
 		``,
 		`Please inspect the workflow result/artifacts as needed, summarize the outcome, and continue with the user's task.`,
-	].filter(Boolean).join("\n");
+	].filter(Boolean).join("\n").slice(0, 12000);
 }
 
 function shellUnquote(value: string): string {
@@ -138,9 +138,11 @@ function canInspectRun(run: AnyEvent, sessionId?: string, fallbackCwd?: string):
 
 function shouldAutoContinue(run: AnyEvent): boolean {
 	if (run.metadata?.autoContinue === false) return false;
-	if ([STATUSES.CANCELLED, STATUSES.SKIPPED].includes(run.normalizedStatus)) return false;
+	if (run.metadata?.autoContinue === "always") return true;
+	if (run.normalizedStatus !== STATUSES.SUCCESS) return false;
+	if (run.metadata?.autoContinue === true) return true;
 	const triggerKind = String(run.trigger?.kind || "");
-	return triggerKind !== "manual";
+	return triggerKind !== "manual" && run.metadata?.dynamic !== true;
 }
 
 function mergeMonitorRuns(cwd: string, sessionId?: string): AnyEvent[] {

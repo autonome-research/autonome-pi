@@ -75,6 +75,7 @@ function parametersSchema() {
 		cwd: Type.Optional(Type.String({ description: "Working directory for the workflow. Defaults to Pi's current cwd or spec.cwd." })),
 		model: Type.Optional(Type.String({ description: "Optional default Pi model pattern for pi/fanout_pi phases." })),
 		background: Type.Optional(Type.Boolean({ description: "Start the workflow in the background and return immediately." })),
+		autoContinue: Type.Optional(Type.Boolean({ description: "Queue a follow-up assistant continuation when the workflow completes successfully. Default false for dynamic workflows." })),
 		timeout: Type.Optional(Type.Number({ description: "Default phase timeout in milliseconds." })),
 	});
 }
@@ -84,22 +85,29 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 	const cwd = path.resolve(ctx.cwd, params.cwd || params.spec?.cwd || ".");
 	const args = ["--cwd", cwd];
 	if (params.harness || params.harnessFile) {
+		if (params.permissions !== "rwx") throw new Error("JavaScript harness mode requires explicit permissions: \"rwx\".");
 		const harnessFile = params.harnessFile ? path.resolve(ctx.cwd, params.harnessFile) : writeHarnessFile(params.harness);
-		args.push("--js-file", harnessFile);
+		args.push("--js-file", harnessFile, "--permissions", params.permissions);
 		if (params.name) args.push("--name", params.name);
-		if (params.permissions) args.push("--permissions", params.permissions);
 	} else {
-		args.push("--spec-file", writeJsonFile(params.spec));
+		const spec = { ...params.spec };
+		if (params.permissions) {
+			if (spec.permissions && spec.permissions !== params.permissions) throw new Error("Top-level permissions conflict with spec.permissions.");
+			spec.permissions = params.permissions;
+		}
+		args.push("--spec-file", writeJsonFile(spec));
 	}
 	if (params.model) args.push("--model", params.model);
 	if (params.timeout !== undefined) args.push("--timeout", String(params.timeout));
 	if (params.background) args.push("--background");
+	if (params.autoContinue) args.push("--auto-continue");
 	addSessionArgs(args, ctx);
 	onUpdate?.({ content: [{ type: "text", text: `Starting ${legacyName ? "dynamic thread-phase" : "dynamic"} workflow in ${cwd}...` }] });
 	const result = await runScript(args, cwd, signal);
-	if (result.code !== 0 && !params.background) throw new Error(result.stderr || result.stdout || `dynamic workflow exited ${result.code}`);
 	let details: any;
 	try { details = parseJsonObject(result.stdout); } catch { details = { stdout: result.stdout, stderr: result.stderr }; }
+	if (params.background && !(result.code === 0 && details?.ok === true && details?.background === true && details?.pid)) throw new Error(result.stderr || result.stdout || "dynamic workflow background launch failed");
+	if (result.code !== 0 && !params.background) throw new Error(result.stderr || result.stdout || `dynamic workflow exited ${result.code}`);
 	const text = details?.background
 		? `Started dynamic workflow in background (pid ${details.pid}). Open ctrl+shift+t to monitor it.`
 		: result.stdout || "Dynamic workflow started.";
@@ -119,7 +127,7 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "dynamic_workflow",
 		label: "Dynamic Workflow",
-		description: "Execute a validated dynamic workflow from a structured spec or advanced JavaScript harness. Emits generic workflow events and artifacts."
+		description: "Execute a validated dynamic workflow from a structured spec or advanced JavaScript harness. Emits generic workflow events and artifacts.",
 		promptSnippet: "Run a deterministic multi-phase workflow from a spec or JavaScript harness",
 		promptGuidelines: guidelines,
 		parameters: parametersSchema(),
@@ -131,8 +139,8 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "dynamic_thread_phase_workflow",
 		label: "Dynamic Workflow (deprecated alias)",
-		description: "Deprecated alias for dynamic_workflow. Execute a validated dynamic workflow spec or JavaScript harness."
-		promptSnippet: "Run a deterministic multi-phase workflow from a JSON spec",
+		description: "Deprecated alias for dynamic_workflow. Execute a validated dynamic workflow spec or JavaScript harness.",
+		promptSnippet: "Run a deterministic multi-phase workflow from a spec or JavaScript harness",
 		promptGuidelines: ["Prefer dynamic_workflow. This tool remains for compatibility.", ...guidelines],
 		parameters: parametersSchema(),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {

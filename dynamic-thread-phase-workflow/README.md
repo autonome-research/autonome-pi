@@ -16,7 +16,7 @@ CLI entrypoints:
 
 The older `dynamic-thread-phase-workflow.mjs` entrypoint remains available.
 
-Use `background: true` for long workflows. Runs emit generic `thread-phase-ui/v1` events, so `ctrl+shift+t` can monitor/cancel them.
+Use `background: true` for long workflows. Runs emit generic `thread-phase-ui/v1` events, so `ctrl+shift+t` can monitor/cancel them. Dynamic workflows do not auto-continue the chat by default; pass `autoContinue: true` when you want a successful background run to queue a follow-up.
 
 ## Modes
 
