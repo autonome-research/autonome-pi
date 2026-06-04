@@ -18,6 +18,8 @@ import {
 const DEFAULT_PI = process.env.PI_MISSION_WORKFLOW_PI_BIN || (existsSync(join(homedir(), ".npm-global", "bin", "pi")) ? join(homedir(), ".npm-global", "bin", "pi") : "pi");
 const DEFAULT_MAX_REPAIR_ITERATIONS = 10;
 const MAX_TEXT_BYTES = 250_000;
+const MAX_JSON_LINE_BYTES = 10_000_000;
+const MAX_USAGE_ENTRIES = 200;
 const MAX_PROMPT_CONTEXT_BYTES = 120_000;
 const REGISTRY_ROOT = join(homedir(), ".pi", "agent", "mission-workflow", "registry");
 const GENERATED_JUNK_PATTERNS = [
@@ -175,12 +177,16 @@ function compactText(text, maxBytes = MAX_TEXT_BYTES) {
 
 function appendBounded(current, chunk, maxBytes = MAX_TEXT_BYTES) {
   const text = typeof chunk === "string" ? chunk : chunk.toString();
-  if (!text) return current;
+  if (!text || maxBytes <= 0) return current;
   const combined = current ? `${current}${text}` : text;
   if (Buffer.byteLength(combined, "utf8") <= maxBytes) return combined;
-  let out = combined.slice(-maxBytes);
-  while (Buffer.byteLength(out, "utf8") > maxBytes) out = out.slice(1);
-  return `[truncated older output]\n${out}`;
+  const marker = "[truncated older output]\n";
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  const tailBudget = Math.max(0, maxBytes - markerBytes);
+  if (tailBudget === 0) return marker.slice(0, maxBytes);
+  let out = combined.slice(-tailBudget);
+  while (Buffer.byteLength(out, "utf8") > tailBudget) out = out.slice(1);
+  return `${marker}${out}`;
 }
 
 function compactJson(value, maxBytes = MAX_PROMPT_CONTEXT_BYTES) {
@@ -321,7 +327,7 @@ function runProcess(command, args = [], options = {}) {
     proc.on("close", (code) => {
       activeChildren.delete(proc);
       options.signal?.removeEventListener("abort", terminate);
-      resolve({ ok: code === 0 && !aborted, code: code ?? 0, stdout: compactText(stdout), stderr: compactText(stderr), aborted, error: aborted ? String(options.signal?.reason || "cancelled") : undefined });
+      resolve({ ok: code === 0 && !aborted, code: code ?? 0, stdout, stderr, aborted, error: aborted ? String(options.signal?.reason || "cancelled") : undefined });
     });
   });
 }
@@ -405,16 +411,29 @@ function parsePiJsonLines(stdout) {
 }
 
 function createPiJsonLineParser() {
-  return { buffer: "", text: "", messages: [], usage: [], model: undefined, stopReason: undefined, stdoutPreview: "", lines: 0, droppedBytes: 0 };
+  return { buffer: "", text: "", messages: [], usage: [], model: undefined, stopReason: undefined, stdoutPreview: "", lines: 0, droppedBytes: 0, parserError: undefined, droppingOversizeLine: false };
 }
 
 function consumePiJsonChunk(state, chunk) {
-  const text = typeof chunk === "string" ? chunk : chunk.toString();
+  let text = typeof chunk === "string" ? chunk : chunk.toString();
   state.stdoutPreview = appendBounded(state.stdoutPreview, text, MAX_TEXT_BYTES);
+  if (state.droppingOversizeLine) {
+    const newline = text.search(/\r?\n/);
+    if (newline < 0) {
+      state.droppedBytes += Buffer.byteLength(text, "utf8");
+      return;
+    }
+    state.droppedBytes += Buffer.byteLength(text.slice(0, newline + 1), "utf8");
+    text = text.slice(newline + 1);
+    state.droppingOversizeLine = false;
+  }
   state.buffer += text;
-  if (Buffer.byteLength(state.buffer, "utf8") > MAX_TEXT_BYTES) {
-    state.droppedBytes += Buffer.byteLength(state.buffer, "utf8") - MAX_TEXT_BYTES;
-    state.buffer = state.buffer.slice(-MAX_TEXT_BYTES);
+  if (Buffer.byteLength(state.buffer, "utf8") > MAX_JSON_LINE_BYTES) {
+    state.parserError = state.parserError || `Pi JSONL record exceeded ${MAX_JSON_LINE_BYTES} bytes`;
+    state.droppedBytes += Buffer.byteLength(state.buffer, "utf8");
+    state.buffer = "";
+    state.droppingOversizeLine = true;
+    return;
   }
   const lines = state.buffer.split(/\r?\n/);
   state.buffer = lines.pop() || "";
@@ -429,7 +448,10 @@ function consumePiJsonLine(state, line) {
   if (event.type !== "message_end" || !event.message) return;
   state.messages.push(event.message);
   if (state.messages.length > 20) state.messages.shift();
-  if (event.message.usage) state.usage.push(event.message.usage);
+  if (event.message.usage) {
+    state.usage.push(event.message.usage);
+    if (state.usage.length > MAX_USAGE_ENTRIES) state.usage.shift();
+  }
   const msg = event.message;
   if (msg.role === "assistant") {
     state.model = msg.model || state.model;
@@ -439,8 +461,8 @@ function consumePiJsonLine(state, line) {
 }
 
 function piParserResult(state) {
-  if (state.buffer.trim()) consumePiJsonLine(state, state.buffer);
-  return { text: state.text, messages: state.messages, usage: state.usage, model: state.model, stopReason: state.stopReason, stdout: state.stdoutPreview, droppedBytes: state.droppedBytes, parsedLines: state.lines };
+  if (!state.droppingOversizeLine && state.buffer.trim()) consumePiJsonLine(state, state.buffer);
+  return { text: state.text, messages: state.messages, usage: state.usage, model: state.model, stopReason: state.stopReason, stdout: state.stdoutPreview, droppedBytes: state.droppedBytes, parsedLines: state.lines, parserError: state.parserError };
 }
 
 async function runPi({ cwd, prompt, tools, model, timeoutMs = 30 * 60 * 1000, signal }) {
@@ -477,7 +499,7 @@ async function runPi({ cwd, prompt, tools, model, timeoutMs = 30 * 60 * 1000, si
       clearTimeout(timer);
       signal?.removeEventListener("abort", terminate);
       const result = piParserResult(parsed);
-      resolve({ ok: code === 0 && Boolean(result.text) && !aborted, code, stderr, aborted, timedOut, ...result, error: aborted ? String(signal?.reason || "cancelled") : code === 0 ? undefined : stderr || `pi exited ${code}` });
+      resolve({ ok: code === 0 && !result.parserError && !aborted, code, stderr, aborted, timedOut, ...result, error: aborted ? String(signal?.reason || "cancelled") : result.parserError ? result.parserError : code === 0 ? undefined : stderr || `pi exited ${code}` });
     });
   });
 }
@@ -511,6 +533,36 @@ function defaultPlan({ goal, cwd, args, repoRoot }) {
   };
 }
 
+function canonicalAssertionId(value, contract) {
+  const assertions = contract?.assertions || [];
+  const byId = new Map(assertions.map((assertion) => [String(assertion.id), String(assertion.id)]));
+  const byDescription = new Map(assertions.map((assertion) => [String(assertion.description), String(assertion.id)]));
+  const candidates = [];
+  if (typeof value === "object" && value) {
+    if (value.id) candidates.push(String(value.id));
+    if (value.description) candidates.push(String(value.description));
+  } else candidates.push(String(value));
+  for (const candidate of candidates) {
+    if (byId.has(candidate)) return byId.get(candidate);
+    const safe = safeName(candidate, "assertion");
+    if (byId.has(safe)) return byId.get(safe);
+    if (byDescription.has(candidate)) return byDescription.get(candidate);
+  }
+  return undefined;
+}
+
+function normalizeAssertionReferences(values, contract) {
+  return Array.from(new Set((values || []).map((value) => canonicalAssertionId(value, contract) || (typeof value === "object" && value ? String(value.id || value.description || "") : String(value))).filter(Boolean)));
+}
+
+function isPassedAssertionStatus(status) {
+  return ["pass", "passed"].includes(String(status || "").trim().toLowerCase());
+}
+
+function isFailedAssertionStatus(status) {
+  return ["fail", "failed"].includes(String(status || "").trim().toLowerCase());
+}
+
 function normalizePlan(plan, { goal, cwd, args, repoRoot }) {
   const fallback = defaultPlan({ goal, cwd, args, repoRoot });
   const missionId = safeName(plan.missionId || fallback.missionId, "mission");
@@ -534,14 +586,14 @@ function normalizePlan(plan, { goal, cwd, args, repoRoot }) {
   };
   if (!Array.isArray(normalized.milestones) || normalized.milestones.length === 0) normalized.milestones = fallback.milestones;
   const assertionIds = normalized.validationContract.assertions.map((assertion) => assertion.id);
-  normalized.milestones = normalized.milestones.map((milestone, mIndex) => ({
+  normalized.milestones = normalized.milestones.map((milestone, mIndex) => ({ 
     id: safeName(milestone.id || `milestone-${mIndex + 1}`, `milestone-${mIndex + 1}`),
     title: String(milestone.title || `Milestone ${mIndex + 1}`),
     features: (Array.isArray(milestone.features) && milestone.features.length ? milestone.features : fallback.milestones[0].features).map((feature, fIndex) => ({
       id: safeName(feature.id || `feature-${mIndex + 1}-${fIndex + 1}`, `feature-${fIndex + 1}`),
       title: String(feature.title || feature.description || `Feature ${fIndex + 1}`),
       description: String(feature.description || feature.title || goal),
-      assertions: Array.isArray(feature.assertions) && feature.assertions.length ? feature.assertions.map(String) : assertionIds,
+      assertions: Array.isArray(feature.assertions) && feature.assertions.length ? normalizeAssertionReferences(feature.assertions, normalized.validationContract) : assertionIds,
       repair: Boolean(feature.repair),
     })),
   }));
@@ -617,7 +669,14 @@ function validatePlanForActivation(plan) {
   if (!plan.missionId) throw new Error("plan.missionId is required");
   if (!Array.isArray(plan.milestones) || plan.milestones.length === 0) throw new Error("plan.milestones must be non-empty");
   if (!plan.validationContract?.assertions?.length) throw new Error("plan.validationContract.assertions must be non-empty");
-  return plan;
+  const normalized = normalizePlan(plan, { goal: plan.goal || plan.missionId, cwd: plan.cwd || process.cwd(), args: {}, repoRoot: plan.cwd || process.cwd() });
+  const known = new Set((normalized.validationContract?.assertions || []).map((assertion) => String(assertion.id)));
+  const unknown = [];
+  for (const milestone of normalized.milestones || []) for (const feature of milestone.features || []) for (const assertionId of feature.assertions || []) {
+    if (!known.has(String(assertionId))) unknown.push(`${milestone.id}/${feature.id}: ${assertionId}`);
+  }
+  if (unknown.length) throw new Error(`Unknown feature assertion references: ${unknown.join(", ")}`);
+  return normalized;
 }
 
 async function ensureMissionWorktrees(plan, ctx, run, options = {}) {
@@ -650,19 +709,23 @@ async function branchMerged(cwd, branch, target, signal) {
   return result.ok;
 }
 
-function normalizeAssertionsAddressed(raw, plan) {
-  const assertions = plan.validationContract?.assertions || [];
-  const byId = new Map(assertions.map((assertion) => [String(assertion.id), assertion]));
-  const byDescription = new Map(assertions.map((assertion) => [String(assertion.description), assertion]));
+function normalizeAssertionsAddressed(raw, plan, allowedLocalAssertions = []) {
+  const allowedLocal = new Set((allowedLocalAssertions || []).map(String));
   const values = Array.isArray(raw) ? raw : [];
   const ids = [];
   const errors = [];
   for (const value of values) {
-    const id = typeof value === "object" && value ? String(value.id || "") : String(value);
-    const description = typeof value === "object" && value ? String(value.description || "") : String(value);
-    const assertion = byId.get(id) || byDescription.get(description);
-    if (!assertion) errors.push(`Unknown assertion addressed: ${compactText(JSON.stringify(value), 500)}`);
-    else ids.push(String(assertion.id));
+    const rawId = typeof value === "object" && value ? String(value.id || "") : String(value);
+    const rawDescription = typeof value === "object" && value ? String(value.description || "") : String(value);
+    const safeId = safeName(rawId, "assertion");
+    const safeDescription = safeName(rawDescription, "assertion");
+    const assertionId = canonicalAssertionId(value, plan.validationContract);
+    if (assertionId) ids.push(assertionId);
+    else if (allowedLocal.has(rawId)) ids.push(rawId);
+    else if (allowedLocal.has(safeId)) ids.push(safeId);
+    else if (allowedLocal.has(rawDescription)) ids.push(rawDescription);
+    else if (allowedLocal.has(safeDescription)) ids.push(safeDescription);
+    else errors.push(`Unknown assertion addressed: ${compactText(JSON.stringify(value), 500)}`);
   }
   return { ids: Array.from(new Set(ids)), errors };
 }
@@ -688,9 +751,9 @@ function validateHandoff({ handoff, featureId, feature, plan, changedFiles }) {
   if (String(handoff.featureId || "") !== featureId) errors.push(`handoff.featureId (${handoff.featureId}) does not match featureId (${featureId})`);
   if (typeof handoff.completed !== "boolean") errors.push("handoff.completed must be boolean");
   for (const field of ["changedFiles", "commandsRun", "assertionsAddressed", "issuesDiscovered", "leftUndone"]) if (!Array.isArray(handoff[field])) errors.push(`handoff.${field} must be an array`);
-  const normalizedAssertions = normalizeAssertionsAddressed(handoff.assertionsAddressed, plan);
-  errors.push(...normalizedAssertions.errors);
   const featureAssertions = Array.isArray(feature.assertions) ? feature.assertions.map(String) : [];
+  const normalizedAssertions = normalizeAssertionsAddressed(handoff.assertionsAddressed, plan, featureAssertions);
+  errors.push(...normalizedAssertions.errors);
   for (const assertionId of normalizedAssertions.ids) if (featureAssertions.length && !featureAssertions.includes(assertionId)) errors.push(`Assertion ${assertionId} is not assigned to feature ${featureId}`);
   const declared = Array.isArray(handoff.changedFiles) ? Array.from(new Set(handoff.changedFiles.map(String).filter(Boolean))).sort() : [];
   const actual = Array.from(new Set(changedFiles || [])).sort();
@@ -781,14 +844,34 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
   }
 }
 
+function contractAssertionMap(plan) {
+  return new Map((plan.validationContract?.assertions || []).map((assertion) => [String(assertion.id), assertion]));
+}
+
 function milestoneAssertionIds(plan, milestone) {
+  const known = contractAssertionMap(plan);
   const ids = new Set();
-  for (const feature of milestone.features || []) for (const id of feature.assertions || []) ids.add(String(id));
-  return ids.size ? ids : new Set((plan.validationContract?.assertions || []).map((assertion) => String(assertion.id)));
+  for (const feature of milestone.features || []) for (const id of feature.assertions || []) if (known.has(String(id))) ids.add(String(id));
+  return ids;
+}
+
+function milestoneCoverageAssertions(plan, milestone, scope = "milestone") {
+  if (scope === "final" || !milestone) return plan.validationContract?.assertions || [];
+  const known = contractAssertionMap(plan);
+  const ids = milestoneAssertionIds(plan, milestone);
+  if (ids.size) return Array.from(ids).map((id) => known.get(id)).filter(Boolean);
+  const local = [];
+  const seen = new Set();
+  for (const feature of milestone.features || []) for (const assertion of feature.assertions || []) {
+    const id = String(assertion);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    local.push({ id, description: id, priority: "must", local: true });
+  }
+  return local;
 }
 
 function buildCoverageReport({ plan, milestone, iterationState, commandReports, validatorReport, scope = "milestone" }) {
-  const milestoneIds = milestone ? milestoneAssertionIds(plan, milestone) : new Set((plan.validationContract?.assertions || []).map((assertion) => String(assertion.id)));
   const featureResults = iterationState?.features || [];
   const featuresByAssertion = new Map();
   const allPlanFeatures = (plan.milestones || []).flatMap((m) => m.features || []);
@@ -806,20 +889,20 @@ function buildCoverageReport({ plan, milestone, iterationState, commandReports, 
   }
   const validatorAssertions = new Map((validatorReport?.assertionResults || []).map((result) => [String(result.assertionId), result]));
   const commandPassed = commandReports.every((report) => report.passed);
-  const rows = (plan.validationContract?.assertions || []).filter((assertion) => scope === "final" || milestoneIds.has(String(assertion.id))).map((assertion) => {
+  const rows = milestoneCoverageAssertions(plan, milestone, scope).map((assertion) => {
     const features = featuresByAssertion.get(String(assertion.id)) || [];
     const validator = validatorAssertions.get(String(assertion.id));
     const validators = [
       ...commandReports.map((report) => ({ validator: report.validator, command: report.command, passed: report.passed, artifact: report.artifact })),
-      ...(validatorReport ? [{ validator: "adversarial-scrutiny", passed: validatorReport.passed && validator?.status !== "fail", artifact: validatorReport.artifact, evidence: validator?.evidence }] : []),
+      ...(validatorReport ? [{ validator: "adversarial-scrutiny", passed: validatorReport.passed && isPassedAssertionStatus(validator?.status), artifact: validatorReport.artifact, evidence: validator?.evidence }] : []),
     ];
     let status = "pass";
     const gaps = [];
     if (!features.length) { status = "gap"; gaps.push("No planned/executed feature maps to assertion."); }
     if (!commandPassed) { status = "fail"; gaps.push("One or more command validators failed."); }
-    if (validator?.status === "fail") { status = "fail"; gaps.push(validator.evidence || "Adversarial validator failed assertion."); }
+    if (validatorReport && !isPassedAssertionStatus(validator?.status)) { status = "fail"; gaps.push(validator?.evidence || "Adversarial validator did not explicitly pass this assertion."); }
     if (validatorReport === null) { status = status === "pass" ? "unknown" : status; gaps.push("No adversarial validator report available."); }
-    return { assertionId: assertion.id, description: assertion.description, priority: assertion.priority || "must", features, commits: features.map((f) => f.commit).filter(Boolean), validators, status, gaps };
+    return { assertionId: assertion.id, description: assertion.description, priority: assertion.priority || "must", local: Boolean(assertion.local), features, commits: features.map((f) => f.commit).filter(Boolean), validators, status, gaps };
   });
   const gaps = rows.filter((row) => row.status !== "pass" && row.priority === "must").flatMap((row) => row.gaps.map((gap) => ({ assertionId: row.assertionId, level: "must", description: gap })));
   return { schema: "pi-mission-workflow/coverage/v1", scope, milestoneId: milestone?.id, generatedAt: new Date().toISOString(), assertions: rows, gaps };
@@ -828,13 +911,18 @@ function buildCoverageReport({ plan, milestone, iterationState, commandReports, 
 function normalizeValidatorReport(raw, { plan, milestone, coverageGaps }) {
   const objections = Array.isArray(raw?.objections) ? raw.objections.map((objection) => ({
     level: ["must", "should", "nit"].includes(String(objection.level)) ? String(objection.level) : "must",
-    assertionId: objection.assertionId ? String(objection.assertionId) : undefined,
+    assertionId: objection.assertionId ? (canonicalAssertionId(objection.assertionId, plan.validationContract) || String(objection.assertionId)) : undefined,
     description: String(objection.description || objection.summary || objection.message || "Validator objection"),
     evidence: String(objection.evidence || ""),
     repairHint: String(objection.repairHint || objection.repair || ""),
   })) : [];
   for (const gap of coverageGaps || []) objections.push({ level: "must", assertionId: gap.assertionId, description: `Coverage gap: ${gap.description}`, evidence: "Requirement/assertion coverage report", repairHint: "Add or repair a feature that directly satisfies this assertion." });
-  const assertionResults = Array.isArray(raw?.assertionResults) ? raw.assertionResults.map((result) => ({ assertionId: String(result.assertionId || ""), status: String(result.status || "unknown"), evidence: String(result.evidence || "") })) : (plan.validationContract?.assertions || []).filter((assertion) => milestoneAssertionIds(plan, milestone).has(String(assertion.id))).map((assertion) => ({ assertionId: assertion.id, status: objections.some((o) => o.assertionId === assertion.id && o.level === "must") ? "fail" : "pass", evidence: "Adversarial scrutiny completed." }));
+  const scopedAssertions = milestoneCoverageAssertions(plan, milestone, "milestone");
+  const scopedIds = new Set(scopedAssertions.map((assertion) => String(assertion.id)));
+  const assertionResults = Array.isArray(raw?.assertionResults) ? raw.assertionResults.map((result) => ({ assertionId: canonicalAssertionId(result.assertionId || result, plan.validationContract) || String(result.assertionId || ""), status: String(result.status || "unknown"), evidence: String(result.evidence || "") })) : scopedAssertions.map((assertion) => ({ assertionId: assertion.id, status: objections.some((o) => o.assertionId === assertion.id && o.level === "must") ? "fail" : "pass", evidence: "Adversarial scrutiny completed." }));
+  for (const assertion of scopedAssertions) if (!assertionResults.some((result) => String(result.assertionId) === String(assertion.id))) assertionResults.push({ assertionId: assertion.id, status: "unknown", evidence: "Validator omitted scoped assertion result." });
+  if (raw?.passed === false && !objections.some((objection) => objection.level === "must")) objections.push({ level: "must", assertionId: assertionResults.find((result) => scopedIds.has(String(result.assertionId)))?.assertionId, description: "Validator marked milestone as failed without a must-level objection.", evidence: String(raw?.summary || "validator passed=false"), repairHint: "Provide or repair the blocking validator objection." });
+  const correctiveFeatures = Array.isArray(raw?.correctiveFeatures) ? raw.correctiveFeatures.map((feature) => ({ ...feature, assertions: normalizeAssertionReferences(feature.assertions || [], plan.validationContract) })) : objections.filter((o) => o.level === "must").map((objection) => ({ title: `Repair ${objection.assertionId || milestone.id}: ${objection.description}`.slice(0, 160), assertions: objection.assertionId ? [objection.assertionId] : scopedAssertions.map((assertion) => assertion.id), rationale: objection.evidence || objection.description }));
   return {
     schema: "pi-mission-workflow/adversarial-validation/v1",
     milestoneId: milestone.id,
@@ -842,7 +930,7 @@ function normalizeValidatorReport(raw, { plan, milestone, coverageGaps }) {
     summary: String(raw?.summary || "Adversarial scrutiny completed."),
     objections,
     assertionResults,
-    correctiveFeatures: Array.isArray(raw?.correctiveFeatures) ? raw.correctiveFeatures : objections.filter((o) => o.level === "must").map((objection) => ({ title: `Repair ${objection.assertionId || milestone.id}: ${objection.description}`.slice(0, 160), assertions: objection.assertionId ? [objection.assertionId] : Array.from(milestoneAssertionIds(plan, milestone)), rationale: objection.evidence || objection.description })),
+    correctiveFeatures,
   };
 }
 
@@ -856,11 +944,12 @@ async function runAdversarialValidator(env, plan, milestone, iterationState, com
     const prompt = compactText([
       "You are a fresh read-only Pi validator agent. Do not edit files or write commits. You may only inspect with read/grep/find/ls.",
       "Adversarially validate the completed milestone. Be skeptical: must-level objections block the mission and should become targeted repair features.",
-      "Review the original/source docs (README.md, specs.md, SPEC.md, requirements.md, docs/*.md, and plan.sourceDocs), validation contract, milestone worker handoffs, git diff, and command validation outputs.",
+      "Scope rule: block only on this milestone's coverage assertions/feature acceptance checks and regressions introduced by this milestone. Do not require future milestones or full-system invariants unless they are explicitly assigned in the coverage draft.",
+      "Review the original/source docs (README.md, specs.md, SPEC.md, requirements.md, docs/*.md, and plan.sourceDocs), scoped validation contract, milestone worker handoffs, git diff, and command validation outputs.",
       "Return ONLY JSON with schema, milestoneId, passed, summary, objections[{level,assertionId,description,evidence,repairHint}], assertionResults[{assertionId,status,evidence}], correctiveFeatures[{title,description,assertions,rationale}].",
       `Mission goal: ${plan.goal}`,
       `Plan sourceDocs: ${compactJson(plan.sourceDocs || [], 8000)}`,
-      `Validation contract: ${compactJson(plan.validationContract, 30000)}`,
+      `Scoped coverage assertions: ${compactJson(coverageDraft.assertions || [], 30000)}`,
       `Milestone: ${compactJson({ id: milestone.id, title: milestone.title, features: milestone.features }, 30000)}`,
       `Worker handoffs and commits: ${compactJson(iterationState.features.map((feature) => ({ featureId: feature.featureId, commit: feature.commit, skipped: feature.skipped, handoffArtifact: feature.handoffArtifact, handoff: feature.handoff, changedFiles: feature.changedFiles })), 30000)}`,
       `Command validation reports: ${compactJson(commandReports, 30000)}`,
@@ -905,7 +994,7 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
   const coveragePath = writeArtifact(run, `coverage/${safeName(milestone.id)}-coverage.json`, coverage, "json", `Coverage: ${milestone.id}`);
   const commandPassed = reports.every((report) => report.passed);
   const mustObjections = validatorReport.objections.filter((objection) => objection.level === "must");
-  const passed = commandPassed && mustObjections.length === 0 && coverage.gaps.length === 0;
+  const passed = commandPassed && validatorReport.passed !== false && mustObjections.length === 0 && coverage.gaps.length === 0;
   const assertionResults = coverage.assertions.map((row) => ({ assertionId: row.assertionId, status: row.status === "pass" ? "pass" : "fail", evidence: row.gaps.join("; ") || "Command and adversarial validators passed." }));
   const correctiveFeatures = passed ? [] : [
     ...validatorReport.correctiveFeatures,
@@ -978,7 +1067,7 @@ async function activateMission(args, cwd, run, ctx) {
   }
   const allFeatureResults = missionState.milestones.flatMap((m) => m.iterations || []).flatMap((iteration) => iteration.features || []);
   const lastValidationReports = missionState.milestones.flatMap((m) => (m.iterations || []).map((iteration) => iteration.validation).filter(Boolean));
-  const finalCoverage = buildCoverageReport({ plan, milestone: undefined, iterationState: { features: allFeatureResults }, commandReports: [], validatorReport: { passed: true, assertionResults: [] }, scope: "final" });
+  const finalCoverage = buildCoverageReport({ plan, milestone: undefined, iterationState: { features: allFeatureResults }, commandReports: [], validatorReport: undefined, scope: "final" });
   const finalCoveragePath = writeArtifact(run, "coverage/final-coverage.json", finalCoverage, "json", "Final requirement coverage");
   if (finalCoverage.gaps.length) {
     writeArtifact(run, "validation/final-coverage-objections.json", { schema: "pi-mission-workflow/final-coverage-objections/v1", passed: false, objections: finalCoverage.gaps.map((gap) => ({ level: "must", assertionId: gap.assertionId, description: `Final coverage gap: ${gap.description}`, evidence: finalCoveragePath, repairHint: "Add or repair features until this assertion has coverage and validator evidence." })) }, "json", "Final coverage objections");

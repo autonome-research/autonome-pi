@@ -95,6 +95,95 @@ try {
   let missionResumeDetails;
   try { missionResumeDetails = missionResume?.stdout ? JSON.parse(missionResume.stdout) : undefined; } catch { missionResumeDetails = undefined; }
   log(Boolean(missionResumeDetails?.branch) && Boolean(missionResumeDetails?.registryPath), 'mission workflow resume emits branch and registry pointer');
+
+  const largeRepo = join(tmp, 'large-jsonl-repo');
+  mkdirSync(largeRepo, { recursive: true });
+  expectExit('large JSONL repo git init', ['git', 'init', '-q'], 0, { cwd: largeRepo });
+  expectExit('large JSONL repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: largeRepo });
+  expectExit('large JSONL repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: largeRepo });
+  writeFileSync(join(largeRepo, 'README.md'), 'large-jsonl\n');
+  expectExit('large JSONL repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: largeRepo });
+  const largePlanPath = join(tmp, 'large-jsonl-plan.json');
+  writeFileSync(largePlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'large-jsonl-smoke', goal: 'large jsonl parser smoke', cwd: largeRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1,
+    worktreeBaseDir: join(tmp, 'large-jsonl-worktrees'), validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  const fakePiLarge = join(tmp, 'fake-pi-large-jsonl.mjs');
+  writeFileSync(fakePiLarge, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nmkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\nwriteFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, changedFiles: [], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'ok' }));\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: true, summary: 'x'.repeat(300000), objections: [], assertionResults: [{ assertionId: 'a1', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-large', usage: { input_tokens: 1, output_tokens: 1 }, content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
+  expectExit('fake pi large JSONL is executable', ['chmod', '+x', fakePiLarge], 0);
+  expectExit('mission workflow handles large Pi JSONL records', ['node', missionCli, 'activate', '--approved', '--plan-path', largePlanPath, '--cwd', largeRepo], 0, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiLarge }, timeout: 60_000 });
+
+  const unsafeRepo = join(tmp, 'unsafe-assertion-repo');
+  mkdirSync(unsafeRepo, { recursive: true });
+  expectExit('unsafe assertion repo git init', ['git', 'init', '-q'], 0, { cwd: unsafeRepo });
+  expectExit('unsafe assertion repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: unsafeRepo });
+  expectExit('unsafe assertion repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: unsafeRepo });
+  writeFileSync(join(unsafeRepo, 'README.md'), 'unsafe\n');
+  expectExit('unsafe assertion repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: unsafeRepo });
+  const unsafePlanPath = join(tmp, 'unsafe-assertion-plan.json');
+  writeFileSync(unsafePlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'unsafe-assertion-smoke', goal: 'unsafe assertion normalization', cwd: unsafeRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    worktreeBaseDir: join(tmp, 'unsafe-assertion-worktrees'), validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['unsafe assertion id'] }] }],
+    validationContract: { assertions: [{ id: 'unsafe assertion id', description: 'unsafe assertion description', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  const unsafeActivate = expectExit('mission workflow normalizes unsafe assertion ids', ['node', missionCli, 'activate', '--approved', '--plan-path', unsafePlanPath, '--cwd', unsafeRepo], 0);
+  let unsafeDetails;
+  try { unsafeDetails = unsafeActivate.stdout ? JSON.parse(unsafeActivate.stdout) : undefined; } catch { unsafeDetails = undefined; }
+  const unsafeCoverage = unsafeDetails?.finalCoveragePath ? JSON.parse(readFileSync(unsafeDetails.finalCoveragePath, 'utf8')) : undefined;
+  log(unsafeCoverage?.gaps?.length === 0, 'unsafe assertion final coverage has no gaps');
+
+  const typoRepo = join(tmp, 'typo-assertion-repo');
+  mkdirSync(typoRepo, { recursive: true });
+  expectExit('typo assertion repo git init', ['git', 'init', '-q'], 0, { cwd: typoRepo });
+  expectExit('typo assertion repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: typoRepo });
+  expectExit('typo assertion repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: typoRepo });
+  writeFileSync(join(typoRepo, 'README.md'), 'typo\n');
+  expectExit('typo assertion repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: typoRepo });
+  const typoPlanPath = join(tmp, 'typo-assertion-plan.json');
+  writeFileSync(typoPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'typo-assertion-smoke', goal: 'typo assertion rejection', cwd: typoRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    worktreeBaseDir: join(tmp, 'typo-assertion-worktrees'), validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a-1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow rejects unknown feature assertion references', ['node', missionCli, 'activate', '--approved', '--plan-path', typoPlanPath, '--cwd', typoRepo], 1);
+
+  const failedValidatorRepo = join(tmp, 'failed-validator-repo');
+  mkdirSync(failedValidatorRepo, { recursive: true });
+  expectExit('failed validator repo git init', ['git', 'init', '-q'], 0, { cwd: failedValidatorRepo });
+  expectExit('failed validator repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: failedValidatorRepo });
+  expectExit('failed validator repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: failedValidatorRepo });
+  writeFileSync(join(failedValidatorRepo, 'README.md'), 'validator\n');
+  expectExit('failed validator repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: failedValidatorRepo });
+  const failedValidatorPlanPath = join(tmp, 'failed-validator-plan.json');
+  writeFileSync(failedValidatorPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'failed-validator-smoke', goal: 'validator false blocks', cwd: failedValidatorRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1,
+    worktreeBaseDir: join(tmp, 'failed-validator-worktrees'), validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  const fakePiValidatorFalse = join(tmp, 'fake-pi-validator-false.mjs');
+  writeFileSync(fakePiValidatorFalse, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nmkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\nwriteFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, changedFiles: [], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'ok' }));\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: false, summary: 'validator says no', objections: [], assertionResults: [{ assertionId: 'a1', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-false', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
+  expectExit('fake pi validator false is executable', ['chmod', '+x', fakePiValidatorFalse], 0);
+  expectExit('mission workflow treats validator passed false as blocking', ['node', missionCli, 'activate', '--approved', '--plan-path', failedValidatorPlanPath, '--cwd', failedValidatorRepo], 1, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiValidatorFalse }, timeout: 60_000 });
+
+  const omittedValidatorRepo = join(tmp, 'omitted-validator-repo');
+  mkdirSync(omittedValidatorRepo, { recursive: true });
+  expectExit('omitted validator repo git init', ['git', 'init', '-q'], 0, { cwd: omittedValidatorRepo });
+  expectExit('omitted validator repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: omittedValidatorRepo });
+  expectExit('omitted validator repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: omittedValidatorRepo });
+  writeFileSync(join(omittedValidatorRepo, 'README.md'), 'validator omitted\n');
+  expectExit('omitted validator repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: omittedValidatorRepo });
+  const omittedValidatorPlanPath = join(tmp, 'omitted-validator-plan.json');
+  writeFileSync(omittedValidatorPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'omitted-validator-smoke', goal: 'validator omissions block', cwd: omittedValidatorRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1,
+    worktreeBaseDir: join(tmp, 'omitted-validator-worktrees'), validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  const fakePiValidatorOmitted = join(tmp, 'fake-pi-validator-omitted.mjs');
+  writeFileSync(fakePiValidatorOmitted, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nmkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\nwriteFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, changedFiles: [], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'ok' }));\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: true, summary: 'omitted assertion result', objections: [], assertionResults: [], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-omitted', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
+  expectExit('fake pi validator omitted is executable', ['chmod', '+x', fakePiValidatorOmitted], 0);
+  expectExit('mission workflow treats omitted validator assertion results as blocking', ['node', missionCli, 'activate', '--approved', '--plan-path', omittedValidatorPlanPath, '--cwd', omittedValidatorRepo], 1, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiValidatorOmitted }, timeout: 60_000 });
+
   const ignoreText = readFileSync(join(root, '.gitignore'), 'utf8');
   log(['__pycache__/', '.pytest_cache/', '.venv/', '*.egg-info/'].every((pattern) => ignoreText.includes(pattern)), 'package .gitignore protects generated junk');
 
