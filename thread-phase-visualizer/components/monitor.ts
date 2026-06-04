@@ -54,7 +54,8 @@ function currentPhaseText(run: RunSummary): string {
 	const phase = [...phases].reverse().find((p) => p.normalizedStatus === STATUSES.RUNNING) || phases[phases.length - 1];
 	if (!phase) return "";
 	const progress = phase.fanout ? formatFanout(phase.fanout) : formatProgress(phase.progress);
-	return `${phase.phase || "phase"}${progress}`;
+	const io = run.activeIo?.component || run.activeIo?.role || run.activeIo?.command;
+	return `${phase.phase || "phase"}${progress}${io ? ` · io:${String(io).slice(0, 32)}` : ""}`;
 }
 
 function cwdLabel(cwd: string | undefined): string {
@@ -112,6 +113,12 @@ function artifactTarget(artifact: ArtifactSummary | undefined): string {
 function compactJson(value: any): string {
 	try { return JSON.stringify(value); }
 	catch { return String(value); }
+}
+
+function sanitizeIoText(value: any): string {
+	return String(value || "")
+		.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+		.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "�");
 }
 
 function detailItems(run: RunSummary | undefined): DetailItem[] {
@@ -274,6 +281,7 @@ class ThreadPhaseMonitorComponent {
 		if (run.cwd) add(t.fg("dim", `cwd: ${run.cwd}`));
 		if (run.heartbeat?.timestamp) add(t.fg("dim", `heartbeat: ${run.heartbeat.timestamp}${run.heartbeat.featureId ? `  feature: ${run.heartbeat.featureId}` : ""}`));
 		if (run.usage?.entries) add(t.fg("muted", `usage: ${formatUsageSummary(run.usage)}`));
+		this.addActiveIo(lines, run.activeIo, width, "active I/O");
 		add("");
 		add(t.fg("toolTitle", t.bold("Phases")) + t.fg("dim", ` (${(run.phases || []).length})`));
 		if (!(run.phases || []).length) add(t.fg("dim", "No phases recorded."));
@@ -307,6 +315,7 @@ class ThreadPhaseMonitorComponent {
 		if (phase.endedAt) lines.push(t.fg("dim", `    ended:   ${phase.endedAt}`));
 		if (phase.progress) lines.push(t.fg("muted", `    progress: ${compactJson(phase.progress)}`));
 		if (phase.usage?.entries) lines.push(t.fg("muted", `    usage: ${formatUsageSummary(phase.usage)}`));
+		this.addActiveIo(lines, phase.activeIo, width, "    I/O");
 		if (!phase.fanout) return;
 		lines.push(t.fg("muted", `    fanout:${formatFanout(phase.fanout)} ${phase.fanout.label || ""}`));
 		for (const item of (phase.fanout.items || []).slice(0, MAX_DETAIL_PHASE_ITEMS)) {
@@ -315,6 +324,18 @@ class ThreadPhaseMonitorComponent {
 			lines.push(truncateToWidth(`      ${t.fg(statusColor(iStatus), statusIcon(iStatus))} ${item.label || item.itemId}${usage}${item.lastMessage ? t.fg("dim", ` — ${item.lastMessage}`) : ""}`, width));
 		}
 		if ((phase.fanout.items || []).length > MAX_DETAIL_PHASE_ITEMS) lines.push(t.fg("dim", `      … ${phase.fanout.items.length - MAX_DETAIL_PHASE_ITEMS} more item(s)`));
+	}
+
+	private addActiveIo(lines: string[], io: any, width: number, title = "I/O"): void {
+		if (!io) return;
+		const t = this.theme;
+		const label = io.component || io.role || io.command || io.componentId || "component";
+		lines.push(truncateToWidth(t.fg("toolTitle", `${title}: `) + t.fg("accent", `${label}`) + t.fg("dim", `${io.status ? ` ${io.status}` : ""}${io.pid ? ` pid:${io.pid}` : ""}`), width));
+		const input = io.inputPreview ? sanitizeIoText(io.inputPreview).split(/\r?\n/).slice(0, 3) : [];
+		const output = io.outputPreview || io.stdoutPreview || io.stderrPreview;
+		const outputLines = output ? sanitizeIoText(output).split(/\r?\n/).slice(-4) : [];
+		for (const line of input) lines.push(truncateToWidth(t.fg("dim", `  in  │ ${line}`), width));
+		for (const line of outputLines) lines.push(truncateToWidth(t.fg("muted", `  out │ ${line}`), width));
 	}
 
 	private renderArtifact(width: number, runs: RunSummary[]): string[] {

@@ -143,12 +143,8 @@ function canInspectRun(run: AnyEvent, sessionId?: string, fallbackCwd?: string):
 }
 
 function shouldAutoContinue(run: AnyEvent): boolean {
-	if (run.metadata?.autoContinue === false) return false;
-	if (run.metadata?.autoContinue === "always") return true;
 	if (run.normalizedStatus !== STATUSES.SUCCESS) return false;
-	if (run.metadata?.autoContinue === true) return true;
-	const triggerKind = String(run.trigger?.kind || "");
-	return triggerKind !== "manual" && run.metadata?.dynamic !== true;
+	return run.metadata?.autoContinue === true || run.metadata?.autoContinue === "always";
 }
 
 function mergeMonitorRuns(cwd: string, sessionId?: string): AnyEvent[] {

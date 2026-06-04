@@ -77,7 +77,7 @@ STATUSES.SKIPPED   // "skipped"
 STATUSES.UNKNOWN   // "unknown"
 ```
 
-Use `phaseEvent(..., { kind: "progress", completed, total })` for progress-like events. Keep workflow-specific detail inside `data`; avoid inventing new top-level event types until the UI needs them.
+Use `phaseEvent(..., { kind: "progress", completed, total })` for progress-like events. Use `emitActiveIo(run, phase, snapshot)` for component I/O snapshots that any monitor, tool, or debugger can consume without being coupled to a particular UI. `phaseEvent(..., { kind: "active_io" })` is also normalized/redacted by the store, but `emitActiveIo` is preferred for clarity. Keep workflow-specific detail inside `data`; avoid inventing new top-level event types until the UI needs them.
 
 Fanout phases use the same `phase_event` top-level type with a `data.kind` convention:
 
@@ -89,6 +89,29 @@ phaseEvent(run, "review", { kind: "progress", completed, total: files.length });
 ```
 
 Projection helpers expose this as `phase.fanout`, with item summaries for expanded UI views.
+
+Active I/O snapshots use a workflow-agnostic payload:
+
+```ts
+emitActiveIo(run, "worker", {
+  componentId: "worker-123",
+  component: "worker M2-F1",
+  role: "pi",                // pi | process | validator | custom
+  status: "running",         // running | success | failed | timeout | ...
+  pid: 12345,
+  cwd: "/repo",
+  command: "pi --mode json ...",
+  inputPreview: "prompt or command preview",
+  outputPreview: "latest model/process output preview",
+  stdoutPreview: "stdout tail",
+  stderrPreview: "stderr tail",
+  inputBytes: 1234,
+  stdoutBytes: 5678,
+  stderrBytes: 0,
+});
+```
+
+Projection helpers expose the latest snapshot as `run.activeIo` and `phase.activeIo`. The monitor panel renders that summary, and non-UI tools can read the same projected fields or raw `active_io` events from JSONL. Snapshots are persisted in append-only logs; the store applies conservative redaction for common token/secret forms and caps preview fields, but workflows should still keep previews compact and avoid including secrets. Set `PI_THREAD_PHASE_ACTIVE_IO=0` to disable active-I/O persistence. Mission active I/O defaults to metadata/status/byte counts only; process/model output previews are opt-in with `PI_THREAD_PHASE_ACTIVE_IO_PREVIEWS=1`, process command text with `PI_THREAD_PHASE_ACTIVE_IO_COMMANDS=1`, and Pi prompt previews with `PI_THREAD_PHASE_ACTIVE_IO_PROMPTS=1`.
 
 From a Node/TypeScript workflow runner:
 
@@ -102,6 +125,7 @@ import {
   artifact,
   completeRun,
   failRun,
+  emitActiveIo,
 } from "~/.pi/agent/extensions/thread-phase-visualizer/lib/store.mjs";
 
 const run = createRun({
@@ -174,6 +198,7 @@ The projected run shape includes:
 - `artifacts[]`
 - `errors[]`
 - `progress` by phase
+- latest `activeIo` snapshot for the run and per phase
 - raw `events[]` for advanced details
 
 ## Demo and test workflows

@@ -83,6 +83,30 @@ export type ThreadPhaseFanoutSummary = {
   items: ThreadPhaseFanoutItemSummary[];
 };
 
+export type ThreadPhaseActiveIoSnapshot = {
+  schema?: "thread-phase-active-io/v1" | string;
+  timestamp?: string;
+  updatedAt?: string;
+  phase?: string;
+  componentId?: string;
+  component?: string;
+  role?: string;
+  status?: string;
+  pid?: number;
+  cwd?: string;
+  command?: string;
+  inputPreview?: string;
+  outputPreview?: string;
+  stdoutPreview?: string;
+  stderrPreview?: string;
+  inputBytes?: number;
+  outputBytes?: number;
+  stdoutBytes?: number;
+  stderrBytes?: number;
+  truncated?: boolean;
+  message?: string;
+};
+
 export type ThreadPhaseHeartbeatSummary = {
   timestamp?: string;
   pid?: number;
@@ -116,6 +140,7 @@ export type ThreadPhasePhaseSummary = {
   fanout?: ThreadPhaseFanoutSummary;
   usage?: ThreadPhaseUsageSummary;
   heartbeat?: ThreadPhaseHeartbeatSummary;
+  activeIo?: ThreadPhaseActiveIoSnapshot;
 };
 
 export type ThreadPhaseRunSummary = {
@@ -134,6 +159,7 @@ export type ThreadPhaseRunSummary = {
   progress: Record<string, { current?: number; total?: number; percent?: number; message?: string }>;
   usage: ThreadPhaseUsageSummary;
   heartbeat?: ThreadPhaseHeartbeatSummary;
+  activeIo?: ThreadPhaseActiveIoSnapshot;
   stale?: ThreadPhaseStaleSummary;
   lastMessage?: string;
   eventCount: number;
@@ -182,9 +208,10 @@ export function createRun(options?: {
   runId?: string;
   message?: string;
 }): ThreadPhaseRunContext;
-export function emit(run: ThreadPhaseRunContext, event?: Partial<ThreadPhaseUiEvent>): ThreadPhaseUiEvent;
+export function emit(run: ThreadPhaseRunContext, event?: Partial<ThreadPhaseUiEvent>): ThreadPhaseUiEvent | undefined;
 export function phaseStart(run: ThreadPhaseRunContext, phase: string, data?: unknown): ThreadPhaseUiEvent;
-export function phaseEvent(run: ThreadPhaseRunContext, phase: string, event?: unknown): ThreadPhaseUiEvent;
+export function phaseEvent(run: ThreadPhaseRunContext, phase: string, event?: unknown): ThreadPhaseUiEvent | undefined;
+export function emitActiveIo(run: ThreadPhaseRunContext, phase: string, io?: ThreadPhaseActiveIoSnapshot): ThreadPhaseUiEvent | undefined;
 export function phaseEnd(run: ThreadPhaseRunContext, phase: string, status?: ThreadPhaseUiStatus, data?: unknown): ThreadPhaseUiEvent;
 export function artifact(run: ThreadPhaseRunContext, artifact: ThreadPhaseArtifact): ThreadPhaseUiEvent;
 export function completeRun(run: ThreadPhaseRunContext, status?: ThreadPhaseUiStatus, data?: unknown): ThreadPhaseUiEvent;

@@ -130,7 +130,7 @@ When a mission fails, do **not** blindly relaunch. First classify the failure:
 
 ## Immediate recommended next step
 
-The working tree now contains the intended `v0.10.9` mission hardening:
+The working tree now contains the intended `v0.11.0` mission hardening:
 
 - handoff assertion canonicalization accepts strings like `assertion-003: detailed explanation` when the leading ID exists in the validation contract, accepts verbose assigned local assertions like `Local assertion: <assigned check>. Verified...`, and accepts supplemental worker-only local evidence either as `local:*` IDs or `{ type: "local", id: "..." }` objects without counting it as global contract coverage;
 - resume no longer treats branch ancestry alone as proof of feature completion, so stale failed feature branches at the mission head are rerun;
@@ -139,6 +139,7 @@ The working tree now contains the intended `v0.10.9` mission hardening:
 - failed worker diffs/status are preserved as artifacts before removing failed feature worktrees;
 - hard failures/cancellations mark the durable registry `failed`/`cancelled` on a best-effort basis, without downgrading an already `completed` mission registry;
 - operation-level watchdog telemetry is emitted on heartbeats, including child PID, operation label, elapsed time, idle time, hard timeout, and idle timeout; stale operations emit `progress_watchdog` events; Pi calls have hard and idle-output timeouts; validation/user-test shell commands now have explicit timeouts instead of being able to hang indefinitely;
+- workflow-agnostic active I/O snapshots are emitted via `active_io` phase events and projected as `run.activeIo`/`phase.activeIo`, so the monitor panel, tools, and debugging sessions can inspect current prompts/commands and output tails without coupling mission-specific logic to the UI;
 - smoke coverage was added for prefixed handoffs, stale branch rerun, completed-head skip with feature-id trailer, same-subject/no-trailer rerun, stale registry skipped/commit records, handoff-backed legacy skips, registry-failed marking, command timeout handling, and completed-registry non-downgrade/immutability.
 
 Before resuming auto_trading again:

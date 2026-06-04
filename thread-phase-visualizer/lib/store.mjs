@@ -155,6 +155,14 @@ export function createRun(options = {}) {
 export function emit(runContext, event = {}) {
   ensureStore();
   const run = normalizeRun(runContext);
+  let eventData = event.data;
+  let eventMessage = event.message;
+  const dataKind = eventData && typeof eventData === "object" ? eventData.kind || eventData.type : undefined;
+  if (dataKind === "active_io") {
+    if (String(process.env.PI_THREAD_PHASE_ACTIVE_IO || "1") === "0") return undefined;
+    eventData = redactActiveIo({ ...eventData, kind: "active_io", schema: "thread-phase-active-io/v1", updatedAt: eventData.updatedAt || new Date().toISOString() });
+    eventMessage = eventData.message ?? (eventMessage ? compactText(redactSecrets(String(eventMessage)), 1200).content : undefined);
+  }
   const normalized = {
     schema: SCHEMA_VERSION,
     eventId: event.eventId || randomUUID(),
@@ -169,8 +177,8 @@ export function emit(runContext, event = {}) {
     // expose normalizedStatus for UI decisions.
     status: event.status ? normalizeStatusValue(event.status) : undefined,
     level: event.level,
-    message: event.message,
-    data: compactValue(event.data),
+    message: eventMessage,
+    data: compactValue(eventData),
     artifact: compactValue(event.artifact, 20_000),
     error: event.error ? serializeError(event.error) : undefined,
     metadata: compactValue(event.metadata),
@@ -186,7 +194,13 @@ export function phaseStart(run, phase, data) {
 }
 
 export function phaseEvent(run, phase, event) {
-  return emit(run, { type: EVENT_TYPES.PHASE_EVENT, phase, message: event?.message, data: event });
+  const kind = event && typeof event === "object" ? event.kind || event.type : undefined;
+  if (kind === "active_io" && String(process.env.PI_THREAD_PHASE_ACTIVE_IO || "1") === "0") return undefined;
+  const data = kind === "active_io"
+    ? redactActiveIo({ ...event, kind: "active_io", schema: "thread-phase-active-io/v1", updatedAt: event.updatedAt || new Date().toISOString() })
+    : event;
+  const message = kind === "active_io" ? data?.message : event?.message;
+  return emit(run, { type: EVENT_TYPES.PHASE_EVENT, phase, message, data });
 }
 
 export function phaseEnd(run, phase, status = STATUSES.SUCCESS, data) {
@@ -221,6 +235,60 @@ export function failRun(run, error, data) {
     data,
   });
   return completeRun(run, STATUSES.FAILED, { error: serializeError(error), ...data });
+}
+
+export function emitActiveIo(run, phase, io = {}) {
+  if (String(process.env.PI_THREAD_PHASE_ACTIVE_IO || "1") === "0") return undefined;
+  return phaseEvent(run, phase, {
+    ...io,
+    kind: "active_io",
+    schema: "thread-phase-active-io/v1",
+    updatedAt: io.updatedAt || new Date().toISOString(),
+  });
+}
+
+function redactActiveIo(io = {}) {
+  const out = {
+    kind: "active_io",
+    schema: "thread-phase-active-io/v1",
+    updatedAt: io.updatedAt,
+    componentId: io.componentId,
+    role: io.role,
+    status: io.status,
+    pid: typeof io.pid === "number" ? io.pid : undefined,
+    cwd: io.cwd,
+    inputBytes: typeof io.inputBytes === "number" ? io.inputBytes : undefined,
+    outputBytes: typeof io.outputBytes === "number" ? io.outputBytes : undefined,
+    stdoutBytes: typeof io.stdoutBytes === "number" ? io.stdoutBytes : undefined,
+    stderrBytes: typeof io.stderrBytes === "number" ? io.stderrBytes : undefined,
+    truncated: io.truncated === undefined ? undefined : Boolean(io.truncated),
+  };
+  for (const key of ["component", "command", "inputPreview", "message"]) {
+    if (io[key] !== undefined) out[key] = compactText(redactSecrets(String(io[key])), 1200).content;
+  }
+  for (const key of ["outputPreview", "stdoutPreview", "stderrPreview"]) {
+    if (io[key] !== undefined) out[key] = compactTail(redactSecrets(String(io[key])), 1200);
+  }
+  return out;
+}
+
+function compactTail(text, maxBytes) {
+  const value = String(text || "");
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  const marker = `[truncated older active I/O: original output was ${Buffer.byteLength(value, "utf8")} bytes]\n`;
+  const budget = Math.max(0, maxBytes - Buffer.byteLength(marker, "utf8"));
+  let out = value.slice(-budget);
+  while (Buffer.byteLength(out, "utf8") > budget) out = out.slice(1);
+  return `${marker}${out}`;
+}
+
+function redactSecrets(text) {
+  return String(text || "")
+    .replace(/(sk-[A-Za-z0-9_-]{12,})/g, "[redacted-api-key]")
+    .replace(/(Authorization:\s*Bearer\s+)[^\s]+/gi, "$1[redacted]")
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1[redacted]")
+    .replace(/\b([A-Za-z0-9_]*(?:TOKEN|SECRET|API[_-]?KEY|PASSWORD|PASSWD|AUTH|BEARER)[A-Za-z0-9_]*)\s*=\s*("[^"]*"|'[^']*'|[^\s'\"]+)/gi, "$1=[redacted]")
+    .replace(/(--?(?:token|secret|api[-_]?key|password|passwd|auth|bearer)(?:\s+|=))(("[^"]*")|('[^']*')|[^\s]+)/gi, "$1[redacted]");
 }
 
 export function emitAgentEvent(run, phase, agentEvent) {
@@ -310,6 +378,7 @@ export function projectRun(events = []) {
     progress: {},
     usage: emptyUsageSummary(),
     heartbeat: undefined,
+    activeIo: undefined,
     stale: undefined,
     lastMessage: first.message,
     eventCount: sorted.length,
@@ -373,6 +442,11 @@ export function projectRun(events = []) {
         summary.heartbeat = heartbeat;
         phase.heartbeat = heartbeat;
         phase.lastMessage = heartbeat.message || phase.lastMessage;
+      }
+      const activeIo = extractActiveIo(event.data, event);
+      if (activeIo) {
+        summary.activeIo = mergeActiveIo(summary.activeIo, activeIo);
+        phase.activeIo = mergeActiveIo(phase.activeIo, activeIo);
       }
       applyFanoutEvent(phase, event.data, event);
       applyUsageEvent(summary, phase, event.data, event);
@@ -528,6 +602,48 @@ function extractHeartbeat(data, event) {
     validator: data.validator,
     branch: data.branch,
     worktree: data.worktree,
+  });
+}
+
+function mergeActiveIo(previous, next) {
+  if (!previous) return next;
+  if (!next) return previous;
+  if (!previous.componentId || !next.componentId || previous.componentId !== next.componentId) return next;
+  return dropUndefined({
+    ...previous,
+    ...next,
+    inputPreview: next.inputPreview !== undefined ? next.inputPreview : previous.inputPreview,
+    command: next.command !== undefined ? next.command : previous.command,
+    cwd: next.cwd !== undefined ? next.cwd : previous.cwd,
+  });
+}
+
+function extractActiveIo(data, event) {
+  if (!data || typeof data !== "object") return undefined;
+  const kind = data.kind || data.type;
+  if (kind !== "active_io") return undefined;
+  return dropUndefined({
+    schema: data.schema || "thread-phase-active-io/v1",
+    timestamp: event.timestamp,
+    updatedAt: data.updatedAt || event.timestamp,
+    phase: event.phase,
+    componentId: data.componentId,
+    component: data.component,
+    role: data.role,
+    status: data.status,
+    pid: data.pid,
+    cwd: data.cwd,
+    command: data.command,
+    inputPreview: data.inputPreview,
+    outputPreview: data.outputPreview,
+    stdoutPreview: data.stdoutPreview,
+    stderrPreview: data.stderrPreview,
+    inputBytes: data.inputBytes,
+    outputBytes: data.outputBytes,
+    stdoutBytes: data.stdoutBytes,
+    stderrBytes: data.stderrBytes,
+    truncated: data.truncated,
+    message: data.message,
   });
 }
 

@@ -59,7 +59,7 @@ Use `ctrl+shift+t` to monitor/cancel. Use `thread_phase_runs` to inspect artifac
 - Must-level adversarial validator objections and coverage gaps fail milestone validation.
 - Final merge is manual by default; do not assume the mission branch is merged into the user's current branch.
 - Default `maxRepairIterations` is 10; it is configurable.
-- The runner emits heartbeat and operation watchdog events. Stale runs can appear when the process is gone, heartbeats stop, or heartbeats continue without non-heartbeat operation progress.
+- The runner emits heartbeat, operation watchdog, and active I/O snapshot events. Stale runs can appear when the process is gone, heartbeats stop, or heartbeats continue without non-heartbeat operation progress.
 - On failure, classify the failure before relaunching: runner/lifecycle, strict handoff, validation/implementation, git/worktree, or plan/contract quality.
 - Strict handoff failures should be inspected via both the raw handoff artifact and the `*-invalid.json` artifact. Patch normalization only when the worker output is semantically valid but formatted differently than expected.
 - Handoff `assertionsAddressed` must cover assigned contract/local assertions. Supplemental worker-only local evidence is allowed as `local:<slug>` or `{ type: "local", id: "..." }`, but it must not be counted as global contract coverage.

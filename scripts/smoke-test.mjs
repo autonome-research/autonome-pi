@@ -54,10 +54,33 @@ try {
   const smokeRun = storeApi.createRun({ workflow: 'usage-test', cwd: root, metadata: { sessionId: 'test' } });
   storeApi.phaseStart(smokeRun, 'agent');
   storeApi.phaseEvent(smokeRun, 'agent', { kind: 'usage', model: 'unit-model', usage: [{ input_tokens: 100, output_tokens: 25, cache_read_input_tokens: 10 }] });
+  storeApi.phaseEvent(smokeRun, 'agent', { kind: 'active_io', componentId: 'agent-1', component: 'unit agent --token rawsecret', role: 'pi', status: 'running', inputPreview: 'hello TOKEN="supersecret" --password hunter2', outputPreview: 'world' });
+  storeApi.emitActiveIo(smokeRun, 'agent', { componentId: 'agent-1', component: 'unit agent --token rawsecret2', role: 'pi', status: 'running', message: 'Authorization: Bearer abc123', outputPreview: 'tail sk-testsecret1234567890 --token=abc123' });
   storeApi.phaseEnd(smokeRun, 'agent', storeApi.STATUSES.SUCCESS);
   storeApi.completeRun(smokeRun, storeApi.STATUSES.SUCCESS);
   const summary = storeApi.getRunSummary(smokeRun.runId);
   log(summary.usage?.inputTokens === 100 && summary.usage?.outputTokens === 25 && summary.phases?.[0]?.usage?.cachedInputTokens === 10, 'usage projection aggregates run and phase usage', JSON.stringify(summary.usage));
+  log(summary.activeIo?.component?.includes('--token [redacted]') && summary.activeIo?.inputPreview?.includes('--password [redacted]') && summary.phases?.[0]?.activeIo?.outputPreview?.includes('[redacted-api-key]') && summary.phases?.[0]?.activeIo?.outputPreview?.includes('--token=[redacted]') && summary.activeIo?.message?.includes('[redacted]'), 'active I/O projection merges snapshots and redacts secrets', JSON.stringify(summary.activeIo));
+  const rawIoRun = storeApi.createRun({ workflow: 'active-io-raw-emit-test', cwd: root });
+  storeApi.emit(rawIoRun, { type: 'phase_event', phase: 'agent', message: 'TOKEN=rawsecret', data: { kind: 'active_io', component: 'raw --password rawsecret', outputPreview: 'Authorization: Bearer rawsecret', rawPrompt: 'SECRET=leak' } });
+  const rawIoEvent = storeApi.readRun(rawIoRun.runId).find((event) => event.data?.kind === 'active_io');
+  log(rawIoEvent?.message?.includes('[redacted]') && rawIoEvent?.data?.component?.includes('[redacted]') && rawIoEvent?.data?.outputPreview?.includes('[redacted]') && rawIoEvent?.data?.rawPrompt === undefined, 'raw emit active I/O is allowlisted/redacted before persistence', JSON.stringify(rawIoEvent));
+  const autoContinueRun = storeApi.createRun({ workflow: 'autocontinue-test', cwd: root, trigger: { kind: 'background' } });
+  storeApi.completeRun(autoContinueRun, storeApi.STATUSES.SUCCESS);
+  log(storeApi.getRunSummary(autoContinueRun.runId).metadata?.autoContinue !== true, 'thread-phase auto-continue is opt-in only');
+
+  const noIdIoRun = storeApi.createRun({ workflow: 'active-io-no-id-test', cwd: root });
+  storeApi.emitActiveIo(noIdIoRun, 'agent', { component: 'first', inputPreview: 'first input' });
+  storeApi.emitActiveIo(noIdIoRun, 'agent', { component: 'second', outputPreview: 'second output' });
+  const noIdIoSummary = storeApi.getRunSummary(noIdIoRun.runId);
+  log(noIdIoSummary.activeIo?.component === 'second' && !noIdIoSummary.activeIo?.inputPreview, 'active I/O without componentId projects latest snapshot without merging unrelated components', JSON.stringify(noIdIoSummary.activeIo));
+
+  const disabledIoRun = storeApi.createRun({ workflow: 'active-io-disabled-test', cwd: root });
+  process.env.PI_THREAD_PHASE_ACTIVE_IO = '0';
+  storeApi.phaseEvent(disabledIoRun, 'agent', { kind: 'active_io', component: 'disabled', outputPreview: 'should not persist' });
+  storeApi.emit(disabledIoRun, { type: 'phase_event', phase: 'agent', data: { kind: 'active_io', outputPreview: 'should not persist either' } });
+  delete process.env.PI_THREAD_PHASE_ACTIVE_IO;
+  log(!storeApi.readRun(disabledIoRun.runId).some((event) => event.data?.kind === 'active_io'), 'active I/O kill switch suppresses direct phaseEvent and raw emit active_io');
 
   expectExit('Pi extension package loads', ['pi', '--no-extensions', '-e', '.', '--list-models'], 0, { env: { PI_OFFLINE: '1' }, timeout: 60_000 });
 

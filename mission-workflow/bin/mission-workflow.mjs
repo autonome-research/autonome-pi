@@ -11,6 +11,7 @@ import {
   completeRun,
   createRun,
   failRun,
+  emitActiveIo,
   phaseEvent,
   readCancellation,
   wrapPhases,
@@ -35,6 +36,7 @@ const DEFAULT_PROCESS_TIMEOUT_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_P
 const DEFAULT_GIT_TIMEOUT_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_GIT_TIMEOUT_MS, 15 * 60 * 1000);
 const DEFAULT_WATCHDOG_STALE_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_WATCHDOG_STALE_MS, 2 * 60 * 1000);
 const TERMINATION_GRACE_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_TERMINATION_GRACE_MS, 5000);
+const ACTIVE_IO_INTERVAL_MS = parseMillis(process.env.PI_THREAD_PHASE_ACTIVE_IO_INTERVAL_MS, 5000);
 
 async function loadThreadPhaseCore() {
   try { return await import("@autonome-research/thread-phase"); }
@@ -108,6 +110,10 @@ function syntheticExitCode({ timedOut = false, aborted = false, code, signal }) 
 
 function emitPhaseEvent(run, phase, data) {
   try { phaseEvent(run, phase, data); } catch { /* best effort observability */ }
+}
+
+function emitActiveIoEvent(run, phase, data) {
+  try { emitActiveIo(run, phase, data); } catch { /* best effort observability */ }
 }
 
 function beginOperation(details = {}) {
@@ -285,6 +291,10 @@ function compactText(text, maxBytes = MAX_TEXT_BYTES) {
   return `${out}\n\n[truncated: original output was ${Buffer.byteLength(text, "utf8")} bytes]`;
 }
 
+function byteLength(text) {
+  return Buffer.byteLength(String(text || ""), "utf8");
+}
+
 function appendBounded(current, chunk, maxBytes = MAX_TEXT_BYTES) {
   const text = typeof chunk === "string" ? chunk : chunk.toString();
   if (!text || maxBytes <= 0) return current;
@@ -438,6 +448,33 @@ function runProcess(command, args = [], options = {}) {
     op.setChildPid(proc.pid);
     let stdout = "";
     let stderr = "";
+    let lastIoEmit = 0;
+    let inputPreviewEmitted = false;
+    const emitIo = (status = "running", force = false) => {
+      if (!activeRun) return;
+      const now = Date.now();
+      if (!force && now - lastIoEmit < ACTIVE_IO_INTERVAL_MS) return;
+      lastIoEmit = now;
+      const includeInput = !inputPreviewEmitted && String(process.env.PI_THREAD_PHASE_ACTIVE_IO_COMMANDS || "0") === "1";
+      const includePreviews = String(process.env.PI_THREAD_PHASE_ACTIVE_IO_PREVIEWS || "0") === "1";
+      inputPreviewEmitted = true;
+      const label = String(options.operationLabel || command);
+      emitActiveIoEvent(activeRun, options.phase || currentHeartbeat.phase || "process", {
+        componentId: op.operation.id,
+        component: label.includes(":") ? label.split(":")[0] : label,
+        role: "process",
+        status,
+        pid: proc.pid,
+        cwd: options.cwd,
+        command: String(process.env.PI_THREAD_PHASE_ACTIVE_IO_COMMANDS || "0") === "1" ? [command, ...args].join(" ") : undefined,
+        inputPreview: includeInput ? [command, ...args].join(" ") : undefined,
+        stdoutPreview: includePreviews ? stdout : undefined,
+        stderrPreview: includePreviews ? stderr : undefined,
+        stdoutBytes: byteLength(stdout),
+        stderrBytes: byteLength(stderr),
+      });
+    };
+    emitIo("running", true);
     let aborted = false;
     let timedOut = false;
     let settled = false;
@@ -462,6 +499,7 @@ function runProcess(command, args = [], options = {}) {
       const error = errorMessage || (timedOut ? `process timed out after ${timeoutMs}ms: ${options.operationLabel || command}` : aborted ? String(options.signal?.reason || "cancelled") : signalName ? `process terminated by ${signalName}: ${options.operationLabel || command}` : undefined);
       const ok = code === 0 && !aborted && !signalName && !timedOut;
       op.finish(ok ? "success" : "failed", { ...(error ? { error } : {}), ...(signalName ? { signal: signalName } : {}), ...(forced ? { forced: true } : {}), timedOut });
+      emitIo(ok ? "success" : timedOut ? "timeout" : aborted ? "cancelled" : "failed", true);
       resolve({ ok, code: exitCode, signal: signalName || undefined, stdout, stderr, aborted, timedOut, forced, error });
     };
     const terminate = (reason = "aborted") => {
@@ -477,8 +515,8 @@ function runProcess(command, args = [], options = {}) {
     timer?.unref?.();
     options.signal?.addEventListener("abort", terminate, { once: true });
     if (options.signal?.aborted) terminate();
-    proc.stdout.on("data", (data) => { op.touch(); stdout = appendBounded(stdout, data); });
-    proc.stderr.on("data", (data) => { op.touch(); stderr = appendBounded(stderr, data); });
+    proc.stdout.on("data", (data) => { op.touch(); stdout = appendBounded(stdout, data); emitIo(); });
+    proc.stderr.on("data", (data) => { op.touch(); stderr = appendBounded(stderr, data); emitIo(); });
     proc.on("error", (error) => finalize({ code: 1, errorMessage: timedOut ? `process timed out after ${timeoutMs}ms: ${options.operationLabel || command}` : error.message }));
     proc.on("close", (code, signalName) => finalize({ code, signalName }));
   });
@@ -630,7 +668,39 @@ async function runPi({ cwd, prompt, tools, model, timeoutMs = DEFAULT_PI_TIMEOUT
     activeChildren.add(proc);
     op.setChildPid(proc.pid);
     const parsed = createPiJsonLineParser();
+    let rawStdout = "";
     let stderr = "";
+    let lastIoEmit = 0;
+    let inputPreviewEmitted = false;
+    const emitIo = (status = "running", force = false) => {
+      if (!activeRun) return;
+      const now = Date.now();
+      if (!force && now - lastIoEmit < ACTIVE_IO_INTERVAL_MS) return;
+      lastIoEmit = now;
+      const result = { text: parsed.text, stdout: parsed.stdoutPreview, droppedBytes: parsed.droppedBytes, stopReason: parsed.stopReason };
+      const includeInput = !inputPreviewEmitted && String(process.env.PI_THREAD_PHASE_ACTIVE_IO_PROMPTS || "0") === "1";
+      const includePreviews = String(process.env.PI_THREAD_PHASE_ACTIVE_IO_PREVIEWS || "0") === "1";
+      inputPreviewEmitted = true;
+      emitActiveIoEvent(activeRun, phase || currentHeartbeat.phase || "pi", {
+        componentId: op.operation.id,
+        component: operationLabel,
+        role: "pi",
+        status,
+        pid: proc.pid,
+        cwd,
+        command: `${DEFAULT_PI} --mode json ...`,
+        inputPreview: includeInput ? prompt : undefined,
+        outputPreview: includePreviews ? result.text || result.stdout || rawStdout : undefined,
+        stdoutPreview: includePreviews ? rawStdout : undefined,
+        stderrPreview: includePreviews ? stderr : undefined,
+        inputBytes: byteLength(prompt),
+        stdoutBytes: byteLength(rawStdout),
+        stderrBytes: byteLength(stderr),
+        truncated: result.droppedBytes ? true : undefined,
+        message: result.stopReason ? `stopReason: ${result.stopReason}` : undefined,
+      });
+    };
+    emitIo("running", true);
     let aborted = false;
     let timedOut = false;
     let idleTimedOut = false;
@@ -659,6 +729,7 @@ async function runPi({ cwd, prompt, tools, model, timeoutMs = DEFAULT_PI_TIMEOUT
       const error = errorMessage || errorText(result) || (signalName ? `pi terminated by ${signalName}: ${operationLabel}` : code === 0 ? undefined : stderr || `pi exited ${code}`);
       const ok = code === 0 && !result.parserError && !aborted && !signalName && !timedOut && !idleTimedOut;
       op.finish(ok ? "success" : "failed", { ...(error ? { error } : {}), ...(signalName ? { signal: signalName } : {}), ...(forced ? { forced: true } : {}), timedOut, idleTimedOut });
+      emitIo(ok ? "success" : timedOut ? "timeout" : idleTimedOut ? "idle-timeout" : aborted ? "cancelled" : "failed", true);
       resolve({ ok, code: exitCode, signal: signalName || undefined, stderr, aborted, timedOut, idleTimedOut, forced, ...result, error });
     };
     const terminate = (reason = "aborted") => {
@@ -679,8 +750,8 @@ async function runPi({ cwd, prompt, tools, model, timeoutMs = DEFAULT_PI_TIMEOUT
     idleTimer?.unref?.();
     signal?.addEventListener("abort", terminate, { once: true });
     if (signal?.aborted) terminate();
-    proc.stdout.on("data", (data) => { op.touch(); consumePiJsonChunk(parsed, data); });
-    proc.stderr.on("data", (data) => { op.touch(); stderr = appendBounded(stderr, data); });
+    proc.stdout.on("data", (data) => { op.touch(); rawStdout = appendBounded(rawStdout, data); consumePiJsonChunk(parsed, data); emitIo(); });
+    proc.stderr.on("data", (data) => { op.touch(); stderr = appendBounded(stderr, data); emitIo(); });
     proc.on("error", (error) => finalize({ code: 1, errorMessage: errorText() || error.message }));
     proc.on("close", (code, signalName) => finalize({ code, signalName }));
   });
