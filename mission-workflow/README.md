@@ -69,6 +69,7 @@ await mission_workflow({
 - The runner avoids changing the user's current checkout by using separate worktrees.
 - Workers are asked not to commit; the deterministic runner owns commits.
 - Worker handoffs are strict JSON: missing/malformed handoffs, mismatched feature ids, unknown assertions, or changedFiles that disagree with git status/diff fail validation instead of being silently synthesized.
+- `assertionsAddressed` must include every assigned contract assertion and every assigned local assertion. Accepted forms include exact IDs, known contract IDs with explanatory suffixes such as `assertion-003: evidence`, verbose assigned local assertions such as `Local assertion: <assigned check>. Verified...`, and supplemental worker-only evidence as `{ "type": "local", "id": "..." }` or `local:<slug>`. Supplemental local evidence is preserved for reviewers but never satisfies global contract coverage.
 - The runner protects commit hygiene by excluding/removing common generated junk (`__pycache__`, `.pytest_cache`, `.venv`, `*.egg-info`, etc.) before staging and refusing junk in commits.
 - Monitor cancellation is cooperative through the thread-phase visualizer cancel file.
 

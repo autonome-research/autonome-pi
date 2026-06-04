@@ -62,6 +62,7 @@ Use `ctrl+shift+t` to monitor/cancel. Use `thread_phase_runs` to inspect artifac
 - The runner emits heartbeat events. Stale runs can appear when the process is gone or heartbeats stop.
 - On failure, classify the failure before relaunching: runner/lifecycle, strict handoff, validation/implementation, git/worktree, or plan/contract quality.
 - Strict handoff failures should be inspected via both the raw handoff artifact and the `*-invalid.json` artifact. Patch normalization only when the worker output is semantically valid but formatted differently than expected.
+- Handoff `assertionsAddressed` must cover assigned contract/local assertions. Supplemental worker-only local evidence is allowed as `local:<slug>` or `{ type: "local", id: "..." }`, but it must not be counted as global contract coverage.
 
 ## Current limitations
 

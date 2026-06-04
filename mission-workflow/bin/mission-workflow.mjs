@@ -892,6 +892,12 @@ function isSupplementalLocalAssertionId(id) {
   return String(id || "").trim().startsWith("local:");
 }
 
+function supplementalLocalAssertionId(id) {
+  const raw = String(id || "").trim();
+  if (!raw) return undefined;
+  return raw.startsWith("local:") ? raw : `local:${safeName(raw, "evidence")}`;
+}
+
 function localAssertionPrefixMatches(text, assertion) {
   if (text === assertion) return true;
   if (!text.startsWith(assertion)) return false;
@@ -927,11 +933,15 @@ function normalizeAssertionsAddressed(raw, plan, allowedLocalAssertions = []) {
   for (const value of values) {
     const rawId = typeof value === "object" && value ? String(value.id || "") : String(value);
     const rawDescription = typeof value === "object" && value ? String(value.description || "") : String(value);
+    const rawType = typeof value === "object" && value ? String(value.type || "").trim().toLowerCase() : "";
     const safeId = safeName(rawId, "assertion");
     const safeDescription = safeName(rawDescription, "assertion");
-    const assertionId = canonicalAssertionId(value, plan.validationContract);
-    const localAssertionId = assertionId ? undefined : canonicalLocalAssertionId(value, allowedLocalAssertions);
-    if (assertionId) ids.push(assertionId);
+    const localAssertionId = canonicalLocalAssertionId(value, allowedLocalAssertions);
+    const supplementalLocalId = supplementalLocalAssertionId(rawId || rawDescription || (typeof value === "object" && value ? String(value.summary || "") : ""));
+    const assertionId = rawType === "local" ? undefined : canonicalAssertionId(value, plan.validationContract);
+    if (rawType === "local" && localAssertionId) ids.push(localAssertionId);
+    else if (rawType === "local" && supplementalLocalId) ids.push(supplementalLocalId);
+    else if (assertionId) ids.push(assertionId);
     else if (localAssertionId) ids.push(localAssertionId);
     else if (isSupplementalLocalAssertionId(rawId)) ids.push(rawId.trim());
     else if (allowedLocal.has(rawId)) ids.push(rawId);
@@ -964,8 +974,10 @@ function validateHandoff({ handoff, featureId, feature, plan, changedFiles }) {
   if (String(handoff.featureId || "") !== featureId) errors.push(`handoff.featureId (${handoff.featureId}) does not match featureId (${featureId})`);
   if (typeof handoff.completed !== "boolean") errors.push("handoff.completed must be boolean");
   for (const field of ["changedFiles", "commandsRun", "assertionsAddressed", "issuesDiscovered", "leftUndone"]) if (!Array.isArray(handoff[field])) errors.push(`handoff.${field} must be an array`);
-  const featureAssertions = [...(Array.isArray(feature.assertions) ? feature.assertions.map(String) : []), ...(Array.isArray(feature.localAssertions) ? feature.localAssertions.map(String) : [])];
-  const normalizedAssertions = normalizeAssertionsAddressed(handoff.assertionsAddressed, plan, featureAssertions);
+  const contractAssertions = Array.isArray(feature.assertions) ? feature.assertions.map(String) : [];
+  const localAssertions = Array.isArray(feature.localAssertions) ? feature.localAssertions.map(String) : [];
+  const featureAssertions = [...contractAssertions, ...localAssertions];
+  const normalizedAssertions = normalizeAssertionsAddressed(handoff.assertionsAddressed, plan, localAssertions);
   errors.push(...normalizedAssertions.errors);
   for (const assertionId of normalizedAssertions.ids) if (featureAssertions.length && !featureAssertions.includes(assertionId) && !isSupplementalLocalAssertionId(assertionId)) errors.push(`Assertion ${assertionId} is not assigned to feature ${featureId}`);
   for (const assertionId of featureAssertions) if (!normalizedAssertions.ids.includes(assertionId)) errors.push(`handoff.assertionsAddressed omitted assigned assertion: ${assertionId}`);
@@ -1005,7 +1017,7 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
       "Before finishing, write a structured JSON handoff file at:",
       handoffRel,
       "The handoff JSON must include: featureId, completed, changedFiles, commandsRun[{command,exitCode}], assertionsAddressed, issuesDiscovered, leftUndone, notesForValidator.",
-      "assertionsAddressed must include every assigned contract assertion and every assigned local assertion for this feature.",
+      "assertionsAddressed must include every assigned contract assertion and every assigned local assertion for this feature. Supplemental worker-only evidence may be included as objects with type:'local' or ids prefixed local:, but supplemental local evidence does not count toward global contract coverage.",
       "Do not include the handoff file itself or generated junk (__pycache__, .pytest_cache, .venv, *.egg-info, etc.) in changedFiles.",
       "Mission goal:", plan.goal,
       "Before implementing, inspect relevant repository source/spec documents, especially specs.md, SPEC.md, requirements.md, README.md, docs/*.md, and any plan sourceDocs.",
