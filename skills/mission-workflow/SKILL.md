@@ -1,6 +1,6 @@
 ---
 name: mission-workflow
-description: Use when planning, approving, activating, debugging, or discussing Droid/Missions-style long-running Pi software missions with orchestrator planning, validation contracts, serial worker features, per-feature git worktrees/commits, command-based validators, and repair loops.
+description: Use when planning, approving, activating, debugging, or discussing Droid/Missions-style long-running Pi software missions with orchestrator planning, validation contracts, strict worker handoffs, per-feature git worktrees/commits, command/adversarial validators, durable registry/resume, coverage reports, and repair loops.
 ---
 
 # Mission Workflow
@@ -16,8 +16,9 @@ A mission is a long-running software-delivery workflow inspired by Droid/Factory
 3. Activated execution runs without more approval until success, failure, or cancellation.
 4. Workers implement features serially in isolated git worktrees.
 5. The runner commits each feature and advances a mission integration branch.
-6. Validators run at milestone boundaries.
-7. Failed validation creates repair features up to a capped iteration count.
+6. Command validators and a fresh read-only adversarial Pi validator run at milestone boundaries.
+7. Assertion coverage artifacts map requirements to features, commits, validators, and status.
+8. Must-level objections or coverage gaps create targeted repair features up to a capped iteration count.
 
 ## Tool usage
 
@@ -45,22 +46,23 @@ await mission_workflow({
 });
 ```
 
-Use `ctrl+shift+t` to monitor/cancel. Use `thread_phase_runs` to inspect artifacts. If an approved mission stopped unexpectedly, use `action: "resume"` with the same plan path and `approved: true`.
+Use `ctrl+shift+t` to monitor/cancel. Use `thread_phase_runs` to inspect artifacts. Durable mission state is under `~/.pi/agent/mission-workflow/registry/<missionId>/`. If an approved mission stopped unexpectedly, use `action: "resume"` with the same plan path and `approved: true`.
 
 ## Important rules
 
 - Do not activate without explicit user approval of the plan.
 - Once activated with `approved: true`, do not insert new human approval gates unless the mission fails or is cancelled.
 - Workers are serial, not parallel.
-- Read-only validators may fan out later, but the MVP is command-based.
+- Missing/malformed worker handoffs are failures; do not claim success without a valid handoff artifact.
+- Must-level adversarial validator objections and coverage gaps fail milestone validation.
 - Final merge is manual by default; do not assume the mission branch is merged into the user's current branch.
 - Default `maxRepairIterations` is 10; it is configurable.
 - The runner emits heartbeat events. Stale runs can appear when the process is gone or heartbeats stop.
 
-## Current MVP limitations
+## Current limitations
 
 - User-testing is command-based only.
-- Resume/reuse is MVP-level and skips already-merged planned feature branches; dynamic repair queue reconstruction should become smarter.
-- Repair features are generic and should become smarter.
+- Dynamic repair queue reconstruction should become smarter.
+- Browser/computer-use QA adapters are not implemented.
 - Worktree cleanup is best-effort.
 - Use small missions first while dogfooding.

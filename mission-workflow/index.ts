@@ -47,6 +47,15 @@ function parseJsonObject(stdout: string): any {
 	return JSON.parse(trimmed);
 }
 
+function compactDetails(details: any): any {
+	if (!details || typeof details !== "object") return details;
+	const out = { ...details };
+	if (out.plan && typeof out.plan === "object") out.plan = { missionId: out.plan.missionId, goal: out.plan.goal, planPath: out.planPath, milestoneCount: Array.isArray(out.plan.milestones) ? out.plan.milestones.length : undefined };
+	if (out.env && typeof out.env === "object") out.env = { missionBranch: out.env.missionBranch, integrationPath: out.env.integrationPath, repoRoot: out.env.repoRoot };
+	delete out.missionState;
+	return out;
+}
+
 function addSessionArgs(args: string[], ctx: any): string[] {
 	const sessionId = ctx.sessionManager?.getSessionId?.();
 	const sessionFile = ctx.sessionManager?.getSessionFile?.();
@@ -157,7 +166,7 @@ export default function missionWorkflow(pi: ExtensionAPI) {
 			onUpdate?.({ content: [{ type: "text", text: `${action === "activate" ? "Activating" : action === "resume" ? "Resuming" : action === "status" ? "Checking" : "Planning"} mission workflow in ${cwd}...` }] });
 			const result = await runScript(buildArgs({ ...params, action, cwd }, ctx), cwd, signal);
 			let details: any;
-			try { details = parseJsonObject(result.stdout); } catch { details = { stdout: result.stdout, stderr: result.stderr }; }
+			try { details = compactDetails(parseJsonObject(result.stdout)); } catch { details = { stdout: truncate(result.stdout), stderr: truncate(result.stderr) }; }
 			if (result.code !== 0 && !(params.background && details?.background)) throw new Error(result.stderr || result.stdout || `mission_workflow exited ${result.code}`);
 			const text = details?.background
 				? `Started mission workflow in background (pid ${details.pid}). Open ctrl+shift+t to monitor it.`

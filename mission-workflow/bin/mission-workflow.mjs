@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -18,6 +18,12 @@ import {
 const DEFAULT_PI = process.env.PI_MISSION_WORKFLOW_PI_BIN || (existsSync(join(homedir(), ".npm-global", "bin", "pi")) ? join(homedir(), ".npm-global", "bin", "pi") : "pi");
 const DEFAULT_MAX_REPAIR_ITERATIONS = 10;
 const MAX_TEXT_BYTES = 250_000;
+const MAX_PROMPT_CONTEXT_BYTES = 120_000;
+const REGISTRY_ROOT = join(homedir(), ".pi", "agent", "mission-workflow", "registry");
+const GENERATED_JUNK_PATTERNS = [
+  "__pycache__/", "*.py[cod]", ".pytest_cache/", ".venv/", "venv/", "env/", "*.egg-info/",
+  ".mypy_cache/", ".ruff_cache/", ".tox/", ".coverage", "coverage/", "dist/", "build/",
+];
 
 async function loadThreadPhaseCore() {
   try { return await import("@autonome-research/thread-phase"); }
@@ -167,6 +173,81 @@ function compactText(text, maxBytes = MAX_TEXT_BYTES) {
   return `${out}\n\n[truncated: original output was ${Buffer.byteLength(text, "utf8")} bytes]`;
 }
 
+function compactJson(value, maxBytes = MAX_PROMPT_CONTEXT_BYTES) {
+  return compactText(JSON.stringify(value, null, 2), maxBytes);
+}
+
+function readJsonFile(file, fallback = undefined) {
+  try { return JSON.parse(readFileSync(file, "utf8")); }
+  catch { return fallback; }
+}
+
+function registryDirFor(missionId) {
+  return join(REGISTRY_ROOT, safeName(missionId, "mission"));
+}
+
+function registryStatePath(missionId) {
+  return join(registryDirFor(missionId), "state.json");
+}
+
+function defaultRegistryState(plan, patch = {}) {
+  const now = new Date().toISOString();
+  return {
+    schema: "pi-mission-workflow/registry/v1",
+    missionId: plan.missionId,
+    goal: plan.goal,
+    status: "planned",
+    planPath: patch.planPath,
+    branch: patch.branch,
+    repoRoot: patch.repoRoot || plan.cwd,
+    worktree: patch.worktree,
+    worktreeBaseDir: plan.worktreeBaseDir,
+    current: {},
+    roleModels: { plan: plan.modelPlan, worker: plan.modelWorker, validator: plan.modelValidator },
+    completedFeatures: [],
+    validationReports: [],
+    coverageReports: [],
+    timestamps: { createdAt: now, updatedAt: now, startedAt: patch.startedAt },
+    ...patch,
+  };
+}
+
+function writeRegistryState(plan, state) {
+  const dir = registryDirFor(plan.missionId);
+  mkdirSync(dir, { recursive: true });
+  const next = {
+    ...state,
+    timestamps: { ...(state.timestamps || {}), updatedAt: new Date().toISOString() },
+  };
+  writeFileSync(registryStatePath(plan.missionId), JSON.stringify(next, null, 2), "utf8");
+  return { dir, statePath: registryStatePath(plan.missionId), state: next };
+}
+
+function updateRegistryState(plan, updater) {
+  const existing = readJsonFile(registryStatePath(plan.missionId), defaultRegistryState(plan));
+  const next = updater({ ...existing });
+  return writeRegistryState(plan, next || existing);
+}
+
+function persistRegistryPlan(plan, planPath) {
+  const dir = registryDirFor(plan.missionId);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "mission-plan.json"), JSON.stringify(plan, null, 2), "utf8");
+  writeFileSync(join(dir, "validation-contract.json"), JSON.stringify(plan.validationContract || {}, null, 2), "utf8");
+  const existing = readJsonFile(registryStatePath(plan.missionId), {});
+  const base = defaultRegistryState(plan, { planPath: planPath ? resolve(planPath) : existing.planPath });
+  return writeRegistryState(plan, {
+    ...base,
+    ...existing,
+    missionId: plan.missionId,
+    goal: plan.goal,
+    planPath: planPath ? resolve(planPath) : existing.planPath,
+    roleModels: { ...base.roleModels, ...(existing.roleModels || {}) },
+    timestamps: { ...(base.timestamps || {}), ...(existing.timestamps || {}) },
+    status: existing.status || "planned",
+  });
+}
+
 function splitList(value) {
   if (!value) return [];
   if (Array.isArray(value)) return value.flatMap(splitList);
@@ -239,6 +320,72 @@ async function git(cwd, args, options = {}) {
   const result = await runProcess("git", args, { cwd, signal: options.signal });
   if (!result.ok && options.reject !== false) throw new Error(result.stderr || result.stdout || `git ${args.join(" ")} exited ${result.code}`);
   return result;
+}
+
+function isGeneratedJunkPath(relPath) {
+  const normalized = String(relPath || "").replace(/\\/g, "/");
+  const parts = normalized.split("/").filter(Boolean);
+  return parts.some((part) => ["__pycache__", ".pytest_cache", ".venv", "venv", "env", ".mypy_cache", ".ruff_cache", ".tox"].includes(part) || part.endsWith(".egg-info"))
+    || /(^|\/)\.coverage$/.test(normalized)
+    || /(^|\/)\w+\.py[cod]$/.test(normalized);
+}
+
+function removeGeneratedJunk(cwd) {
+  const visit = (dir, rel = "") => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (entry.name === ".git") continue;
+      const abs = join(dir, entry.name);
+      const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+      if (isGeneratedJunkPath(childRel)) {
+        rmSync(abs, { recursive: true, force: true });
+        continue;
+      }
+      if (entry.isDirectory()) visit(abs, childRel);
+    }
+  };
+  visit(cwd);
+}
+
+function parseStatusPaths(stdout) {
+  const paths = [];
+  for (const line of String(stdout || "").split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const value = line.slice(3).trim();
+    if (!value) continue;
+    const renamed = value.includes(" -> ") ? value.split(" -> ").pop() : value;
+    paths.push(renamed);
+  }
+  return Array.from(new Set(paths));
+}
+
+async function ensureGeneratedJunkIgnored(cwd, signal) {
+  const gitPath = await git(cwd, ["rev-parse", "--git-path", "info/exclude"], { signal, reject: false });
+  if (!gitPath.ok) return undefined;
+  const excludePath = resolve(cwd, gitPath.stdout.trim());
+  mkdirSync(dirname(excludePath), { recursive: true });
+  const current = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
+  const missing = GENERATED_JUNK_PATTERNS.filter((pattern) => !current.split(/\r?\n/).includes(pattern));
+  if (missing.length) writeFileSync(excludePath, `${current}${current && !current.endsWith("\n") ? "\n" : ""}\n# Pi mission-workflow generated junk protection\n${missing.join("\n")}\n`, "utf8");
+  return excludePath;
+}
+
+async function restoreGeneratedJunkChanges(cwd, signal) {
+  const status = await git(cwd, ["status", "--short"], { signal, reject: false });
+  if (!status.ok) return [];
+  const junk = parseStatusPaths(status.stdout).filter(isGeneratedJunkPath);
+  if (junk.length) await git(cwd, ["restore", "--staged", "--worktree", "--", ...junk], { signal, reject: false });
+  return junk;
+}
+
+async function getChangedFiles(cwd, signal) {
+  const tracked = await git(cwd, ["diff", "--name-only", "HEAD"], { signal, reject: false });
+  const untracked = await git(cwd, ["ls-files", "--others", "--exclude-standard"], { signal, reject: false });
+  return Array.from(new Set([
+    ...(tracked.ok ? tracked.stdout.split(/\r?\n/).filter(Boolean) : []),
+    ...(untracked.ok ? untracked.stdout.split(/\r?\n/).filter(Boolean) : []),
+  ].filter((file) => !isGeneratedJunkPath(file)))).sort();
 }
 
 function parsePiJsonLines(stdout) {
@@ -416,6 +563,7 @@ async function createPlan(args, cwd, run, ctx) {
   plan = normalizePlan(plan, { goal, cwd: repoRoot, args, repoRoot });
   const planPath = writeArtifact(run, "mission-plan.json", plan, "json", "Mission plan");
   const contractPath = writeArtifact(run, "validation-contract.json", plan.validationContract, "json", "Validation contract");
+  const registry = persistRegistryPlan(plan, planPath);
   const approval = [
     "# Mission approval required",
     "",
@@ -429,7 +577,7 @@ async function createPlan(args, cwd, run, ctx) {
     "```",
   ].join("\n");
   const approvalPath = writeArtifact(run, "approval-instructions.md", approval, "markdown", "Approval instructions");
-  return { plan, planPath, contractPath, approvalPath };
+  return { plan, planPath, contractPath, approvalPath, registryPath: registry.statePath };
 }
 
 function validatePlanForActivation(plan) {
@@ -449,10 +597,12 @@ async function ensureMissionWorktrees(plan, ctx, run, options = {}) {
   mkdirSync(root, { recursive: true });
   if (existsSync(integrationPath)) {
     if (!options.resume) throw new Error(`integration worktree already exists: ${integrationPath}`);
+    await ensureGeneratedJunkIgnored(integrationPath, ctx.signal);
     phaseEvent(run, "prepare-mission", { kind: "data", key: "missionBranch", value: missionBranch, message: `Resuming ${missionBranch}` });
     return { repoRoot, baseHead, missionBranch, root, integrationPath, resumed: true };
   }
   await git(repoRoot, ["worktree", "add", "-B", missionBranch, integrationPath, baseHead], { signal: ctx.signal });
+  await ensureGeneratedJunkIgnored(integrationPath, ctx.signal);
   phaseEvent(run, "prepare-mission", { kind: "data", key: "missionBranch", value: missionBranch, message: `Created ${missionBranch}` });
   return { repoRoot, baseHead, missionBranch, root, integrationPath, resumed: false };
 }
@@ -468,13 +618,65 @@ async function branchMerged(cwd, branch, target, signal) {
   return result.ok;
 }
 
+function normalizeAssertionsAddressed(raw, plan) {
+  const assertions = plan.validationContract?.assertions || [];
+  const byId = new Map(assertions.map((assertion) => [String(assertion.id), assertion]));
+  const byDescription = new Map(assertions.map((assertion) => [String(assertion.description), assertion]));
+  const values = Array.isArray(raw) ? raw : [];
+  const ids = [];
+  const errors = [];
+  for (const value of values) {
+    const id = typeof value === "object" && value ? String(value.id || "") : String(value);
+    const description = typeof value === "object" && value ? String(value.description || "") : String(value);
+    const assertion = byId.get(id) || byDescription.get(description);
+    if (!assertion) errors.push(`Unknown assertion addressed: ${compactText(JSON.stringify(value), 500)}`);
+    else ids.push(String(assertion.id));
+  }
+  return { ids: Array.from(new Set(ids)), errors };
+}
+
+function summarizeHandoff(handoff, artifactPath) {
+  return {
+    artifact: artifactPath,
+    featureId: handoff.featureId,
+    completed: Boolean(handoff.completed),
+    changedFiles: Array.isArray(handoff.changedFiles) ? handoff.changedFiles.map(String) : [],
+    commandsRun: Array.isArray(handoff.commandsRun) ? handoff.commandsRun.map((cmd) => ({ command: String(cmd.command || ""), exitCode: Number(cmd.exitCode ?? 0) })) : [],
+    assertionsAddressed: Array.isArray(handoff.assertionsAddressed) ? handoff.assertionsAddressed.map((value) => typeof value === "object" && value ? String(value.id || value.description || "") : String(value)) : [],
+    issuesDiscoveredCount: Array.isArray(handoff.issuesDiscovered) ? handoff.issuesDiscovered.length : 0,
+    leftUndoneCount: Array.isArray(handoff.leftUndone) ? handoff.leftUndone.length : 0,
+    notesForValidator: compactText(String(handoff.notesForValidator || ""), 4000),
+  };
+}
+
+function validateHandoff({ handoff, featureId, feature, plan, changedFiles }) {
+  const errors = [];
+  const required = ["featureId", "completed", "changedFiles", "commandsRun", "assertionsAddressed", "issuesDiscovered", "leftUndone", "notesForValidator"];
+  for (const field of required) if (!(field in handoff)) errors.push(`Missing handoff field: ${field}`);
+  if (String(handoff.featureId || "") !== featureId) errors.push(`handoff.featureId (${handoff.featureId}) does not match featureId (${featureId})`);
+  if (typeof handoff.completed !== "boolean") errors.push("handoff.completed must be boolean");
+  for (const field of ["changedFiles", "commandsRun", "assertionsAddressed", "issuesDiscovered", "leftUndone"]) if (!Array.isArray(handoff[field])) errors.push(`handoff.${field} must be an array`);
+  const normalizedAssertions = normalizeAssertionsAddressed(handoff.assertionsAddressed, plan);
+  errors.push(...normalizedAssertions.errors);
+  const featureAssertions = Array.isArray(feature.assertions) ? feature.assertions.map(String) : [];
+  for (const assertionId of normalizedAssertions.ids) if (featureAssertions.length && !featureAssertions.includes(assertionId)) errors.push(`Assertion ${assertionId} is not assigned to feature ${featureId}`);
+  const declared = Array.isArray(handoff.changedFiles) ? Array.from(new Set(handoff.changedFiles.map(String).filter(Boolean))).sort() : [];
+  const actual = Array.from(new Set(changedFiles || [])).sort();
+  const missing = actual.filter((file) => !declared.includes(file));
+  const extra = declared.filter((file) => !actual.includes(file));
+  if (missing.length) errors.push(`handoff.changedFiles omitted changed files: ${missing.join(", ")}`);
+  if (extra.length) errors.push(`handoff.changedFiles listed files not changed in git status/diff: ${extra.join(", ")}`);
+  if (declared.some(isGeneratedJunkPath) || actual.some(isGeneratedJunkPath)) errors.push("Generated junk paths are not allowed in handoff.changedFiles or commits");
+  return { ok: errors.length === 0, errors, assertionsAddressed: normalizedAssertions.ids };
+}
+
 async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
   const featureId = safeName(feature.id || feature.title, "feature");
   const featureBranch = `mission-feature/${safeName(plan.missionId, "mission")}/${featureId}`;
   const featurePath = join(env.root, featureId);
   if (await branchMerged(env.repoRoot, featureBranch, env.missionBranch, ctx.signal)) {
     phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "resume", value: true, message: `Skipped already-merged ${featureId}` });
-    return { featureId, featureBranch, featurePath, skipped: true, resumed: true };
+    return { featureId, featureBranch, featurePath, assertions: feature.assertions || [], skipped: true, resumed: true };
   }
   if (existsSync(featurePath)) await git(env.repoRoot, ["worktree", "remove", "--force", featurePath], { signal: ctx.signal, reject: false });
   if (existsSync(featurePath)) rmSync(featurePath, { recursive: true, force: true });
@@ -487,6 +689,7 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
       "Before finishing, write a structured JSON handoff file at:",
       handoffRel,
       "The handoff JSON must include: featureId, completed, changedFiles, commandsRun[{command,exitCode}], assertionsAddressed, issuesDiscovered, leftUndone, notesForValidator.",
+      "Do not include the handoff file itself or generated junk (__pycache__, .pytest_cache, .venv, *.egg-info, etc.) in changedFiles.",
       "Mission goal:", plan.goal,
       "Before implementing, inspect relevant repository source/spec documents, especially specs.md, SPEC.md, requirements.md, README.md, docs/*.md, and any plan sourceDocs.",
       "Plan sourceDocs:", JSON.stringify(plan.sourceDocs || [], null, 2),
@@ -494,75 +697,220 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
       "Feature:", JSON.stringify(feature, null, 2),
       "Validation contract:", JSON.stringify(plan.validationContract, null, 2),
     ].join("\n");
+    await ensureGeneratedJunkIgnored(featurePath, ctx.signal);
     const result = String(plan.planner || "pi") === "mock"
       ? { ok: true, text: "mock worker", usage: [] }
       : await runPi({ cwd: featurePath, prompt, tools: ["read", "grep", "find", "ls", "edit", "write", "bash"], model: ctx.modelWorker, signal: ctx.signal });
     if (result.usage?.length) phaseEvent(run, `worker-${featureId}`, { kind: "usage", usage: result.usage, model: result.model });
     if (!result.ok) throw new Error(result.error || `worker failed for ${featureId}`);
     const handoffPath = join(featurePath, handoffRel);
-    let handoff;
-    if (existsSync(handoffPath)) {
-      handoff = parseJsonFromText(readFileSync(handoffPath, "utf8"));
-    } else {
-      const status = await git(featurePath, ["status", "--short"], { signal: ctx.signal, reject: false });
-      handoff = { featureId, completed: true, changedFiles: status.stdout.split(/\r?\n/).filter(Boolean).map((line) => line.slice(3)), commandsRun: [], assertionsAddressed: feature.assertions || [], issuesDiscovered: ["Worker did not write handoff file; runner synthesized a minimal handoff."], leftUndone: [], notesForValidator: result.text || "" };
+    if (String(plan.planner || "pi") === "mock" && !existsSync(handoffPath)) {
+      mkdirSync(dirname(handoffPath), { recursive: true });
+      writeFileSync(handoffPath, JSON.stringify({ featureId, completed: true, changedFiles: [], commandsRun: [], assertionsAddressed: feature.assertions || [], issuesDiscovered: [], leftUndone: [], notesForValidator: "Mock worker completed with no repository changes." }, null, 2), "utf8");
     }
-    writeArtifact(run, `handoffs/${featureId}.json`, handoff, "json", `Worker handoff: ${featureId}`);
-    const status = await git(featurePath, ["status", "--short"], { signal: ctx.signal, reject: false });
-    if (!status.stdout.trim()) {
+    if (!existsSync(handoffPath)) {
+      const failure = { featureId, passed: false, errors: [`Worker did not write required handoff file: ${handoffRel}`] };
+      writeArtifact(run, `handoffs/${featureId}-invalid.json`, failure, "json", `Invalid worker handoff: ${featureId}`);
+      throw new Error(`Strict handoff validation failed for ${featureId}: missing ${handoffRel}`);
+    }
+    const handoff = parseJsonFromText(readFileSync(handoffPath, "utf8"));
+    const handoffArtifact = writeArtifact(run, `handoffs/${featureId}.json`, handoff, "json", `Worker handoff: ${featureId}`);
+    rmSync(handoffPath, { force: true });
+    await git(featurePath, ["reset", "-q"], { signal: ctx.signal, reject: false });
+    removeGeneratedJunk(featurePath);
+    await restoreGeneratedJunkChanges(featurePath, ctx.signal);
+    const changedFiles = await getChangedFiles(featurePath, ctx.signal);
+    const handoffValidation = validateHandoff({ handoff, featureId, feature, plan, changedFiles });
+    if (!handoffValidation.ok) {
+      const failure = { featureId, passed: false, errors: handoffValidation.errors, changedFiles, handoffArtifact };
+      writeArtifact(run, `handoffs/${featureId}-invalid.json`, failure, "json", `Invalid worker handoff: ${featureId}`);
+      throw new Error(`Strict handoff validation failed for ${featureId}: ${handoffValidation.errors.join("; ")}`);
+    }
+    handoff.assertionsAddressed = handoffValidation.assertionsAddressed;
+    const handoffSummary = summarizeHandoff(handoff, handoffArtifact);
+    if (!changedFiles.length) {
       phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "changes", value: 0, message: "No file changes to commit" });
-      return { featureId, featureBranch, featurePath, handoff, commit: undefined };
+      return { featureId, featureBranch, featurePath, assertions: handoffValidation.assertionsAddressed.length ? handoffValidation.assertionsAddressed : (feature.assertions || []), handoffArtifact, handoff: handoffSummary, changedFiles, commit: undefined };
     }
     await git(featurePath, ["add", "-A"], { signal: ctx.signal });
+    const staged = await git(featurePath, ["diff", "--cached", "--name-only"], { signal: ctx.signal, reject: false });
+    const junkStaged = (staged.ok ? staged.stdout.split(/\r?\n/).filter(Boolean) : []).filter(isGeneratedJunkPath);
+    if (junkStaged.length) {
+      await git(featurePath, ["restore", "--staged", "--", ...junkStaged], { signal: ctx.signal, reject: false });
+      throw new Error(`Generated junk staged for commit in ${featureId}: ${junkStaged.join(", ")}`);
+    }
     await git(featurePath, ["commit", "-m", `mission(${plan.missionId}): ${feature.title || featureId}`], { signal: ctx.signal });
     const commit = (await git(featurePath, ["rev-parse", "HEAD"], { signal: ctx.signal })).stdout.trim();
     await git(env.integrationPath, ["merge", "--ff-only", featureBranch], { signal: ctx.signal });
     phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "commit", value: commit, message: `Committed ${featureId}` });
-    return { featureId, featureBranch, featurePath, handoff: { ...handoff, commit }, commit };
+    return { featureId, featureBranch, featurePath, assertions: handoffValidation.assertionsAddressed.length ? handoffValidation.assertionsAddressed : (feature.assertions || []), handoffArtifact, handoff: handoffSummary, changedFiles, commit };
   } finally {
     await git(env.repoRoot, ["worktree", "remove", "--force", featurePath], { signal: ctx.signal, reject: false });
   }
 }
 
-async function runValidation(env, plan, milestone, ctx, run) {
+function milestoneAssertionIds(plan, milestone) {
+  const ids = new Set();
+  for (const feature of milestone.features || []) for (const id of feature.assertions || []) ids.add(String(id));
+  return ids.size ? ids : new Set((plan.validationContract?.assertions || []).map((assertion) => String(assertion.id)));
+}
+
+function buildCoverageReport({ plan, milestone, iterationState, commandReports, validatorReport, scope = "milestone" }) {
+  const milestoneIds = milestone ? milestoneAssertionIds(plan, milestone) : new Set((plan.validationContract?.assertions || []).map((assertion) => String(assertion.id)));
+  const featureResults = iterationState?.features || [];
+  const featuresByAssertion = new Map();
+  const allPlanFeatures = (plan.milestones || []).flatMap((m) => m.features || []);
+  const candidateFeatures = scope === "final" ? allPlanFeatures : (milestone?.features || []);
+  for (const feature of candidateFeatures) for (const id of feature.assertions || []) {
+    const key = String(id);
+    if (!featuresByAssertion.has(key)) featuresByAssertion.set(key, []);
+    const result = featureResults.find((item) => item.featureId === safeName(feature.id || feature.title, "feature"));
+    featuresByAssertion.get(key).push({ featureId: safeName(feature.id || feature.title, "feature"), title: feature.title, commit: result?.commit, handoff: result?.handoffArtifact || result?.handoff?.artifact, status: result ? (result.skipped ? "previously-completed" : "completed") : "planned" });
+  }
+  for (const result of featureResults) for (const id of result.assertions || []) {
+    const key = String(id);
+    if (!featuresByAssertion.has(key)) featuresByAssertion.set(key, []);
+    if (!featuresByAssertion.get(key).some((item) => item.featureId === result.featureId && item.commit === result.commit)) featuresByAssertion.get(key).push({ featureId: result.featureId, title: result.featureId, commit: result.commit, handoff: result.handoffArtifact || result.handoff?.artifact, status: result.skipped ? "previously-completed" : "completed" });
+  }
+  const validatorAssertions = new Map((validatorReport?.assertionResults || []).map((result) => [String(result.assertionId), result]));
+  const commandPassed = commandReports.every((report) => report.passed);
+  const rows = (plan.validationContract?.assertions || []).filter((assertion) => scope === "final" || milestoneIds.has(String(assertion.id))).map((assertion) => {
+    const features = featuresByAssertion.get(String(assertion.id)) || [];
+    const validator = validatorAssertions.get(String(assertion.id));
+    const validators = [
+      ...commandReports.map((report) => ({ validator: report.validator, command: report.command, passed: report.passed, artifact: report.artifact })),
+      ...(validatorReport ? [{ validator: "adversarial-scrutiny", passed: validatorReport.passed && validator?.status !== "fail", artifact: validatorReport.artifact, evidence: validator?.evidence }] : []),
+    ];
+    let status = "pass";
+    const gaps = [];
+    if (!features.length) { status = "gap"; gaps.push("No planned/executed feature maps to assertion."); }
+    if (!commandPassed) { status = "fail"; gaps.push("One or more command validators failed."); }
+    if (validator?.status === "fail") { status = "fail"; gaps.push(validator.evidence || "Adversarial validator failed assertion."); }
+    if (validatorReport === null) { status = status === "pass" ? "unknown" : status; gaps.push("No adversarial validator report available."); }
+    return { assertionId: assertion.id, description: assertion.description, priority: assertion.priority || "must", features, commits: features.map((f) => f.commit).filter(Boolean), validators, status, gaps };
+  });
+  const gaps = rows.filter((row) => row.status !== "pass" && row.priority === "must").flatMap((row) => row.gaps.map((gap) => ({ assertionId: row.assertionId, level: "must", description: gap })));
+  return { schema: "pi-mission-workflow/coverage/v1", scope, milestoneId: milestone?.id, generatedAt: new Date().toISOString(), assertions: rows, gaps };
+}
+
+function normalizeValidatorReport(raw, { plan, milestone, coverageGaps }) {
+  const objections = Array.isArray(raw?.objections) ? raw.objections.map((objection) => ({
+    level: ["must", "should", "nit"].includes(String(objection.level)) ? String(objection.level) : "must",
+    assertionId: objection.assertionId ? String(objection.assertionId) : undefined,
+    description: String(objection.description || objection.summary || objection.message || "Validator objection"),
+    evidence: String(objection.evidence || ""),
+    repairHint: String(objection.repairHint || objection.repair || ""),
+  })) : [];
+  for (const gap of coverageGaps || []) objections.push({ level: "must", assertionId: gap.assertionId, description: `Coverage gap: ${gap.description}`, evidence: "Requirement/assertion coverage report", repairHint: "Add or repair a feature that directly satisfies this assertion." });
+  const assertionResults = Array.isArray(raw?.assertionResults) ? raw.assertionResults.map((result) => ({ assertionId: String(result.assertionId || ""), status: String(result.status || "unknown"), evidence: String(result.evidence || "") })) : (plan.validationContract?.assertions || []).filter((assertion) => milestoneAssertionIds(plan, milestone).has(String(assertion.id))).map((assertion) => ({ assertionId: assertion.id, status: objections.some((o) => o.assertionId === assertion.id && o.level === "must") ? "fail" : "pass", evidence: "Adversarial scrutiny completed." }));
+  return {
+    schema: "pi-mission-workflow/adversarial-validation/v1",
+    milestoneId: milestone.id,
+    passed: !objections.some((objection) => objection.level === "must") && raw?.passed !== false,
+    summary: String(raw?.summary || "Adversarial scrutiny completed."),
+    objections,
+    assertionResults,
+    correctiveFeatures: Array.isArray(raw?.correctiveFeatures) ? raw.correctiveFeatures : objections.filter((o) => o.level === "must").map((objection) => ({ title: `Repair ${objection.assertionId || milestone.id}: ${objection.description}`.slice(0, 160), assertions: objection.assertionId ? [objection.assertionId] : Array.from(milestoneAssertionIds(plan, milestone)), rationale: objection.evidence || objection.description })),
+  };
+}
+
+async function runAdversarialValidator(env, plan, milestone, iterationState, commandReports, coverageDraft, ctx, run) {
+  let raw;
+  if (String(plan.planner || "pi") === "mock") {
+    raw = { passed: true, summary: "Mock adversarial validator accepted the milestone.", objections: [], assertionResults: Array.from(milestoneAssertionIds(plan, milestone)).map((assertionId) => ({ assertionId, status: "pass", evidence: "Mock validation." })) };
+  } else {
+    const diffStat = await git(env.integrationPath, ["diff", "--stat", `${env.baseHead}..HEAD`], { signal: ctx.signal, reject: false });
+    const diffFiles = await git(env.integrationPath, ["diff", "--name-only", `${env.baseHead}..HEAD`], { signal: ctx.signal, reject: false });
+    const prompt = compactText([
+      "You are a fresh read-only Pi validator agent. Do not edit files or write commits. You may only inspect with read/grep/find/ls.",
+      "Adversarially validate the completed milestone. Be skeptical: must-level objections block the mission and should become targeted repair features.",
+      "Review the original/source docs (README.md, specs.md, SPEC.md, requirements.md, docs/*.md, and plan.sourceDocs), validation contract, milestone worker handoffs, git diff, and command validation outputs.",
+      "Return ONLY JSON with schema, milestoneId, passed, summary, objections[{level,assertionId,description,evidence,repairHint}], assertionResults[{assertionId,status,evidence}], correctiveFeatures[{title,description,assertions,rationale}].",
+      `Mission goal: ${plan.goal}`,
+      `Plan sourceDocs: ${compactJson(plan.sourceDocs || [], 8000)}`,
+      `Validation contract: ${compactJson(plan.validationContract, 30000)}`,
+      `Milestone: ${compactJson({ id: milestone.id, title: milestone.title, features: milestone.features }, 30000)}`,
+      `Worker handoffs and commits: ${compactJson(iterationState.features.map((feature) => ({ featureId: feature.featureId, commit: feature.commit, skipped: feature.skipped, handoffArtifact: feature.handoffArtifact, handoff: feature.handoff, changedFiles: feature.changedFiles })), 30000)}`,
+      `Command validation reports: ${compactJson(commandReports, 30000)}`,
+      `Coverage draft: ${compactJson(coverageDraft, 30000)}`,
+      `Git diff stat ${env.baseHead}..HEAD:\n${compactText(diffStat.stdout || diffStat.stderr || "", 12000)}`,
+      `Git diff files ${env.baseHead}..HEAD:\n${compactText(diffFiles.stdout || diffFiles.stderr || "", 12000)}`,
+    ].join("\n\n"), MAX_PROMPT_CONTEXT_BYTES);
+    const validatorPromptPath = writeArtifact(run, `validation/${safeName(milestone.id)}-validator-prompt.md`, prompt, "markdown", `Validator prompt: ${milestone.id}`);
+    const result = await runPi({ cwd: env.integrationPath, prompt, tools: ["read", "grep", "find", "ls"], model: ctx.modelValidator, signal: ctx.signal });
+    if (result.usage?.length) phaseEvent(run, `validator-${milestone.id}`, { kind: "usage", usage: result.usage, model: result.model });
+    if (!result.ok) raw = { passed: false, summary: "Validator agent failed.", objections: [{ level: "must", description: result.error || "validator failed", evidence: compactText(result.stderr || result.stdout || "", 4000), repairHint: "Rerun or repair validation environment." }], assertionResults: [] };
+    else {
+      try { raw = parseJsonFromText(result.text); }
+      catch (error) {
+        writeArtifact(run, `validation/${safeName(milestone.id)}-validator-output.md`, result.text, "markdown", `Validator raw output: ${milestone.id}`);
+        raw = { passed: false, summary: "Validator returned malformed JSON.", objections: [{ level: "must", description: error.message, evidence: validatorPromptPath, repairHint: "Return strict JSON validation report." }], assertionResults: [] };
+      }
+    }
+  }
+  const normalized = normalizeValidatorReport(raw, { plan, milestone, coverageGaps: coverageDraft.gaps });
+  const artifactPath = writeArtifact(run, `validation/${safeName(milestone.id)}-adversarial-report.json`, normalized, "json", `Adversarial validation report: ${milestone.id}`);
+  return { ...normalized, artifact: artifactPath };
+}
+
+async function runValidation(env, plan, milestone, iterationState, ctx, run) {
   const reports = [];
   for (const command of plan.validationCommands || []) {
     const result = await runProcess(command, [], { cwd: env.integrationPath, shell: true, signal: ctx.signal });
     const file = writeArtifact(run, `validation/${safeName(milestone.id)}-${safeName(command)}.txt`, [`$ ${command}`, "", result.stdout, result.stderr].join("\n"), "file", `Validation command: ${command}`);
-    reports.push({ validator: "scrutiny", command, passed: result.ok, exitCode: result.code, artifact: file });
+    reports.push({ validator: "scrutiny-command", command, passed: result.ok, exitCode: result.code, artifact: file, stdoutExcerpt: compactText(result.stdout || "", 4000), stderrExcerpt: compactText(result.stderr || "", 4000) });
   }
   if (plan.userTestCommand) {
     const command = plan.userTestCommand;
     const result = await runProcess(command, [], { cwd: env.integrationPath, shell: true, signal: ctx.signal });
     const file = writeArtifact(run, `validation/${safeName(milestone.id)}-user-test.txt`, [`$ ${command}`, "", result.stdout, result.stderr].join("\n"), "file", `User testing command: ${command}`);
-    reports.push({ validator: "user-testing", command, passed: result.ok, exitCode: result.code, artifact: file });
+    reports.push({ validator: "user-testing-command", command, passed: result.ok, exitCode: result.code, artifact: file, stdoutExcerpt: compactText(result.stdout || "", 4000), stderrExcerpt: compactText(result.stderr || "", 4000) });
   }
-  if (reports.length === 0) reports.push({ validator: "scrutiny", command: "none", passed: true, note: "No validation commands configured." });
-  const passed = reports.every((report) => report.passed);
-  const assertionResults = (plan.validationContract?.assertions || []).map((assertion) => ({ assertionId: assertion.id, status: passed ? "pass" : "unknown", evidence: passed ? "Configured validation passed." : "One or more validation commands failed." }));
-  const report = { milestoneId: milestone.id, passed, reports, assertionResults, correctiveFeatures: passed ? [] : [{ title: `Repair validation failures for ${milestone.title}`, assertions: assertionResults.map((r) => r.assertionId), rationale: "Validation command failed." }] };
-  writeArtifact(run, `validation/${safeName(milestone.id)}-report.json`, report, "json", `Validation report: ${milestone.id}`);
-  return report;
+  if (reports.length === 0) reports.push({ validator: "scrutiny-command", command: "none", passed: true, note: "No validation commands configured." });
+  const coverageDraft = buildCoverageReport({ plan, milestone, iterationState, commandReports: reports, validatorReport: undefined, scope: "milestone" });
+  const validatorReport = await runAdversarialValidator(env, plan, milestone, iterationState, reports, coverageDraft, ctx, run);
+  const coverage = buildCoverageReport({ plan, milestone, iterationState, commandReports: reports, validatorReport, scope: "milestone" });
+  const coveragePath = writeArtifact(run, `coverage/${safeName(milestone.id)}-coverage.json`, coverage, "json", `Coverage: ${milestone.id}`);
+  const commandPassed = reports.every((report) => report.passed);
+  const mustObjections = validatorReport.objections.filter((objection) => objection.level === "must");
+  const passed = commandPassed && mustObjections.length === 0 && coverage.gaps.length === 0;
+  const assertionResults = coverage.assertions.map((row) => ({ assertionId: row.assertionId, status: row.status === "pass" ? "pass" : "fail", evidence: row.gaps.join("; ") || "Command and adversarial validators passed." }));
+  const correctiveFeatures = passed ? [] : [
+    ...validatorReport.correctiveFeatures,
+    ...coverage.gaps.map((gap) => ({ title: `Close coverage gap for ${gap.assertionId}`, assertions: [gap.assertionId], rationale: gap.description })),
+    ...(!commandPassed ? [{ title: `Repair validation command failures for ${milestone.title}`, assertions: assertionResults.map((r) => r.assertionId), rationale: "Validation command failed." }] : []),
+  ];
+  const report = { schema: "pi-mission-workflow/milestone-validation/v1", milestoneId: milestone.id, passed, reports, validatorReport, coveragePath, assertionResults, correctiveFeatures };
+  const reportPath = writeArtifact(run, `validation/${safeName(milestone.id)}-report.json`, report, "json", `Validation report: ${milestone.id}`);
+  return { ...report, artifact: reportPath };
 }
 
-function repairFeatureFromReport(report, iteration) {
-  return {
-    id: `repair-${safeName(report.milestoneId)}-${iteration}`,
-    title: report.correctiveFeatures?.[0]?.title || `Repair ${report.milestoneId}`,
-    description: `Repair validation failures from report: ${JSON.stringify(report.reports || [], null, 2)}`,
-    assertions: report.assertionResults?.map((result) => result.assertionId).filter(Boolean) || [],
+function repairFeaturesFromReport(report, iteration) {
+  const fallback = { title: `Repair ${report.milestoneId}`, assertions: report.assertionResults?.map((result) => result.assertionId).filter(Boolean) || [], rationale: "Milestone validation failed." };
+  const corrective = report.correctiveFeatures?.length ? report.correctiveFeatures : [fallback];
+  return corrective.map((feature, index) => ({
+    id: `repair-${safeName(report.milestoneId)}-${iteration}-${index + 1}`,
+    title: feature.title || fallback.title,
+    description: compactText(feature.description || `Repair validation failures from report: ${JSON.stringify({ commandReports: report.reports || [], objections: report.validatorReport?.objections || [], coveragePath: report.coveragePath, rationale: feature.rationale }, null, 2)}`, 8000),
+    assertions: Array.isArray(feature.assertions) && feature.assertions.length ? feature.assertions.map(String) : fallback.assertions,
     repair: true,
-  };
+  }));
 }
 
 async function activateMission(args, cwd, run, ctx) {
   if (!isTruthyFlag(args.approved)) throw new Error("Activation requires --approved after the user reviews the mission plan.");
   if (!args["plan-path"]) throw new Error("--plan-path is required for activation");
-  const plan = validatePlanForActivation(JSON.parse(readFileSync(resolve(cwd, String(args["plan-path"])), "utf8")));
+  const planPathAbs = resolve(cwd, String(args["plan-path"]));
+  const plan = validatePlanForActivation(JSON.parse(readFileSync(planPathAbs, "utf8")));
   ctx.modelWorker = args["model-worker"] || plan.modelWorker || ctx.modelWorker;
   ctx.modelValidator = args["model-validator"] || plan.modelValidator || ctx.modelValidator;
+  persistRegistryPlan(plan, planPathAbs);
   const env = await ensureMissionWorktrees(plan, ctx, run, { resume: isTruthyFlag(args.resume) });
-  const missionState = { missionId: plan.missionId, missionBranch: env.missionBranch, integrationPath: env.integrationPath, baseHead: env.baseHead, modelWorker: ctx.modelWorker, modelValidator: ctx.modelValidator, resumed: env.resumed, milestones: [], startedAt: new Date().toISOString() };
+  const priorRegistry = readJsonFile(registryStatePath(plan.missionId), {});
+  if (isTruthyFlag(args.resume) && priorRegistry.branch && priorRegistry.branch !== env.missionBranch) throw new Error(`Registry branch ${priorRegistry.branch} does not match expected mission branch ${env.missionBranch}`);
+  phaseEvent(run, "prepare-mission", { kind: "data", key: "registry", value: registryStatePath(plan.missionId), message: "Using durable mission registry" });
+  const registry = updateRegistryState(plan, (state) => ({ ...state, status: "running", planPath: planPathAbs, branch: env.missionBranch, repoRoot: env.repoRoot, worktree: env.integrationPath, worktreeBaseDir: env.root, roleModels: { plan: plan.modelPlan, worker: ctx.modelWorker, validator: ctx.modelValidator }, resumed: env.resumed, resumeCompletedFeatureCount: isTruthyFlag(args.resume) ? (priorRegistry.completedFeatures || []).length : undefined, timestamps: { ...(state.timestamps || {}), startedAt: state.timestamps?.startedAt || new Date().toISOString() } }));
+  const missionState = { missionId: plan.missionId, missionBranch: env.missionBranch, integrationPath: env.integrationPath, baseHead: env.baseHead, registryPath: registry.statePath, modelWorker: ctx.modelWorker, modelValidator: ctx.modelValidator, resumed: env.resumed, milestones: [], startedAt: new Date().toISOString() };
   for (const milestone of plan.milestones) {
     currentHeartbeat = { phase: "execute-mission", missionId: plan.missionId, milestoneId: milestone.id, milestoneTitle: milestone.title, branch: env.missionBranch, worktree: env.integrationPath };
     let iteration = 0;
@@ -572,28 +920,42 @@ async function activateMission(args, cwd, run, ctx) {
       if (ctx.signal.aborted) throw abortError(ctx.signal.reason || "cancelled");
       iteration++;
       const iterationState = { iteration, features: [], validation: undefined };
+      updateRegistryState(plan, (state) => ({ ...state, current: { milestoneId: milestone.id, iteration }, status: "running" }));
       for (const feature of queue) {
         const featureId = safeName(feature.id || feature.title, "feature");
         currentHeartbeat = { phase: "execute-mission", missionId: plan.missionId, milestoneId: milestone.id, iteration, featureId, branch: env.missionBranch, worktree: env.integrationPath };
+        updateRegistryState(plan, (state) => ({ ...state, current: { milestoneId: milestone.id, iteration, featureId }, status: "running" }));
         phaseEvent(run, "execute-mission", { kind: "heartbeat", ...currentHeartbeat, pid: process.pid, childPids: Array.from(activeChildren).map((child) => child.pid).filter(Boolean), message: `Worker ${featureId}` });
         phaseEvent(run, "execute-mission", { kind: "progress", current: iterationState.features.length, total: queue.length, message: `Worker ${featureId}` });
         const result = await runWorkerForFeature(env, milestone, feature, plan, ctx, run);
         iterationState.features.push(result);
+        updateRegistryState(plan, (state) => ({ ...state, completedFeatures: [...(state.completedFeatures || []).filter((item) => item.featureId !== result.featureId), { featureId: result.featureId, milestoneId: milestone.id, iteration, branch: result.featureBranch, commit: result.commit, handoffArtifact: result.handoffArtifact, changedFiles: result.changedFiles || [], assertions: result.assertions || [], skipped: Boolean(result.skipped), completedAt: new Date().toISOString() }] }));
       }
       queue = [];
-      currentHeartbeat = { phase: "execute-mission", missionId: plan.missionId, milestoneId: milestone.id, iteration, validator: "commands", branch: env.missionBranch, worktree: env.integrationPath };
-      const validation = await runValidation(env, plan, milestone, ctx, run);
-      iterationState.validation = validation;
+      currentHeartbeat = { phase: "execute-mission", missionId: plan.missionId, milestoneId: milestone.id, iteration, validator: "adversarial-scrutiny", branch: env.missionBranch, worktree: env.integrationPath };
+      const validation = await runValidation(env, plan, milestone, iterationState, ctx, run);
+      iterationState.validation = { artifact: validation.artifact, passed: validation.passed, coveragePath: validation.coveragePath, objections: validation.validatorReport?.objections || [] };
       milestoneState.iterations.push(iterationState);
-      writeArtifact(run, `state/${safeName(milestone.id)}-iteration-${iteration}.json`, iterationState, "json", `Mission state: ${milestone.id} iteration ${iteration}`);
+      const iterationPath = writeArtifact(run, `state/${safeName(milestone.id)}-iteration-${iteration}.json`, iterationState, "json", `Mission state: ${milestone.id} iteration ${iteration}`);
+      updateRegistryState(plan, (state) => ({ ...state, validationReports: [...(state.validationReports || []), { milestoneId: milestone.id, iteration, artifact: validation.artifact, coveragePath: validation.coveragePath, passed: validation.passed, completedAt: new Date().toISOString() }], coverageReports: [...(state.coverageReports || []), { milestoneId: milestone.id, iteration, artifact: validation.coveragePath }], current: { milestoneId: milestone.id, iteration, validationReport: validation.artifact }, lastIterationState: iterationPath }));
       if (validation.passed) break;
       if (iteration >= Number(plan.maxRepairIterations || DEFAULT_MAX_REPAIR_ITERATIONS)) throw new Error(`Mission ${plan.missionId} reached max repair iterations (${iteration}) for ${milestone.id}`);
-      queue = [repairFeatureFromReport(validation, iteration)];
+      queue = repairFeaturesFromReport(validation, iteration);
     }
     missionState.milestones.push(milestoneState);
   }
+  const allFeatureResults = missionState.milestones.flatMap((m) => m.iterations || []).flatMap((iteration) => iteration.features || []);
+  const lastValidationReports = missionState.milestones.flatMap((m) => (m.iterations || []).map((iteration) => iteration.validation).filter(Boolean));
+  const finalCoverage = buildCoverageReport({ plan, milestone: undefined, iterationState: { features: allFeatureResults }, commandReports: [], validatorReport: { passed: true, assertionResults: [] }, scope: "final" });
+  const finalCoveragePath = writeArtifact(run, "coverage/final-coverage.json", finalCoverage, "json", "Final requirement coverage");
+  if (finalCoverage.gaps.length) {
+    writeArtifact(run, "validation/final-coverage-objections.json", { schema: "pi-mission-workflow/final-coverage-objections/v1", passed: false, objections: finalCoverage.gaps.map((gap) => ({ level: "must", assertionId: gap.assertionId, description: `Final coverage gap: ${gap.description}`, evidence: finalCoveragePath, repairHint: "Add or repair features until this assertion has coverage and validator evidence." })) }, "json", "Final coverage objections");
+    throw new Error(`Mission ${plan.missionId} has final requirement coverage gaps: ${finalCoverage.gaps.map((gap) => `${gap.assertionId}: ${gap.description}`).join("; ")}`);
+  }
   missionState.completedAt = new Date().toISOString();
+  missionState.finalCoveragePath = finalCoveragePath;
   const statePath = writeArtifact(run, "mission-state.json", missionState, "json", "Mission state");
+  updateRegistryState(plan, (state) => ({ ...state, status: "completed", current: {}, finalCoveragePath, statePath, validationReports: state.validationReports || lastValidationReports, coverageReports: [...(state.coverageReports || []), { scope: "final", artifact: finalCoveragePath }], timestamps: { ...(state.timestamps || {}), completedAt: missionState.completedAt } }));
   const final = [
     "# Mission complete",
     "",
@@ -601,6 +963,8 @@ async function activateMission(args, cwd, run, ctx) {
     `Branch: ${env.missionBranch}`,
     `Integration worktree: ${env.integrationPath}`,
     `Base HEAD: ${env.baseHead}`,
+    `Registry state: ${registry.statePath}`,
+    `Final coverage: ${finalCoveragePath}`,
     "",
     "Review and merge manually when ready:",
     "",
@@ -613,7 +977,7 @@ async function activateMission(args, cwd, run, ctx) {
     "```",
   ].join("\n");
   const finalPath = writeArtifact(run, "final-report.md", final, "markdown", "Final mission report");
-  return { plan, env, missionState, statePath, finalPath };
+  return { plan: { missionId: plan.missionId }, env, registryPath: registry.statePath, statePath, finalPath, finalCoveragePath };
 }
 
 async function status(args, cwd) {
@@ -660,7 +1024,7 @@ async function main() {
     if (action === "plan") {
       const phases = [{ name: "create-plan", async *run(phaseCtx) { result = await createPlan(args, cwd, run, phaseCtx); yield { type: "data", kind: "data", key: "planPath", value: result.planPath, message: "Mission plan created" }; } }];
       for await (const _event of runPipeline(wrapPhases(phases, run), ctx, { signal: controller.signal })) {}
-      completeRun(run, STATUSES.SUCCESS, { ok: true, planPath: result.planPath, contractPath: result.contractPath });
+      completeRun(run, STATUSES.SUCCESS, { ok: true, planPath: result.planPath, contractPath: result.contractPath, registryPath: result.registryPath });
       finalizedRun = true;
       console.log(JSON.stringify({ ok: true, action, runId: run.runId, cwd, ...result }, null, 2));
     } else if (action === "activate" || action === "resume") {
@@ -670,9 +1034,9 @@ async function main() {
         { name: "final-report", async *run() { yield { type: "data", kind: "data", key: "report", value: result.finalPath, message: "Final report written" }; } },
       ];
       for await (const _event of runPipeline(wrapPhases(phases, run), ctx, { signal: controller.signal })) {}
-      completeRun(run, STATUSES.SUCCESS, { ok: true, missionId: result.plan.missionId, branch: result.env.missionBranch, finalPath: result.finalPath });
+      completeRun(run, STATUSES.SUCCESS, { ok: true, missionId: result.plan.missionId, branch: result.env.missionBranch, finalPath: result.finalPath, registryPath: result.registryPath, finalCoveragePath: result.finalCoveragePath });
       finalizedRun = true;
-      console.log(JSON.stringify({ ok: true, action, runId: run.runId, cwd, missionId: result.plan.missionId, branch: result.env.missionBranch, finalPath: result.finalPath }, null, 2));
+      console.log(JSON.stringify({ ok: true, action, runId: run.runId, cwd, missionId: result.plan.missionId, branch: result.env.missionBranch, finalPath: result.finalPath, registryPath: result.registryPath, finalCoveragePath: result.finalCoveragePath }, null, 2));
     } else {
       throw new Error(`Unknown action: ${action}`);
     }

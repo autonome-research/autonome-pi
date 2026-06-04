@@ -8,7 +8,7 @@ Private Pi package for thread-phase workflow visualization and example workflows
 - `codebase-exploration-workflow` — fanout codebase exploration workflow using Pi subagents.
 - `code-review-workflow` — git diff/commit code review workflow using Pi subagents.
 - `dynamic-workflows` — validated ad-hoc workflow runner for dynamic workflows planned in chat, with structured spec mode and advanced JavaScript harness mode.
-- `mission-workflow` — MVP Droid/Missions-style long-running software mission extension with plan approval, validation contracts, per-feature worktrees/commits, command validators, and repair loops.
+- `mission-workflow` — Droid/Missions-style long-running software mission extension with plan approval, validation contracts, strict handoffs, per-feature worktrees/commits, command + adversarial validators, durable registry/resume, coverage artifacts, and repair loops.
 - `skills/dynamic-workflows` and `skills/mission-workflow` — on-demand Pi skills that teach other sessions/configurations how to use these workflow tools safely.
 
 ## Install
@@ -47,9 +47,9 @@ Recent changes:
   - JavaScript harness mode for richer control flow. Harness mode requires explicit `permissions: "rwx"`.
 - Dynamic workflows do not auto-continue by default; pass `autoContinue: true` for successful-run follow-up.
 - Usage events are aggregated into run, phase, and fanout-item summaries and rendered in tools/monitor/completion cards.
-- `npm test` runs smoke coverage for extension load, permission denial before harness import, structured validation, JS harness mode, structured shell mode, and usage projection.
+- `npm test` runs smoke coverage for extension load, permission denial before harness import, structured validation, JS harness mode, structured shell mode, usage projection, and mission registry/resume/strict-handoff checks.
 - The package now ships workflow skills so fresh Pi sessions get progressive-disclosure guidance for dynamic workflows and mission workflows.
-- Added `mission_workflow` MVP with plan/activate/resume split, approval-before-activation, git worktree isolation, deterministic per-feature commits, command-based validators, heartbeat/stale observability, and capped repair loops.
+- Hardened `mission_workflow` with adversarial post-milestone validation, strict handoff validation, durable registry/resume pointers, assertion coverage reports, generated-junk protection, compact result payloads, and capped repair loops.
 - Thread-phase dependency is `^4.0.0`.
 
 ## Remaining work
@@ -60,8 +60,8 @@ High-value follow-ups:
 - Dynamic workflow hardening: add tests for harness cancellation, background invalid specs, broader permission matrices, and fanout terminal states.
 - Usage budgets: optionally fail/stop workflows when projected token usage exceeds configured limits.
 - Saved workflow templates: support reusable specs/harnesses under a Pi workflow directory.
-- Resume support: allow structured/dynamic workflows and mission workflows to resume/reuse completed phase artifacts after interruption.
-- Mission workflow hardening: smarter repair planning, browser/computer-use QA adapters, resumable worktrees, final merge policy options, and larger dogfood tests.
+- Resume support: allow structured/dynamic workflows to resume/reuse completed phase artifacts after interruption.
+- Mission workflow follow-ups: smarter repair planning, browser/computer-use QA adapters, final merge policy options, and larger dogfood tests.
 
 ## Notes
 

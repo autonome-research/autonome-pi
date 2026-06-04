@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -85,12 +85,37 @@ try {
   let missionActivateDetails;
   try { missionActivateDetails = missionActivate?.stdout ? JSON.parse(missionActivate.stdout) : undefined; } catch { missionActivateDetails = undefined; }
   log(Boolean(missionActivateDetails?.branch), 'mission workflow activation emits mission branch');
+  log(Boolean(missionActivateDetails?.registryPath) && existsSync(missionActivateDetails.registryPath), 'mission workflow activation creates durable registry');
+  const registryState = missionActivateDetails?.registryPath ? JSON.parse(readFileSync(missionActivateDetails.registryPath, 'utf8')) : undefined;
+  log(registryState?.status === 'completed' && Array.isArray(registryState.completedFeatures), 'mission workflow registry records completed state');
+  log(Boolean(missionActivateDetails?.finalCoveragePath) && existsSync(missionActivateDetails.finalCoveragePath), 'mission workflow writes final coverage report');
   const missionResume = missionPlanDetails?.planPath
     ? expectExit('mission workflow mock resume succeeds', ['node', missionCli, 'resume', '--approved', '--plan-path', missionPlanDetails.planPath, '--cwd', missionRepo], 0)
     : undefined;
   let missionResumeDetails;
   try { missionResumeDetails = missionResume?.stdout ? JSON.parse(missionResume.stdout) : undefined; } catch { missionResumeDetails = undefined; }
-  log(Boolean(missionResumeDetails?.branch), 'mission workflow resume emits mission branch');
+  log(Boolean(missionResumeDetails?.branch) && Boolean(missionResumeDetails?.registryPath), 'mission workflow resume emits branch and registry pointer');
+  const ignoreText = readFileSync(join(root, '.gitignore'), 'utf8');
+  log(['__pycache__/', '.pytest_cache/', '.venv/', '*.egg-info/'].every((pattern) => ignoreText.includes(pattern)), 'package .gitignore protects generated junk');
+
+  const strictRepo = join(tmp, 'strict-handoff-repo');
+  mkdirSync(strictRepo, { recursive: true });
+  expectExit('strict handoff repo git init', ['git', 'init', '-q'], 0, { cwd: strictRepo });
+  expectExit('strict handoff repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: strictRepo });
+  expectExit('strict handoff repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: strictRepo });
+  writeFileSync(join(strictRepo, 'README.md'), 'strict\n');
+  expectExit('strict handoff repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: strictRepo });
+  const strictPlanPath = join(tmp, 'strict-plan.json');
+  writeFileSync(strictPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'strict-handoff-smoke', goal: 'strict handoff rejection', cwd: strictRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1,
+    worktreeBaseDir: join(tmp, 'strict-worktrees'), validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  const fakePi = join(tmp, 'fake-pi-no-handoff.mjs');
+  writeFileSync(fakePi, `#!/usr/bin/env node\nconsole.log(JSON.stringify({type:'message_end', message:{role:'assistant', model:'fake', content:[{type:'text', text:'done without handoff'}]}}));\n`);
+  expectExit('fake pi no-handoff is executable', ['chmod', '+x', fakePi], 0);
+  expectExit('mission workflow rejects missing strict handoff', ['node', missionCli, 'activate', '--approved', '--plan-path', strictPlanPath, '--cwd', strictRepo], 1, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePi } });
+
   if (missionPlanDetails?.plan?.worktreeBaseDir) rmSync(missionPlanDetails.plan.worktreeBaseDir, { recursive: true, force: true });
 } finally {
   if (process.env.KEEP_PI_THREAD_PHASE_TEST_TMP !== '1') rmSync(tmp, { recursive: true, force: true });

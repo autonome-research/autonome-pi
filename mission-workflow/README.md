@@ -21,7 +21,7 @@ Actions:
 
 - `plan` — create `mission-plan.json`, `validation-contract.json`, and approval instructions.
 - `activate` — execute an approved plan in the background or foreground.
-- `resume` — resume an approved mission after an unexpected stop by reusing the mission branch/worktrees and skipping already-merged feature branches.
+- `resume` — resume an approved mission after an unexpected stop by using the mission registry plus git branches/worktrees and skipping already-merged feature branches.
 - `status` — show git worktree status from the repo.
 
 ## Example
@@ -54,10 +54,13 @@ await mission_workflow({
 - Creates an integration worktree under `~/.pi/agent/mission-workflow/worktrees/<missionId>/integration`.
 - Runs worker features serially in isolated per-feature worktrees.
 - The runner commits each feature and fast-forwards the mission branch.
-- Scrutiny validators run configured `validationCommands` after each milestone.
+- Command validators run configured `validationCommands` after each milestone.
+- A fresh read-only adversarial Pi validator agent then reviews source/spec docs, the validation contract, worker handoffs, git diff, and command outputs. It uses `modelValidator` when provided and writes structured JSON reports.
+- Must-level validator objections or requirement coverage gaps fail milestone validation and enqueue targeted repair features up to `maxRepairIterations` (default `10`).
 - User-testing validator starts as a configured command (`userTestCommand`).
-- Failed validation enqueues repair features up to `maxRepairIterations` (default `10`).
-- Heartbeat events record current milestone/feature/branch/worktree and child process ids for stale-run detection.
+- Heartbeat events record compact current milestone/feature/branch/worktree pointers and child process ids for stale-run detection.
+- Durable mission state is persisted under `~/.pi/agent/mission-workflow/registry/<missionId>/` with plan path, branch, worktree, completed features, validation/coverage reports, current work item, role models, and timestamps.
+- Per-milestone and final coverage artifacts map assertion -> features -> commits -> validators -> status.
 - Final merge into the user's target branch is manual by default.
 
 ## Safety model
@@ -65,12 +68,14 @@ await mission_workflow({
 - `activate` requires `approved: true`.
 - The runner avoids changing the user's current checkout by using separate worktrees.
 - Workers are asked not to commit; the deterministic runner owns commits.
+- Worker handoffs are strict JSON: missing/malformed handoffs, mismatched feature ids, unknown assertions, or changedFiles that disagree with git status/diff fail validation instead of being silently synthesized.
+- The runner protects commit hygiene by excluding/removing common generated junk (`__pycache__`, `.pytest_cache`, `.venv`, `*.egg-info`, etc.) before staging and refusing junk in commits.
 - Monitor cancellation is cooperative through the thread-phase visualizer cancel file.
 
 ## Current limitations
 
 - This MVP is intentionally simple and should be dogfooded on small missions first.
-- Resume/reuse is MVP-level: it skips feature branches already merged into the mission branch, but does not yet reconstruct dynamic repair queues beyond rerunning milestone validation.
+- Resume/reuse uses the durable registry and git branch ancestry; dynamic in-memory queues still restart from the current plan/milestone and rerun validation as needed.
 - Worktree cleanup is best-effort.
 - Browser/computer-use QA is not implemented; user testing is command-based.
 - Repair planning currently creates generic corrective features from failed validators.
