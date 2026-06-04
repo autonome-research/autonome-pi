@@ -72,12 +72,14 @@ await mission_workflow({
 - `assertionsAddressed` must include every assigned contract assertion and every assigned local assertion. Accepted forms include exact IDs, known contract IDs with explanatory suffixes such as `assertion-003: evidence`, verbose assigned local assertions such as `Local assertion: <assigned check>. Verified...`, and supplemental worker-only evidence as `{ "type": "local", "id": "..." }` or `local:<slug>`. Supplemental local evidence is preserved for reviewers but never satisfies global contract coverage.
 - The runner protects commit hygiene by excluding/removing common generated junk (`__pycache__`, `.pytest_cache`, `.venv`, `*.egg-info`, etc.) before staging and refusing junk in commits.
 - Monitor cancellation is cooperative through the thread-phase visualizer cancel file.
+- The runner emits operation-level watchdog telemetry in heartbeat events: current child PID, operation label, elapsed time, idle time since child stdout/stderr, hard timeout, and idle timeout. If an operation is silent longer than `PI_MISSION_WORKFLOW_WATCHDOG_STALE_MS` (default `2m`), it emits a `progress_watchdog` event.
+- Pi worker/planner/validator calls have a hard timeout (`PI_MISSION_WORKFLOW_PI_TIMEOUT_MS`, default `30m`) and an idle-output timeout (`PI_MISSION_WORKFLOW_PI_IDLE_TIMEOUT_MS`, default `12m`). Shell/git child processes have timeouts too: validation/user-test commands use `PI_MISSION_WORKFLOW_COMMAND_TIMEOUT_MS` (default `20m`), git commands use `PI_MISSION_WORKFLOW_GIT_TIMEOUT_MS` (default `15m`), while other child processes use `PI_MISSION_WORKFLOW_PROCESS_TIMEOUT_MS` (default `5m`). Timed-out children are force-finalized after `PI_MISSION_WORKFLOW_TERMINATION_GRACE_MS` (default `5s`) even if inherited pipes keep the OS process open. Values accept `ms`, `s`, `m`, or `h` suffixes.
 
 ## Failure-mode handling
 
 Do not blindly relaunch a failed mission. First classify the failure:
 
-- **Runner/lifecycle failure**: stale/dead process, parser crash, unbounded output, cancellation issue, registry inconsistency. Patch/release the extension, validate, then resume.
+- **Runner/lifecycle failure**: stale/dead process, parser crash, unbounded output, cancellation issue, registry inconsistency, missing non-heartbeat progress, operation timeout. Patch/release the extension, validate, then resume.
 - **Strict handoff failure**: missing handoff, mismatched feature id, unknown assertion refs, changedFiles mismatch, generated junk. Inspect the raw handoff and invalid-handoff artifact; patch normalization only when the worker output is semantically valid.
 - **Validation/implementation failure**: command failure, adversarial must objection, coverage gap. Inspect validation and coverage artifacts and let targeted repairs run within `maxRepairIterations`.
 - **Git/worktree failure**: stale worktree/branch, ff-only merge failure, dirty generated files. Inspect worktree list/status and only remove stale failed feature worktrees/branches when safe.

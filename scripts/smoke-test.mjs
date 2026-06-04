@@ -268,6 +268,27 @@ try {
   expectExit('fake pi local contract collision is executable', ['chmod', '+x', fakePiLocalContractCollision], 0);
   expectExit('mission workflow rejects local-typed contract assertion as contract coverage', ['node', missionCli, 'activate', '--approved', '--plan-path', localContractCollisionPlanPath, '--cwd', localContractCollisionRepo], 1, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiLocalContractCollision }, timeout: 60_000 });
 
+  const commandTimeoutRepo = join(tmp, 'command-timeout-repo');
+  mkdirSync(commandTimeoutRepo, { recursive: true });
+  expectExit('command timeout repo git init', ['git', 'init', '-q'], 0, { cwd: commandTimeoutRepo });
+  expectExit('command timeout repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: commandTimeoutRepo });
+  expectExit('command timeout repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: commandTimeoutRepo });
+  writeFileSync(join(commandTimeoutRepo, 'README.md'), 'command timeout\n');
+  expectExit('command timeout repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: commandTimeoutRepo });
+  const commandTimeoutPlanPath = join(tmp, 'command-timeout-plan.json');
+  writeFileSync(commandTimeoutPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'command-timeout-smoke', goal: 'timeout validation commands', cwd: commandTimeoutRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1,
+    worktreeBaseDir: join(tmp, 'command-timeout-worktrees'), validationCommands: ['node -e "process.on(\\\"SIGTERM\\\",()=>process.exit(0)); require(\\\"child_process\\\").spawn(process.execPath,[\\\"-e\\\",\\\"setTimeout(()=>{},2000)\\\"],{stdio:[\\\"ignore\\\",1,2],detached:true}).unref(); setTimeout(()=>{},2000)"'], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  const fakePiCommandTimeout = join(tmp, 'fake-pi-command-timeout.mjs');
+  writeFileSync(fakePiCommandTimeout, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nmkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\nwriteFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, changedFiles: [], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'ok' }));\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: true, summary: 'validator ok', objections: [], assertionResults: [{ assertionId: 'a1', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-command-timeout', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
+  expectExit('fake pi command timeout is executable', ['chmod', '+x', fakePiCommandTimeout], 0);
+  const commandTimeoutResult = expectExit('mission workflow times out hanging validation command', ['node', missionCli, 'activate', '--approved', '--plan-path', commandTimeoutPlanPath, '--cwd', commandTimeoutRepo], 1, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiCommandTimeout, PI_MISSION_WORKFLOW_COMMAND_TIMEOUT_MS: '100ms', PI_MISSION_WORKFLOW_TERMINATION_GRACE_MS: '100ms' }, timeout: 60_000 });
+  const commandTimeoutOutput = JSON.parse(commandTimeoutResult.stdout || '{}');
+  const commandTimeoutReport = JSON.parse(readFileSync(join(store, 'artifacts', commandTimeoutOutput.runId, 'validation', 'm1-report.json'), 'utf8'));
+  log(commandTimeoutReport.reports?.[0]?.timedOut === true && commandTimeoutReport.reports?.[0]?.exitCode === 124 && commandTimeoutReport.reports?.[0]?.passed === false, 'validation timeout reports non-zero synthetic exit code', JSON.stringify(commandTimeoutReport.reports?.[0] || {}));
+
   const staleBranchRepo = join(tmp, 'stale-branch-repo');
   mkdirSync(staleBranchRepo, { recursive: true });
   expectExit('stale branch repo git init', ['git', 'init', '-q'], 0, { cwd: staleBranchRepo });

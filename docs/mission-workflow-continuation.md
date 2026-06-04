@@ -130,7 +130,7 @@ When a mission fails, do **not** blindly relaunch. First classify the failure:
 
 ## Immediate recommended next step
 
-The working tree now contains the intended `v0.10.8` mission hardening:
+The working tree now contains the intended `v0.10.9` mission hardening:
 
 - handoff assertion canonicalization accepts strings like `assertion-003: detailed explanation` when the leading ID exists in the validation contract, accepts verbose assigned local assertions like `Local assertion: <assigned check>. Verified...`, and accepts supplemental worker-only local evidence either as `local:*` IDs or `{ type: "local", id: "..." }` objects without counting it as global contract coverage;
 - resume no longer treats branch ancestry alone as proof of feature completion, so stale failed feature branches at the mission head are rerun;
@@ -138,7 +138,8 @@ The working tree now contains the intended `v0.10.8` mission hardening:
 - branch-only resume recognizes completed features only with stronger proof: merged, not at the base head, runner-owned commit subject plus matching `Mission-Feature-Id` and `Mission-Feature-Fingerprint` trailers; fingerprint schema `pi-mission-feature-fingerprint/v2` includes the milestone id, feature metadata, assigned assertion ids, local assertion ids, and assigned validation-contract assertion descriptions/priorities/methods/coverage refs; registry-backed legacy commit records may still use subject plus `Mission-Feature-Id` when no fingerprint was historically recorded, but still require current milestone/assignment metadata; valid completed no-change handoff artifacts remain trusted for legacy/no-change work; subject-only legacy skipped records are no longer trusted;
 - failed worker diffs/status are preserved as artifacts before removing failed feature worktrees;
 - hard failures/cancellations mark the durable registry `failed`/`cancelled` on a best-effort basis, without downgrading an already `completed` mission registry;
-- smoke coverage was added for prefixed handoffs, stale branch rerun, completed-head skip with feature-id trailer, same-subject/no-trailer rerun, stale registry skipped/commit records, handoff-backed legacy skips, registry-failed marking, and completed-registry non-downgrade/immutability.
+- operation-level watchdog telemetry is emitted on heartbeats, including child PID, operation label, elapsed time, idle time, hard timeout, and idle timeout; stale operations emit `progress_watchdog` events; Pi calls have hard and idle-output timeouts; validation/user-test shell commands now have explicit timeouts instead of being able to hang indefinitely;
+- smoke coverage was added for prefixed handoffs, stale branch rerun, completed-head skip with feature-id trailer, same-subject/no-trailer rerun, stale registry skipped/commit records, handoff-backed legacy skips, registry-failed marking, command timeout handling, and completed-registry non-downgrade/immutability.
 
 Before resuming auto_trading again:
 

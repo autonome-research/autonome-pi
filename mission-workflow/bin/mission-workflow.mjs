@@ -27,6 +27,14 @@ const GENERATED_JUNK_PATTERNS = [
   "__pycache__/", "*.py[cod]", ".pytest_cache/", ".venv/", "venv/", "env/", "*.egg-info/",
   ".mypy_cache/", ".ruff_cache/", ".tox/", ".coverage", "coverage/", "dist/", "build/",
 ];
+const HEARTBEAT_INTERVAL_MS = 30_000;
+const DEFAULT_PI_TIMEOUT_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_PI_TIMEOUT_MS, 30 * 60 * 1000);
+const DEFAULT_PI_IDLE_TIMEOUT_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_PI_IDLE_TIMEOUT_MS, 12 * 60 * 1000);
+const DEFAULT_COMMAND_TIMEOUT_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_COMMAND_TIMEOUT_MS, 20 * 60 * 1000);
+const DEFAULT_PROCESS_TIMEOUT_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_PROCESS_TIMEOUT_MS, 5 * 60 * 1000);
+const DEFAULT_GIT_TIMEOUT_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_GIT_TIMEOUT_MS, 15 * 60 * 1000);
+const DEFAULT_WATCHDOG_STALE_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_WATCHDOG_STALE_MS, 2 * 60 * 1000);
+const TERMINATION_GRACE_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_TERMINATION_GRACE_MS, 5000);
 
 async function loadThreadPhaseCore() {
   try { return await import("@autonome-research/thread-phase"); }
@@ -47,6 +55,99 @@ let activeAbortController;
 let cancellationRequested = false;
 let finalizedRun = false;
 let currentHeartbeat = {};
+const activeOperations = new Map();
+let operationCounter = 0;
+
+function parseMillis(value, fallback) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const text = String(value).trim().toLowerCase();
+  const match = text.match(/^(\d+(?:\.\d+)?)(ms|s|m|h)?$/);
+  if (!match) return fallback;
+  const number = Number(match[1]);
+  if (!Number.isFinite(number) || number <= 0) return fallback;
+  const unit = match[2] || "ms";
+  const multiplier = unit === "h" ? 60 * 60 * 1000 : unit === "m" ? 60 * 1000 : unit === "s" ? 1000 : 1;
+  return Math.max(1, Math.round(number * multiplier));
+}
+
+function selectOperation() {
+  const operations = Array.from(activeOperations.values());
+  if (!operations.length) return undefined;
+  operations.sort((a, b) => a.startedAtMs - b.startedAtMs);
+  return operations[0];
+}
+
+function operationView(operation = selectOperation()) {
+  if (!operation) return undefined;
+  const now = operation.endedAtMs || Date.now();
+  return {
+    id: operation.id,
+    kind: operation.kind,
+    label: operation.label,
+    phase: operation.phase,
+    cwd: operation.cwd,
+    command: operation.command,
+    childPid: operation.childPid,
+    startedAt: operation.startedAt,
+    endedAt: operation.endedAt,
+    lastActivityAt: operation.lastActivityAt,
+    elapsedMs: now - operation.startedAtMs,
+    idleMs: now - operation.lastActivityAtMs,
+    timeoutMs: operation.timeoutMs,
+    idleTimeoutMs: operation.idleTimeoutMs,
+  };
+}
+
+function syntheticExitCode({ timedOut = false, aborted = false, code, signal }) {
+  if (timedOut) return 124;
+  if (aborted) return 130;
+  if (signal) return 1;
+  if (typeof code === "number") return code;
+  return 1;
+}
+
+function emitPhaseEvent(run, phase, data) {
+  try { phaseEvent(run, phase, data); } catch { /* best effort observability */ }
+}
+
+function beginOperation(details = {}) {
+  const now = Date.now();
+  const operation = {
+    id: `${Date.now().toString(36)}-${++operationCounter}`,
+    kind: details.kind || "operation",
+    label: details.label || details.command || details.kind || "operation",
+    phase: details.phase || currentHeartbeat.phase || "execute-mission",
+    cwd: details.cwd,
+    command: details.command,
+    timeoutMs: details.timeoutMs,
+    idleTimeoutMs: details.idleTimeoutMs,
+    startedAtMs: now,
+    lastActivityAtMs: now,
+    startedAt: new Date(now).toISOString(),
+    lastActivityAt: new Date(now).toISOString(),
+    childPid: undefined,
+    lastWatchdogAtMs: 0,
+  };
+  activeOperations.set(operation.id, operation);
+  if (activeRun) emitPhaseEvent(activeRun, operation.phase, { kind: "operation_start", operation: operationView(operation), message: `Started ${operation.label}` });
+  const touch = () => {
+    const at = Date.now();
+    operation.lastActivityAtMs = at;
+    operation.lastActivityAt = new Date(at).toISOString();
+  };
+  return {
+    operation,
+    touch,
+    setChildPid(pid) { operation.childPid = pid; touch(); },
+    finish(status = "success", extra = {}) {
+      const endedAtMs = Date.now();
+      operation.endedAtMs = endedAtMs;
+      operation.endedAt = new Date(endedAtMs).toISOString();
+      if (activeRun) emitPhaseEvent(activeRun, operation.phase, { kind: "operation_end", status, operation: operationView(operation), ...extra, message: `${operation.label} ${status}` });
+      activeOperations.delete(operation.id);
+    },
+  };
+}
 
 function abortError(reason = "cancelled") {
   const error = new Error(String(reason));
@@ -82,15 +183,23 @@ function recordFatal(error) {
 function startHeartbeat(run, details = {}) {
   const timer = setInterval(() => {
     if (finalizedRun) return;
-    phaseEvent(run, currentHeartbeat.phase || "heartbeat", {
+    const selectedOperation = selectOperation();
+    const operation = operationView(selectedOperation);
+    const phase = currentHeartbeat.phase || operation?.phase || "heartbeat";
+    phaseEvent(run, phase, {
       kind: "heartbeat",
       pid: process.pid,
       childPids: Array.from(activeChildren).map((child) => child.pid).filter(Boolean),
+      operation,
       ...details,
       ...currentHeartbeat,
       timestamp: new Date().toISOString(),
     });
-  }, 30_000);
+    if (selectedOperation && operation && operation.idleMs >= DEFAULT_WATCHDOG_STALE_MS && Date.now() - selectedOperation.lastWatchdogAtMs >= DEFAULT_WATCHDOG_STALE_MS) {
+      selectedOperation.lastWatchdogAtMs = Date.now();
+      emitPhaseEvent(run, phase, { kind: "progress_watchdog", operation, message: `No child output/activity for ${operation.idleMs}ms during ${operation.label}` });
+    }
+  }, HEARTBEAT_INTERVAL_MS);
   timer.unref?.();
   return () => clearInterval(timer);
 }
@@ -316,6 +425,8 @@ function runProcess(command, args = [], options = {}) {
       resolve({ ok: false, code: 130, stdout: "", stderr: String(options.signal.reason || "cancelled"), aborted: true });
       return;
     }
+    const timeoutMs = options.timeoutMs === undefined ? DEFAULT_PROCESS_TIMEOUT_MS : options.timeoutMs;
+    const op = beginOperation({ kind: "process", label: options.operationLabel || command, phase: options.phase, cwd: options.cwd, command: [command, ...args].join(" "), timeoutMs });
     const proc = spawn(command, args, {
       cwd: options.cwd,
       shell: Boolean(options.shell),
@@ -324,34 +435,58 @@ function runProcess(command, args = [], options = {}) {
       detached: process.platform !== "win32",
     });
     activeChildren.add(proc);
+    op.setChildPid(proc.pid);
     let stdout = "";
     let stderr = "";
     let aborted = false;
-    const terminate = () => {
-      aborted = true;
-      terminateChild(proc, "SIGTERM");
-      setTimeout(() => terminateChild(proc, "SIGKILL"), 5000).unref();
+    let timedOut = false;
+    let settled = false;
+    let forceTimer;
+    let killTimer;
+    const cleanup = () => {
+      activeChildren.delete(proc);
+      clearTimeout(timer);
+      clearTimeout(forceTimer);
+      clearTimeout(killTimer);
+      options.signal?.removeEventListener("abort", terminate);
     };
+    const finalize = ({ code = null, signalName, errorMessage, forced = false } = {}) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (forced) {
+        try { proc.stdout?.destroy(); } catch { /* ignore */ }
+        try { proc.stderr?.destroy(); } catch { /* ignore */ }
+      }
+      const exitCode = syntheticExitCode({ timedOut, aborted, code, signal: signalName });
+      const error = errorMessage || (timedOut ? `process timed out after ${timeoutMs}ms: ${options.operationLabel || command}` : aborted ? String(options.signal?.reason || "cancelled") : signalName ? `process terminated by ${signalName}: ${options.operationLabel || command}` : undefined);
+      const ok = code === 0 && !aborted && !signalName && !timedOut;
+      op.finish(ok ? "success" : "failed", { ...(error ? { error } : {}), ...(signalName ? { signal: signalName } : {}), ...(forced ? { forced: true } : {}), timedOut });
+      resolve({ ok, code: exitCode, signal: signalName || undefined, stdout, stderr, aborted, timedOut, forced, error });
+    };
+    const terminate = (reason = "aborted") => {
+      aborted = true;
+      if (reason === "timeout") timedOut = true;
+      terminateChild(proc, "SIGTERM");
+      killTimer ||= setTimeout(() => { if (!settled) terminateChild(proc, "SIGKILL"); }, TERMINATION_GRACE_MS);
+      killTimer.unref?.();
+      forceTimer ||= setTimeout(() => finalize({ signalName: "SIGKILL", forced: true }), TERMINATION_GRACE_MS + 1000);
+      forceTimer.unref?.();
+    };
+    const timer = timeoutMs ? setTimeout(() => terminate("timeout"), timeoutMs) : undefined;
+    timer?.unref?.();
     options.signal?.addEventListener("abort", terminate, { once: true });
     if (options.signal?.aborted) terminate();
-    proc.stdout.on("data", (data) => { stdout = appendBounded(stdout, data); });
-    proc.stderr.on("data", (data) => { stderr = appendBounded(stderr, data); });
-    proc.on("error", (error) => {
-      activeChildren.delete(proc);
-      options.signal?.removeEventListener("abort", terminate);
-      resolve({ ok: false, code: 1, stdout: compactText(stdout), stderr: compactText(error.message || stderr), error: error.message, aborted });
-    });
-    proc.on("close", (code) => {
-      activeChildren.delete(proc);
-      options.signal?.removeEventListener("abort", terminate);
-      resolve({ ok: code === 0 && !aborted, code: code ?? 0, stdout, stderr, aborted, error: aborted ? String(options.signal?.reason || "cancelled") : undefined });
-    });
+    proc.stdout.on("data", (data) => { op.touch(); stdout = appendBounded(stdout, data); });
+    proc.stderr.on("data", (data) => { op.touch(); stderr = appendBounded(stderr, data); });
+    proc.on("error", (error) => finalize({ code: 1, errorMessage: timedOut ? `process timed out after ${timeoutMs}ms: ${options.operationLabel || command}` : error.message }));
+    proc.on("close", (code, signalName) => finalize({ code, signalName }));
   });
 }
 
 async function git(cwd, args, options = {}) {
-  const result = await runProcess("git", args, { cwd, signal: options.signal });
-  if (!result.ok && options.reject !== false) throw new Error(result.stderr || result.stdout || `git ${args.join(" ")} exited ${result.code}`);
+  const result = await runProcess("git", args, { cwd, signal: options.signal, timeoutMs: options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS, operationLabel: `git ${args.join(" ")}`, phase: options.phase || "git" });
+  if (!result.ok && options.reject !== false) throw new Error(result.error || result.stderr || result.stdout || `git ${args.join(" ")} exited ${result.code}`);
   return result;
 }
 
@@ -482,7 +617,7 @@ function piParserResult(state) {
   return { text: state.text, messages: state.messages, usage: state.usage, model: state.model, stopReason: state.stopReason, stdout: state.stdoutPreview, droppedBytes: state.droppedBytes, parsedLines: state.lines, parserError: state.parserError };
 }
 
-async function runPi({ cwd, prompt, tools, model, timeoutMs = 30 * 60 * 1000, signal }) {
+async function runPi({ cwd, prompt, tools, model, timeoutMs = DEFAULT_PI_TIMEOUT_MS, idleTimeoutMs = DEFAULT_PI_IDLE_TIMEOUT_MS, signal, operationLabel = "pi agent", phase }) {
   if (signal?.aborted) return { ok: false, aborted: true, error: String(signal.reason || "cancelled"), text: "" };
   const args = [
     "--mode", "json", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
@@ -490,34 +625,64 @@ async function runPi({ cwd, prompt, tools, model, timeoutMs = 30 * 60 * 1000, si
   ];
   if (model) args.unshift("--model", model);
   return await new Promise((resolve) => {
+    const op = beginOperation({ kind: "pi", label: operationLabel, phase, cwd, command: `${DEFAULT_PI} --mode json ...`, timeoutMs, idleTimeoutMs });
     const proc = spawn(DEFAULT_PI, args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env, detached: process.platform !== "win32" });
     activeChildren.add(proc);
+    op.setChildPid(proc.pid);
     const parsed = createPiJsonLineParser();
     let stderr = "";
     let aborted = false;
     let timedOut = false;
-    const terminate = () => {
-      aborted = true;
-      terminateChild(proc, "SIGTERM");
-      setTimeout(() => terminateChild(proc, "SIGKILL"), 5000).unref();
+    let idleTimedOut = false;
+    let settled = false;
+    let forceTimer;
+    let killTimer;
+    const cleanup = () => {
+      activeChildren.delete(proc);
+      clearTimeout(timer);
+      clearTimeout(forceTimer);
+      clearTimeout(killTimer);
+      clearInterval(idleTimer);
+      signal?.removeEventListener("abort", terminate);
     };
-    const timer = setTimeout(() => { timedOut = true; terminate(); }, timeoutMs);
-    signal?.addEventListener("abort", terminate, { once: true });
-    proc.stdout.on("data", (data) => { consumePiJsonChunk(parsed, data); });
-    proc.stderr.on("data", (data) => { stderr = appendBounded(stderr, data); });
-    proc.on("error", (error) => {
-      activeChildren.delete(proc);
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", terminate);
-      resolve({ ok: false, text: "", error: error.message, stdout: piParserResult(parsed).stdout, stderr, aborted, timedOut });
-    });
-    proc.on("close", (code) => {
-      activeChildren.delete(proc);
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", terminate);
+    const errorText = (result = {}) => timedOut ? `pi timed out after ${timeoutMs}ms: ${operationLabel}` : idleTimedOut ? `pi produced no output for ${idleTimeoutMs}ms: ${operationLabel}` : aborted ? String(signal?.reason || "cancelled") : result.parserError ? result.parserError : undefined;
+    const finalize = ({ code = null, signalName, errorMessage, forced = false } = {}) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (forced) {
+        try { proc.stdout?.destroy(); } catch { /* ignore */ }
+        try { proc.stderr?.destroy(); } catch { /* ignore */ }
+      }
       const result = piParserResult(parsed);
-      resolve({ ok: code === 0 && !result.parserError && !aborted, code, stderr, aborted, timedOut, ...result, error: aborted ? String(signal?.reason || "cancelled") : result.parserError ? result.parserError : code === 0 ? undefined : stderr || `pi exited ${code}` });
-    });
+      const exitCode = syntheticExitCode({ timedOut: timedOut || idleTimedOut, aborted, code, signal: signalName });
+      const error = errorMessage || errorText(result) || (signalName ? `pi terminated by ${signalName}: ${operationLabel}` : code === 0 ? undefined : stderr || `pi exited ${code}`);
+      const ok = code === 0 && !result.parserError && !aborted && !signalName && !timedOut && !idleTimedOut;
+      op.finish(ok ? "success" : "failed", { ...(error ? { error } : {}), ...(signalName ? { signal: signalName } : {}), ...(forced ? { forced: true } : {}), timedOut, idleTimedOut });
+      resolve({ ok, code: exitCode, signal: signalName || undefined, stderr, aborted, timedOut, idleTimedOut, forced, ...result, error });
+    };
+    const terminate = (reason = "aborted") => {
+      aborted = true;
+      if (reason === "timeout") timedOut = true;
+      if (reason === "idle-timeout") idleTimedOut = true;
+      terminateChild(proc, "SIGTERM");
+      killTimer ||= setTimeout(() => { if (!settled) terminateChild(proc, "SIGKILL"); }, TERMINATION_GRACE_MS);
+      killTimer.unref?.();
+      forceTimer ||= setTimeout(() => finalize({ signalName: "SIGKILL", forced: true }), TERMINATION_GRACE_MS + 1000);
+      forceTimer.unref?.();
+    };
+    const timer = timeoutMs ? setTimeout(() => terminate("timeout"), timeoutMs) : undefined;
+    timer?.unref?.();
+    const idleTimer = idleTimeoutMs ? setInterval(() => {
+      if (Date.now() - op.operation.lastActivityAtMs >= idleTimeoutMs) terminate("idle-timeout");
+    }, Math.min(30_000, Math.max(1000, Math.floor(idleTimeoutMs / 4)))) : undefined;
+    idleTimer?.unref?.();
+    signal?.addEventListener("abort", terminate, { once: true });
+    if (signal?.aborted) terminate();
+    proc.stdout.on("data", (data) => { op.touch(); consumePiJsonChunk(parsed, data); });
+    proc.stderr.on("data", (data) => { op.touch(); stderr = appendBounded(stderr, data); });
+    proc.on("error", (error) => finalize({ code: 1, errorMessage: errorText() || error.message }));
+    proc.on("close", (code, signalName) => finalize({ code, signalName }));
   });
 }
 
@@ -676,7 +841,7 @@ async function createPlan(args, cwd, run, ctx) {
       `Validation commands: ${splitList(args["validation-command"]).join("; ") || "none provided"}`,
       `User test command: ${args["user-test-command"] || "none provided"}`,
     ].join("\n");
-    const result = await runPi({ cwd: repoRoot, prompt, tools: ["read", "grep", "find", "ls"], model: args["model-plan"], signal: ctx.signal });
+    const result = await runPi({ cwd: repoRoot, prompt, tools: ["read", "grep", "find", "ls"], model: args["model-plan"], signal: ctx.signal, operationLabel: "planner agent", phase: "create-plan", timeoutMs: ctx.piTimeoutMs, idleTimeoutMs: ctx.piIdleTimeoutMs });
     if (result.usage?.length) phaseEvent(run, "create-plan", { kind: "usage", usage: result.usage, model: result.model });
     if (!result.ok) throw new Error(result.error || "planner failed");
     try { plan = parseJsonFromText(result.text); }
@@ -1029,7 +1194,7 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
     await ensureGeneratedJunkIgnored(featurePath, ctx.signal);
     const result = String(plan.planner || "pi") === "mock"
       ? { ok: true, text: "mock worker", usage: [] }
-      : await runPi({ cwd: featurePath, prompt, tools: ["read", "grep", "find", "ls", "edit", "write", "bash"], model: ctx.modelWorker, signal: ctx.signal });
+      : await runPi({ cwd: featurePath, prompt, tools: ["read", "grep", "find", "ls", "edit", "write", "bash"], model: ctx.modelWorker, signal: ctx.signal, operationLabel: `worker ${featureId}`, phase: `worker-${featureId}`, timeoutMs: ctx.piTimeoutMs, idleTimeoutMs: ctx.piIdleTimeoutMs });
     if (result.usage?.length) phaseEvent(run, `worker-${featureId}`, { kind: "usage", usage: result.usage, model: result.model });
     if (!result.ok) throw new Error(result.error || `worker failed for ${featureId}`);
     const handoffPath = join(featurePath, handoffRel);
@@ -1046,6 +1211,7 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
     const handoffArtifact = writeArtifact(run, `handoffs/${featureId}.json`, handoff, "json", `Worker handoff: ${featureId}`);
     rmSync(handoffPath, { force: true });
     await git(featurePath, ["reset", "-q"], { signal: ctx.signal, reject: false });
+    await git(featurePath, ["restore", "--staged", "--worktree", "--", handoffRel], { signal: ctx.signal, reject: false });
     removeGeneratedJunk(featurePath);
     await restoreGeneratedJunkChanges(featurePath, ctx.signal);
     const changedFiles = await getChangedFiles(featurePath, ctx.signal);
@@ -1207,7 +1373,7 @@ async function runAdversarialValidator(env, plan, milestone, iterationState, com
       `Git diff files ${env.baseHead}..HEAD:\n${compactText(diffFiles.stdout || diffFiles.stderr || "", 12000)}`,
     ].join("\n\n"), MAX_PROMPT_CONTEXT_BYTES);
     const validatorPromptPath = writeArtifact(run, `validation/${safeName(milestone.id)}-validator-prompt.md`, prompt, "markdown", `Validator prompt: ${milestone.id}`);
-    const result = await runPi({ cwd: env.integrationPath, prompt, tools: ["read", "grep", "find", "ls"], model: ctx.modelValidator, signal: ctx.signal });
+    const result = await runPi({ cwd: env.integrationPath, prompt, tools: ["read", "grep", "find", "ls"], model: ctx.modelValidator, signal: ctx.signal, operationLabel: `validator ${milestone.id}`, phase: `validator-${milestone.id}`, timeoutMs: ctx.piTimeoutMs, idleTimeoutMs: ctx.piIdleTimeoutMs });
     if (result.usage?.length) phaseEvent(run, `validator-${milestone.id}`, { kind: "usage", usage: result.usage, model: result.model });
     if (!result.ok) raw = { passed: false, summary: "Validator agent failed.", objections: [{ level: "must", description: result.error || "validator failed", evidence: compactText(result.stderr || result.stdout || "", 4000), repairHint: "Rerun or repair validation environment." }], assertionResults: [] };
     else {
@@ -1226,15 +1392,15 @@ async function runAdversarialValidator(env, plan, milestone, iterationState, com
 async function runValidation(env, plan, milestone, iterationState, ctx, run) {
   const reports = [];
   for (const command of plan.validationCommands || []) {
-    const result = await runProcess(command, [], { cwd: env.integrationPath, shell: true, signal: ctx.signal });
-    const file = writeArtifact(run, `validation/${safeName(milestone.id)}-${safeName(command)}.txt`, [`$ ${command}`, "", result.stdout, result.stderr].join("\n"), "file", `Validation command: ${command}`);
-    reports.push({ validator: "scrutiny-command", command, passed: result.ok, exitCode: result.code, artifact: file, stdoutExcerpt: compactText(result.stdout || "", 4000), stderrExcerpt: compactText(result.stderr || "", 4000) });
+    const result = await runProcess(command, [], { cwd: env.integrationPath, shell: true, signal: ctx.signal, timeoutMs: ctx.commandTimeoutMs, operationLabel: `validation command: ${command}`, phase: `validation-${milestone.id}` });
+    const file = writeArtifact(run, `validation/${safeName(milestone.id)}-${safeName(command)}.txt`, [`$ ${command}`, result.error ? `# ${result.error}` : "", result.stdout, result.stderr].join("\n"), "file", `Validation command: ${command}`);
+    reports.push({ validator: "scrutiny-command", command, passed: result.ok, exitCode: result.code, timedOut: Boolean(result.timedOut), artifact: file, stdoutExcerpt: compactText(result.stdout || "", 4000), stderrExcerpt: compactText(result.stderr || result.error || "", 4000) });
   }
   if (plan.userTestCommand) {
     const command = plan.userTestCommand;
-    const result = await runProcess(command, [], { cwd: env.integrationPath, shell: true, signal: ctx.signal });
-    const file = writeArtifact(run, `validation/${safeName(milestone.id)}-user-test.txt`, [`$ ${command}`, "", result.stdout, result.stderr].join("\n"), "file", `User testing command: ${command}`);
-    reports.push({ validator: "user-testing-command", command, passed: result.ok, exitCode: result.code, artifact: file, stdoutExcerpt: compactText(result.stdout || "", 4000), stderrExcerpt: compactText(result.stderr || "", 4000) });
+    const result = await runProcess(command, [], { cwd: env.integrationPath, shell: true, signal: ctx.signal, timeoutMs: ctx.commandTimeoutMs, operationLabel: `user test command: ${command}`, phase: `validation-${milestone.id}` });
+    const file = writeArtifact(run, `validation/${safeName(milestone.id)}-user-test.txt`, [`$ ${command}`, result.error ? `# ${result.error}` : "", result.stdout, result.stderr].join("\n"), "file", `User testing command: ${command}`);
+    reports.push({ validator: "user-testing-command", command, passed: result.ok, exitCode: result.code, timedOut: Boolean(result.timedOut), artifact: file, stdoutExcerpt: compactText(result.stdout || "", 4000), stderrExcerpt: compactText(result.stderr || result.error || "", 4000) });
   }
   if (reports.length === 0) reports.push({ validator: "scrutiny-command", command: "none", passed: true, note: "No validation commands configured." });
   const coverageDraft = buildCoverageReport({ plan, milestone, iterationState, commandReports: reports, validatorReport: undefined, scope: "milestone" });
@@ -1388,12 +1554,20 @@ async function main() {
   activeAbortController = controller;
   const stopWatchingCancellation = watchCancellation(run, controller);
   const stopHeartbeat = startHeartbeat(run, { action });
-  const ctx = { cache: new PipelineCache(), signal: controller.signal, modelWorker: args["model-worker"], modelValidator: args["model-validator"] };
+  const ctx = {
+    cache: new PipelineCache(),
+    signal: controller.signal,
+    modelWorker: args["model-worker"],
+    modelValidator: args["model-validator"],
+    piTimeoutMs: parseMillis(args["pi-timeout-ms"], DEFAULT_PI_TIMEOUT_MS),
+    piIdleTimeoutMs: parseMillis(args["pi-idle-timeout-ms"], DEFAULT_PI_IDLE_TIMEOUT_MS),
+    commandTimeoutMs: parseMillis(args["command-timeout-ms"], DEFAULT_COMMAND_TIMEOUT_MS),
+  };
 
   try {
     let result;
     if (action === "plan") {
-      const phases = [{ name: "create-plan", async *run(phaseCtx) { result = await createPlan(args, cwd, run, phaseCtx); yield { type: "data", kind: "data", key: "planPath", value: result.planPath, message: "Mission plan created" }; } }];
+      const phases = [{ name: "create-plan", async *run() { result = await createPlan(args, cwd, run, ctx); yield { type: "data", kind: "data", key: "planPath", value: result.planPath, message: "Mission plan created" }; } }];
       for await (const _event of runPipeline(wrapPhases(phases, run), ctx, { signal: controller.signal })) {}
       completeRun(run, STATUSES.SUCCESS, { ok: true, planPath: result.planPath, contractPath: result.contractPath, registryPath: result.registryPath });
       finalizedRun = true;
@@ -1401,7 +1575,7 @@ async function main() {
     } else if (action === "activate" || action === "resume") {
       const phases = [
         { name: "prepare-mission", async *run() { yield { type: "data", kind: "data", key: "planPath", value: args["plan-path"], message: "Loading approved mission plan" }; } },
-        { name: "execute-mission", async *run(phaseCtx) { result = await activateMission(args, cwd, run, phaseCtx); yield { type: "data", kind: "data", key: "branch", value: result.env.missionBranch, message: "Mission execution complete" }; } },
+        { name: "execute-mission", async *run() { result = await activateMission(args, cwd, run, ctx); yield { type: "data", kind: "data", key: "branch", value: result.env.missionBranch, message: "Mission execution complete" }; } },
         { name: "final-report", async *run() { yield { type: "data", kind: "data", key: "report", value: result.finalPath, message: "Final report written" }; } },
       ];
       for await (const _event of runPipeline(wrapPhases(phases, run), ctx, { signal: controller.signal })) {}
