@@ -7,6 +7,8 @@ description: Use when planning, approving, activating, debugging, or discussing 
 
 Use this skill for the `mission_workflow` Pi extension.
 
+Before changing implementation, read the Droid/Missions design context at `/home/velvet/droid_flows.md` (private machine-local context), then read the package-relative continuation notes at `../../docs/mission-workflow-continuation.md` for current dogfood state and failure-mode guidance.
+
 ## Mental model
 
 A mission is a long-running software-delivery workflow inspired by Droid/Factory Missions:
@@ -58,6 +60,8 @@ Use `ctrl+shift+t` to monitor/cancel. Use `thread_phase_runs` to inspect artifac
 - Final merge is manual by default; do not assume the mission branch is merged into the user's current branch.
 - Default `maxRepairIterations` is 10; it is configurable.
 - The runner emits heartbeat events. Stale runs can appear when the process is gone or heartbeats stop.
+- On failure, classify the failure before relaunching: runner/lifecycle, strict handoff, validation/implementation, git/worktree, or plan/contract quality.
+- Strict handoff failures should be inspected via both the raw handoff artifact and the `*-invalid.json` artifact. Patch normalization only when the worker output is semantically valid but formatted differently than expected.
 
 ## Current limitations
 

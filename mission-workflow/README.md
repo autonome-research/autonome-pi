@@ -2,7 +2,7 @@
 
 Droid/Missions-style long-running software workflow extension for Pi.
 
-Status: MVP prototype. It is intended for small, approved missions first.
+Status: dogfooding/hardened prototype. Continue implementation against the Droid/Missions context in `/home/velvet/droid_flows.md` and the session handoff notes in `../docs/mission-workflow-continuation.md`.
 
 ## Concept
 
@@ -71,6 +71,18 @@ await mission_workflow({
 - Worker handoffs are strict JSON: missing/malformed handoffs, mismatched feature ids, unknown assertions, or changedFiles that disagree with git status/diff fail validation instead of being silently synthesized.
 - The runner protects commit hygiene by excluding/removing common generated junk (`__pycache__`, `.pytest_cache`, `.venv`, `*.egg-info`, etc.) before staging and refusing junk in commits.
 - Monitor cancellation is cooperative through the thread-phase visualizer cancel file.
+
+## Failure-mode handling
+
+Do not blindly relaunch a failed mission. First classify the failure:
+
+- **Runner/lifecycle failure**: stale/dead process, parser crash, unbounded output, cancellation issue, registry inconsistency. Patch/release the extension, validate, then resume.
+- **Strict handoff failure**: missing handoff, mismatched feature id, unknown assertion refs, changedFiles mismatch, generated junk. Inspect the raw handoff and invalid-handoff artifact; patch normalization only when the worker output is semantically valid.
+- **Validation/implementation failure**: command failure, adversarial must objection, coverage gap. Inspect validation and coverage artifacts and let targeted repairs run within `maxRepairIterations`.
+- **Git/worktree failure**: stale worktree/branch, ff-only merge failure, dirty generated files. Inspect worktree list/status and only remove stale failed feature worktrees/branches when safe.
+- **Plan/contract quality failure**: assertions not mapped to contract IDs, missing coverage, local assertions confused with global coverage. Patch the plan with backups and preserve local acceptance checks.
+
+For current dogfood state and exact auto_trading failure context, see `../docs/mission-workflow-continuation.md`.
 
 ## Current limitations
 

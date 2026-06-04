@@ -264,6 +264,22 @@ function persistRegistryPlan(plan, planPath) {
   });
 }
 
+function markMissionRegistryTerminalFromArgs(args, cwd, status, error) {
+  if (!args?.["plan-path"]) return;
+  const planPath = resolve(cwd, String(args["plan-path"]));
+  const plan = readJsonFile(planPath, undefined);
+  if (!plan?.missionId) return;
+  const at = new Date().toISOString();
+  updateRegistryState(plan, (state) => ({
+    ...state,
+    status: state.status === "completed" ? state.status : status,
+    planPath: state.status === "completed" ? state.planPath : planPath,
+    lastError: state.status === "completed" ? state.lastError : (error ? { message: String(error.message || error), stack: error.stack ? String(error.stack) : undefined, at, status } : state.lastError),
+    ...(state.status === "completed" ? { [`last${status === "cancelled" ? "Cancelled" : "Failed"}Attempt`]: { at, message: error ? String(error.message || error) : undefined } } : {}),
+    timestamps: { ...(state.timestamps || {}), ...(state.status === "completed" ? {} : { [`${status}At`]: at }) },
+  }));
+}
+
 function splitList(value) {
   if (!value) return [];
   if (Array.isArray(value)) return value.flatMap(splitList);
@@ -544,8 +560,14 @@ function canonicalAssertionId(value, contract) {
   } else candidates.push(String(value));
   for (const candidate of candidates) {
     if (byId.has(candidate)) return byId.get(candidate);
+    const prefix = candidate.match(/^\s*(assertion-[A-Za-z0-9_.-]+)\s*:/i)?.[1]?.trim();
+    if (prefix && byId.has(prefix)) return byId.get(prefix);
     const safe = safeName(candidate, "assertion");
     if (byId.has(safe)) return byId.get(safe);
+    if (prefix) {
+      const safePrefix = safeName(prefix, "assertion");
+      if (byId.has(safePrefix)) return byId.get(safePrefix);
+    }
     if (byDescription.has(candidate)) return byDescription.get(candidate);
   }
   return undefined;
@@ -729,6 +751,69 @@ async function branchMerged(cwd, branch, target, signal) {
   return result.ok;
 }
 
+async function gitRef(cwd, ref, signal) {
+  const result = await git(cwd, ["rev-parse", ref], { signal, reject: false });
+  return result.ok ? result.stdout.trim() : undefined;
+}
+
+async function gitSubject(cwd, ref, signal) {
+  const result = await git(cwd, ["log", "-1", "--format=%s", ref], { signal, reject: false });
+  return result.ok ? result.stdout.trim() : undefined;
+}
+
+function expectedFeatureCommitSubject(plan, feature, featureId) {
+  const title = String(feature.title || featureId).replace(/\s+/g, " ").trim().slice(0, 160) || featureId;
+  return `mission(${plan.missionId}): ${title}`;
+}
+
+async function gitCommitLooksCompleted(cwd, ref, baseHead, plan, feature, featureId, signal) {
+  const [commit, subject, body] = await Promise.all([
+    gitRef(cwd, ref, signal),
+    gitSubject(cwd, ref, signal),
+    git(cwd, ["log", "-1", "--format=%B", ref], { signal, reject: false }),
+  ]);
+  if (!commit || commit === baseHead) return false;
+  if (subject !== expectedFeatureCommitSubject(plan, feature, featureId)) return false;
+  return body.ok && new RegExp(`^Mission-Feature-Id: ${featureId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m").test(body.stdout);
+}
+
+async function handoffArtifactLooksCompleted(artifactPath, featureId) {
+  if (!artifactPath || !existsSync(String(artifactPath))) return false;
+  const handoff = readJsonFile(String(artifactPath), undefined);
+  return String(handoff?.featureId || "") === featureId && handoff.completed === true;
+}
+
+async function completedFeatureRecord(plan, feature, featureId, featureBranch, missionBranch, baseHead, signal) {
+  const state = readJsonFile(registryStatePath(plan.missionId), {});
+  const record = (state.completedFeatures || []).find((item) => String(item.featureId) === featureId && (!item.branch || String(item.branch) === featureBranch));
+  if (!record) return undefined;
+  if (record.commit && await branchMerged(plan.cwd, String(record.commit), missionBranch, signal) && await gitCommitLooksCompleted(plan.cwd, String(record.commit), baseHead, plan, feature, featureId, signal)) return record;
+  if (record.handoffArtifact && await handoffArtifactLooksCompleted(record.handoffArtifact, featureId) && await branchMerged(plan.cwd, featureBranch, missionBranch, signal)) return record;
+  if (record.skipped && await branchMerged(plan.cwd, featureBranch, missionBranch, signal)) {
+    const [featureHead, missionHead] = await Promise.all([
+      gitRef(plan.cwd, featureBranch, signal),
+      gitRef(plan.cwd, missionBranch, signal),
+    ]);
+    if (featureHead && featureHead !== missionHead && await gitCommitLooksCompleted(plan.cwd, featureBranch, baseHead, plan, feature, featureId, signal)) return record;
+  }
+  return undefined;
+}
+
+async function featureBranchLooksCompleted(cwd, featureBranch, missionBranch, baseHead, plan, feature, featureId, signal) {
+  if (!(await branchMerged(cwd, featureBranch, missionBranch, signal))) return false;
+  return await gitCommitLooksCompleted(cwd, featureBranch, baseHead, plan, feature, featureId, signal);
+}
+
+async function preserveFailedWorkerArtifacts(featurePath, featureId, run, signal) {
+  if (!existsSync(featurePath)) return;
+  const status = await git(featurePath, ["status", "--short"], { signal, reject: false });
+  if (!status.ok || !status.stdout.trim()) return;
+  writeArtifact(run, `failed-workers/${featureId}-status.txt`, status.stdout, "file", `Failed worker status: ${featureId}`);
+  await git(featurePath, ["add", "-N", "."], { signal, reject: false });
+  const diff = await git(featurePath, ["diff", "--binary", "HEAD", "--"], { signal, reject: false });
+  if (diff.ok && diff.stdout.trim()) writeArtifact(run, `failed-workers/${featureId}.diff`, compactText(diff.stdout, MAX_TEXT_BYTES), "file", `Failed worker diff: ${featureId}`);
+}
+
 function normalizeAssertionsAddressed(raw, plan, allowedLocalAssertions = []) {
   const allowedLocal = new Set((allowedLocalAssertions || []).map(String));
   const values = Array.isArray(raw) ? raw : [];
@@ -789,13 +874,19 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
   const featureId = safeName(feature.id || feature.title, "feature");
   const featureBranch = `mission-feature/${safeName(plan.missionId, "mission")}/${featureId}`;
   const featurePath = join(env.root, featureId);
+  const registryCompletion = await completedFeatureRecord(plan, feature, featureId, featureBranch, env.missionBranch, env.baseHead, ctx.signal);
+  if (registryCompletion || await featureBranchLooksCompleted(env.repoRoot, featureBranch, env.missionBranch, env.baseHead, plan, feature, featureId, ctx.signal)) {
+    const commit = registryCompletion?.commit || await gitRef(env.repoRoot, featureBranch, ctx.signal);
+    phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "resume", value: true, message: `Skipped completed ${featureId}` });
+    return { featureId, featureBranch, featurePath, assertions: feature.assertions || [], localAssertions: feature.localAssertions || [], skipped: true, resumed: true, commit };
+  }
   if (await branchMerged(env.repoRoot, featureBranch, env.missionBranch, ctx.signal)) {
-    phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "resume", value: true, message: `Skipped already-merged ${featureId}` });
-    return { featureId, featureBranch, featurePath, assertions: feature.assertions || [], localAssertions: feature.localAssertions || [], skipped: true, resumed: true };
+    phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "staleBranch", value: featureBranch, message: `Re-running stale unverified branch ${featureId}` });
   }
   if (existsSync(featurePath)) await git(env.repoRoot, ["worktree", "remove", "--force", featurePath], { signal: ctx.signal, reject: false });
   if (existsSync(featurePath)) rmSync(featurePath, { recursive: true, force: true });
   await git(env.repoRoot, ["worktree", "add", "-B", featureBranch, featurePath, env.missionBranch], { signal: ctx.signal });
+  let completedSuccessfully = false;
   try {
     const handoffRel = join(".mission", "handoffs", `${featureId}.json`);
     const prompt = [
@@ -845,7 +936,9 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
     const handoffSummary = summarizeHandoff(handoff, handoffArtifact);
     if (!changedFiles.length) {
       phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "changes", value: 0, message: "No file changes to commit" });
-      return { featureId, featureBranch, featurePath, assertions: handoffValidation.assertionsAddressed.length ? handoffValidation.assertionsAddressed.filter((id) => knownContractAssertionIds(plan).has(String(id))) : (feature.assertions || []), localAssertions: handoffValidation.assertionsAddressed.filter((id) => !knownContractAssertionIds(plan).has(String(id))), handoffArtifact, handoff: handoffSummary, changedFiles, commit: undefined };
+      const output = { featureId, featureBranch, featurePath, assertions: handoffValidation.assertionsAddressed.length ? handoffValidation.assertionsAddressed.filter((id) => knownContractAssertionIds(plan).has(String(id))) : (feature.assertions || []), localAssertions: handoffValidation.assertionsAddressed.filter((id) => !knownContractAssertionIds(plan).has(String(id))), handoffArtifact, handoff: handoffSummary, changedFiles, commit: undefined };
+      completedSuccessfully = true;
+      return output;
     }
     await git(featurePath, ["add", "-A"], { signal: ctx.signal });
     const staged = await git(featurePath, ["diff", "--cached", "--name-only"], { signal: ctx.signal, reject: false });
@@ -854,12 +947,15 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
       await git(featurePath, ["restore", "--staged", "--", ...junkStaged], { signal: ctx.signal, reject: false });
       throw new Error(`Generated junk staged for commit in ${featureId}: ${junkStaged.join(", ")}`);
     }
-    await git(featurePath, ["commit", "-m", `mission(${plan.missionId}): ${feature.title || featureId}`], { signal: ctx.signal });
+    await git(featurePath, ["commit", "-m", expectedFeatureCommitSubject(plan, feature, featureId), "-m", `Mission-Feature-Id: ${featureId}`], { signal: ctx.signal });
     const commit = (await git(featurePath, ["rev-parse", "HEAD"], { signal: ctx.signal })).stdout.trim();
     await git(env.integrationPath, ["merge", "--ff-only", featureBranch], { signal: ctx.signal });
     phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "commit", value: commit, message: `Committed ${featureId}` });
-    return { featureId, featureBranch, featurePath, assertions: handoffValidation.assertionsAddressed.length ? handoffValidation.assertionsAddressed.filter((id) => knownContractAssertionIds(plan).has(String(id))) : (feature.assertions || []), localAssertions: handoffValidation.assertionsAddressed.filter((id) => !knownContractAssertionIds(plan).has(String(id))), handoffArtifact, handoff: handoffSummary, changedFiles, commit };
+    const output = { featureId, featureBranch, featurePath, assertions: handoffValidation.assertionsAddressed.length ? handoffValidation.assertionsAddressed.filter((id) => knownContractAssertionIds(plan).has(String(id))) : (feature.assertions || []), localAssertions: handoffValidation.assertionsAddressed.filter((id) => !knownContractAssertionIds(plan).has(String(id))), handoffArtifact, handoff: handoffSummary, changedFiles, commit };
+    completedSuccessfully = true;
+    return output;
   } finally {
+    if (!completedSuccessfully) await preserveFailedWorkerArtifacts(featurePath, featureId, run, ctx.signal).catch(() => {});
     await git(env.repoRoot, ["worktree", "remove", "--force", featurePath], { signal: ctx.signal, reject: false });
   }
 }
@@ -1055,9 +1151,10 @@ async function activateMission(args, cwd, run, ctx) {
   const plan = validatePlanForActivation(JSON.parse(readFileSync(planPathAbs, "utf8")));
   ctx.modelWorker = args["model-worker"] || plan.modelWorker || ctx.modelWorker;
   ctx.modelValidator = args["model-validator"] || plan.modelValidator || ctx.modelValidator;
+  const priorRegistry = readJsonFile(registryStatePath(plan.missionId), {});
+  if (priorRegistry.status === "completed") throw new Error(`Mission ${plan.missionId} is already completed; review the final report or start a new mission.`);
   persistRegistryPlan(plan, planPathAbs);
   const env = await ensureMissionWorktrees(plan, ctx, run, { resume: isTruthyFlag(args.resume) });
-  const priorRegistry = readJsonFile(registryStatePath(plan.missionId), {});
   if (isTruthyFlag(args.resume) && priorRegistry.branch && priorRegistry.branch !== env.missionBranch) throw new Error(`Registry branch ${priorRegistry.branch} does not match expected mission branch ${env.missionBranch}`);
   phaseEvent(run, "prepare-mission", { kind: "data", key: "registry", value: registryStatePath(plan.missionId), message: "Using durable mission registry" });
   const registry = updateRegistryState(plan, (state) => ({ ...state, status: "running", planPath: planPathAbs, branch: env.missionBranch, repoRoot: env.repoRoot, worktree: env.integrationPath, worktreeBaseDir: env.root, roleModels: { plan: plan.modelPlan, worker: ctx.modelWorker, validator: ctx.modelValidator }, resumed: env.resumed, resumeCompletedFeatureCount: isTruthyFlag(args.resume) ? (priorRegistry.completedFeatures || []).length : undefined, timestamps: { ...(state.timestamps || {}), startedAt: state.timestamps?.startedAt || new Date().toISOString() } }));
@@ -1193,11 +1290,13 @@ async function main() {
     }
   } catch (error) {
     if (cancellationRequested || isAbortError(error) || controller.signal.aborted) {
+      try { markMissionRegistryTerminalFromArgs(args, cwd, "cancelled", error); } catch { /* registry terminal marking is best effort */ }
       if (activeRun === run) completeRun(run, STATUSES.CANCELLED, { cancelled: true, reason: controller.signal.reason || error?.message });
       finalizedRun = true;
       console.log(JSON.stringify({ ok: false, cancelled: true, action, runId: run.runId, cwd }, null, 2));
       process.exitCode = 130;
     } else {
+      try { markMissionRegistryTerminalFromArgs(args, cwd, "failed", error); } catch { /* registry terminal marking is best effort */ }
       failRun(run, error);
       finalizedRun = true;
       console.log(JSON.stringify({ ok: false, action, runId: run.runId, cwd, error: error.message }, null, 2));
