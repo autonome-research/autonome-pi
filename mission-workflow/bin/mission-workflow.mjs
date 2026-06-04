@@ -173,6 +173,16 @@ function compactText(text, maxBytes = MAX_TEXT_BYTES) {
   return `${out}\n\n[truncated: original output was ${Buffer.byteLength(text, "utf8")} bytes]`;
 }
 
+function appendBounded(current, chunk, maxBytes = MAX_TEXT_BYTES) {
+  const text = typeof chunk === "string" ? chunk : chunk.toString();
+  if (!text) return current;
+  const combined = current ? `${current}${text}` : text;
+  if (Buffer.byteLength(combined, "utf8") <= maxBytes) return combined;
+  let out = combined.slice(-maxBytes);
+  while (Buffer.byteLength(out, "utf8") > maxBytes) out = out.slice(1);
+  return `[truncated older output]\n${out}`;
+}
+
 function compactJson(value, maxBytes = MAX_PROMPT_CONTEXT_BYTES) {
   return compactText(JSON.stringify(value, null, 2), maxBytes);
 }
@@ -301,8 +311,8 @@ function runProcess(command, args = [], options = {}) {
     };
     options.signal?.addEventListener("abort", terminate, { once: true });
     if (options.signal?.aborted) terminate();
-    proc.stdout.on("data", (data) => stdout += data.toString());
-    proc.stderr.on("data", (data) => stderr += data.toString());
+    proc.stdout.on("data", (data) => { stdout = appendBounded(stdout, data); });
+    proc.stderr.on("data", (data) => { stderr = appendBounded(stderr, data); });
     proc.on("error", (error) => {
       activeChildren.delete(proc);
       options.signal?.removeEventListener("abort", terminate);
@@ -389,26 +399,48 @@ async function getChangedFiles(cwd, signal) {
 }
 
 function parsePiJsonLines(stdout) {
-  const messages = [];
-  const usage = [];
-  let text = "";
-  let model;
-  let stopReason;
-  for (const line of stdout.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    let event;
-    try { event = JSON.parse(line); } catch { continue; }
-    if (event.type !== "message_end" || !event.message) continue;
-    messages.push(event.message);
-    if (event.message.usage) usage.push(event.message.usage);
-    const msg = event.message;
-    if (msg.role === "assistant") {
-      model = msg.model || model;
-      stopReason = msg.stopReason || stopReason;
-      for (const part of msg.content || []) if (part.type === "text") text = part.text;
-    }
+  const state = createPiJsonLineParser();
+  consumePiJsonChunk(state, stdout);
+  return piParserResult(state);
+}
+
+function createPiJsonLineParser() {
+  return { buffer: "", text: "", messages: [], usage: [], model: undefined, stopReason: undefined, stdoutPreview: "", lines: 0, droppedBytes: 0 };
+}
+
+function consumePiJsonChunk(state, chunk) {
+  const text = typeof chunk === "string" ? chunk : chunk.toString();
+  state.stdoutPreview = appendBounded(state.stdoutPreview, text, MAX_TEXT_BYTES);
+  state.buffer += text;
+  if (Buffer.byteLength(state.buffer, "utf8") > MAX_TEXT_BYTES) {
+    state.droppedBytes += Buffer.byteLength(state.buffer, "utf8") - MAX_TEXT_BYTES;
+    state.buffer = state.buffer.slice(-MAX_TEXT_BYTES);
   }
-  return { text, messages, usage, model, stopReason };
+  const lines = state.buffer.split(/\r?\n/);
+  state.buffer = lines.pop() || "";
+  for (const line of lines) consumePiJsonLine(state, line);
+}
+
+function consumePiJsonLine(state, line) {
+  if (!line.trim()) return;
+  state.lines += 1;
+  let event;
+  try { event = JSON.parse(line); } catch { return; }
+  if (event.type !== "message_end" || !event.message) return;
+  state.messages.push(event.message);
+  if (state.messages.length > 20) state.messages.shift();
+  if (event.message.usage) state.usage.push(event.message.usage);
+  const msg = event.message;
+  if (msg.role === "assistant") {
+    state.model = msg.model || state.model;
+    state.stopReason = msg.stopReason || state.stopReason;
+    for (const part of msg.content || []) if (part.type === "text") state.text = part.text;
+  }
+}
+
+function piParserResult(state) {
+  if (state.buffer.trim()) consumePiJsonLine(state, state.buffer);
+  return { text: state.text, messages: state.messages, usage: state.usage, model: state.model, stopReason: state.stopReason, stdout: state.stdoutPreview, droppedBytes: state.droppedBytes, parsedLines: state.lines };
 }
 
 async function runPi({ cwd, prompt, tools, model, timeoutMs = 30 * 60 * 1000, signal }) {
@@ -421,7 +453,7 @@ async function runPi({ cwd, prompt, tools, model, timeoutMs = 30 * 60 * 1000, si
   return await new Promise((resolve) => {
     const proc = spawn(DEFAULT_PI, args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env, detached: process.platform !== "win32" });
     activeChildren.add(proc);
-    let stdout = "";
+    const parsed = createPiJsonLineParser();
     let stderr = "";
     let aborted = false;
     let timedOut = false;
@@ -432,20 +464,20 @@ async function runPi({ cwd, prompt, tools, model, timeoutMs = 30 * 60 * 1000, si
     };
     const timer = setTimeout(() => { timedOut = true; terminate(); }, timeoutMs);
     signal?.addEventListener("abort", terminate, { once: true });
-    proc.stdout.on("data", (data) => stdout += data.toString());
-    proc.stderr.on("data", (data) => stderr += data.toString());
+    proc.stdout.on("data", (data) => { consumePiJsonChunk(parsed, data); });
+    proc.stderr.on("data", (data) => { stderr = appendBounded(stderr, data); });
     proc.on("error", (error) => {
       activeChildren.delete(proc);
       clearTimeout(timer);
       signal?.removeEventListener("abort", terminate);
-      resolve({ ok: false, text: "", error: error.message, stdout, stderr, aborted, timedOut });
+      resolve({ ok: false, text: "", error: error.message, stdout: piParserResult(parsed).stdout, stderr, aborted, timedOut });
     });
     proc.on("close", (code) => {
       activeChildren.delete(proc);
       clearTimeout(timer);
       signal?.removeEventListener("abort", terminate);
-      const parsed = parsePiJsonLines(stdout);
-      resolve({ ok: code === 0 && Boolean(parsed.text) && !aborted, code, stdout, stderr, aborted, timedOut, ...parsed, error: aborted ? String(signal?.reason || "cancelled") : code === 0 ? undefined : stderr || `pi exited ${code}` });
+      const result = piParserResult(parsed);
+      resolve({ ok: code === 0 && Boolean(result.text) && !aborted, code, stderr, aborted, timedOut, ...result, error: aborted ? String(signal?.reason || "cancelled") : code === 0 ? undefined : stderr || `pi exited ${code}` });
     });
   });
 }
