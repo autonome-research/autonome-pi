@@ -892,6 +892,33 @@ function isSupplementalLocalAssertionId(id) {
   return String(id || "").trim().startsWith("local:");
 }
 
+function localAssertionPrefixMatches(text, assertion) {
+  if (text === assertion) return true;
+  if (!text.startsWith(assertion)) return false;
+  return /^(\s|[:.]| - | – | — )/.test(text.slice(assertion.length));
+}
+
+function canonicalLocalAssertionId(value, allowedLocalAssertions = []) {
+  const allowed = Array.from(new Set((allowedLocalAssertions || []).map(String).filter(Boolean))).sort((a, b) => b.length - a.length);
+  const candidates = [];
+  if (typeof value === "object" && value) {
+    if (value.id) candidates.push(String(value.id));
+    if (value.description) candidates.push(String(value.description));
+    if (value.summary) candidates.push(String(value.summary));
+  } else candidates.push(String(value));
+  for (const candidate of candidates) {
+    const trimmed = candidate.trim();
+    const withoutLabel = trimmed.replace(/^local\s+assertion\s*:\s*/i, "");
+    for (const assertion of allowed) {
+      const safe = safeName(assertion, "assertion");
+      for (const text of [trimmed, withoutLabel, safeName(trimmed, "assertion"), safeName(withoutLabel, "assertion")]) {
+        if (localAssertionPrefixMatches(text, assertion) || localAssertionPrefixMatches(text, safe)) return assertion;
+      }
+    }
+  }
+  return undefined;
+}
+
 function normalizeAssertionsAddressed(raw, plan, allowedLocalAssertions = []) {
   const allowedLocal = new Set((allowedLocalAssertions || []).map(String));
   const values = Array.isArray(raw) ? raw : [];
@@ -903,7 +930,9 @@ function normalizeAssertionsAddressed(raw, plan, allowedLocalAssertions = []) {
     const safeId = safeName(rawId, "assertion");
     const safeDescription = safeName(rawDescription, "assertion");
     const assertionId = canonicalAssertionId(value, plan.validationContract);
+    const localAssertionId = assertionId ? undefined : canonicalLocalAssertionId(value, allowedLocalAssertions);
     if (assertionId) ids.push(assertionId);
+    else if (localAssertionId) ids.push(localAssertionId);
     else if (isSupplementalLocalAssertionId(rawId)) ids.push(rawId.trim());
     else if (allowedLocal.has(rawId)) ids.push(rawId);
     else if (allowedLocal.has(safeId)) ids.push(safeId);
