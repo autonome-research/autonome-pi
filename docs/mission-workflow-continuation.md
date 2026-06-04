@@ -72,37 +72,23 @@ mission/trading-automation-system-v1
 /home/velvet/.pi/agent/mission-workflow/worktrees/trading-automation-system-v1/integration
 ```
 
-Latest failed run:
+Current active run after `v0.11.0` release/resume:
 
 ```text
-mission-workflow-2026-06-04T02-14-04-825Z-f9bfa40e
+mission-workflow-2026-06-04T23-24-17-413Z-8284068a
+pid: 1412093
+current observed feature: M2-F3
 ```
 
-Progress in that run:
+As of the connection-loss check, the mission process and child Pi worker were still alive. The run had skipped/validated M0 and M1, committed/recognized M2-F1 and M2-F2, and was re-running stale/unverified branch `M2-F3` with active I/O/watchdog telemetry visible in the thread-phase log.
 
-- M0 validated successfully after earlier repairs.
-- M1 original features were skipped as already merged.
-- M1 repair commits landed on the mission branch:
-  - `d410000` — `repair-M1-1-1`, risk-approved order boundary before broker adapters.
-  - `0c81846` — `repair-M1-1-2`, coverage gap for `assertion-006`.
-- M1 iteration 2 validation still had must objections for:
-  - `assertion-003` — malformed LLM output auditability,
-  - `assertion-009` — quant-feature reproducibility payload validation,
-  - `assertion-006` — risk approval forgery concerns.
-- The runner generated `repair-M1-2-1` and the worker changed:
-  - `auto_trading/signals/llm.py`
-  - `tests/test_llm_combiner.py`
-- That repair was **not committed** because strict handoff validation failed.
-
-Exact latest failure:
+Most recent resolved failure before this run:
 
 ```text
-Strict handoff validation failed for repair-M1-2-1:
-Unknown assertion addressed: "assertion-003: malformed LLM endpoint responses now degrade to a neutral assessment while preserving the actual endpoint raw output and explicit failure metadata in parsed_output."
-Unknown assertion addressed: "assertion-009: LLM invocation audit material now keeps the raw malformed output for ledger/reconstruction paths instead of replacing it with fallback JSON."
+mission-workflow-2026-06-04T20-23-17-231Z-5ebe2499
 ```
 
-Interpretation: this is likely an extension strict-handoff normalization issue. The worker wrote verbose strings prefixed with valid assertion IDs. The normalizer should canonicalize `assertion-003: ...` to `assertion-003` and `assertion-009: ...` to `assertion-009`, provided those IDs exist in the validation contract and are assigned to the repair feature.
+That run failed at `M2-F1` strict handoff validation because the worker-created `.mission/handoffs/M2-F1.json` was tracked from a stale branch and then removed by the runner, so git status only saw the handoff-file deletion while the handoff listed implementation files. `v0.10.9`/`v0.11.0` restored the handoff path after artifact extraction and hardened operation timeouts/watchdogs, allowing the later resume to pass M2-F1.
 
 ## Failure-mode handling rules
 
@@ -139,14 +125,7 @@ The working tree now contains the intended `v0.11.0` mission hardening:
 - failed worker diffs/status are preserved as artifacts before removing failed feature worktrees;
 - hard failures/cancellations mark the durable registry `failed`/`cancelled` on a best-effort basis, without downgrading an already `completed` mission registry;
 - operation-level watchdog telemetry is emitted on heartbeats, including child PID, operation label, elapsed time, idle time, hard timeout, and idle timeout; stale operations emit `progress_watchdog` events; Pi calls have hard and idle-output timeouts; validation/user-test shell commands now have explicit timeouts instead of being able to hang indefinitely;
-- workflow-agnostic active I/O snapshots are emitted via `active_io` phase events and projected as `run.activeIo`/`phase.activeIo`, so the monitor panel, tools, and debugging sessions can inspect current prompts/commands and output tails without coupling mission-specific logic to the UI;
+- workflow-agnostic active I/O snapshots are emitted via `active_io` phase events and projected as `run.activeIo`/`phase.activeIo`, so the monitor panel, tools, and debugging sessions can inspect current component status and byte counts without coupling mission-specific logic to the UI; active I/O is redacted/capped, can be disabled with `PI_THREAD_PHASE_ACTIVE_IO=0`, and raw-ish process/model previews are opt-in (`PI_THREAD_PHASE_ACTIVE_IO_PREVIEWS=1`, `PI_THREAD_PHASE_ACTIVE_IO_COMMANDS=1`, `PI_THREAD_PHASE_ACTIVE_IO_PROMPTS=1`);
 - smoke coverage was added for prefixed handoffs, stale branch rerun, completed-head skip with feature-id trailer, same-subject/no-trailer rerun, stale registry skipped/commit records, handoff-backed legacy skips, registry-failed marking, command timeout handling, and completed-registry non-downgrade/immutability.
 
-Before resuming auto_trading again:
-
-1. run `node --check mission-workflow/bin/mission-workflow.mjs`,
-2. run `PI_OFFLINE=1 pi --no-extensions -e . --list-models`,
-3. run `npm test`,
-4. code-review the working tree,
-5. commit/release the package tag,
-6. resume the approved auto_trading mission with the same plan path.
+`v0.11.0` has been committed/tagged/pushed (`2f703f9 Add active workflow IO snapshots`) and the approved auto_trading mission has already been resumed. If the current run fails or is cancelled, inspect the run artifacts first and classify the failure before resuming again.
