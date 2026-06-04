@@ -552,7 +552,13 @@ function canonicalAssertionId(value, contract) {
 }
 
 function normalizeAssertionReferences(values, contract) {
-  return Array.from(new Set((values || []).map((value) => canonicalAssertionId(value, contract) || (typeof value === "object" && value ? String(value.id || value.description || "") : String(value))).filter(Boolean)));
+  const list = Array.isArray(values) ? values : values ? [values] : [];
+  return Array.from(new Set(list.map((value) => canonicalAssertionId(value, contract) || (typeof value === "object" && value ? String(value.id || value.description || "") : String(value))).filter(Boolean)));
+}
+
+function normalizeLocalAssertions(values) {
+  const list = Array.isArray(values) ? values : values ? [values] : [];
+  return Array.from(new Set(list.map((value) => typeof value === "object" && value ? String(value.id || value.description || "") : String(value)).filter(Boolean)));
 }
 
 function isPassedAssertionStatus(status) {
@@ -589,13 +595,19 @@ function normalizePlan(plan, { goal, cwd, args, repoRoot }) {
   normalized.milestones = normalized.milestones.map((milestone, mIndex) => ({ 
     id: safeName(milestone.id || `milestone-${mIndex + 1}`, `milestone-${mIndex + 1}`),
     title: String(milestone.title || `Milestone ${mIndex + 1}`),
-    features: (Array.isArray(milestone.features) && milestone.features.length ? milestone.features : fallback.milestones[0].features).map((feature, fIndex) => ({
-      id: safeName(feature.id || `feature-${mIndex + 1}-${fIndex + 1}`, `feature-${fIndex + 1}`),
-      title: String(feature.title || feature.description || `Feature ${fIndex + 1}`),
-      description: String(feature.description || feature.title || goal),
-      assertions: Array.isArray(feature.assertions) && feature.assertions.length ? normalizeAssertionReferences(feature.assertions, normalized.validationContract) : assertionIds,
-      repair: Boolean(feature.repair),
-    })),
+    features: (Array.isArray(milestone.features) && milestone.features.length ? milestone.features : fallback.milestones[0].features).map((feature, fIndex) => {
+      const localAssertions = normalizeLocalAssertions(feature.localAssertions || []);
+      const rawAssertions = feature.assertions ? (Array.isArray(feature.assertions) ? feature.assertions : [feature.assertions]) : [];
+      return {
+        id: safeName(feature.id || `feature-${mIndex + 1}-${fIndex + 1}`, `feature-${fIndex + 1}`),
+        title: String(feature.title || feature.description || `Feature ${fIndex + 1}`),
+        description: String(feature.description || feature.title || goal),
+        assertions: rawAssertions.length ? normalizeAssertionReferences(rawAssertions, normalized.validationContract) : (feature.localOnly ? [] : assertionIds),
+        localAssertions,
+        localOnly: Boolean(feature.localOnly),
+        repair: Boolean(feature.repair),
+      };
+    }),
   }));
   return normalized;
 }
@@ -628,7 +640,8 @@ async function createPlan(args, cwd, run, ctx) {
       "You are a mission orchestrator. Inspect the repository before planning, especially files named specs.md, SPEC.md, requirements.md, README.md, or docs/*.md.",
       "Create a JSON mission plan for a Droid/Missions-style software workflow. For large specs, decompose the whole spec into milestones and serial features rather than shrinking scope.",
       "Return ONLY JSON with: missionId, goal, sourceDocs?, maxRepairIterations, validationCommands, userTestCommand, milestones[], validationContract.assertions[].",
-      "Each milestone has id,title,features[]. Each feature has id,title,description,assertions[].",
+      "Each milestone has id,title,features[]. Each feature has id,title,description,assertions[]. assertions[] must reference validationContract assertion IDs/descriptions.",
+      "Optional localAssertions[] are feature-local acceptance checks; they supplement validator context but do not satisfy global/final contract coverage. Use localOnly:true only for feature-local work with no global contract assertion.",
       "Validation assertions must be written before implementation and independently define correctness.",
       `Goal: ${goal}`,
       `Default maxRepairIterations: ${args["max-repair-iterations"] || DEFAULT_MAX_REPAIR_ITERATIONS}`,
@@ -672,10 +685,17 @@ function validatePlanForActivation(plan) {
   const normalized = normalizePlan(plan, { goal: plan.goal || plan.missionId, cwd: plan.cwd || process.cwd(), args: {}, repoRoot: plan.cwd || process.cwd() });
   const known = new Set((normalized.validationContract?.assertions || []).map((assertion) => String(assertion.id)));
   const unknown = [];
-  for (const milestone of normalized.milestones || []) for (const feature of milestone.features || []) for (const assertionId of feature.assertions || []) {
-    if (!known.has(String(assertionId))) unknown.push(`${milestone.id}/${feature.id}: ${assertionId}`);
+  const localCollisions = [];
+  for (const milestone of normalized.milestones || []) for (const feature of milestone.features || []) {
+    for (const assertionId of feature.assertions || []) {
+      if (!known.has(String(assertionId))) unknown.push(`${milestone.id}/${feature.id}: ${assertionId}`);
+    }
+    for (const localAssertion of feature.localAssertions || []) {
+      if (canonicalAssertionId(localAssertion, normalized.validationContract)) localCollisions.push(`${milestone.id}/${feature.id}: ${localAssertion}`);
+    }
   }
   if (unknown.length) throw new Error(`Unknown feature assertion references: ${unknown.join(", ")}`);
+  if (localCollisions.length) throw new Error(`Local assertions must not duplicate validation contract assertions: ${localCollisions.join(", ")}`);
   return normalized;
 }
 
@@ -751,7 +771,7 @@ function validateHandoff({ handoff, featureId, feature, plan, changedFiles }) {
   if (String(handoff.featureId || "") !== featureId) errors.push(`handoff.featureId (${handoff.featureId}) does not match featureId (${featureId})`);
   if (typeof handoff.completed !== "boolean") errors.push("handoff.completed must be boolean");
   for (const field of ["changedFiles", "commandsRun", "assertionsAddressed", "issuesDiscovered", "leftUndone"]) if (!Array.isArray(handoff[field])) errors.push(`handoff.${field} must be an array`);
-  const featureAssertions = Array.isArray(feature.assertions) ? feature.assertions.map(String) : [];
+  const featureAssertions = [...(Array.isArray(feature.assertions) ? feature.assertions.map(String) : []), ...(Array.isArray(feature.localAssertions) ? feature.localAssertions.map(String) : [])];
   const normalizedAssertions = normalizeAssertionsAddressed(handoff.assertionsAddressed, plan, featureAssertions);
   errors.push(...normalizedAssertions.errors);
   for (const assertionId of normalizedAssertions.ids) if (featureAssertions.length && !featureAssertions.includes(assertionId)) errors.push(`Assertion ${assertionId} is not assigned to feature ${featureId}`);
@@ -771,7 +791,7 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
   const featurePath = join(env.root, featureId);
   if (await branchMerged(env.repoRoot, featureBranch, env.missionBranch, ctx.signal)) {
     phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "resume", value: true, message: `Skipped already-merged ${featureId}` });
-    return { featureId, featureBranch, featurePath, assertions: feature.assertions || [], skipped: true, resumed: true };
+    return { featureId, featureBranch, featurePath, assertions: feature.assertions || [], localAssertions: feature.localAssertions || [], skipped: true, resumed: true };
   }
   if (existsSync(featurePath)) await git(env.repoRoot, ["worktree", "remove", "--force", featurePath], { signal: ctx.signal, reject: false });
   if (existsSync(featurePath)) rmSync(featurePath, { recursive: true, force: true });
@@ -825,7 +845,7 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
     const handoffSummary = summarizeHandoff(handoff, handoffArtifact);
     if (!changedFiles.length) {
       phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "changes", value: 0, message: "No file changes to commit" });
-      return { featureId, featureBranch, featurePath, assertions: handoffValidation.assertionsAddressed.length ? handoffValidation.assertionsAddressed : (feature.assertions || []), handoffArtifact, handoff: handoffSummary, changedFiles, commit: undefined };
+      return { featureId, featureBranch, featurePath, assertions: handoffValidation.assertionsAddressed.length ? handoffValidation.assertionsAddressed.filter((id) => knownContractAssertionIds(plan).has(String(id))) : (feature.assertions || []), localAssertions: handoffValidation.assertionsAddressed.filter((id) => !knownContractAssertionIds(plan).has(String(id))), handoffArtifact, handoff: handoffSummary, changedFiles, commit: undefined };
     }
     await git(featurePath, ["add", "-A"], { signal: ctx.signal });
     const staged = await git(featurePath, ["diff", "--cached", "--name-only"], { signal: ctx.signal, reject: false });
@@ -838,7 +858,7 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
     const commit = (await git(featurePath, ["rev-parse", "HEAD"], { signal: ctx.signal })).stdout.trim();
     await git(env.integrationPath, ["merge", "--ff-only", featureBranch], { signal: ctx.signal });
     phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "commit", value: commit, message: `Committed ${featureId}` });
-    return { featureId, featureBranch, featurePath, assertions: handoffValidation.assertionsAddressed.length ? handoffValidation.assertionsAddressed : (feature.assertions || []), handoffArtifact, handoff: handoffSummary, changedFiles, commit };
+    return { featureId, featureBranch, featurePath, assertions: handoffValidation.assertionsAddressed.length ? handoffValidation.assertionsAddressed.filter((id) => knownContractAssertionIds(plan).has(String(id))) : (feature.assertions || []), localAssertions: handoffValidation.assertionsAddressed.filter((id) => !knownContractAssertionIds(plan).has(String(id))), handoffArtifact, handoff: handoffSummary, changedFiles, commit };
   } finally {
     await git(env.repoRoot, ["worktree", "remove", "--force", featurePath], { signal: ctx.signal, reject: false });
   }
@@ -846,6 +866,10 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
 
 function contractAssertionMap(plan) {
   return new Map((plan.validationContract?.assertions || []).map((assertion) => [String(assertion.id), assertion]));
+}
+
+function knownContractAssertionIds(plan) {
+  return new Set((plan.validationContract?.assertions || []).map((assertion) => String(assertion.id)));
 }
 
 function milestoneAssertionIds(plan, milestone) {
@@ -859,30 +883,36 @@ function milestoneCoverageAssertions(plan, milestone, scope = "milestone") {
   if (scope === "final" || !milestone) return plan.validationContract?.assertions || [];
   const known = contractAssertionMap(plan);
   const ids = milestoneAssertionIds(plan, milestone);
-  if (ids.size) return Array.from(ids).map((id) => known.get(id)).filter(Boolean);
-  const local = [];
-  const seen = new Set();
-  for (const feature of milestone.features || []) for (const assertion of feature.assertions || []) {
+  const rows = Array.from(ids).map((id) => known.get(id)).filter(Boolean);
+  const seen = new Set(rows.map((assertion) => String(assertion.id)));
+  for (const feature of milestone.features || []) for (const assertion of feature.localAssertions || []) {
     const id = String(assertion);
     if (seen.has(id)) continue;
     seen.add(id);
-    local.push({ id, description: id, priority: "must", local: true });
+    rows.push({ id, description: id, priority: "must", local: true });
   }
-  return local;
+  return rows;
 }
 
 function buildCoverageReport({ plan, milestone, iterationState, commandReports, validatorReport, scope = "milestone" }) {
   const featureResults = iterationState?.features || [];
+  const knownAssertions = contractAssertionMap(plan);
   const featuresByAssertion = new Map();
   const allPlanFeatures = (plan.milestones || []).flatMap((m) => m.features || []);
   const candidateFeatures = scope === "final" ? allPlanFeatures : (milestone?.features || []);
-  for (const feature of candidateFeatures) for (const id of feature.assertions || []) {
+  for (const feature of candidateFeatures) for (const id of [...(feature.assertions || []), ...(scope === "final" ? [] : (feature.localAssertions || []))]) {
     const key = String(id);
     if (!featuresByAssertion.has(key)) featuresByAssertion.set(key, []);
     const result = featureResults.find((item) => item.featureId === safeName(feature.id || feature.title, "feature"));
     featuresByAssertion.get(key).push({ featureId: safeName(feature.id || feature.title, "feature"), title: feature.title, commit: result?.commit, handoff: result?.handoffArtifact || result?.handoff?.artifact, status: result ? (result.skipped ? "previously-completed" : "completed") : "planned" });
   }
   for (const result of featureResults) for (const id of result.assertions || []) {
+    const key = String(id);
+    if (scope === "final" && !knownAssertions.has(key)) continue;
+    if (!featuresByAssertion.has(key)) featuresByAssertion.set(key, []);
+    if (!featuresByAssertion.get(key).some((item) => item.featureId === result.featureId && item.commit === result.commit)) featuresByAssertion.get(key).push({ featureId: result.featureId, title: result.featureId, commit: result.commit, handoff: result.handoffArtifact || result.handoff?.artifact, status: result.skipped ? "previously-completed" : "completed" });
+  }
+  if (scope !== "final") for (const result of featureResults) for (const id of result.localAssertions || []) {
     const key = String(id);
     if (!featuresByAssertion.has(key)) featuresByAssertion.set(key, []);
     if (!featuresByAssertion.get(key).some((item) => item.featureId === result.featureId && item.commit === result.commit)) featuresByAssertion.get(key).push({ featureId: result.featureId, title: result.featureId, commit: result.commit, handoff: result.handoffArtifact || result.handoff?.artifact, status: result.skipped ? "previously-completed" : "completed" });
@@ -937,7 +967,7 @@ function normalizeValidatorReport(raw, { plan, milestone, coverageGaps }) {
 async function runAdversarialValidator(env, plan, milestone, iterationState, commandReports, coverageDraft, ctx, run) {
   let raw;
   if (String(plan.planner || "pi") === "mock") {
-    raw = { passed: true, summary: "Mock adversarial validator accepted the milestone.", objections: [], assertionResults: Array.from(milestoneAssertionIds(plan, milestone)).map((assertionId) => ({ assertionId, status: "pass", evidence: "Mock validation." })) };
+    raw = { passed: true, summary: "Mock adversarial validator accepted the milestone.", objections: [], assertionResults: milestoneCoverageAssertions(plan, milestone, "milestone").map((assertion) => ({ assertionId: assertion.id, status: "pass", evidence: "Mock validation." })) };
   } else {
     const diffStat = await git(env.integrationPath, ["diff", "--stat", `${env.baseHead}..HEAD`], { signal: ctx.signal, reject: false });
     const diffFiles = await git(env.integrationPath, ["diff", "--name-only", `${env.baseHead}..HEAD`], { signal: ctx.signal, reject: false });

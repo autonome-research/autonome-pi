@@ -148,6 +148,40 @@ try {
   }, null, 2));
   expectExit('mission workflow rejects unknown feature assertion references', ['node', missionCli, 'activate', '--approved', '--plan-path', typoPlanPath, '--cwd', typoRepo], 1);
 
+  const localCollisionRepo = join(tmp, 'local-collision-repo');
+  mkdirSync(localCollisionRepo, { recursive: true });
+  expectExit('local collision repo git init', ['git', 'init', '-q'], 0, { cwd: localCollisionRepo });
+  expectExit('local collision repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: localCollisionRepo });
+  expectExit('local collision repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: localCollisionRepo });
+  writeFileSync(join(localCollisionRepo, 'README.md'), 'local collision\n');
+  expectExit('local collision repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: localCollisionRepo });
+  const localCollisionPlanPath = join(tmp, 'local-collision-plan.json');
+  writeFileSync(localCollisionPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'local-collision-smoke', goal: 'local collision rejection', cwd: localCollisionRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    worktreeBaseDir: join(tmp, 'local-collision-worktrees'), validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'], localAssertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow rejects local assertion contract collisions', ['node', missionCli, 'activate', '--approved', '--plan-path', localCollisionPlanPath, '--cwd', localCollisionRepo], 1);
+
+  const localSupplementRepo = join(tmp, 'local-supplement-repo');
+  mkdirSync(localSupplementRepo, { recursive: true });
+  expectExit('local supplement repo git init', ['git', 'init', '-q'], 0, { cwd: localSupplementRepo });
+  expectExit('local supplement repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: localSupplementRepo });
+  expectExit('local supplement repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: localSupplementRepo });
+  writeFileSync(join(localSupplementRepo, 'README.md'), 'local supplement\n');
+  expectExit('local supplement repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: localSupplementRepo });
+  const localSupplementPlanPath = join(tmp, 'local-supplement-plan.json');
+  writeFileSync(localSupplementPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'local-supplement-smoke', goal: 'local supplement coverage', cwd: localSupplementRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    worktreeBaseDir: join(tmp, 'local-supplement-worktrees'), validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', localAssertions: ['local acceptance check'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  const localSupplementActivate = expectExit('mission workflow treats localAssertions as supplemental by default', ['node', missionCli, 'activate', '--approved', '--plan-path', localSupplementPlanPath, '--cwd', localSupplementRepo], 0);
+  let localSupplementDetails;
+  try { localSupplementDetails = localSupplementActivate.stdout ? JSON.parse(localSupplementActivate.stdout) : undefined; } catch { localSupplementDetails = undefined; }
+  const localSupplementCoverage = localSupplementDetails?.finalCoveragePath ? JSON.parse(readFileSync(localSupplementDetails.finalCoveragePath, 'utf8')) : undefined;
+  log(localSupplementCoverage?.gaps?.length === 0, 'local supplement final coverage has no gaps');
+
   const failedValidatorRepo = join(tmp, 'failed-validator-repo');
   mkdirSync(failedValidatorRepo, { recursive: true });
   expectExit('failed validator repo git init', ['git', 'init', '-q'], 0, { cwd: failedValidatorRepo });
