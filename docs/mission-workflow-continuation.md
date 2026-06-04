@@ -130,9 +130,9 @@ When a mission fails, do **not** blindly relaunch. First classify the failure:
 
 ## Immediate recommended next step
 
-The working tree now contains the intended `v0.10.5` mission hardening:
+The working tree now contains the intended `v0.10.6` mission hardening:
 
-- handoff assertion canonicalization accepts strings like `assertion-003: detailed explanation` when the leading ID exists in the validation contract;
+- handoff assertion canonicalization accepts strings like `assertion-003: detailed explanation` when the leading ID exists in the validation contract, and accepts supplemental `local:*` worker test/evidence IDs without counting them as global contract coverage;
 - resume no longer treats branch ancestry alone as proof of feature completion, so stale failed feature branches at the mission head are rerun;
 - runner-owned commits now include `Mission-Feature-Id: <featureId>` and `Mission-Feature-Fingerprint: <fingerprint>` trailers;
 - branch-only resume recognizes completed features only with stronger proof: merged, not at the base head, runner-owned commit subject plus matching `Mission-Feature-Id` and `Mission-Feature-Fingerprint` trailers; fingerprint schema `pi-mission-feature-fingerprint/v2` includes the milestone id, feature metadata, assigned assertion ids, local assertion ids, and assigned validation-contract assertion descriptions/priorities/methods/coverage refs; registry-backed legacy commit records may still use subject plus `Mission-Feature-Id` when no fingerprint was historically recorded, but still require current milestone/assignment metadata; valid completed no-change handoff artifacts remain trusted for legacy/no-change work; subject-only legacy skipped records are no longer trusted;

@@ -888,6 +888,10 @@ async function preserveFailedWorkerArtifacts(featurePath, featureId, run, signal
   if (diff.ok && diff.stdout.trim()) writeArtifact(run, `failed-workers/${featureId}.diff`, compactText(diff.stdout, MAX_TEXT_BYTES), "file", `Failed worker diff: ${featureId}`);
 }
 
+function isSupplementalLocalAssertionId(id) {
+  return String(id || "").trim().startsWith("local:");
+}
+
 function normalizeAssertionsAddressed(raw, plan, allowedLocalAssertions = []) {
   const allowedLocal = new Set((allowedLocalAssertions || []).map(String));
   const values = Array.isArray(raw) ? raw : [];
@@ -900,6 +904,7 @@ function normalizeAssertionsAddressed(raw, plan, allowedLocalAssertions = []) {
     const safeDescription = safeName(rawDescription, "assertion");
     const assertionId = canonicalAssertionId(value, plan.validationContract);
     if (assertionId) ids.push(assertionId);
+    else if (isSupplementalLocalAssertionId(rawId)) ids.push(rawId.trim());
     else if (allowedLocal.has(rawId)) ids.push(rawId);
     else if (allowedLocal.has(safeId)) ids.push(safeId);
     else if (allowedLocal.has(rawDescription)) ids.push(rawDescription);
@@ -933,7 +938,7 @@ function validateHandoff({ handoff, featureId, feature, plan, changedFiles }) {
   const featureAssertions = [...(Array.isArray(feature.assertions) ? feature.assertions.map(String) : []), ...(Array.isArray(feature.localAssertions) ? feature.localAssertions.map(String) : [])];
   const normalizedAssertions = normalizeAssertionsAddressed(handoff.assertionsAddressed, plan, featureAssertions);
   errors.push(...normalizedAssertions.errors);
-  for (const assertionId of normalizedAssertions.ids) if (featureAssertions.length && !featureAssertions.includes(assertionId)) errors.push(`Assertion ${assertionId} is not assigned to feature ${featureId}`);
+  for (const assertionId of normalizedAssertions.ids) if (featureAssertions.length && !featureAssertions.includes(assertionId) && !isSupplementalLocalAssertionId(assertionId)) errors.push(`Assertion ${assertionId} is not assigned to feature ${featureId}`);
   for (const assertionId of featureAssertions) if (!normalizedAssertions.ids.includes(assertionId)) errors.push(`handoff.assertionsAddressed omitted assigned assertion: ${assertionId}`);
   const declared = Array.isArray(handoff.changedFiles) ? Array.from(new Set(handoff.changedFiles.map(String).filter(Boolean))).sort() : [];
   const actual = Array.from(new Set(changedFiles || [])).sort();
