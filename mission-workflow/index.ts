@@ -11,7 +11,7 @@ const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(EXT_DIR, "bin", "mission-workflow.mjs");
 const MAX_TOOL_TEXT = 30_000;
 
-type MissionAction = "plan" | "activate" | "status";
+type MissionAction = "plan" | "activate" | "resume" | "status";
 type PlannerMode = "pi" | "mock";
 
 function truncate(text: string, max = MAX_TOOL_TEXT): string {
@@ -134,9 +134,10 @@ export default function missionWorkflow(pi: ExtensionAPI) {
 			"Use mission_workflow for Droid/Missions-style multi-feature implementation workflows that need planning, validation contracts, worker handoffs, worktrees, and milestone validation.",
 			"Always run action='plan' first and ask the user to approve the generated plan before action='activate'.",
 			"Once activated with approved=true, the mission runs without further human approval unless cancelled or failed.",
+			"Use action='resume' only for an approved mission whose previous activation stopped unexpectedly; it reuses the mission branch/worktrees and skips already-merged feature branches.",
 		],
 		parameters: Type.Object({
-			action: Type.Optional(StringEnum(["plan", "activate", "status"] as const, { default: "plan" })),
+			action: Type.Optional(StringEnum(["plan", "activate", "resume", "status"] as const, { default: "plan" })),
 			goal: Type.Optional(Type.String({ description: "Mission goal. Required for action=plan." })),
 			cwd: Type.Optional(Type.String({ description: "Repository directory. Defaults to Pi's active cwd." })),
 			planPath: Type.Optional(Type.String({ description: "Path to an approved mission-plan.json for action=activate." })),
@@ -153,7 +154,7 @@ export default function missionWorkflow(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const action = (params.action || "plan") as MissionAction;
 			const cwd = resolveAgainstActive(activeCwd || ctx.cwd, params.cwd);
-			onUpdate?.({ content: [{ type: "text", text: `${action === "activate" ? "Activating" : action === "status" ? "Checking" : "Planning"} mission workflow in ${cwd}...` }] });
+			onUpdate?.({ content: [{ type: "text", text: `${action === "activate" ? "Activating" : action === "resume" ? "Resuming" : action === "status" ? "Checking" : "Planning"} mission workflow in ${cwd}...` }] });
 			const result = await runScript(buildArgs({ ...params, action, cwd }, ctx), cwd, signal);
 			let details: any;
 			try { details = parseJsonObject(result.stdout); } catch { details = { stdout: result.stdout, stderr: result.stderr }; }

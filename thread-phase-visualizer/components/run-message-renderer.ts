@@ -16,7 +16,7 @@ function compactRunLine(run: RunSummary, theme: any): string {
 	const status = run.normalizedStatus || run.status;
 	const icon = theme.fg(statusColor(status), statusIcon(status));
 	const workflow = theme.fg("accent", run.workflow || "workflow");
-	const statusText = status === STATUSES.RUNNING ? "running" : status === STATUSES.FAILED ? "failed" : "completed";
+	const statusText = run.stale ? `stale (${run.stale.reason})` : status === STATUSES.RUNNING ? "running" : status === STATUSES.FAILED ? "failed" : "completed";
 	const usage = run.usage?.entries ? ` · ${formatUsageSummary(run.usage)}` : "";
 	const counts = theme.fg("muted", `${phaseSummaryText(run)} · ${artifactSummaryText(run)}${usage}`);
 	const id = theme.fg("dim", shortRunId(run.runId));
@@ -50,6 +50,8 @@ function renderRunMessage(message: any, expanded: boolean, theme: any) {
 	if (run.startedAt || run.updatedAt) {
 		container.addChild(new Text(theme.fg("dim", `Started: ${run.startedAt || "?"}  Updated: ${run.updatedAt || "?"}`), 0, 0));
 	}
+	if (run.heartbeat?.timestamp) container.addChild(new Text(theme.fg("dim", `Heartbeat: ${run.heartbeat.timestamp}${run.heartbeat.featureId ? ` feature=${run.heartbeat.featureId}` : ""}`), 0, 0));
+	if (run.stale) container.addChild(new Text(theme.fg("warning", `Stale: ${run.stale.reason}${run.stale.pid ? ` pid=${run.stale.pid}` : ""}`), 0, 0));
 	if (run.usage?.entries) container.addChild(new Text(theme.fg("muted", `Usage: ${formatUsageSummary(run.usage)}`), 0, 0));
 
 	container.addChild(new Spacer(1));

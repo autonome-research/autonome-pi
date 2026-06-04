@@ -49,7 +49,7 @@ Recent changes:
 - Usage events are aggregated into run, phase, and fanout-item summaries and rendered in tools/monitor/completion cards.
 - `npm test` runs smoke coverage for extension load, permission denial before harness import, structured validation, JS harness mode, structured shell mode, and usage projection.
 - The package now ships workflow skills so fresh Pi sessions get progressive-disclosure guidance for dynamic workflows and mission workflows.
-- Added `mission_workflow` MVP with plan/activate split, approval-before-activation, git worktree isolation, deterministic per-feature commits, command-based validators, and capped repair loops.
+- Added `mission_workflow` MVP with plan/activate/resume split, approval-before-activation, git worktree isolation, deterministic per-feature commits, command-based validators, heartbeat/stale observability, and capped repair loops.
 - Thread-phase dependency is `^4.0.0`.
 
 ## Remaining work

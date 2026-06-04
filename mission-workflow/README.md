@@ -21,6 +21,7 @@ Actions:
 
 - `plan` — create `mission-plan.json`, `validation-contract.json`, and approval instructions.
 - `activate` — execute an approved plan in the background or foreground.
+- `resume` — resume an approved mission after an unexpected stop by reusing the mission branch/worktrees and skipping already-merged feature branches.
 - `status` — show git worktree status from the repo.
 
 ## Example
@@ -56,6 +57,7 @@ await mission_workflow({
 - Scrutiny validators run configured `validationCommands` after each milestone.
 - User-testing validator starts as a configured command (`userTestCommand`).
 - Failed validation enqueues repair features up to `maxRepairIterations` (default `10`).
+- Heartbeat events record current milestone/feature/branch/worktree and child process ids for stale-run detection.
 - Final merge into the user's target branch is manual by default.
 
 ## Safety model
@@ -68,7 +70,7 @@ await mission_workflow({
 ## Current limitations
 
 - This MVP is intentionally simple and should be dogfooded on small missions first.
-- Resume/reuse is not implemented; activation fails if the integration worktree already exists.
+- Resume/reuse is MVP-level: it skips feature branches already merged into the mission branch, but does not yet reconstruct dynamic repair queues beyond rerunning milestone validation.
 - Worktree cleanup is best-effort.
 - Browser/computer-use QA is not implemented; user testing is command-based.
 - Repair planning currently creates generic corrective features from failed validators.

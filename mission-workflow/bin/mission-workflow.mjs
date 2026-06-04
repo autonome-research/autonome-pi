@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -36,6 +36,8 @@ const activeChildren = new Set();
 let activeRun;
 let activeAbortController;
 let cancellationRequested = false;
+let finalizedRun = false;
+let currentHeartbeat = {};
 
 function abortError(reason = "cancelled") {
   const error = new Error(String(reason));
@@ -62,6 +64,28 @@ function requestCancel(reason = "cancelled") {
   for (const child of activeChildren) terminateChild(child, "SIGTERM");
 }
 
+function recordFatal(error) {
+  if (!activeRun || finalizedRun) return;
+  finalizedRun = true;
+  try { failRun(activeRun, error); } catch { /* best effort */ }
+}
+
+function startHeartbeat(run, details = {}) {
+  const timer = setInterval(() => {
+    if (finalizedRun) return;
+    phaseEvent(run, currentHeartbeat.phase || "heartbeat", {
+      kind: "heartbeat",
+      pid: process.pid,
+      childPids: Array.from(activeChildren).map((child) => child.pid).filter(Boolean),
+      ...details,
+      ...currentHeartbeat,
+      timestamp: new Date().toISOString(),
+    });
+  }, 30_000);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
 function watchCancellation(run, controller) {
   const timer = setInterval(() => {
     const request = readCancellation(run.runId);
@@ -76,6 +100,8 @@ function watchCancellation(run, controller) {
 
 process.once("SIGTERM", () => requestCancel("SIGTERM"));
 process.once("SIGINT", () => requestCancel("SIGINT"));
+process.on("uncaughtException", (error) => { recordFatal(error); throw error; });
+process.on("unhandledRejection", (reason) => { recordFatal(reason instanceof Error ? reason : new Error(String(reason))); });
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -291,6 +317,10 @@ function defaultPlan({ goal, cwd, args, repoRoot }) {
     maxRepairIterations: Number(args["max-repair-iterations"] || DEFAULT_MAX_REPAIR_ITERATIONS),
     validationCommands: splitList(args["validation-command"]),
     userTestCommand: args["user-test-command"] ? String(args["user-test-command"]) : undefined,
+    planner: String(args.planner || "pi"),
+    modelPlan: args["model-plan"] ? String(args["model-plan"]) : undefined,
+    modelWorker: args["model-worker"] ? String(args["model-worker"]) : undefined,
+    modelValidator: args["model-validator"] ? String(args["model-validator"]) : undefined,
     milestones: [{
       id: "milestone-001",
       title: "Implement requested mission goal",
@@ -317,6 +347,10 @@ function normalizePlan(plan, { goal, cwd, args, repoRoot }) {
     maxRepairIterations: Number(plan.maxRepairIterations || args["max-repair-iterations"] || DEFAULT_MAX_REPAIR_ITERATIONS),
     validationCommands: Array.isArray(plan.validationCommands) ? plan.validationCommands : fallback.validationCommands,
     userTestCommand: plan.userTestCommand || fallback.userTestCommand,
+    planner: String(args.planner || plan.planner || fallback.planner || "pi"),
+    modelPlan: args["model-plan"] ? String(args["model-plan"]) : plan.modelPlan,
+    modelWorker: args["model-worker"] ? String(args["model-worker"]) : plan.modelWorker,
+    modelValidator: args["model-validator"] ? String(args["model-validator"]) : plan.modelValidator,
     validationContract: normalizeValidationContract(plan.validationContract || fallback.validationContract, goal),
   };
   if (!Array.isArray(normalized.milestones) || normalized.milestones.length === 0) normalized.milestones = fallback.milestones;
@@ -406,23 +440,43 @@ function validatePlanForActivation(plan) {
   return plan;
 }
 
-async function ensureMissionWorktrees(plan, ctx, run) {
+async function ensureMissionWorktrees(plan, ctx, run, options = {}) {
   const repoRoot = (await git(plan.cwd, ["rev-parse", "--show-toplevel"], { signal: ctx.signal })).stdout.trim();
   const baseHead = (await git(repoRoot, ["rev-parse", plan.baseRef || "HEAD"], { signal: ctx.signal })).stdout.trim();
   const missionBranch = `mission/${safeName(plan.missionId, "mission")}`;
   const root = resolve(plan.worktreeBaseDir || join(homedir(), ".pi", "agent", "mission-workflow", "worktrees", plan.missionId));
   const integrationPath = join(root, "integration");
   mkdirSync(root, { recursive: true });
-  if (existsSync(integrationPath)) throw new Error(`integration worktree already exists: ${integrationPath}`);
+  if (existsSync(integrationPath)) {
+    if (!options.resume) throw new Error(`integration worktree already exists: ${integrationPath}`);
+    phaseEvent(run, "prepare-mission", { kind: "data", key: "missionBranch", value: missionBranch, message: `Resuming ${missionBranch}` });
+    return { repoRoot, baseHead, missionBranch, root, integrationPath, resumed: true };
+  }
   await git(repoRoot, ["worktree", "add", "-B", missionBranch, integrationPath, baseHead], { signal: ctx.signal });
   phaseEvent(run, "prepare-mission", { kind: "data", key: "missionBranch", value: missionBranch, message: `Created ${missionBranch}` });
-  return { repoRoot, baseHead, missionBranch, root, integrationPath };
+  return { repoRoot, baseHead, missionBranch, root, integrationPath, resumed: false };
+}
+
+async function branchExists(cwd, branch, signal) {
+  const result = await git(cwd, ["rev-parse", "--verify", branch], { signal, reject: false });
+  return result.ok;
+}
+
+async function branchMerged(cwd, branch, target, signal) {
+  if (!(await branchExists(cwd, branch, signal))) return false;
+  const result = await git(cwd, ["merge-base", "--is-ancestor", branch, target], { signal, reject: false });
+  return result.ok;
 }
 
 async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
   const featureId = safeName(feature.id || feature.title, "feature");
   const featureBranch = `mission-feature/${safeName(plan.missionId, "mission")}/${featureId}`;
   const featurePath = join(env.root, featureId);
+  if (await branchMerged(env.repoRoot, featureBranch, env.missionBranch, ctx.signal)) {
+    phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "resume", value: true, message: `Skipped already-merged ${featureId}` });
+    return { featureId, featureBranch, featurePath, skipped: true, resumed: true };
+  }
+  if (existsSync(featurePath)) await git(env.repoRoot, ["worktree", "remove", "--force", featurePath], { signal: ctx.signal, reject: false });
   if (existsSync(featurePath)) rmSync(featurePath, { recursive: true, force: true });
   await git(env.repoRoot, ["worktree", "add", "-B", featureBranch, featurePath, env.missionBranch], { signal: ctx.signal });
   try {
@@ -505,9 +559,12 @@ async function activateMission(args, cwd, run, ctx) {
   if (!isTruthyFlag(args.approved)) throw new Error("Activation requires --approved after the user reviews the mission plan.");
   if (!args["plan-path"]) throw new Error("--plan-path is required for activation");
   const plan = validatePlanForActivation(JSON.parse(readFileSync(resolve(cwd, String(args["plan-path"])), "utf8")));
-  const env = await ensureMissionWorktrees(plan, ctx, run);
-  const missionState = { missionId: plan.missionId, missionBranch: env.missionBranch, integrationPath: env.integrationPath, baseHead: env.baseHead, milestones: [], startedAt: new Date().toISOString() };
+  ctx.modelWorker = args["model-worker"] || plan.modelWorker || ctx.modelWorker;
+  ctx.modelValidator = args["model-validator"] || plan.modelValidator || ctx.modelValidator;
+  const env = await ensureMissionWorktrees(plan, ctx, run, { resume: isTruthyFlag(args.resume) });
+  const missionState = { missionId: plan.missionId, missionBranch: env.missionBranch, integrationPath: env.integrationPath, baseHead: env.baseHead, modelWorker: ctx.modelWorker, modelValidator: ctx.modelValidator, resumed: env.resumed, milestones: [], startedAt: new Date().toISOString() };
   for (const milestone of plan.milestones) {
+    currentHeartbeat = { phase: "execute-mission", missionId: plan.missionId, milestoneId: milestone.id, milestoneTitle: milestone.title, branch: env.missionBranch, worktree: env.integrationPath };
     let iteration = 0;
     let queue = [...(milestone.features || [])];
     const milestoneState = { id: milestone.id, title: milestone.title, iterations: [] };
@@ -517,11 +574,14 @@ async function activateMission(args, cwd, run, ctx) {
       const iterationState = { iteration, features: [], validation: undefined };
       for (const feature of queue) {
         const featureId = safeName(feature.id || feature.title, "feature");
+        currentHeartbeat = { phase: "execute-mission", missionId: plan.missionId, milestoneId: milestone.id, iteration, featureId, branch: env.missionBranch, worktree: env.integrationPath };
+        phaseEvent(run, "execute-mission", { kind: "heartbeat", ...currentHeartbeat, pid: process.pid, childPids: Array.from(activeChildren).map((child) => child.pid).filter(Boolean), message: `Worker ${featureId}` });
         phaseEvent(run, "execute-mission", { kind: "progress", current: iterationState.features.length, total: queue.length, message: `Worker ${featureId}` });
         const result = await runWorkerForFeature(env, milestone, feature, plan, ctx, run);
         iterationState.features.push(result);
       }
       queue = [];
+      currentHeartbeat = { phase: "execute-mission", missionId: plan.missionId, milestoneId: milestone.id, iteration, validator: "commands", branch: env.missionBranch, worktree: env.integrationPath };
       const validation = await runValidation(env, plan, milestone, ctx, run);
       iterationState.validation = validation;
       milestoneState.iterations.push(iterationState);
@@ -566,11 +626,12 @@ async function main() {
   const args = parseArgs(rawArgv);
   const action = String(args._[0] || args.action || "plan");
   if (["help", "--help", "-h"].includes(action)) {
-    console.log("Usage: mission-workflow.mjs plan --goal GOAL --cwd REPO | activate --plan-path mission-plan.json --approved --cwd REPO [--background]");
+    console.log("Usage: mission-workflow.mjs plan --goal GOAL --cwd REPO | activate|resume --plan-path mission-plan.json --approved --cwd REPO [--background]");
     return;
   }
   const cwd = resolve(String(args.cwd || process.cwd()));
-  if (action === "activate" && (!args["plan-path"] || !isTruthyFlag(args.approved))) throw new Error("activate requires --plan-path and --approved");
+  if (action === "resume") args.resume = true;
+  if (["activate", "resume"].includes(action) && (!args["plan-path"] || !isTruthyFlag(args.approved))) throw new Error(`${action} requires --plan-path and --approved`);
   if (maybeBackground(rawArgv, args, cwd)) return;
 
   if (action === "status") {
@@ -591,6 +652,7 @@ async function main() {
   const controller = new AbortController();
   activeAbortController = controller;
   const stopWatchingCancellation = watchCancellation(run, controller);
+  const stopHeartbeat = startHeartbeat(run, { action });
   const ctx = { cache: new PipelineCache(), signal: controller.signal, modelWorker: args["model-worker"], modelValidator: args["model-validator"] };
 
   try {
@@ -599,8 +661,9 @@ async function main() {
       const phases = [{ name: "create-plan", async *run(phaseCtx) { result = await createPlan(args, cwd, run, phaseCtx); yield { type: "data", kind: "data", key: "planPath", value: result.planPath, message: "Mission plan created" }; } }];
       for await (const _event of runPipeline(wrapPhases(phases, run), ctx, { signal: controller.signal })) {}
       completeRun(run, STATUSES.SUCCESS, { ok: true, planPath: result.planPath, contractPath: result.contractPath });
+      finalizedRun = true;
       console.log(JSON.stringify({ ok: true, action, runId: run.runId, cwd, ...result }, null, 2));
-    } else if (action === "activate") {
+    } else if (action === "activate" || action === "resume") {
       const phases = [
         { name: "prepare-mission", async *run() { yield { type: "data", kind: "data", key: "planPath", value: args["plan-path"], message: "Loading approved mission plan" }; } },
         { name: "execute-mission", async *run(phaseCtx) { result = await activateMission(args, cwd, run, phaseCtx); yield { type: "data", kind: "data", key: "branch", value: result.env.missionBranch, message: "Mission execution complete" }; } },
@@ -608,6 +671,7 @@ async function main() {
       ];
       for await (const _event of runPipeline(wrapPhases(phases, run), ctx, { signal: controller.signal })) {}
       completeRun(run, STATUSES.SUCCESS, { ok: true, missionId: result.plan.missionId, branch: result.env.missionBranch, finalPath: result.finalPath });
+      finalizedRun = true;
       console.log(JSON.stringify({ ok: true, action, runId: run.runId, cwd, missionId: result.plan.missionId, branch: result.env.missionBranch, finalPath: result.finalPath }, null, 2));
     } else {
       throw new Error(`Unknown action: ${action}`);
@@ -615,15 +679,18 @@ async function main() {
   } catch (error) {
     if (cancellationRequested || isAbortError(error) || controller.signal.aborted) {
       if (activeRun === run) completeRun(run, STATUSES.CANCELLED, { cancelled: true, reason: controller.signal.reason || error?.message });
+      finalizedRun = true;
       console.log(JSON.stringify({ ok: false, cancelled: true, action, runId: run.runId, cwd }, null, 2));
       process.exitCode = 130;
     } else {
       failRun(run, error);
+      finalizedRun = true;
       console.log(JSON.stringify({ ok: false, action, runId: run.runId, cwd, error: error.message }, null, 2));
       process.exitCode = 1;
     }
   } finally {
     stopWatchingCancellation?.();
+    stopHeartbeat?.();
     activeRun = undefined;
     activeAbortController = undefined;
   }

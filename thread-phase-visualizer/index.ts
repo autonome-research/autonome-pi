@@ -47,8 +47,9 @@ function formatRunSummary(run: AnyEvent): string {
 		.join(", ");
 	const artifacts = (run.artifacts || []).map((a: AnyEvent) => a.path || a.title).filter(Boolean);
 	return [
-		`- ${statusIcon(run.normalizedStatus)} ${run.workflow} (${run.runId})`,
+		`- ${statusIcon(run.normalizedStatus)} ${run.workflow} (${run.runId})${run.stale ? ` [STALE: ${run.stale.reason}]` : ""}`,
 		`  updated: ${run.updatedAt}`,
+		run.heartbeat?.timestamp ? `  heartbeat: ${run.heartbeat.timestamp}${run.heartbeat.featureId ? ` feature=${run.heartbeat.featureId}` : ""}` : undefined,
 		run.usage?.entries ? `  usage: ${formatUsageSummary(run.usage)}` : undefined,
 		phases ? `  phases: ${phases}` : undefined,
 		artifacts.length ? `  artifacts: ${artifacts.join(", ")}` : undefined,
@@ -59,9 +60,10 @@ function formatRunSummary(run: AnyEvent): string {
 function formatRunDetail(run: AnyEvent): string {
 	const artifacts = run.artifacts || [];
 	return truncate([
-		`${statusIcon(run.normalizedStatus)} Thread-phase workflow ${run.status}: ${run.workflow}`,
+		`${statusIcon(run.normalizedStatus)} Thread-phase workflow ${run.status}: ${run.workflow}${run.stale ? ` [STALE: ${run.stale.reason}]` : ""}`,
 		`Run: ${run.runId}`,
 		run.cwd ? `CWD: ${run.cwd}` : undefined,
+		run.heartbeat?.timestamp ? `Heartbeat: ${run.heartbeat.timestamp}${run.heartbeat.featureId ? ` feature=${run.heartbeat.featureId}` : ""}` : undefined,
 		run.usage?.entries ? `Usage: ${formatUsageSummary(run.usage)}` : undefined,
 		run.phases?.length ? `\nPhases:\n${run.phases.map((p: AnyEvent) => `- ${statusIcon(p.normalizedStatus)} ${p.phase}${p.usage?.entries ? ` · ${formatUsageSummary(p.usage)}` : ""}${p.lastMessage ? ` — ${p.lastMessage}` : ""}`).join("\n")}` : undefined,
 		artifacts.length ? `\nArtifacts:\n${artifacts.map((a: AnyEvent) => `- ${a.title || a.kind}: ${a.path || a.preview || (a.content ? "(inline)" : "")}`).join("\n")}` : undefined,
@@ -152,7 +154,7 @@ function shouldAutoContinue(run: AnyEvent): boolean {
 function mergeMonitorRuns(cwd: string, sessionId?: string): AnyEvent[] {
 	const allRecent = latestRunSummaries({ limit: 150, readLimit: 8000 });
 	const scopedRuns = allRecent.filter((run: AnyEvent) => belongsToSession(run, sessionId, cwd));
-	const localUnscopedRunning = allRecent.filter((run: AnyEvent) => !runSessionId(run) && run.cwd === cwd && run.normalizedStatus === STATUSES.RUNNING);
+	const localUnscopedRunning = allRecent.filter((run: AnyEvent) => !runSessionId(run) && run.normalizedStatus === STATUSES.RUNNING);
 	const byRun = new Map<string, AnyEvent>();
 	for (const run of [...scopedRuns, ...localUnscopedRunning]) if (run.runId) byRun.set(run.runId, run);
 	return Array.from(byRun.values()).sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));

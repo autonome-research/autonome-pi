@@ -16,7 +16,7 @@ function progressText(phase: Record<string, any> | undefined): string {
 }
 
 export function activeRunWidgetLines(runs: RunSummary[], options: { maxRuns?: number } = {}): string[] {
-	const active = runs.filter((run) => run.normalizedStatus === STATUSES.RUNNING);
+	const active = runs.filter((run) => run.normalizedStatus === STATUSES.RUNNING && !run.stale);
 	if (active.length === 0) return [];
 
 	const maxRuns = options.maxRuns ?? 3;

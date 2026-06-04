@@ -45,7 +45,7 @@ await mission_workflow({
 });
 ```
 
-Use `ctrl+shift+t` to monitor/cancel. Use `thread_phase_runs` to inspect artifacts.
+Use `ctrl+shift+t` to monitor/cancel. Use `thread_phase_runs` to inspect artifacts. If an approved mission stopped unexpectedly, use `action: "resume"` with the same plan path and `approved: true`.
 
 ## Important rules
 
@@ -55,11 +55,12 @@ Use `ctrl+shift+t` to monitor/cancel. Use `thread_phase_runs` to inspect artifac
 - Read-only validators may fan out later, but the MVP is command-based.
 - Final merge is manual by default; do not assume the mission branch is merged into the user's current branch.
 - Default `maxRepairIterations` is 10; it is configurable.
+- The runner emits heartbeat events. Stale runs can appear when the process is gone or heartbeats stop.
 
 ## Current MVP limitations
 
 - User-testing is command-based only.
-- Resume/reuse is not implemented yet.
+- Resume/reuse is MVP-level and skips already-merged planned feature branches; dynamic repair queue reconstruction should become smarter.
 - Repair features are generic and should become smarter.
 - Worktree cleanup is best-effort.
 - Use small missions first while dogfooding.

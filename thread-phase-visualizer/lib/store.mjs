@@ -309,6 +309,8 @@ export function projectRun(events = []) {
     errors: [],
     progress: {},
     usage: emptyUsageSummary(),
+    heartbeat: undefined,
+    stale: undefined,
     lastMessage: first.message,
     eventCount: sorted.length,
     events: sorted,
@@ -366,6 +368,12 @@ export function projectRun(events = []) {
         summary.progress[event.phase] = progress;
         phase.progress = progress;
       }
+      const heartbeat = extractHeartbeat(event.data, event);
+      if (heartbeat) {
+        summary.heartbeat = heartbeat;
+        phase.heartbeat = heartbeat;
+        phase.lastMessage = heartbeat.message || phase.lastMessage;
+      }
       applyFanoutEvent(phase, event.data, event);
       applyUsageEvent(summary, phase, event.data, event);
     }
@@ -390,6 +398,7 @@ export function projectRun(events = []) {
     summary.status = STATUSES.FAILED;
     summary.normalizedStatus = STATUSES.FAILED;
   }
+  if (summary.normalizedStatus === STATUSES.RUNNING) summary.stale = detectStaleRun(summary);
   return summary;
 }
 
@@ -502,6 +511,40 @@ function extractProgress(data) {
       ? current / total
       : undefined;
   return dropUndefined({ current, total, percent, message: data.message });
+}
+
+function extractHeartbeat(data, event) {
+  if (!data || typeof data !== "object") return undefined;
+  const kind = data.kind || data.type;
+  if (kind !== "heartbeat") return undefined;
+  return dropUndefined({
+    timestamp: event.timestamp,
+    pid: data.pid,
+    childPids: Array.isArray(data.childPids) ? data.childPids : undefined,
+    phase: event.phase,
+    message: data.message,
+    milestoneId: data.milestoneId,
+    featureId: data.featureId,
+    validator: data.validator,
+    branch: data.branch,
+    worktree: data.worktree,
+  });
+}
+
+function detectStaleRun(summary) {
+  const pid = summary.metadata?.pid;
+  if (typeof pid === "number" && !isPidAlive(pid)) return { reason: "pid_not_running", pid, checkedAt: new Date().toISOString() };
+  if (summary.heartbeat?.timestamp) {
+    const ageMs = Date.now() - Date.parse(summary.heartbeat.timestamp);
+    if (Number.isFinite(ageMs) && ageMs > 5 * 60 * 1000) return { reason: "heartbeat_stale", ageMs, checkedAt: new Date().toISOString() };
+  }
+  return undefined;
+}
+
+function isPidAlive(pid) {
+  if (typeof pid !== "number" || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch { return false; }
 }
 
 function emptyUsageSummary() {

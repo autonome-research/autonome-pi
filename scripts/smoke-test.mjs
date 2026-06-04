@@ -85,6 +85,12 @@ try {
   let missionActivateDetails;
   try { missionActivateDetails = missionActivate?.stdout ? JSON.parse(missionActivate.stdout) : undefined; } catch { missionActivateDetails = undefined; }
   log(Boolean(missionActivateDetails?.branch), 'mission workflow activation emits mission branch');
+  const missionResume = missionPlanDetails?.planPath
+    ? expectExit('mission workflow mock resume succeeds', ['node', missionCli, 'resume', '--approved', '--plan-path', missionPlanDetails.planPath, '--cwd', missionRepo], 0)
+    : undefined;
+  let missionResumeDetails;
+  try { missionResumeDetails = missionResume?.stdout ? JSON.parse(missionResume.stdout) : undefined; } catch { missionResumeDetails = undefined; }
+  log(Boolean(missionResumeDetails?.branch), 'mission workflow resume emits mission branch');
   if (missionPlanDetails?.plan?.worktreeBaseDir) rmSync(missionPlanDetails.plan.worktreeBaseDir, { recursive: true, force: true });
 } finally {
   if (process.env.KEEP_PI_THREAD_PHASE_TEST_TMP !== '1') rmSync(tmp, { recursive: true, force: true });

@@ -83,6 +83,26 @@ export type ThreadPhaseFanoutSummary = {
   items: ThreadPhaseFanoutItemSummary[];
 };
 
+export type ThreadPhaseHeartbeatSummary = {
+  timestamp?: string;
+  pid?: number;
+  childPids?: number[];
+  phase?: string;
+  message?: string;
+  milestoneId?: string;
+  featureId?: string;
+  validator?: string;
+  branch?: string;
+  worktree?: string;
+};
+
+export type ThreadPhaseStaleSummary = {
+  reason: "pid_not_running" | "heartbeat_stale" | string;
+  pid?: number;
+  ageMs?: number;
+  checkedAt?: string;
+};
+
 export type ThreadPhasePhaseSummary = {
   phase: string;
   status?: ThreadPhaseUiStatus;
@@ -95,6 +115,7 @@ export type ThreadPhasePhaseSummary = {
   progress?: { current?: number; total?: number; percent?: number; message?: string };
   fanout?: ThreadPhaseFanoutSummary;
   usage?: ThreadPhaseUsageSummary;
+  heartbeat?: ThreadPhaseHeartbeatSummary;
 };
 
 export type ThreadPhaseRunSummary = {
@@ -112,6 +133,8 @@ export type ThreadPhaseRunSummary = {
   errors: Array<{ timestamp?: string; phase?: string; message?: string; error?: unknown }>;
   progress: Record<string, { current?: number; total?: number; percent?: number; message?: string }>;
   usage: ThreadPhaseUsageSummary;
+  heartbeat?: ThreadPhaseHeartbeatSummary;
+  stale?: ThreadPhaseStaleSummary;
   lastMessage?: string;
   eventCount: number;
   events: ThreadPhaseUiEvent[];

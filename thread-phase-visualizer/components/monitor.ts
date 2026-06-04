@@ -75,7 +75,7 @@ function belongsToSession(run: RunSummary, sessionId?: string, cwd?: string): bo
 function monitorRuns(cwd: string, sessionId?: string): RunSummary[] {
 	const allRecent = latestRunSummaries({ limit: 150, readLimit: 8000 });
 	const scopedRuns = allRecent.filter((run: RunSummary) => belongsToSession(run, sessionId, cwd));
-	const localUnscopedRunning = allRecent.filter((run: RunSummary) => !runSessionId(run) && run.cwd === cwd && run.normalizedStatus === STATUSES.RUNNING);
+	const localUnscopedRunning = allRecent.filter((run: RunSummary) => !runSessionId(run) && run.normalizedStatus === STATUSES.RUNNING);
 	const byRun = new Map<string, RunSummary>();
 	for (const run of [...scopedRuns, ...localUnscopedRunning]) if (run.runId) byRun.set(run.runId, run);
 	return Array.from(byRun.values()).sort((a, b) => {
@@ -91,7 +91,14 @@ function runtimePid(run: RunSummary): number | undefined {
 }
 
 function isRunningCancellable(run: RunSummary | undefined): boolean {
-	return Boolean(run?.normalizedStatus === STATUSES.RUNNING && run?.runId);
+	return Boolean(run?.normalizedStatus === STATUSES.RUNNING && !run?.stale && run?.runId);
+}
+
+function staleText(run: RunSummary | undefined): string {
+	if (!run?.stale) return "";
+	if (run.stale.reason === "pid_not_running") return `STALE pid ${run.stale.pid} exited`;
+	if (run.stale.reason === "heartbeat_stale") return `STALE heartbeat ${Math.round((run.stale.ageMs || 0) / 1000)}s ago`;
+	return `STALE ${run.stale.reason || "unknown"}`;
 }
 
 function artifactTitle(artifact: ArtifactSummary | undefined): string {
@@ -229,8 +236,9 @@ class ThreadPhaseMonitorComponent {
 			const selected = index === this.selected;
 			const status = run.normalizedStatus || run.status;
 			const prefix = selected ? t.fg("accent", "›") : " ";
-			const live = status === STATUSES.RUNNING ? t.fg("accent", " LIVE") : "";
-			const head = `${prefix} ${workflowGlyph(status, t)} ${selected ? t.fg("accent", run.workflow || "workflow") : run.workflow || "workflow"}${live} ${t.fg("dim", `[${shortRunId(run.runId)}]`)}`;
+			const stale = staleText(run);
+			const live = stale ? t.fg("warning", ` ${stale}`) : status === STATUSES.RUNNING ? t.fg("accent", " LIVE") : "";
+			const head = `${prefix} ${workflowGlyph(stale ? STATUSES.UNKNOWN : status, t)} ${selected ? t.fg("accent", run.workflow || "workflow") : run.workflow || "workflow"}${live} ${t.fg("dim", `[${shortRunId(run.runId)}]`)}`;
 			const current = status === STATUSES.RUNNING ? currentPhaseText(run) : "";
 			const location = run.cwd ? t.fg("dim", ` @ ${cwdLabel(run.cwd)}`) : "";
 			lines.push(truncateToWidth(`${head}${location}${current ? t.fg("muted", ` — ${current}`) : ""}`, width));
@@ -262,8 +270,9 @@ class ThreadPhaseMonitorComponent {
 		add(t.fg("dim", `← back • ↑↓ select phase/artifact • enter ${selectedItem?.kind === "artifact" ? "open" : "expand"}${cancelHint} • q close`));
 		add(t.fg("accent", t.bold(`${workflowGlyph(status, t)} ${run.workflow || "workflow"}`)) + t.fg("dim", ` [${run.runId || "unknown"}]`));
 		const pid = runtimePid(run);
-		add(t.fg("dim", `status: ${run.status || status}  updated: ${run.updatedAt || "?"}${pid && status === STATUSES.RUNNING ? `  pid: ${pid}` : ""}`));
+		add(t.fg("dim", `status: ${run.status || status}${run.stale ? ` (${staleText(run)})` : ""}  updated: ${run.updatedAt || "?"}${pid && status === STATUSES.RUNNING ? `  pid: ${pid}` : ""}`));
 		if (run.cwd) add(t.fg("dim", `cwd: ${run.cwd}`));
+		if (run.heartbeat?.timestamp) add(t.fg("dim", `heartbeat: ${run.heartbeat.timestamp}${run.heartbeat.featureId ? `  feature: ${run.heartbeat.featureId}` : ""}`));
 		if (run.usage?.entries) add(t.fg("muted", `usage: ${formatUsageSummary(run.usage)}`));
 		add("");
 		add(t.fg("toolTitle", t.bold("Phases")) + t.fg("dim", ` (${(run.phases || []).length})`));
