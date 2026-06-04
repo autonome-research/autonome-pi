@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 const root = resolve(new URL('..', import.meta.url).pathname);
 const tmp = mkdtempSync(join(tmpdir(), 'pi-thread-phase-tools-test-'));
@@ -28,6 +29,16 @@ function run(name, args, options = {}) {
     timeout: options.timeout || 45_000,
   });
   return result;
+}
+
+function featureFingerprint({ milestoneId, featureId, title, description = '', repair = false, assertions = [], localAssertions = [], contractAssertions = [] }) {
+  const contract = new Map(contractAssertions.map((assertion) => [String(assertion.id), assertion]));
+  const assertionIds = assertions.map(String).sort();
+  const contractData = assertionIds.map((id) => {
+    const assertion = contract.get(id) || { id };
+    return { id, description: String(assertion.description || '').replace(/\s+/g, ' ').trim(), priority: String(assertion.priority || ''), validationMethod: String(assertion.validationMethod || ''), coveredBy: (assertion.coveredBy || []).map(String).sort() };
+  });
+  return createHash('sha256').update(JSON.stringify({ schema: 'pi-mission-feature-fingerprint/v2', milestoneId, featureId, title: String(title || '').replace(/\s+/g, ' ').trim(), description: repair ? '' : String(description || '').replace(/\s+/g, ' ').trim(), repair: Boolean(repair), assertions: assertionIds, contractAssertions: contractData, localAssertions: localAssertions.map(String).sort() })).digest('hex').slice(0, 24);
 }
 
 function expectExit(name, args, expected, options = {}) {
@@ -231,11 +242,11 @@ try {
   const prefixedHandoffPlanPath = join(tmp, 'prefixed-handoff-plan.json');
   writeFileSync(prefixedHandoffPlanPath, JSON.stringify({
     schema: 'pi-mission-workflow/v1', missionId: 'prefixed-handoff-smoke', goal: 'prefixed handoff normalization', cwd: prefixedHandoffRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1,
-    worktreeBaseDir: join(tmp, 'prefixed-handoff-worktrees'), validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['assertion-003'] }] }],
-    validationContract: { assertions: [{ id: 'assertion-003', description: 'assertion three', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+    worktreeBaseDir: join(tmp, 'prefixed-handoff-worktrees'), validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['risk-approval'] }] }],
+    validationContract: { assertions: [{ id: 'risk-approval', description: 'risk approval assertion', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
   }, null, 2));
   const fakePiPrefixedHandoff = join(tmp, 'fake-pi-prefixed-handoff.mjs');
-  writeFileSync(fakePiPrefixedHandoff, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nmkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\nwriteFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, changedFiles: [], commandsRun: [], assertionsAddressed: ['assertion-003: detailed repair evidence'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'ok' }));\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: true, summary: 'prefixed handoff accepted', objections: [], assertionResults: [{ assertionId: 'assertion-003', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-prefixed', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
+  writeFileSync(fakePiPrefixedHandoff, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nmkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\nwriteFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, changedFiles: [], commandsRun: [], assertionsAddressed: ['risk-approval: detailed repair evidence'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'ok' }));\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: true, summary: 'prefixed handoff accepted', objections: [], assertionResults: [{ assertionId: 'risk-approval', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-prefixed', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
   expectExit('fake pi prefixed handoff is executable', ['chmod', '+x', fakePiPrefixedHandoff], 0);
   expectExit('mission workflow canonicalizes prefixed handoff assertion ids', ['node', missionCli, 'activate', '--approved', '--plan-path', prefixedHandoffPlanPath, '--cwd', prefixedHandoffRepo], 0, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiPrefixedHandoff }, timeout: 60_000 });
 
@@ -267,7 +278,9 @@ try {
   expectExit('completed head repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: completedHeadRepo });
   writeFileSync(join(completedHeadRepo, 'README.md'), 'completed head initial\n');
   expectExit('completed head repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: completedHeadRepo });
-  expectExit('completed head mission branch with feature commit', ['sh', '-c', "base=$(git branch --show-current) && git switch -q -c mission/completed-head-smoke && printf 'already completed feature\\n' > README.md && git add README.md && git commit -q -m 'mission(completed-head-smoke): Done Feature' -m 'Mission-Feature-Id: f1' && git branch mission-feature/completed-head-smoke/f1 HEAD && git switch -q $base"], 0, { cwd: completedHeadRepo });
+  const completedHeadFingerprint = featureFingerprint({ milestoneId: 'm1', featureId: 'f1', title: 'Done\nFeature', description: 'f1', assertions: ['a1'], localAssertions: [], contractAssertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] });
+  expectExit('completed head mission branch with feature commit', ['sh', '-c', `base=$(git branch --show-current) && git switch -q -c mission/completed-head-smoke && printf 'already completed feature\\n' > README.md && git add README.md && git commit -q -m 'mission(completed-head-smoke): Done Feature' -m 'Mission-Feature-Id: f1
+Mission-Feature-Fingerprint: ${completedHeadFingerprint}' && git branch mission-feature/completed-head-smoke/f1 HEAD && git switch -q $base`], 0, { cwd: completedHeadRepo });
   const completedHeadWorktrees = join(tmp, 'completed-head-worktrees');
   mkdirSync(completedHeadWorktrees, { recursive: true });
   expectExit('completed head integration worktree exists', ['git', 'worktree', 'add', '-q', join(completedHeadWorktrees, 'integration'), 'mission/completed-head-smoke'], 0, { cwd: completedHeadRepo });
@@ -285,12 +298,53 @@ try {
   log((completedHeadReadme.stdout || '').includes('already completed feature') && !(completedHeadReadme.stdout || '').includes('reran completed feature'), 'completed branch at mission head was skipped without registry');
   const completedRegistryPath = join(testHome, '.pi', 'agent', 'mission-workflow', 'registry', 'completed-head-smoke', 'state.json');
   const completedRegistryBeforeBadPlan = existsSync(completedRegistryPath) ? JSON.parse(readFileSync(completedRegistryPath, 'utf8')) : undefined;
+
+  const contractDriftRepo = join(tmp, 'contract-drift-repo');
+  mkdirSync(contractDriftRepo, { recursive: true });
+  expectExit('contract drift repo git init', ['git', 'init', '-q'], 0, { cwd: contractDriftRepo });
+  expectExit('contract drift repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: contractDriftRepo });
+  expectExit('contract drift repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: contractDriftRepo });
+  writeFileSync(join(contractDriftRepo, 'README.md'), 'contract drift initial\n');
+  expectExit('contract drift repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: contractDriftRepo });
+  const oldContractFingerprint = featureFingerprint({ milestoneId: 'm1', featureId: 'f1', title: 'Contract Drift Feature', description: 'f1', assertions: ['a1'], localAssertions: [], contractAssertions: [{ id: 'a1', description: 'old contract meaning', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] });
+  expectExit('contract drift branch has old fingerprint', ['sh', '-c', `base=$(git branch --show-current) && git switch -q -c mission/contract-drift-smoke && printf 'old contract feature\\n' > README.md && git add README.md && git commit -q -m 'mission(contract-drift-smoke): Contract Drift Feature' -m 'Mission-Feature-Id: f1
+Mission-Feature-Fingerprint: ${oldContractFingerprint}' && git branch mission-feature/contract-drift-smoke/f1 HEAD && git switch -q $base`], 0, { cwd: contractDriftRepo });
+  const contractDriftWorktrees = join(tmp, 'contract-drift-worktrees');
+  expectExit('contract drift integration worktree exists', ['git', 'worktree', 'add', '-q', join(contractDriftWorktrees, 'integration'), 'mission/contract-drift-smoke'], 0, { cwd: contractDriftRepo });
+  const contractDriftPlanPath = join(tmp, 'contract-drift-plan.json');
+  writeFileSync(contractDriftPlanPath, JSON.stringify({ schema: 'pi-mission-workflow/v1', missionId: 'contract-drift-smoke', goal: 'contract drift rerun', cwd: contractDriftRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1, worktreeBaseDir: contractDriftWorktrees, validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'Contract Drift Feature', description: 'f1', assertions: ['a1'] }] }], validationContract: { assertions: [{ id: 'a1', description: 'new contract meaning', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] } }, null, 2));
+  const fakePiContractDrift = join(tmp, 'fake-pi-contract-drift.mjs');
+  writeFileSync(fakePiContractDrift, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nconst prompt = process.argv.includes('-p') ? process.argv[process.argv.indexOf('-p') + 1] : '';\nif (prompt.includes('mission worker')) {\n  writeFileSync(join(process.cwd(), 'README.md'), 'reran contract drift feature\\n');\n  mkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\n  writeFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, changedFiles: ['README.md'], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'reran' }));\n}\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: true, summary: 'ok', objections: [], assertionResults: [{ assertionId: 'a1', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-contract-drift', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
+  expectExit('fake pi contract drift is executable', ['chmod', '+x', fakePiContractDrift], 0);
+  expectExit('mission workflow reruns old fingerprint after contract description changes', ['node', missionCli, 'resume', '--approved', '--plan-path', contractDriftPlanPath, '--cwd', contractDriftRepo], 0, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiContractDrift }, timeout: 60_000 });
+  const contractDriftReadme = expectExit('contract drift mission output contains rerun changes', ['git', 'show', 'mission/contract-drift-smoke:README.md'], 0, { cwd: contractDriftRepo });
+  log((contractDriftReadme.stdout || '').includes('reran contract drift feature'), 'fingerprinted branch reran after validation contract description changed');
+
   const badCompletedPlanPath = join(tmp, 'completed-head-bad-plan.json');
   writeFileSync(badCompletedPlanPath, JSON.stringify({ ...JSON.parse(readFileSync(completedHeadPlanPath, 'utf8')), goal: 'bad replacement goal', validationContract: { assertions: [{ id: 'bad', description: 'bad', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] } }, null, 2));
   expectExit('completed registry later activate failure', ['node', missionCli, 'activate', '--approved', '--plan-path', badCompletedPlanPath, '--cwd', completedHeadRepo], 1, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiCompletedHead }, timeout: 60_000 });
   const completedRegistry = existsSync(completedRegistryPath) ? JSON.parse(readFileSync(completedRegistryPath, 'utf8')) : undefined;
   const completedRegistryPlanCopy = existsSync(join(testHome, '.pi', 'agent', 'mission-workflow', 'registry', 'completed-head-smoke', 'mission-plan.json')) ? JSON.parse(readFileSync(join(testHome, '.pi', 'agent', 'mission-workflow', 'registry', 'completed-head-smoke', 'mission-plan.json'), 'utf8')) : undefined;
   log(completedRegistry?.status === 'completed' && completedRegistry?.lastFailedAttempt && completedRegistry?.goal === completedRegistryBeforeBadPlan?.goal && completedRegistry?.planPath === completedRegistryBeforeBadPlan?.planPath && completedRegistryPlanCopy?.goal === completedRegistryBeforeBadPlan?.goal, 'completed registry is not downgraded or overwritten by later failed invocation', completedRegistry?.status || 'missing registry');
+
+  const legacyTrailerRepo = join(tmp, 'legacy-trailer-repo');
+  mkdirSync(legacyTrailerRepo, { recursive: true });
+  expectExit('legacy trailer repo git init', ['git', 'init', '-q'], 0, { cwd: legacyTrailerRepo });
+  expectExit('legacy trailer repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: legacyTrailerRepo });
+  expectExit('legacy trailer repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: legacyTrailerRepo });
+  writeFileSync(join(legacyTrailerRepo, 'README.md'), 'legacy trailer initial\n');
+  expectExit('legacy trailer repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: legacyTrailerRepo });
+  expectExit('legacy trailer mission branch with feature-id-only commit', ['sh', '-c', "base=$(git branch --show-current) && git switch -q -c mission/legacy-trailer-smoke && printf 'legacy feature id only\\n' > README.md && git add README.md && git commit -q -m 'mission(legacy-trailer-smoke): Legacy Trailer Feature' -m 'Mission-Feature-Id: f1' && git branch mission-feature/legacy-trailer-smoke/f1 HEAD && git switch -q $base"], 0, { cwd: legacyTrailerRepo });
+  const legacyTrailerWorktrees = join(tmp, 'legacy-trailer-worktrees');
+  expectExit('legacy trailer integration worktree exists', ['git', 'worktree', 'add', '-q', join(legacyTrailerWorktrees, 'integration'), 'mission/legacy-trailer-smoke'], 0, { cwd: legacyTrailerRepo });
+  const legacyTrailerPlanPath = join(tmp, 'legacy-trailer-plan.json');
+  writeFileSync(legacyTrailerPlanPath, JSON.stringify({ schema: 'pi-mission-workflow/v1', missionId: 'legacy-trailer-smoke', goal: 'legacy trailer skip', cwd: legacyTrailerRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1, worktreeBaseDir: legacyTrailerWorktrees, validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'Legacy Trailer Feature', description: 'f1', assertions: ['a1'] }] }], validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] } }, null, 2));
+  const fakePiLegacyTrailer = join(tmp, 'fake-pi-legacy-trailer.mjs');
+  writeFileSync(fakePiLegacyTrailer, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nconst prompt = process.argv.includes('-p') ? process.argv[process.argv.indexOf('-p') + 1] : '';\nif (prompt.includes('mission worker')) {\n  writeFileSync(join(process.cwd(), 'README.md'), 'reran legacy trailer feature\\n');\n  mkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\n  writeFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, changedFiles: ['README.md'], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'reran' }));\n}\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: true, summary: 'ok', objections: [], assertionResults: [{ assertionId: 'a1', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-legacy-trailer', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
+  expectExit('fake pi legacy trailer is executable', ['chmod', '+x', fakePiLegacyTrailer], 0);
+  expectExit('mission workflow reruns branch-only feature-id legacy commit without fingerprint', ['node', missionCli, 'resume', '--approved', '--plan-path', legacyTrailerPlanPath, '--cwd', legacyTrailerRepo], 0, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiLegacyTrailer }, timeout: 60_000 });
+  const legacyTrailerReadme = expectExit('legacy trailer mission output contains rerun changes', ['git', 'show', 'mission/legacy-trailer-smoke:README.md'], 0, { cwd: legacyTrailerRepo });
+  log((legacyTrailerReadme.stdout || '').includes('reran legacy trailer feature'), 'branch-only feature-id legacy commit without fingerprint was not trusted');
 
   const sameSubjectRepo = join(tmp, 'same-subject-repo');
   mkdirSync(sameSubjectRepo, { recursive: true });
@@ -338,6 +392,79 @@ try {
   const legacySkippedReadme = expectExit('legacy skipped mission output contains rerun changes', ['git', 'show', 'mission/legacy-skipped-smoke:README.md'], 0, { cwd: legacySkippedRepo });
   log((legacySkippedReadme.stdout || '').includes('reran legacy skipped feature'), 'legacy skipped record at mission head was not falsely trusted');
 
+  const legacyCompletedRepo = join(tmp, 'legacy-completed-repo');
+  mkdirSync(legacyCompletedRepo, { recursive: true });
+  expectExit('legacy completed repo git init', ['git', 'init', '-q'], 0, { cwd: legacyCompletedRepo });
+  expectExit('legacy completed repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: legacyCompletedRepo });
+  expectExit('legacy completed repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: legacyCompletedRepo });
+  writeFileSync(join(legacyCompletedRepo, 'README.md'), 'legacy completed initial\n');
+  expectExit('legacy completed repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: legacyCompletedRepo });
+  expectExit('legacy completed no-change branch behind mission head', ['sh', '-c', "base=$(git branch --show-current) && git branch mission/legacy-completed-smoke HEAD && git branch mission-feature/legacy-completed-smoke/f1 HEAD && git switch -q mission/legacy-completed-smoke && printf 'later mission commit\\n' >> README.md && git add README.md && git commit -q -m 'later mission work' && git switch -q $base"], 0, { cwd: legacyCompletedRepo });
+  const legacyCompletedWorktrees = join(tmp, 'legacy-completed-worktrees');
+  expectExit('legacy completed integration worktree exists', ['git', 'worktree', 'add', '-q', join(legacyCompletedWorktrees, 'integration'), 'mission/legacy-completed-smoke'], 0, { cwd: legacyCompletedRepo });
+  const legacyCompletedPlanPath = join(tmp, 'legacy-completed-plan.json');
+  writeFileSync(legacyCompletedPlanPath, JSON.stringify({ schema: 'pi-mission-workflow/v1', missionId: 'legacy-completed-smoke', goal: 'legacy completed skip', cwd: legacyCompletedRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1, worktreeBaseDir: legacyCompletedWorktrees, validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'Legacy Completed Feature', description: 'f1', assertions: ['a1'] }] }], validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] } }, null, 2));
+  const legacyCompletedRegistryDir = join(testHome, '.pi', 'agent', 'mission-workflow', 'registry', 'legacy-completed-smoke');
+  mkdirSync(legacyCompletedRegistryDir, { recursive: true });
+  const legacyCompletedHandoff = join(tmp, 'legacy-completed-handoff.json');
+  writeFileSync(legacyCompletedHandoff, JSON.stringify({ featureId: 'f1', completed: true, changedFiles: [], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'legacy no-change handoff' }));
+  writeFileSync(join(legacyCompletedRegistryDir, 'state.json'), JSON.stringify({ schema: 'pi-mission-workflow/registry/v1', missionId: 'legacy-completed-smoke', status: 'running', completedFeatures: [{ featureId: 'f1', milestoneId: 'm1', branch: 'mission-feature/legacy-completed-smoke/f1', assertions: ['a1'], localAssertions: [], handoffArtifact: legacyCompletedHandoff, skipped: true }] }, null, 2));
+  const fakePiLegacyCompleted = join(tmp, 'fake-pi-legacy-completed.mjs');
+  writeFileSync(fakePiLegacyCompleted, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nconst prompt = process.argv.includes('-p') ? process.argv[process.argv.indexOf('-p') + 1] : '';\nif (prompt.includes('mission worker')) {\n  writeFileSync(join(process.cwd(), 'README.md'), 'reran legacy completed feature\\n');\n  mkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\n  writeFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, changedFiles: ['README.md'], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'reran' }));\n}\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: true, summary: 'ok', objections: [], assertionResults: [{ assertionId: 'a1', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-legacy-completed', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
+  expectExit('fake pi legacy completed is executable', ['chmod', '+x', fakePiLegacyCompleted], 0);
+  expectExit('mission workflow trusts handoff-backed legacy skipped record behind mission head', ['node', missionCli, 'resume', '--approved', '--plan-path', legacyCompletedPlanPath, '--cwd', legacyCompletedRepo], 0, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiLegacyCompleted }, timeout: 60_000 });
+  const legacyCompletedReadme = expectExit('legacy completed mission output was not rerun', ['git', 'show', 'mission/legacy-completed-smoke:README.md'], 0, { cwd: legacyCompletedRepo });
+  log((legacyCompletedReadme.stdout || '').includes('legacy completed initial') && (legacyCompletedReadme.stdout || '').includes('later mission commit') && !(legacyCompletedReadme.stdout || '').includes('reran legacy completed feature'), 'handoff-backed no-change legacy skipped record behind mission head was trusted');
+  const legacyCompletedRegistry = JSON.parse(readFileSync(join(legacyCompletedRegistryDir, 'state.json'), 'utf8'));
+  const legacyCompletedRecord = (legacyCompletedRegistry.completedFeatures || []).find((item) => item.featureId === 'f1');
+  log(legacyCompletedRecord?.skipped === true && !legacyCompletedRecord?.commit && legacyCompletedRecord?.handoffArtifact === legacyCompletedHandoff, 'legacy skipped handoff evidence is preserved without synthetic commit');
+
+  const extraHandoffRepo = join(tmp, 'extra-handoff-repo');
+  mkdirSync(extraHandoffRepo, { recursive: true });
+  expectExit('extra handoff repo git init', ['git', 'init', '-q'], 0, { cwd: extraHandoffRepo });
+  expectExit('extra handoff repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: extraHandoffRepo });
+  expectExit('extra handoff repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: extraHandoffRepo });
+  writeFileSync(join(extraHandoffRepo, 'README.md'), 'extra handoff initial\n');
+  expectExit('extra handoff repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: extraHandoffRepo });
+  expectExit('extra handoff no-change branch exists', ['sh', '-c', 'git branch mission/extra-handoff-smoke HEAD && git branch mission-feature/extra-handoff-smoke/f1 HEAD'], 0, { cwd: extraHandoffRepo });
+  const extraHandoffWorktrees = join(tmp, 'extra-handoff-worktrees');
+  expectExit('extra handoff integration worktree exists', ['git', 'worktree', 'add', '-q', join(extraHandoffWorktrees, 'integration'), 'mission/extra-handoff-smoke'], 0, { cwd: extraHandoffRepo });
+  const extraHandoffPlanPath = join(tmp, 'extra-handoff-plan.json');
+  writeFileSync(extraHandoffPlanPath, JSON.stringify({ schema: 'pi-mission-workflow/v1', missionId: 'extra-handoff-smoke', goal: 'extra handoff assertion rerun', cwd: extraHandoffRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1, worktreeBaseDir: extraHandoffWorktrees, validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'Extra Handoff Feature', description: 'f1', assertions: ['a1'] }] }], validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }, { id: 'a2', description: 'unassigned to f1', priority: 'should', coveredBy: ['other'], validationMethod: 'validator' }] } }, null, 2));
+  const extraHandoffRegistryDir = join(testHome, '.pi', 'agent', 'mission-workflow', 'registry', 'extra-handoff-smoke');
+  mkdirSync(extraHandoffRegistryDir, { recursive: true });
+  const extraHandoffArtifact = join(tmp, 'extra-handoff-artifact.json');
+  writeFileSync(extraHandoffArtifact, JSON.stringify({ featureId: 'f1', completed: true, changedFiles: [], commandsRun: [], assertionsAddressed: ['a1', 'a2'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'extra assertion should not be trusted' }));
+  writeFileSync(join(extraHandoffRegistryDir, 'state.json'), JSON.stringify({ schema: 'pi-mission-workflow/registry/v1', missionId: 'extra-handoff-smoke', status: 'running', completedFeatures: [{ featureId: 'f1', milestoneId: 'm1', branch: 'mission-feature/extra-handoff-smoke/f1', assertions: ['a1'], localAssertions: [], handoffArtifact: extraHandoffArtifact, skipped: true }] }, null, 2));
+  const fakePiExtraHandoff = join(tmp, 'fake-pi-extra-handoff.mjs');
+  writeFileSync(fakePiExtraHandoff, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nconst prompt = process.argv.includes('-p') ? process.argv[process.argv.indexOf('-p') + 1] : '';\nif (prompt.includes('mission worker')) {\n  writeFileSync(join(process.cwd(), 'README.md'), 'reran extra assertion handoff feature\\n');\n  mkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\n  writeFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, changedFiles: ['README.md'], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'reran' }));\n}\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: true, summary: 'ok', objections: [], assertionResults: [{ assertionId: 'a1', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-extra-handoff', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
+  expectExit('fake pi extra handoff is executable', ['chmod', '+x', fakePiExtraHandoff], 0);
+  expectExit('mission workflow rejects no-change handoff with unassigned assertion', ['node', missionCli, 'resume', '--approved', '--plan-path', extraHandoffPlanPath, '--cwd', extraHandoffRepo], 0, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiExtraHandoff }, timeout: 60_000 });
+  const extraHandoffReadme = expectExit('extra handoff mission output contains rerun changes', ['git', 'show', 'mission/extra-handoff-smoke:README.md'], 0, { cwd: extraHandoffRepo });
+  log((extraHandoffReadme.stdout || '').includes('reran extra assertion handoff feature'), 'no-change handoff with unassigned assertion was not trusted');
+
+  const legacyLocalMismatchRepo = join(tmp, 'legacy-local-mismatch-repo');
+  mkdirSync(legacyLocalMismatchRepo, { recursive: true });
+  expectExit('legacy local mismatch repo git init', ['git', 'init', '-q'], 0, { cwd: legacyLocalMismatchRepo });
+  expectExit('legacy local mismatch repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: legacyLocalMismatchRepo });
+  expectExit('legacy local mismatch repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: legacyLocalMismatchRepo });
+  writeFileSync(join(legacyLocalMismatchRepo, 'README.md'), 'legacy local initial\n');
+  expectExit('legacy local mismatch repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: legacyLocalMismatchRepo });
+  expectExit('legacy local mismatch branch behind mission head', ['sh', '-c', "base=$(git branch --show-current) && git switch -q -c mission/legacy-local-mismatch-smoke && printf 'legacy local feature\\n' > README.md && git add README.md && git commit -q -m 'mission(legacy-local-mismatch-smoke): Legacy Local Feature' && git branch mission-feature/legacy-local-mismatch-smoke/f1 HEAD && printf 'later mission commit\\n' >> README.md && git add README.md && git commit -q -m 'later mission work' && git switch -q $base"], 0, { cwd: legacyLocalMismatchRepo });
+  const legacyLocalMismatchWorktrees = join(tmp, 'legacy-local-mismatch-worktrees');
+  expectExit('legacy local mismatch integration worktree exists', ['git', 'worktree', 'add', '-q', join(legacyLocalMismatchWorktrees, 'integration'), 'mission/legacy-local-mismatch-smoke'], 0, { cwd: legacyLocalMismatchRepo });
+  const legacyLocalMismatchPlanPath = join(tmp, 'legacy-local-mismatch-plan.json');
+  writeFileSync(legacyLocalMismatchPlanPath, JSON.stringify({ schema: 'pi-mission-workflow/v1', missionId: 'legacy-local-mismatch-smoke', goal: 'legacy local mismatch rerun', cwd: legacyLocalMismatchRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1, worktreeBaseDir: legacyLocalMismatchWorktrees, validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'Legacy Local Feature', description: 'f1', assertions: ['a1'], localAssertions: ['new-local-check'] }] }], validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] } }, null, 2));
+  const legacyLocalMismatchRegistryDir = join(testHome, '.pi', 'agent', 'mission-workflow', 'registry', 'legacy-local-mismatch-smoke');
+  mkdirSync(legacyLocalMismatchRegistryDir, { recursive: true });
+  writeFileSync(join(legacyLocalMismatchRegistryDir, 'state.json'), JSON.stringify({ schema: 'pi-mission-workflow/registry/v1', missionId: 'legacy-local-mismatch-smoke', status: 'running', completedFeatures: [{ featureId: 'f1', milestoneId: 'm1', branch: 'mission-feature/legacy-local-mismatch-smoke/f1', assertions: ['a1'], localAssertions: [], skipped: true }] }, null, 2));
+  const fakePiLegacyLocalMismatch = join(tmp, 'fake-pi-legacy-local-mismatch.mjs');
+  writeFileSync(fakePiLegacyLocalMismatch, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nconst prompt = process.argv.includes('-p') ? process.argv[process.argv.indexOf('-p') + 1] : '';\nif (prompt.includes('mission worker')) {\n  writeFileSync(join(process.cwd(), 'README.md'), 'reran legacy local mismatch feature\\n');\n  mkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\n  writeFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, changedFiles: ['README.md'], commandsRun: [], assertionsAddressed: ['a1', 'new-local-check'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'reran' }));\n}\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: true, summary: 'ok', objections: [], assertionResults: [{ assertionId: 'a1', status: 'pass', evidence: 'ok' }, { assertionId: 'new-local-check', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-legacy-local-mismatch', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
+  expectExit('fake pi legacy local mismatch is executable', ['chmod', '+x', fakePiLegacyLocalMismatch], 0);
+  expectExit('mission workflow reruns legacy skipped record with local assertion mismatch', ['node', missionCli, 'resume', '--approved', '--plan-path', legacyLocalMismatchPlanPath, '--cwd', legacyLocalMismatchRepo], 0, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiLegacyLocalMismatch }, timeout: 60_000 });
+  const legacyLocalMismatchReadme = expectExit('legacy local mismatch mission output contains rerun changes', ['git', 'show', 'mission/legacy-local-mismatch-smoke:README.md'], 0, { cwd: legacyLocalMismatchRepo });
+  log((legacyLocalMismatchReadme.stdout || '').includes('reran legacy local mismatch feature'), 'legacy skipped record with local assertion mismatch was not trusted');
+
   const staleCommitRepo = join(tmp, 'stale-commit-repo');
   mkdirSync(staleCommitRepo, { recursive: true });
   expectExit('stale commit repo git init', ['git', 'init', '-q'], 0, { cwd: staleCommitRepo });
@@ -346,18 +473,20 @@ try {
   writeFileSync(join(staleCommitRepo, 'README.md'), 'stale commit initial\n');
   expectExit('stale commit repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: staleCommitRepo });
   const staleBase = expectExit('stale commit base rev', ['git', 'rev-parse', 'HEAD'], 0, { cwd: staleCommitRepo }).stdout.trim();
-  expectExit('stale commit branches at base', ['sh', '-c', 'git branch mission/stale-commit-smoke HEAD && git branch mission-feature/stale-commit-smoke/f1 HEAD'], 0, { cwd: staleCommitRepo });
+  expectExit('stale commit branch has matching subject but registry points at base', ['sh', '-c', "base=$(git branch --show-current) && git switch -q -c mission/stale-commit-smoke && printf 'stale subject feature\\n' > README.md && git add README.md && git commit -q -m 'mission(stale-commit-smoke): Stale Commit Feature' && git branch mission-feature/stale-commit-smoke/f1 HEAD && printf 'later stale mission commit\\n' >> README.md && git add README.md && git commit -q -m 'later mission work' && git switch -q $base"], 0, { cwd: staleCommitRepo });
   const staleCommitWorktrees = join(tmp, 'stale-commit-worktrees');
   expectExit('stale commit integration worktree exists', ['git', 'worktree', 'add', '-q', join(staleCommitWorktrees, 'integration'), 'mission/stale-commit-smoke'], 0, { cwd: staleCommitRepo });
   const staleCommitPlanPath = join(tmp, 'stale-commit-plan.json');
   writeFileSync(staleCommitPlanPath, JSON.stringify({ schema: 'pi-mission-workflow/v1', missionId: 'stale-commit-smoke', goal: 'stale commit rerun', cwd: staleCommitRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1, worktreeBaseDir: staleCommitWorktrees, validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'Stale Commit Feature', description: 'f1', assertions: ['a1'] }] }], validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] } }, null, 2));
   const staleCommitRegistryDir = join(testHome, '.pi', 'agent', 'mission-workflow', 'registry', 'stale-commit-smoke');
   mkdirSync(staleCommitRegistryDir, { recursive: true });
-  writeFileSync(join(staleCommitRegistryDir, 'state.json'), JSON.stringify({ schema: 'pi-mission-workflow/registry/v1', missionId: 'stale-commit-smoke', status: 'running', completedFeatures: [{ featureId: 'f1', branch: 'mission-feature/stale-commit-smoke/f1', commit: staleBase }] }, null, 2));
+  const staleCommitHandoff = join(tmp, 'stale-commit-handoff.json');
+  writeFileSync(staleCommitHandoff, JSON.stringify({ featureId: 'f1', completed: true, changedFiles: ['README.md'], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'stale handoff' }));
+  writeFileSync(join(staleCommitRegistryDir, 'state.json'), JSON.stringify({ schema: 'pi-mission-workflow/registry/v1', missionId: 'stale-commit-smoke', status: 'running', completedFeatures: [{ featureId: 'f1', milestoneId: 'm1', branch: 'mission-feature/stale-commit-smoke/f1', commit: staleBase, handoffArtifact: staleCommitHandoff, changedFiles: ['README.md'], assertions: ['a1'], skipped: true }] }, null, 2));
   const fakePiStaleCommit = join(tmp, 'fake-pi-stale-commit.mjs');
   writeFileSync(fakePiStaleCommit, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nconst prompt = process.argv.includes('-p') ? process.argv[process.argv.indexOf('-p') + 1] : '';\nif (prompt.includes('mission worker')) {\n  writeFileSync(join(process.cwd(), 'README.md'), 'reran stale commit feature\\n');\n  mkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\n  writeFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, changedFiles: ['README.md'], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'reran' }));\n}\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: true, summary: 'ok', objections: [], assertionResults: [{ assertionId: 'a1', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-stale-commit', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
   expectExit('fake pi stale commit is executable', ['chmod', '+x', fakePiStaleCommit], 0);
-  expectExit('mission workflow ignores stale registry commit at base', ['node', missionCli, 'resume', '--approved', '--plan-path', staleCommitPlanPath, '--cwd', staleCommitRepo], 0, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiStaleCommit }, timeout: 60_000 });
+  expectExit('mission workflow ignores stale registry commit at base despite matching subject branch', ['node', missionCli, 'resume', '--approved', '--plan-path', staleCommitPlanPath, '--cwd', staleCommitRepo], 0, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiStaleCommit }, timeout: 60_000 });
   const staleCommitReadme = expectExit('stale commit mission output contains rerun changes', ['git', 'show', 'mission/stale-commit-smoke:README.md'], 0, { cwd: staleCommitRepo });
   log((staleCommitReadme.stdout || '').includes('reran stale commit feature'), 'stale registry commit at base was not falsely trusted');
 
