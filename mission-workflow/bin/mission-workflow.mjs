@@ -1708,11 +1708,30 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
   return { ...report, artifact: reportPath };
 }
 
+function repairFeatureStableId(report, iteration, feature, index, fallback) {
+  const title = feature.title || fallback.title;
+  const assertions = Array.isArray(feature.assertions) && feature.assertions.length ? feature.assertions.map(String).sort() : (fallback.assertions || []).map(String).sort();
+  const hash = createHash("sha256").update(JSON.stringify({
+    schema: "pi-mission-repair-feature-id/v1",
+    milestoneId: String(report.milestoneId || ""),
+    iteration: Number(iteration),
+    index: Number(index),
+    title: String(title || "").replace(/\s+/g, " ").trim(),
+    description: String(feature.description || "").replace(/\s+/g, " ").trim(),
+    assertions,
+    rationale: String(feature.rationale || "").replace(/\s+/g, " ").trim(),
+  })).digest("hex").slice(0, 10);
+  const prefix = `repair-${safeName(report.milestoneId)}-${iteration}-${hash}`;
+  const titleBudget = Math.max(0, 80 - prefix.length - 1);
+  const titleSlug = safeName(title, "repair").slice(0, titleBudget);
+  return titleSlug ? `${prefix}-${titleSlug}` : prefix;
+}
+
 function repairFeaturesFromReport(report, iteration) {
   const fallback = { title: `Repair ${report.milestoneId}`, assertions: report.assertionResults?.map((result) => result.assertionId).filter(Boolean) || [], rationale: "Milestone validation failed." };
   const corrective = report.correctiveFeatures?.length ? report.correctiveFeatures : [fallback];
   return corrective.map((feature, index) => ({
-    id: `repair-${safeName(report.milestoneId)}-${iteration}-${index + 1}`,
+    id: repairFeatureStableId(report, iteration, feature, index, fallback),
     title: feature.title || fallback.title,
     description: compactText(feature.description || `Repair validation failures from report: ${JSON.stringify({ commandReports: report.reports || [], objections: report.validatorReport?.objections || [], coveragePath: report.coveragePath, rationale: feature.rationale }, null, 2)}`, 8000),
     assertions: Array.isArray(feature.assertions) && feature.assertions.length ? feature.assertions.map(String) : fallback.assertions,
@@ -1755,7 +1774,15 @@ async function activateMission(args, cwd, run, ctx) {
         const result = await runWorkerForFeature(env, milestone, feature, plan, ctx, run);
         iterationState.features.push(result);
         const trustedHead = (await git(env.integrationPath, ["rev-parse", "HEAD"], { signal: ctx.signal })).stdout.trim();
-        updateRegistryState(plan, (state) => ({ ...state, trustedBaseHead: state.trustedBaseHead || env.baseHead, trustedHead, trustedPlanFingerprint: missionPlanFingerprint(plan, env.baseHead), trustedCommits: Array.from(new Set([...(state.trustedCommits || []), ...(result.commit ? [result.commit] : [])])), completedFeatures: [...(state.completedFeatures || []).filter((item) => !(item.featureId === result.featureId && item.milestoneId === milestone.id)), { featureId: result.featureId, milestoneId: milestone.id, iteration, branch: result.featureBranch, commit: result.commit, handoffArtifact: result.handoffArtifact, changedFiles: result.changedFiles || [], assertions: result.assertions || [], localAssertions: result.localAssertions || [], assignedAssertions: feature.assertions || [], assignedLocalAssertions: feature.localAssertions || [], featureFingerprint: result.featureFingerprint, skipped: Boolean(result.skipped), completedAt: new Date().toISOString() }] }));
+        updateRegistryState(plan, (state) => {
+          const sameResultRecord = (item) => {
+            if (!(item.featureId === result.featureId && item.milestoneId === milestone.id)) return false;
+            const existingFingerprint = item.featureFingerprint ? String(item.featureFingerprint) : "";
+            const resultFingerprint = result.featureFingerprint ? String(result.featureFingerprint) : "";
+            return !existingFingerprint || !resultFingerprint || existingFingerprint === resultFingerprint;
+          };
+          return { ...state, trustedBaseHead: state.trustedBaseHead || env.baseHead, trustedHead, trustedPlanFingerprint: missionPlanFingerprint(plan, env.baseHead), trustedCommits: Array.from(new Set([...(state.trustedCommits || []), ...(result.commit ? [result.commit] : [])])), completedFeatures: [...(state.completedFeatures || []).filter((item) => !sameResultRecord(item)), { featureId: result.featureId, milestoneId: milestone.id, iteration, branch: result.featureBranch, commit: result.commit, handoffArtifact: result.handoffArtifact, changedFiles: result.changedFiles || [], assertions: result.assertions || [], localAssertions: result.localAssertions || [], assignedAssertions: feature.assertions || [], assignedLocalAssertions: feature.localAssertions || [], featureFingerprint: result.featureFingerprint, skipped: Boolean(result.skipped), completedAt: new Date().toISOString() }] };
+        });
       }
       queue = [];
       currentHeartbeat = { phase: "execute-mission", missionId: plan.missionId, milestoneId: milestone.id, iteration, validator: "adversarial-scrutiny", branch: env.missionBranch, worktree: env.integrationPath };
