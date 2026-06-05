@@ -1262,7 +1262,7 @@ function handoffArtifactLooksCompleted(artifactPath, featureId, feature, plan) {
   if (!artifactPath || !existsSync(String(artifactPath))) return false;
   const handoff = readJsonFile(String(artifactPath), undefined);
   if (!handoff || handoff.completed !== true) return false;
-  const validation = validateHandoff({ handoff, featureId, feature, plan, changedFiles: [] });
+  const validation = validateHandoff({ handoff, featureId, feature, plan, changedFiles: [], strictWorkerAssertions: true });
   return validation.ok;
 }
 
@@ -1432,11 +1432,14 @@ function normalizeAssertionsAddressed(raw, plan, allowedLocalAssertions = []) {
 function summarizeHandoff(handoff, artifactPath) {
   return {
     artifact: artifactPath,
+    schema: String(handoff.schema || "pi-mission-worker-handoff/v1"),
     featureId: handoff.featureId,
     completed: Boolean(handoff.completed),
-    changedFiles: Array.isArray(handoff.changedFiles) ? handoff.changedFiles.map(String) : [],
+    outcome: handoff.outcome ? String(handoff.outcome) : undefined,
+    workerDeclaredChangedFiles: Array.isArray(handoff.changedFiles) ? handoff.changedFiles.map(String) : [],
     commandsRun: Array.isArray(handoff.commandsRun) ? handoff.commandsRun.map((cmd) => ({ command: String(cmd.command || ""), exitCode: Number(cmd.exitCode ?? 0) })) : [],
-    assertionsAddressed: Array.isArray(handoff.assertionsAddressed) ? handoff.assertionsAddressed.map((value) => typeof value === "object" && value ? String(value.id || value.description || "") : String(value)) : [],
+    assertionsMentioned: Array.isArray(handoff.assertionsAddressed) ? handoff.assertionsAddressed.map((value) => typeof value === "object" && value ? String(value.id || value.description || value.evidence || "") : String(value)) : [],
+    evidence: Array.isArray(handoff.evidence) ? handoff.evidence.map((value) => compactText(typeof value === "object" && value ? JSON.stringify(value) : String(value), 1000)) : [],
     issuesDiscoveredCount: Array.isArray(handoff.issuesDiscovered) ? handoff.issuesDiscovered.length : 0,
     leftUndoneCount: Array.isArray(handoff.leftUndone) ? handoff.leftUndone.length : 0,
     notesForValidator: compactText(String(handoff.notesForValidator || ""), 4000),
@@ -1449,28 +1452,37 @@ function canonicalHandoffFeatureId(value, expectedFeatureId) {
   return safeName(raw, "feature") === expectedFeatureId ? expectedFeatureId : raw;
 }
 
-function validateHandoff({ handoff, featureId, feature, plan, changedFiles }) {
+function validateHandoff({ handoff, featureId, feature, plan, changedFiles, strictWorkerAssertions = false, strictChangedFiles = false }) {
   const errors = [];
-  const required = ["featureId", "completed", "changedFiles", "commandsRun", "assertionsAddressed", "issuesDiscovered", "leftUndone", "notesForValidator"];
+  const required = ["featureId", "completed", "commandsRun", "issuesDiscovered", "leftUndone", "notesForValidator"];
   for (const field of required) if (!(field in handoff)) errors.push(`Missing handoff field: ${field}`);
   if (canonicalHandoffFeatureId(handoff.featureId, featureId) !== featureId) errors.push(`handoff.featureId (${handoff.featureId}) does not match featureId (${featureId})`);
   if (typeof handoff.completed !== "boolean") errors.push("handoff.completed must be boolean");
-  for (const field of ["changedFiles", "commandsRun", "assertionsAddressed", "issuesDiscovered", "leftUndone"]) if (!Array.isArray(handoff[field])) errors.push(`handoff.${field} must be an array`);
+  if (handoff.completed !== true) errors.push("handoff.completed must be true for runner-owned mission commits");
+  for (const field of ["commandsRun", "issuesDiscovered", "leftUndone"]) if (!Array.isArray(handoff[field])) errors.push(`handoff.${field} must be an array`);
+  for (const field of ["changedFiles", "assertionsAddressed", "evidence"]) if (field in handoff && !Array.isArray(handoff[field])) errors.push(`handoff.${field} must be an array when present`);
   const contractAssertions = Array.isArray(feature.assertions) ? feature.assertions.map(String) : [];
   const localAssertions = Array.isArray(feature.localAssertions) ? feature.localAssertions.map(String) : [];
   const featureAssertions = [...contractAssertions, ...localAssertions];
   const normalizedAssertions = normalizeAssertionsAddressed(handoff.assertionsAddressed, plan, localAssertions);
-  errors.push(...normalizedAssertions.errors);
-  for (const assertionId of normalizedAssertions.ids) if (featureAssertions.length && !featureAssertions.includes(assertionId) && !isSupplementalLocalAssertionId(assertionId)) errors.push(`Assertion ${assertionId} is not assigned to feature ${featureId}`);
-  for (const assertionId of featureAssertions) if (!normalizedAssertions.ids.includes(assertionId)) errors.push(`handoff.assertionsAddressed omitted assigned assertion: ${assertionId}`);
+  const normalizedErrors = normalizedAssertions.errors;
+  const unassigned = normalizedAssertions.ids.filter((assertionId) => featureAssertions.length && !featureAssertions.includes(assertionId) && !isSupplementalLocalAssertionId(assertionId));
+  const omitted = featureAssertions.filter((assertionId) => !normalizedAssertions.ids.includes(assertionId));
+  if (strictWorkerAssertions) {
+    errors.push(...normalizedErrors);
+    for (const assertionId of unassigned) errors.push(`Assertion ${assertionId} is not assigned to feature ${featureId}`);
+    for (const assertionId of omitted) errors.push(`handoff.assertionsAddressed omitted assigned assertion: ${assertionId}`);
+  }
   const declared = Array.isArray(handoff.changedFiles) ? Array.from(new Set(handoff.changedFiles.map(String).filter(Boolean))).sort() : [];
   const actual = Array.from(new Set(changedFiles || [])).sort();
-  const missing = actual.filter((file) => !declared.includes(file));
-  const extra = declared.filter((file) => !actual.includes(file));
-  if (missing.length) errors.push(`handoff.changedFiles omitted changed files: ${missing.join(", ")}`);
-  if (extra.length) errors.push(`handoff.changedFiles listed files not changed in git status/diff: ${extra.join(", ")}`);
+  if (strictChangedFiles) {
+    const missing = actual.filter((file) => !declared.includes(file));
+    const extra = declared.filter((file) => !actual.includes(file));
+    if (missing.length) errors.push(`handoff.changedFiles omitted changed files: ${missing.join(", ")}`);
+    if (extra.length) errors.push(`handoff.changedFiles listed files not changed in git status/diff: ${extra.join(", ")}`);
+  }
   if (declared.some(isGeneratedJunkPath) || actual.some(isGeneratedJunkPath)) errors.push("Generated junk paths are not allowed in handoff.changedFiles or commits");
-  return { ok: errors.length === 0, errors, assertionsAddressed: normalizedAssertions.ids };
+  return { ok: errors.length === 0, errors, assertionsAddressed: featureAssertions, workerMentionedAssertions: normalizedAssertions.ids, supplementalHandoffNotes: { unassigned, omitted, unknown: normalizedErrors } };
 }
 
 async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
@@ -1495,16 +1507,16 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
     const handoffRel = join(".mission", "handoffs", `${featureId}.json`);
     const handoffPath = join(featurePath, handoffRel);
     mkdirSync(dirname(handoffPath), { recursive: true });
-    writeFileSync(handoffPath, JSON.stringify({ featureId, completed: false, changedFiles: [], commandsRun: [], assertionsAddressed: [], issuesDiscovered: [], leftUndone: [], notesForValidator: "Fill this runner-provided handoff skeleton. Preserve featureId exactly." }, null, 2), "utf8");
+    writeFileSync(handoffPath, JSON.stringify({ schema: "pi-mission-worker-handoff/v2", featureId, completed: false, outcome: "changed", evidence: [], commandsRun: [], issuesDiscovered: [], leftUndone: [], notesForValidator: "Fill this runner-provided handoff skeleton. Preserve featureId exactly. The runner derives changed files and assigned assertion coverage." }, null, 2), "utf8");
     const prompt = [
       "You are a mission worker implementing exactly one feature in an isolated git worktree.",
       "Implement the requested feature. You may modify files. Do not ask for approval. Do not create commits; the runner commits after validating your handoff.",
       "Before finishing, update the runner-provided structured JSON handoff file at:",
       handoffRel,
-      "The handoff JSON must include: featureId, completed, changedFiles, commandsRun[{command,exitCode}], assertionsAddressed, issuesDiscovered, leftUndone, notesForValidator.",
+      "The handoff JSON must include: featureId, completed, outcome, evidence, commandsRun[{command,exitCode}], issuesDiscovered, leftUndone, notesForValidator. You may keep legacy changedFiles/assertionsAddressed fields if already present, but the runner derives actual changed files and assigned assertion coverage deterministically.",
       "Preserve the provided featureId exactly; do not retype, shorten, extend, or add punctuation to it.",
-      "assertionsAddressed must include every assigned contract assertion and every assigned local assertion for this feature. Supplemental worker-only evidence may be included as objects with type:'local' or ids prefixed local:, but supplemental local evidence does not count toward global contract coverage.",
-      "changedFiles must list only files that are actually changed relative to git HEAD in this worktree. If the feature is already satisfied by the inherited codebase and you make no repository changes, write changedFiles: [] and explain the no-change completion in notesForValidator.",
+      "Write free-form evidence instead of relying on exact assertion id tags. The runner already knows this feature's assigned contract/local assertions and will attach your evidence to those assigned assertions only. Extra assertion mentions are treated as supplemental notes, not coverage.",
+      "The runner derives changed files from git status/diff. If the feature is already satisfied by the inherited codebase and you make no repository changes, set outcome to already_satisfied and explain the no-change completion in notesForValidator.",
       "Do not include the handoff file itself or generated junk (__pycache__, .pytest_cache, .venv, *.egg-info, etc.) in changedFiles.",
       "Lockfiles are not generic generated junk. If a validation command accidentally creates an untracked uv.lock without dependency manifest changes, remove it before writing the handoff. If dependency/reproducibility changes intentionally create or modify a lockfile, include that lockfile in changedFiles.",
       "Mission goal:", plan.goal,
@@ -1521,7 +1533,7 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
     if (result.usage?.length) phaseEvent(run, `worker-${featureId}`, { kind: "usage", usage: result.usage, model: result.model });
     if (!result.ok) throw new Error(result.error || `worker failed for ${featureId}`);
     if (String(plan.planner || "pi") === "mock") {
-      writeFileSync(handoffPath, JSON.stringify({ featureId, completed: true, changedFiles: [], commandsRun: [], assertionsAddressed: [...(feature.assertions || []), ...(feature.localAssertions || [])], issuesDiscovered: [], leftUndone: [], notesForValidator: "Mock worker completed with no repository changes." }, null, 2), "utf8");
+      writeFileSync(handoffPath, JSON.stringify({ schema: "pi-mission-worker-handoff/v2", featureId, completed: true, outcome: "already_satisfied", evidence: ["Mock worker completed with no repository changes."], commandsRun: [], issuesDiscovered: [], leftUndone: [], notesForValidator: "Mock worker completed with no repository changes." }, null, 2), "utf8");
     }
     if (!existsSync(handoffPath)) {
       const failure = { featureId, passed: false, errors: [`Worker did not write required handoff file: ${handoffRel}`] };
@@ -1738,9 +1750,14 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
   const mustObjections = validatorReport.objections.filter((objection) => objection.level === "must");
   const passed = commandPassed && validatorReport.passed !== false && mustObjections.length === 0 && coverage.gaps.length === 0;
   const assertionResults = coverage.assertions.map((row) => ({ assertionId: row.assertionId, status: row.status === "pass" ? "pass" : "fail", evidence: row.gaps.join("; ") || "Command and adversarial validators passed." }));
+  const validatorCorrectiveFeatures = validatorReport.correctiveFeatures || [];
+  const validatorCorrectiveAssertions = new Set(validatorCorrectiveFeatures.flatMap((feature) => Array.isArray(feature.assertions) ? feature.assertions.map(String) : []));
+  const coverageGapFeatures = coverage.gaps
+    .filter((gap) => !validatorCorrectiveAssertions.has(String(gap.assertionId)))
+    .map((gap) => ({ title: `Close coverage gap for ${gap.assertionId}`, assertions: [gap.assertionId], rationale: gap.description }));
   const correctiveFeatures = passed ? [] : [
-    ...validatorReport.correctiveFeatures,
-    ...coverage.gaps.map((gap) => ({ title: `Close coverage gap for ${gap.assertionId}`, assertions: [gap.assertionId], rationale: gap.description })),
+    ...validatorCorrectiveFeatures,
+    ...coverageGapFeatures,
     ...(!commandPassed ? [{ title: `Repair validation command failures for ${milestone.title}`, assertions: assertionResults.map((r) => r.assertionId), rationale: "Validation command failed." }] : []),
   ];
   const report = { schema: "pi-mission-workflow/milestone-validation/v1", milestoneId: milestone.id, passed, reports, validatorReport, coveragePath, assertionResults, correctiveFeatures };
