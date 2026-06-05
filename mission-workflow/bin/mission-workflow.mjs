@@ -1107,6 +1107,20 @@ function missionPlanFingerprint(plan, baseHead = "") {
   return createHash("sha256").update(JSON.stringify({ schema: "pi-mission-plan-fingerprint/v1", missionId: String(plan?.missionId || ""), baseHead: String(baseHead || ""), validationContract: normalizedAssertions, milestones })).digest("hex").slice(0, 24);
 }
 
+function parseRepairSignatureFromId(featureId) {
+  const match = String(featureId || "").match(/^repair-[^-]+-\d+-([0-9a-f]{10})(?:-|$)/i);
+  return match ? match[1].toLowerCase() : undefined;
+}
+
+function repairSignatureFromFeature(feature, featureId) {
+  if (!feature?.repair) return undefined;
+  return String(feature.repairSignature || feature.repairHash || parseRepairSignatureFromId(featureId) || "").toLowerCase() || undefined;
+}
+
+function repairSignatureFromRecord(record) {
+  return String(record?.repairSignature || record?.repairHash || parseRepairSignatureFromId(record?.featureId) || "").toLowerCase() || undefined;
+}
+
 function featureFingerprint(plan, milestone, feature, featureId) {
   const contract = new Map((plan?.validationContract?.assertions || []).map((assertion) => [String(assertion.id), assertion]));
   const assertionIds = (feature.assertions || []).map(String).sort();
@@ -1273,6 +1287,8 @@ function sameStringSet(left = [], right = []) {
 
 function recordMatchesCurrentFeature(record, plan, milestone, feature, featureId) {
   if (String(record.milestoneId || "") !== String(milestone.id)) return false;
+  const currentRepairSignature = repairSignatureFromFeature(feature, featureId);
+  const repairSignatureMatched = Boolean(currentRepairSignature && repairSignatureFromRecord(record) === currentRepairSignature);
   if (Array.isArray(record.assignedAssertions)) {
     if (!sameStringSet(record.assignedAssertions, feature.assertions || [])) return false;
   } else if (Array.isArray(record.assertions)) {
@@ -1283,19 +1299,30 @@ function recordMatchesCurrentFeature(record, plan, milestone, feature, featureId
   } else if (Array.isArray(record.localAssertions)) {
     if (!sameStringSet(record.localAssertions, feature.localAssertions || [])) return false;
   } else if ((feature.localAssertions || []).length) return false;
-  if (record.featureFingerprint && String(record.featureFingerprint) !== featureFingerprint(plan, milestone, feature, featureId)) return false;
+  if (record.featureFingerprint && String(record.featureFingerprint) !== featureFingerprint(plan, milestone, feature, featureId) && !repairSignatureMatched) return false;
   return true;
 }
 
 async function completedFeatureRecord(plan, milestone, feature, featureId, featureBranch, missionBranch, baseHead, signal) {
   const state = readJsonFile(registryStatePath(plan.missionId), {});
+  const currentRepairSignature = repairSignatureFromFeature(feature, featureId);
   const candidates = (state.completedFeatures || [])
-    .filter((item) => String(item.featureId) === featureId && (!item.branch || String(item.branch) === featureBranch))
-    .sort((a, b) => (String(b.milestoneId || "") === String(milestone.id) ? 1 : 0) - (String(a.milestoneId || "") === String(milestone.id) ? 1 : 0));
+    .filter((item) => {
+      const exactFeature = String(item.featureId) === featureId && (!item.branch || String(item.branch) === featureBranch);
+      const repairAlias = currentRepairSignature && repairSignatureFromRecord(item) === currentRepairSignature;
+      return exactFeature || repairAlias;
+    })
+    .sort((a, b) => {
+      const milestoneDelta = (String(b.milestoneId || "") === String(milestone.id) ? 1 : 0) - (String(a.milestoneId || "") === String(milestone.id) ? 1 : 0);
+      if (milestoneDelta) return milestoneDelta;
+      return (String(b.featureId) === featureId ? 1 : 0) - (String(a.featureId) === featureId ? 1 : 0);
+    });
   for (const record of candidates) {
     if (!recordMatchesCurrentFeature(record, plan, milestone, feature, featureId)) continue;
+    const repairAlias = currentRepairSignature && repairSignatureFromRecord(record) === currentRepairSignature && String(record.featureId) !== featureId;
     if (record.commit && await branchMerged(plan.cwd, String(record.commit), missionBranch, signal)) {
       if (await gitCommitLooksCompleted(plan.cwd, String(record.commit), baseHead, plan, milestone, feature, featureId, signal, { requireFingerprint: true })) return record;
+      if (repairAlias && (state.trustedCommits || []).map(String).includes(String(record.commit))) return { ...record, repairAliasOf: record.featureId };
       continue;
     }
     if (record.handoffArtifact && handoffArtifactLooksCompleted(record.handoffArtifact, featureId, feature, plan) && handoffOnlyEvidenceIsNoChange(record) && await branchMerged(plan.cwd, featureBranch, missionBranch, signal)) return record;
@@ -1416,11 +1443,17 @@ function summarizeHandoff(handoff, artifactPath) {
   };
 }
 
+function canonicalHandoffFeatureId(value, expectedFeatureId) {
+  const raw = String(value || "").trim();
+  if (raw === expectedFeatureId) return expectedFeatureId;
+  return safeName(raw, "feature") === expectedFeatureId ? expectedFeatureId : raw;
+}
+
 function validateHandoff({ handoff, featureId, feature, plan, changedFiles }) {
   const errors = [];
   const required = ["featureId", "completed", "changedFiles", "commandsRun", "assertionsAddressed", "issuesDiscovered", "leftUndone", "notesForValidator"];
   for (const field of required) if (!(field in handoff)) errors.push(`Missing handoff field: ${field}`);
-  if (String(handoff.featureId || "") !== featureId) errors.push(`handoff.featureId (${handoff.featureId}) does not match featureId (${featureId})`);
+  if (canonicalHandoffFeatureId(handoff.featureId, featureId) !== featureId) errors.push(`handoff.featureId (${handoff.featureId}) does not match featureId (${featureId})`);
   if (typeof handoff.completed !== "boolean") errors.push("handoff.completed must be boolean");
   for (const field of ["changedFiles", "commandsRun", "assertionsAddressed", "issuesDiscovered", "leftUndone"]) if (!Array.isArray(handoff[field])) errors.push(`handoff.${field} must be an array`);
   const contractAssertions = Array.isArray(feature.assertions) ? feature.assertions.map(String) : [];
@@ -1460,12 +1493,16 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
   let completedSuccessfully = false;
   try {
     const handoffRel = join(".mission", "handoffs", `${featureId}.json`);
+    const handoffPath = join(featurePath, handoffRel);
+    mkdirSync(dirname(handoffPath), { recursive: true });
+    writeFileSync(handoffPath, JSON.stringify({ featureId, completed: false, changedFiles: [], commandsRun: [], assertionsAddressed: [], issuesDiscovered: [], leftUndone: [], notesForValidator: "Fill this runner-provided handoff skeleton. Preserve featureId exactly." }, null, 2), "utf8");
     const prompt = [
       "You are a mission worker implementing exactly one feature in an isolated git worktree.",
       "Implement the requested feature. You may modify files. Do not ask for approval. Do not create commits; the runner commits after validating your handoff.",
-      "Before finishing, write a structured JSON handoff file at:",
+      "Before finishing, update the runner-provided structured JSON handoff file at:",
       handoffRel,
       "The handoff JSON must include: featureId, completed, changedFiles, commandsRun[{command,exitCode}], assertionsAddressed, issuesDiscovered, leftUndone, notesForValidator.",
+      "Preserve the provided featureId exactly; do not retype, shorten, extend, or add punctuation to it.",
       "assertionsAddressed must include every assigned contract assertion and every assigned local assertion for this feature. Supplemental worker-only evidence may be included as objects with type:'local' or ids prefixed local:, but supplemental local evidence does not count toward global contract coverage.",
       "changedFiles must list only files that are actually changed relative to git HEAD in this worktree. If the feature is already satisfied by the inherited codebase and you make no repository changes, write changedFiles: [] and explain the no-change completion in notesForValidator.",
       "Do not include the handoff file itself or generated junk (__pycache__, .pytest_cache, .venv, *.egg-info, etc.) in changedFiles.",
@@ -1483,9 +1520,7 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
       : await runPi({ cwd: featurePath, prompt, tools: ["read", "grep", "find", "ls", "edit", "write", "bash"], model: ctx.modelWorker, signal: ctx.signal, operationLabel: `worker ${featureId}`, phase: `worker-${featureId}`, timeoutMs: ctx.piTimeoutMs, idleTimeoutMs: ctx.piIdleTimeoutMs });
     if (result.usage?.length) phaseEvent(run, `worker-${featureId}`, { kind: "usage", usage: result.usage, model: result.model });
     if (!result.ok) throw new Error(result.error || `worker failed for ${featureId}`);
-    const handoffPath = join(featurePath, handoffRel);
-    if (String(plan.planner || "pi") === "mock" && !existsSync(handoffPath)) {
-      mkdirSync(dirname(handoffPath), { recursive: true });
+    if (String(plan.planner || "pi") === "mock") {
       writeFileSync(handoffPath, JSON.stringify({ featureId, completed: true, changedFiles: [], commandsRun: [], assertionsAddressed: [...(feature.assertions || []), ...(feature.localAssertions || [])], issuesDiscovered: [], leftUndone: [], notesForValidator: "Mock worker completed with no repository changes." }, null, 2), "utf8");
     }
     if (!existsSync(handoffPath)) {
@@ -1494,6 +1529,11 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
       throw new Error(`Strict handoff validation failed for ${featureId}: missing ${handoffRel}`);
     }
     const handoff = parseJsonFromText(readFileSync(handoffPath, "utf8"));
+    const canonicalFeatureId = canonicalHandoffFeatureId(handoff.featureId, featureId);
+    if (canonicalFeatureId === featureId && String(handoff.featureId || "") !== featureId) {
+      phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "canonicalizedHandoffFeatureId", value: { from: handoff.featureId, to: featureId }, message: `Canonicalized handoff featureId to ${featureId}` });
+      handoff.featureId = featureId;
+    }
     const handoffArtifact = writeArtifact(run, `handoffs/${featureId}.json`, handoff, "json", `Worker handoff: ${featureId}`);
     rmSync(handoffPath, { force: true });
     await git(featurePath, ["reset", "-q"], { signal: ctx.signal, reject: false });
@@ -1708,10 +1748,10 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
   return { ...report, artifact: reportPath };
 }
 
-function repairFeatureStableId(report, iteration, feature, index, fallback) {
+function repairFeatureStableHash(report, iteration, feature, index, fallback) {
   const title = feature.title || fallback.title;
   const assertions = Array.isArray(feature.assertions) && feature.assertions.length ? feature.assertions.map(String).sort() : (fallback.assertions || []).map(String).sort();
-  const hash = createHash("sha256").update(JSON.stringify({
+  return createHash("sha256").update(JSON.stringify({
     schema: "pi-mission-repair-feature-id/v1",
     milestoneId: String(report.milestoneId || ""),
     iteration: Number(iteration),
@@ -1721,10 +1761,10 @@ function repairFeatureStableId(report, iteration, feature, index, fallback) {
     assertions,
     rationale: String(feature.rationale || "").replace(/\s+/g, " ").trim(),
   })).digest("hex").slice(0, 10);
-  const prefix = `repair-${safeName(report.milestoneId)}-${iteration}-${hash}`;
-  const titleBudget = Math.max(0, 80 - prefix.length - 1);
-  const titleSlug = safeName(title, "repair").slice(0, titleBudget);
-  return titleSlug ? `${prefix}-${titleSlug}` : prefix;
+}
+
+function repairFeatureStableId(report, iteration, feature, index, fallback) {
+  return `repair-${safeName(report.milestoneId)}-${iteration}-${repairFeatureStableHash(report, iteration, feature, index, fallback)}`;
 }
 
 function repairFeaturesFromReport(report, iteration) {
@@ -1732,6 +1772,7 @@ function repairFeaturesFromReport(report, iteration) {
   const corrective = report.correctiveFeatures?.length ? report.correctiveFeatures : [fallback];
   return corrective.map((feature, index) => ({
     id: repairFeatureStableId(report, iteration, feature, index, fallback),
+    repairSignature: repairFeatureStableHash(report, iteration, feature, index, fallback),
     title: feature.title || fallback.title,
     description: compactText(feature.description || `Repair validation failures from report: ${JSON.stringify({ commandReports: report.reports || [], objections: report.validatorReport?.objections || [], coveragePath: report.coveragePath, rationale: feature.rationale }, null, 2)}`, 8000),
     assertions: Array.isArray(feature.assertions) && feature.assertions.length ? feature.assertions.map(String) : fallback.assertions,
@@ -1781,7 +1822,7 @@ async function activateMission(args, cwd, run, ctx) {
             const resultFingerprint = result.featureFingerprint ? String(result.featureFingerprint) : "";
             return !existingFingerprint || !resultFingerprint || existingFingerprint === resultFingerprint;
           };
-          return { ...state, trustedBaseHead: state.trustedBaseHead || env.baseHead, trustedHead, trustedPlanFingerprint: missionPlanFingerprint(plan, env.baseHead), trustedCommits: Array.from(new Set([...(state.trustedCommits || []), ...(result.commit ? [result.commit] : [])])), completedFeatures: [...(state.completedFeatures || []).filter((item) => !sameResultRecord(item)), { featureId: result.featureId, milestoneId: milestone.id, iteration, branch: result.featureBranch, commit: result.commit, handoffArtifact: result.handoffArtifact, changedFiles: result.changedFiles || [], assertions: result.assertions || [], localAssertions: result.localAssertions || [], assignedAssertions: feature.assertions || [], assignedLocalAssertions: feature.localAssertions || [], featureFingerprint: result.featureFingerprint, skipped: Boolean(result.skipped), completedAt: new Date().toISOString() }] };
+          return { ...state, trustedBaseHead: state.trustedBaseHead || env.baseHead, trustedHead, trustedPlanFingerprint: missionPlanFingerprint(plan, env.baseHead), trustedCommits: Array.from(new Set([...(state.trustedCommits || []), ...(result.commit ? [result.commit] : [])])), completedFeatures: [...(state.completedFeatures || []).filter((item) => !sameResultRecord(item)), { featureId: result.featureId, milestoneId: milestone.id, iteration, branch: result.featureBranch, commit: result.commit, handoffArtifact: result.handoffArtifact, changedFiles: result.changedFiles || [], assertions: result.assertions || [], localAssertions: result.localAssertions || [], assignedAssertions: feature.assertions || [], assignedLocalAssertions: feature.localAssertions || [], featureFingerprint: result.featureFingerprint, repairSignature: repairSignatureFromFeature(feature, result.featureId), skipped: Boolean(result.skipped), completedAt: new Date().toISOString() }] };
         });
       }
       queue = [];
