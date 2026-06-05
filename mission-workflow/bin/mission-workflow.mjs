@@ -1121,6 +1121,65 @@ function repairSignatureFromRecord(record) {
   return String(record?.repairSignature || record?.repairHash || parseRepairSignatureFromId(record?.featureId) || "").toLowerCase() || undefined;
 }
 
+function validationCursorMetadata(plan, requestedModel = "", actualModel = "", runtime = {}) {
+  const planner = String(plan.planner || "pi");
+  const validatorMode = planner === "mock" ? "mock" : "pi";
+  const requested = String(requestedModel || "");
+  return {
+    schema: "pi-mission-validation-cursor-metadata/v1",
+    planner,
+    validatorMode,
+    requestedModel: requested,
+    actualModel: actualModel ? String(actualModel) : undefined,
+    piBin: validatorMode === "pi" ? DEFAULT_PI : undefined,
+    commandTimeoutMs: runtime.commandTimeoutMs,
+    piTimeoutMs: runtime.piTimeoutMs,
+    piIdleTimeoutMs: runtime.piIdleTimeoutMs,
+    stableIdentity: validatorMode === "mock" || Boolean(requested),
+  };
+}
+
+function validationCursorFingerprint(plan, milestone, baseHead = "", validator = {}) {
+  const contractAssertions = milestoneCoverageAssertions(plan, milestone, "milestone").map((assertion) => ({
+    id: String(assertion.id || ""),
+    description: String(assertion.description || "").replace(/\s+/g, " ").trim(),
+    priority: String(assertion.priority || ""),
+    validationMethod: String(assertion.validationMethod || ""),
+    coveredBy: (assertion.coveredBy || []).map(String).sort(),
+    local: Boolean(assertion.local),
+  })).sort((a, b) => a.id.localeCompare(b.id));
+  const features = (milestone?.features || []).map((feature) => {
+    const featureId = safeName(feature.id || feature.title, "feature");
+    return {
+      id: featureId,
+      fingerprint: featureFingerprint(plan, milestone, feature, featureId),
+      assertions: (feature.assertions || []).map(String).sort(),
+      localAssertions: (feature.localAssertions || []).map(String).sort(),
+    };
+  });
+  return createHash("sha256").update(JSON.stringify({
+    schema: "pi-mission-validation-cursor-fingerprint/v1",
+    missionId: String(plan?.missionId || ""),
+    baseHead: String(baseHead || ""),
+    goal: String(plan.goal || "").replace(/\s+/g, " ").trim(),
+    sourceDocs: (plan.sourceDocs || []).map(String).sort(),
+    milestoneId: String(milestone?.id || ""),
+    milestoneTitle: String(milestone?.title || "").replace(/\s+/g, " ").trim(),
+    planner: String(validator.planner || plan.planner || "pi"),
+    validatorMode: String(validator.validatorMode || (String(plan.planner || "pi") === "mock" ? "mock" : "pi")),
+    requestedValidatorModel: String(validator.requestedModel || ""),
+    validatorPiBin: String(validator.piBin || ""),
+    commandTimeoutMs: Number(validator.commandTimeoutMs || 0),
+    piTimeoutMs: Number(validator.piTimeoutMs || 0),
+    piIdleTimeoutMs: Number(validator.piIdleTimeoutMs || 0),
+    validatorStableIdentity: Boolean(validator.stableIdentity),
+    validationCommands: (plan.validationCommands || []).map(String),
+    userTestCommand: String(plan.userTestCommand || ""),
+    contractAssertions,
+    features,
+  })).digest("hex").slice(0, 24);
+}
+
 function featureFingerprint(plan, milestone, feature, featureId) {
   const contract = new Map((plan?.validationContract?.assertions || []).map((assertion) => [String(assertion.id), assertion]));
   const assertionIds = (feature.assertions || []).map(String).sort();
@@ -1147,20 +1206,24 @@ function featureFingerprint(plan, milestone, feature, featureId) {
   })).digest("hex").slice(0, 24);
 }
 
-async function gitCommitLooksCompleted(cwd, ref, baseHead, plan, milestone, feature, featureId, signal, options = {}) {
-  const [commit, subject, body] = await Promise.all([
+async function gitCommitHasRunnerFeatureTrailers(cwd, ref, baseHead, featureId, fingerprint, signal, options = {}) {
+  const [commit, body] = await Promise.all([
     gitRef(cwd, ref, signal),
-    gitSubject(cwd, ref, signal),
     git(cwd, ["log", "-1", "--format=%B", ref], { signal, reject: false }),
   ]);
-  if (!commit || commit === baseHead) return false;
-  if (subject !== expectedFeatureCommitSubject(plan, feature, featureId)) return false;
-  const escapedFeatureId = featureId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const featureIdMatches = body.ok && new RegExp(`^Mission-Feature-Id: ${escapedFeatureId}$`, "m").test(body.stdout);
-  if (!featureIdMatches) return false;
+  if (!commit || commit === baseHead || !body.ok) return false;
+  const escapedFeatureId = String(featureId || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (!escapedFeatureId || !new RegExp(`^Mission-Feature-Id: ${escapedFeatureId}$`, "m").test(body.stdout)) return false;
   const fingerprintMatch = body.stdout.match(/^Mission-Feature-Fingerprint: (\S+)$/m);
   if (!fingerprintMatch) return !options.requireFingerprint;
-  return fingerprintMatch[1] === featureFingerprint(plan, milestone, feature, featureId);
+  if (!fingerprint) return !options.requireFingerprint;
+  return fingerprintMatch[1] === String(fingerprint);
+}
+
+async function gitCommitLooksCompleted(cwd, ref, baseHead, plan, milestone, feature, featureId, signal, options = {}) {
+  const subject = await gitSubject(cwd, ref, signal);
+  if (subject !== expectedFeatureCommitSubject(plan, feature, featureId)) return false;
+  return await gitCommitHasRunnerFeatureTrailers(cwd, ref, baseHead, featureId, featureFingerprint(plan, milestone, feature, featureId), signal, options);
 }
 
 function planFeatureContexts(plan) {
@@ -1262,8 +1325,10 @@ function handoffArtifactLooksCompleted(artifactPath, featureId, feature, plan) {
   if (!artifactPath || !existsSync(String(artifactPath))) return false;
   const handoff = readJsonFile(String(artifactPath), undefined);
   if (!handoff || handoff.completed !== true) return false;
-  const validation = validateHandoff({ handoff, featureId, feature, plan, changedFiles: [], strictWorkerAssertions: true });
-  return validation.ok;
+  const validation = validateHandoff({ handoff, featureId, feature, plan, changedFiles: [] });
+  if (!validation.ok) return false;
+  const notes = validation.supplementalHandoffNotes || {};
+  return !(notes.unassigned || []).length && !(notes.unknown || []).length;
 }
 
 function handoffChangedFiles(artifactPath) {
@@ -1439,6 +1504,7 @@ function summarizeHandoff(handoff, artifactPath) {
     workerDeclaredChangedFiles: Array.isArray(handoff.changedFiles) ? handoff.changedFiles.map(String) : [],
     commandsRun: Array.isArray(handoff.commandsRun) ? handoff.commandsRun.map((cmd) => ({ command: String(cmd.command || ""), exitCode: Number(cmd.exitCode ?? 0) })) : [],
     assertionsMentioned: Array.isArray(handoff.assertionsAddressed) ? handoff.assertionsAddressed.map((value) => typeof value === "object" && value ? String(value.id || value.description || value.evidence || "") : String(value)) : [],
+    workerAssertionsMentioned: Array.isArray(handoff.workerAssertionsAddressed) ? handoff.workerAssertionsAddressed.map((value) => typeof value === "object" && value ? String(value.id || value.description || value.evidence || "") : String(value)) : [],
     evidence: Array.isArray(handoff.evidence) ? handoff.evidence.map((value) => compactText(typeof value === "object" && value ? JSON.stringify(value) : String(value), 1000)) : [],
     issuesDiscoveredCount: Array.isArray(handoff.issuesDiscovered) ? handoff.issuesDiscovered.length : 0,
     leftUndoneCount: Array.isArray(handoff.leftUndone) ? handoff.leftUndone.length : 0,
@@ -1546,7 +1612,6 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
       phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "canonicalizedHandoffFeatureId", value: { from: handoff.featureId, to: featureId }, message: `Canonicalized handoff featureId to ${featureId}` });
       handoff.featureId = featureId;
     }
-    const handoffArtifact = writeArtifact(run, `handoffs/${featureId}.json`, handoff, "json", `Worker handoff: ${featureId}`);
     rmSync(handoffPath, { force: true });
     await git(featurePath, ["reset", "-q"], { signal: ctx.signal, reject: false });
     await git(featurePath, ["restore", "--staged", "--worktree", "--", handoffRel], { signal: ctx.signal, reject: false });
@@ -1556,11 +1621,14 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
     changedFiles = await autoCleanOmittedTransientArtifacts({ cwd: featurePath, handoff, changedFiles, run, phase: `worker-${featureId}`, featureId, signal: ctx.signal });
     const handoffValidation = validateHandoff({ handoff, featureId, feature, plan, changedFiles });
     if (!handoffValidation.ok) {
-      const failure = { featureId, passed: false, errors: handoffValidation.errors, changedFiles, handoffArtifact };
+      const rawHandoffArtifact = writeArtifact(run, `handoffs/${featureId}-raw-invalid.json`, handoff, "json", `Invalid worker handoff payload: ${featureId}`);
+      const failure = { featureId, passed: false, errors: handoffValidation.errors, changedFiles, handoffArtifact: rawHandoffArtifact };
       writeArtifact(run, `handoffs/${featureId}-invalid.json`, failure, "json", `Invalid worker handoff: ${featureId}`);
       throw new Error(`Strict handoff validation failed for ${featureId}: ${handoffValidation.errors.join("; ")}`);
     }
+    if (Array.isArray(handoff.assertionsAddressed)) handoff.workerAssertionsAddressed = handoff.assertionsAddressed;
     handoff.assertionsAddressed = handoffValidation.assertionsAddressed;
+    const handoffArtifact = writeArtifact(run, `handoffs/${featureId}.json`, handoff, "json", `Worker handoff: ${featureId}`);
     const handoffSummary = summarizeHandoff(handoff, handoffArtifact);
     if (!changedFiles.length) {
       phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "changes", value: 0, message: "No file changes to commit" });
@@ -1690,7 +1758,9 @@ function normalizeValidatorReport(raw, { plan, milestone, coverageGaps }) {
 
 async function runAdversarialValidator(env, plan, milestone, iterationState, commandReports, coverageDraft, ctx, run) {
   let raw;
+  let validatorMetadata = validationCursorMetadata(plan, ctx.modelValidator, "", ctx);
   if (String(plan.planner || "pi") === "mock") {
+    validatorMetadata = validationCursorMetadata(plan, ctx.modelValidator, "mock", ctx);
     raw = { passed: true, summary: "Mock adversarial validator accepted the milestone.", objections: [], assertionResults: milestoneCoverageAssertions(plan, milestone, "milestone").map((assertion) => ({ assertionId: assertion.id, status: "pass", evidence: "Mock validation." })) };
   } else {
     const diffStat = await git(env.integrationPath, ["diff", "--stat", `${env.baseHead}..HEAD`], { signal: ctx.signal, reject: false });
@@ -1713,6 +1783,7 @@ async function runAdversarialValidator(env, plan, milestone, iterationState, com
     ].join("\n\n"), MAX_PROMPT_CONTEXT_BYTES);
     const validatorPromptPath = writeArtifact(run, `validation/${safeName(milestone.id)}-validator-prompt.md`, prompt, "markdown", `Validator prompt: ${milestone.id}`);
     const result = await runPi({ cwd: env.integrationPath, prompt, tools: ["read", "grep", "find", "ls"], model: ctx.modelValidator, signal: ctx.signal, operationLabel: `validator ${milestone.id}`, phase: `validator-${milestone.id}`, timeoutMs: ctx.piTimeoutMs, idleTimeoutMs: ctx.piIdleTimeoutMs });
+    validatorMetadata = validationCursorMetadata(plan, ctx.modelValidator, result.model, ctx);
     if (result.usage?.length) phaseEvent(run, `validator-${milestone.id}`, { kind: "usage", usage: result.usage, model: result.model });
     if ((result.aborted && !result.timedOut && !result.idleTimedOut) || ctx.signal.aborted) throw abortError(ctx.signal.reason || result.error || "cancelled");
     if (!result.ok) raw = { passed: false, summary: "Validator agent failed.", objections: [{ level: "must", description: result.error || "validator failed", evidence: compactText(result.stderr || result.stdout || "", 4000), repairHint: "Rerun or repair validation environment." }], assertionResults: [] };
@@ -1724,7 +1795,7 @@ async function runAdversarialValidator(env, plan, milestone, iterationState, com
       }
     }
   }
-  const normalized = normalizeValidatorReport(raw, { plan, milestone, coverageGaps: coverageDraft.gaps });
+  const normalized = { ...normalizeValidatorReport(raw, { plan, milestone, coverageGaps: coverageDraft.gaps }), validatorMetadata };
   const artifactPath = writeArtifact(run, `validation/${safeName(milestone.id)}-adversarial-report.json`, normalized, "json", `Adversarial validation report: ${milestone.id}`);
   return { ...normalized, artifact: artifactPath };
 }
@@ -1800,25 +1871,116 @@ function repairFeaturesFromReport(report, iteration) {
   }));
 }
 
-function latestPassedValidationReport(state, milestoneId) {
-  return [...(state.validationReports || [])].reverse().find((report) => String(report.milestoneId || "") === String(milestoneId) && report.passed === true);
+function firstNonEmptyArray(...values) {
+  for (const value of values) if (Array.isArray(value) && value.length) return value;
+  return [];
 }
 
-function registryFeatureResultsForMilestone(state, milestone) {
-  return (state.completedFeatures || [])
-    .filter((record) => String(record.milestoneId || "") === String(milestone.id || ""))
-    .map((record) => ({
-      featureId: String(record.featureId || ""),
-      featureBranch: record.branch,
-      assertions: record.assertions || record.assignedAssertions || [],
-      localAssertions: record.localAssertions || record.assignedLocalAssertions || [],
-      skipped: true,
-      resumed: true,
-      commit: record.commit,
-      handoffArtifact: record.handoffArtifact,
-      changedFiles: record.changedFiles || [],
-      featureFingerprint: record.featureFingerprint,
-    }));
+function featureResultFromRegistryRecord(record, fallback = {}) {
+  return {
+    featureId: String(record.featureId || fallback.featureId || ""),
+    featureBranch: record.branch || fallback.featureBranch,
+    assertions: firstNonEmptyArray(record.assertions, record.assignedAssertions, fallback.assertions),
+    localAssertions: firstNonEmptyArray(record.localAssertions, record.assignedLocalAssertions, fallback.localAssertions),
+    skipped: true,
+    resumed: true,
+    commit: record.commit,
+    handoffArtifact: record.handoffArtifact,
+    changedFiles: record.changedFiles || [],
+    featureFingerprint: record.featureFingerprint || fallback.featureFingerprint,
+  };
+}
+
+function validationFeatureRecord(result, milestoneId) {
+  return {
+    featureId: String(result.featureId || ""),
+    milestoneId: String(milestoneId || ""),
+    branch: result.featureBranch,
+    commit: result.commit,
+    handoffArtifact: result.handoffArtifact,
+    changedFiles: result.changedFiles || [],
+    assertions: result.assertions || [],
+    localAssertions: result.localAssertions || [],
+    featureFingerprint: result.featureFingerprint,
+  };
+}
+
+async function verifiedValidationFeatureAtCursor(plan, env, milestone, record, cursorHead, signal, contexts) {
+  const featureId = String(record?.featureId || "");
+  if (!featureId || String(record?.milestoneId || "") !== String(milestone.id || "")) return false;
+  const context = contexts.get(featureId);
+  if (record.commit) {
+    const commit = await gitRef(env.repoRoot, String(record.commit), signal);
+    if (!commit || commit === env.baseHead || !(await branchMerged(env.repoRoot, commit, cursorHead, signal))) return false;
+    if (context) {
+      if (!recordMatchesCurrentFeature(record, plan, context.milestone, context.feature, context.featureId)) return false;
+      return await gitCommitLooksCompleted(env.repoRoot, commit, env.baseHead, plan, context.milestone, context.feature, context.featureId, signal, { requireFingerprint: true });
+    }
+    return await gitCommitHasRunnerFeatureTrailers(env.repoRoot, commit, env.baseHead, featureId, record.featureFingerprint, signal, { requireFingerprint: true });
+  }
+  if ((record.changedFiles || []).length) return false;
+  if (!record.handoffArtifact || !existsSync(String(record.handoffArtifact))) return false;
+  if (record.branch && !(await branchMerged(env.repoRoot, String(record.branch), cursorHead, signal))) return false;
+  if (context) {
+    if (!recordMatchesCurrentFeature(record, plan, context.milestone, context.feature, context.featureId)) return false;
+    return handoffArtifactLooksCompleted(record.handoffArtifact, context.featureId, context.feature, plan);
+  }
+  const handoff = readJsonFile(String(record.handoffArtifact), undefined);
+  return Boolean(handoff?.completed === true && canonicalHandoffFeatureId(handoff.featureId, featureId) === featureId && String(record.featureFingerprint || ""));
+}
+
+async function verifiedValidationFeaturesAtCursor(plan, env, milestone, report, cursorHead, signal) {
+  if (!existsSync(String(report.artifact || "")) || !existsSync(String(report.coveragePath || ""))) return undefined;
+  const records = Array.isArray(report.validatedFeatures) ? report.validatedFeatures : [];
+  if (!records.length) return undefined;
+  const contexts = new Map(planFeatureContexts(plan).map((context) => [context.featureId, context]));
+  const results = [];
+  const seenPlanFeatures = new Set();
+  for (const record of records) {
+    if (!(await verifiedValidationFeatureAtCursor(plan, env, milestone, record, cursorHead, signal, contexts))) return undefined;
+    const result = featureResultFromRegistryRecord(record);
+    results.push(result);
+    if (contexts.has(String(record.featureId || ""))) seenPlanFeatures.add(String(record.featureId));
+  }
+  for (const feature of milestone.features || []) {
+    const featureId = safeName(feature.id || feature.title, "feature");
+    if (!seenPlanFeatures.has(featureId)) return undefined;
+  }
+  return results;
+}
+
+async function latestTrustedPassedValidationCursor(plan, env, milestone, ctx, run) {
+  const state = readJsonFile(registryStatePath(plan.missionId), {});
+  for (const report of [...(state.validationReports || [])].reverse()) {
+    if (String(report.milestoneId || "") !== String(milestone.id || "") || report.passed !== true) continue;
+    const cursorHead = String(report.trustedHead || "");
+    if (!cursorHead) {
+      phaseEvent(run, "execute-mission", { kind: "data", key: "ignoredResumeCursor", value: { milestoneId: milestone.id, reason: "missing-trustedHead" }, message: `Ignored legacy passed validation cursor for ${milestone.id}: missing trustedHead` });
+      continue;
+    }
+    const exists = await git(env.repoRoot, ["cat-file", "-e", `${cursorHead}^{commit}`], { signal: ctx.signal, reject: false });
+    if (!exists.ok || !(await branchMerged(env.repoRoot, cursorHead, env.missionBranch, ctx.signal))) {
+      phaseEvent(run, "execute-mission", { kind: "data", key: "ignoredResumeCursor", value: { milestoneId: milestone.id, trustedHead: cursorHead, reason: "unreachable-trustedHead" }, message: `Ignored passed validation cursor for ${milestone.id}: trustedHead is not reachable from the mission branch` });
+      continue;
+    }
+    const expectedMetadata = validationCursorMetadata(plan, ctx.modelValidator, "", ctx);
+    if (!report.validationCursorMetadata?.stableIdentity || !expectedMetadata.stableIdentity) {
+      phaseEvent(run, "execute-mission", { kind: "data", key: "ignoredResumeCursor", value: { milestoneId: milestone.id, trustedHead: cursorHead, reason: "unstable-validator-identity" }, message: `Ignored passed validation cursor for ${milestone.id}: validator identity is not pinned/stable` });
+      continue;
+    }
+    const expectedFingerprint = validationCursorFingerprint(plan, milestone, env.baseHead, expectedMetadata);
+    if (!report.validationCursorFingerprint || String(report.validationCursorFingerprint) !== expectedFingerprint) {
+      phaseEvent(run, "execute-mission", { kind: "data", key: "ignoredResumeCursor", value: { milestoneId: milestone.id, trustedHead: cursorHead, reason: "validation-fingerprint-mismatch" }, message: `Ignored passed validation cursor for ${milestone.id}: validation configuration changed or cursor is legacy` });
+      continue;
+    }
+    const features = await verifiedValidationFeaturesAtCursor(plan, env, milestone, report, cursorHead, ctx.signal);
+    if (!features) {
+      phaseEvent(run, "execute-mission", { kind: "data", key: "ignoredResumeCursor", value: { milestoneId: milestone.id, trustedHead: cursorHead, reason: "unverified-features" }, message: `Ignored passed validation cursor for ${milestone.id}: feature evidence is incomplete or stale` });
+      continue;
+    }
+    return { report, trustedHead: cursorHead, features };
+  }
+  return undefined;
 }
 
 async function activateMission(args, cwd, run, ctx) {
@@ -1838,12 +2000,10 @@ async function activateMission(args, cwd, run, ctx) {
   const registry = updateRegistryState(plan, (state) => ({ ...state, status: "running", planPath: planPathAbs, branch: env.missionBranch, repoRoot: env.repoRoot, worktree: env.integrationPath, worktreeBaseDir: env.root, roleModels: { plan: plan.modelPlan, worker: ctx.modelWorker, validator: ctx.modelValidator }, resumed: env.resumed, resumeCompletedFeatureCount: isTruthyFlag(args.resume) ? (priorRegistry.completedFeatures || []).length : undefined, timestamps: { ...(state.timestamps || {}), ...(registryPlan.state.timestamps || {}), startedAt: state.timestamps?.startedAt || new Date().toISOString() } }));
   const missionState = { missionId: plan.missionId, missionBranch: env.missionBranch, integrationPath: env.integrationPath, baseHead: env.baseHead, registryPath: registry.statePath, modelWorker: ctx.modelWorker, modelValidator: ctx.modelValidator, resumed: env.resumed, milestones: [], startedAt: new Date().toISOString() };
   for (const milestone of plan.milestones) {
-    const resumeRegistryState = readJsonFile(registryStatePath(plan.missionId), {});
-    const passedValidation = isTruthyFlag(args.resume) ? latestPassedValidationReport(resumeRegistryState, milestone.id) : undefined;
+    const passedValidation = isTruthyFlag(args.resume) ? await latestTrustedPassedValidationCursor(plan, env, milestone, ctx, run) : undefined;
     if (passedValidation) {
-      const skippedFeatures = registryFeatureResultsForMilestone(resumeRegistryState, milestone);
-      missionState.milestones.push({ id: milestone.id, title: milestone.title, skippedOnResume: true, iterations: [{ iteration: passedValidation.iteration, features: skippedFeatures, validation: { artifact: passedValidation.artifact, passed: true, coveragePath: passedValidation.coveragePath } }] });
-      phaseEvent(run, "execute-mission", { kind: "data", key: "skippedMilestone", value: milestone.id, message: `Skipped completed milestone ${milestone.id}` });
+      missionState.milestones.push({ id: milestone.id, title: milestone.title, skippedOnResume: true, trustedHead: passedValidation.trustedHead, iterations: [{ iteration: passedValidation.report.iteration, features: passedValidation.features, validation: { artifact: passedValidation.report.artifact, passed: true, coveragePath: passedValidation.report.coveragePath } }] });
+      phaseEvent(run, "execute-mission", { kind: "data", key: "skippedMilestone", value: { milestoneId: milestone.id, trustedHead: passedValidation.trustedHead }, message: `Skipped completed milestone ${milestone.id} at trusted validation cursor` });
       continue;
     }
     currentHeartbeat = { phase: "execute-mission", missionId: plan.missionId, milestoneId: milestone.id, milestoneTitle: milestone.title, branch: env.missionBranch, worktree: env.integrationPath };
@@ -1881,7 +2041,9 @@ async function activateMission(args, cwd, run, ctx) {
       milestoneState.iterations.push(iterationState);
       const iterationPath = writeArtifact(run, `state/${safeName(milestone.id)}-iteration-${iteration}.json`, iterationState, "json", `Mission state: ${milestone.id} iteration ${iteration}`);
       const validationTrustedHead = (await git(env.integrationPath, ["rev-parse", "HEAD"], { signal: ctx.signal })).stdout.trim();
-      updateRegistryState(plan, (state) => ({ ...state, validationReports: [...(state.validationReports || []), { milestoneId: milestone.id, iteration, artifact: validation.artifact, coveragePath: validation.coveragePath, passed: validation.passed, trustedHead: validationTrustedHead, completedAt: new Date().toISOString() }], coverageReports: [...(state.coverageReports || []), { milestoneId: milestone.id, iteration, artifact: validation.coveragePath }], current: { milestoneId: milestone.id, iteration, validationReport: validation.artifact }, lastIterationState: iterationPath }));
+      const cursorMetadata = validation.validatorReport?.validatorMetadata || validationCursorMetadata(plan, ctx.modelValidator, "", ctx);
+      const validatedFeatures = milestoneState.iterations.flatMap((item) => item.features || []).map((item) => validationFeatureRecord(item, milestone.id));
+      updateRegistryState(plan, (state) => ({ ...state, validationReports: [...(state.validationReports || []), { milestoneId: milestone.id, iteration, artifact: validation.artifact, coveragePath: validation.coveragePath, passed: validation.passed, trustedHead: validationTrustedHead, validationCursorMetadata: cursorMetadata, validationCursorFingerprint: validationCursorFingerprint(plan, milestone, env.baseHead, cursorMetadata), validatedFeatures, completedAt: new Date().toISOString() }], coverageReports: [...(state.coverageReports || []), { milestoneId: milestone.id, iteration, artifact: validation.coveragePath }], current: { milestoneId: milestone.id, iteration, validationReport: validation.artifact }, lastIterationState: iterationPath }));
       if (validation.passed) break;
       if (iteration >= Number(plan.maxRepairIterations || DEFAULT_MAX_REPAIR_ITERATIONS)) throw new Error(`Mission ${plan.missionId} reached max repair iterations (${iteration}) for ${milestone.id}`);
       queue = repairFeaturesFromReport(validation, iteration);
