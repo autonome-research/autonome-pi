@@ -14,7 +14,7 @@ Private Pi package for thread-phase workflow visualization and example workflows
 ## Install
 
 ```bash
-pi install git:git@github.com:Code4me2/pi-thread-phase-tools@v0.11.1
+pi install git:git@github.com:Code4me2/pi-thread-phase-tools@v0.11.2
 ```
 
 For active development:
@@ -36,7 +36,7 @@ pi install git:git@github.com:Code4me2/pi-thread-phase-tools@main
 
 ## Current status
 
-Latest release: `v0.11.1`.
+Latest release: `v0.11.2`.
 
 Recent changes:
 
@@ -49,7 +49,7 @@ Recent changes:
 - Usage events are aggregated into run, phase, and fanout-item summaries and rendered in tools/monitor/completion cards.
 - `npm test` runs smoke coverage for extension load, permission denial before harness import, structured validation, JS harness mode, structured shell mode, usage projection, and mission registry/resume/strict-handoff checks.
 - The package now ships workflow skills so fresh Pi sessions get progressive-disclosure guidance for dynamic workflows and mission workflows.
-- Hardened `mission_workflow` with adversarial post-milestone validation, strict handoff validation, durable trusted checkpoints for resume, contaminated-branch detection/reset, assertion coverage reports, generated-junk protection, compact result payloads, and capped repair loops.
+- Hardened `mission_workflow` with adversarial post-milestone validation, strict handoff validation, durable trusted checkpoints for resume, contaminated-branch detection/reset, assertion coverage reports, generated-junk protection, transient `uv.lock` cleanup with audit artifacts, compact result payloads, and capped repair loops.
 - Thread-phase dependency is `^4.1.0`; global `@autonome-research/thread-phase-cli` was updated to `4.1.0` for improved cancellation/error/fanout primitives.
 - Mission continuation/failure-mode notes are in `docs/mission-workflow-continuation.md`; read `/home/velvet/droid_flows.md` first for Droid/Missions design context.
 

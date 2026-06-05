@@ -28,6 +28,7 @@ const GENERATED_JUNK_PATTERNS = [
   "__pycache__/", "*.py[cod]", ".pytest_cache/", ".venv/", "venv/", "env/", "*.egg-info/",
   ".mypy_cache/", ".ruff_cache/", ".tox/", ".coverage", "coverage/", "dist/", "build/",
 ];
+const TRANSIENT_LOCKFILE_PATHS = new Set(["uv.lock"]);
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const DEFAULT_PI_TIMEOUT_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_PI_TIMEOUT_MS, 30 * 60 * 1000);
 const DEFAULT_PI_IDLE_TIMEOUT_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_PI_IDLE_TIMEOUT_MS, 12 * 60 * 1000);
@@ -587,6 +588,59 @@ async function restoreGeneratedJunkChanges(cwd, signal) {
   const junk = parseStatusPaths(status.stdout).filter(isGeneratedJunkPath);
   if (junk.length) await git(cwd, ["restore", "--staged", "--worktree", "--", ...junk], { signal, reject: false });
   return junk;
+}
+
+function normalizeRelPath(relPath) {
+  return String(relPath || "").replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+function isTransientLockfilePath(relPath) {
+  return TRANSIENT_LOCKFILE_PATHS.has(normalizeRelPath(relPath));
+}
+
+function isDependencyManifestPath(relPath) {
+  const normalized = normalizeRelPath(relPath);
+  const name = basename(normalized);
+  return ["pyproject.toml", "setup.py", "setup.cfg", "Pipfile", "uv.toml"].includes(name)
+    || /^requirements(?:[-_.].*)?\.txt$/i.test(name);
+}
+
+async function autoCleanOmittedTransientArtifacts({ cwd, handoff, changedFiles, run, phase, featureId, signal }) {
+  const declared = new Set(Array.isArray(handoff.changedFiles) ? handoff.changedFiles.map((file) => normalizeRelPath(file)).filter(Boolean) : []);
+  const actual = Array.from(new Set((changedFiles || []).map((file) => normalizeRelPath(file)).filter(Boolean))).sort();
+  const omittedTransient = actual.filter((file) => isTransientLockfilePath(file) && !declared.has(file));
+  if (!omittedTransient.length) return changedFiles;
+  const dependencyManifestChanged = actual.some((file) => !isTransientLockfilePath(file) && isDependencyManifestPath(file))
+    || Array.from(declared).some((file) => !isTransientLockfilePath(file) && isDependencyManifestPath(file));
+  if (dependencyManifestChanged) return changedFiles;
+  const root = resolve(cwd);
+  const cleaned = [];
+  const skipped = [];
+  for (const file of omittedTransient) {
+    const tracked = await git(cwd, ["ls-files", "--error-unmatch", "--", file], { signal, reject: false });
+    if (tracked.ok) {
+      skipped.push({ file, reason: "tracked lockfile" });
+      continue;
+    }
+    const abs = resolve(cwd, file);
+    if (abs !== root && !abs.startsWith(`${root}/`)) {
+      skipped.push({ file, reason: "path outside worktree" });
+      continue;
+    }
+    rmSync(abs, { force: true });
+    cleaned.push(file);
+  }
+  if (!cleaned.length) return changedFiles;
+  const artifactPath = writeArtifact(run, `handoffs/${featureId}-auto-cleaned-transient-artifacts.json`, {
+    featureId,
+    cleaned,
+    skipped,
+    reason: "Removed omitted untracked transient lockfile(s) before strict handoff validation because no dependency manifest changed.",
+    declaredChangedFiles: Array.from(declared).sort(),
+    actualChangedFilesBeforeCleanup: actual,
+  }, "json", `Auto-cleaned transient artifacts: ${featureId}`);
+  phaseEvent(run, phase, { kind: "data", key: "autoCleanedTransientArtifacts", value: cleaned, artifactPath, message: `Auto-cleaned transient artifact(s): ${cleaned.join(", ")}` });
+  return await getChangedFiles(cwd, signal);
 }
 
 async function getChangedFiles(cwd, signal) {
@@ -1266,7 +1320,19 @@ async function preserveFailedWorkerArtifacts(featurePath, featureId, run, signal
   const status = await git(featurePath, ["status", "--short"], { signal, reject: false });
   if (!status.ok || !status.stdout.trim()) return;
   writeArtifact(run, `failed-workers/${featureId}-status.txt`, status.stdout, "file", `Failed worker status: ${featureId}`);
+  const untrackedBeforeIntent = await git(featurePath, ["ls-files", "--others", "--exclude-standard"], { signal, reject: false });
   await git(featurePath, ["add", "-N", "."], { signal, reject: false });
+  const nameStatus = await git(featurePath, ["diff", "--name-status", "HEAD", "--"], { signal, reject: false });
+  const stat = await git(featurePath, ["diff", "--stat", "HEAD", "--"], { signal, reject: false });
+  const changedFiles = await getChangedFiles(featurePath, signal);
+  writeArtifact(run, `failed-workers/${featureId}-diagnostics.json`, {
+    featureId,
+    statusShort: status.stdout,
+    changedFiles,
+    diffNameStatus: nameStatus.ok ? nameStatus.stdout : undefined,
+    diffStat: stat.ok ? stat.stdout : undefined,
+    untrackedBeforeIntentToAdd: untrackedBeforeIntent.ok ? untrackedBeforeIntent.stdout.split(/\r?\n/).filter(Boolean) : undefined,
+  }, "json", `Failed worker diagnostics: ${featureId}`);
   const diff = await git(featurePath, ["diff", "--binary", "HEAD", "--"], { signal, reject: false });
   if (diff.ok && diff.stdout.trim()) writeArtifact(run, `failed-workers/${featureId}.diff`, compactText(diff.stdout, MAX_TEXT_BYTES), "file", `Failed worker diff: ${featureId}`);
 }
@@ -1403,6 +1469,7 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
       "assertionsAddressed must include every assigned contract assertion and every assigned local assertion for this feature. Supplemental worker-only evidence may be included as objects with type:'local' or ids prefixed local:, but supplemental local evidence does not count toward global contract coverage.",
       "changedFiles must list only files that are actually changed relative to git HEAD in this worktree. If the feature is already satisfied by the inherited codebase and you make no repository changes, write changedFiles: [] and explain the no-change completion in notesForValidator.",
       "Do not include the handoff file itself or generated junk (__pycache__, .pytest_cache, .venv, *.egg-info, etc.) in changedFiles.",
+      "Lockfiles are not generic generated junk. If a validation command accidentally creates an untracked uv.lock without dependency manifest changes, remove it before writing the handoff. If dependency/reproducibility changes intentionally create or modify a lockfile, include that lockfile in changedFiles.",
       "Mission goal:", plan.goal,
       "Before implementing, inspect relevant repository source/spec documents, especially specs.md, SPEC.md, requirements.md, README.md, docs/*.md, and any plan sourceDocs.",
       "Plan sourceDocs:", JSON.stringify(plan.sourceDocs || [], null, 2),
@@ -1433,7 +1500,8 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
     await git(featurePath, ["restore", "--staged", "--worktree", "--", handoffRel], { signal: ctx.signal, reject: false });
     removeGeneratedJunk(featurePath);
     await restoreGeneratedJunkChanges(featurePath, ctx.signal);
-    const changedFiles = await getChangedFiles(featurePath, ctx.signal);
+    let changedFiles = await getChangedFiles(featurePath, ctx.signal);
+    changedFiles = await autoCleanOmittedTransientArtifacts({ cwd: featurePath, handoff, changedFiles, run, phase: `worker-${featureId}`, featureId, signal: ctx.signal });
     const handoffValidation = validateHandoff({ handoff, featureId, feature, plan, changedFiles });
     if (!handoffValidation.ok) {
       const failure = { featureId, passed: false, errors: handoffValidation.errors, changedFiles, handoffArtifact };

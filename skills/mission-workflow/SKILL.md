@@ -63,7 +63,7 @@ Use `ctrl+shift+t` to monitor/cancel. Use `thread_phase_runs` to inspect artifac
 - On failure, classify the failure before relaunching: runner/lifecycle, strict handoff, validation/implementation, git/worktree, or plan/contract quality.
 - Strict handoff failures should be inspected via both the raw handoff artifact and the `*-invalid.json` artifact. Patch normalization only when the worker output is semantically valid but formatted differently than expected.
 - If a run emits `state/contaminated-mission-branch.json`, do not blindly resume. The mission branch contains untrusted code relative to the durable checkpoint/registry/plan fingerprint. Either release a runner fix, restore the matching plan/checkpoint, or start a clean mission/registry.
-- Handoff `assertionsAddressed` must cover assigned contract/local assertions. Supplemental worker-only local evidence is allowed as `local:<slug>` or `{ type: "local", id: "..." }`, but it must not be counted as global contract coverage. Handoff `changedFiles` must match actual git changes; no-change completions must use `changedFiles: []`.
+- Handoff `assertionsAddressed` must cover assigned contract/local assertions. Supplemental worker-only local evidence is allowed as `local:<slug>` or `{ type: "local", id: "..." }`, but it must not be counted as global contract coverage. Handoff `changedFiles` must match actual git changes; no-change completions must use `changedFiles: []`. Lockfiles are not generic junk; the runner only auto-cleans an omitted untracked root `uv.lock` when no dependency manifest changed, and emits an audit artifact.
 
 ## Current limitations
 
