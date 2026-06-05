@@ -21,7 +21,7 @@ Actions:
 
 - `plan` — create `mission-plan.json`, `validation-contract.json`, and approval instructions.
 - `activate` — execute an approved plan in the background or foreground.
-- `resume` — resume an approved mission after an unexpected stop by using the mission registry plus git branches/worktrees and skipping already-merged feature branches.
+- `resume` — resume an approved mission after an unexpected stop by using the durable mission registry, trusted checkpoint, and git worktrees; skips features proven by current registry records, feature branches, or trusted mission-branch commits with matching fingerprints.
 - `status` — show git worktree status from the repo.
 
 ## Example
@@ -59,7 +59,7 @@ await mission_workflow({
 - Must-level validator objections or requirement coverage gaps fail milestone validation and enqueue targeted repair features up to `maxRepairIterations` (default `10`).
 - User-testing validator starts as a configured command (`userTestCommand`).
 - Heartbeat events record compact current milestone/feature/branch/worktree pointers and child process ids for stale-run detection.
-- Durable mission state is persisted under `~/.pi/agent/mission-workflow/registry/<missionId>/` with plan path, branch, worktree, completed features, validation/coverage reports, current work item, role models, and timestamps.
+- Durable mission state is persisted under `~/.pi/agent/mission-workflow/registry/<missionId>/` with plan path, branch, worktree, completed features, validation/coverage reports, current work item, role models, trusted base/head checkpoints, trusted plan fingerprint, trusted runner-owned commits, and timestamps.
 - Per-milestone and final coverage artifacts map assertion -> features -> commits -> validators -> status.
 - Final merge into the user's target branch is manual by default.
 
@@ -68,9 +68,10 @@ await mission_workflow({
 - `activate` requires `approved: true`.
 - The runner avoids changing the user's current checkout by using separate worktrees.
 - Workers are asked not to commit; the deterministic runner owns commits.
-- Worker handoffs are strict JSON: missing/malformed handoffs, mismatched feature ids, unknown assertions, or changedFiles that disagree with git status/diff fail validation instead of being silently synthesized.
+- Worker handoffs are strict JSON: missing/malformed handoffs, mismatched feature ids, unknown assertions, or `changedFiles` that disagree with git status/diff fail validation instead of being silently synthesized. Workers are explicitly allowed to complete with `changedFiles: []` when the inherited trusted codebase already satisfies the feature.
 - `assertionsAddressed` must include every assigned contract assertion and every assigned local assertion. Accepted forms include exact IDs, known contract IDs with explanatory suffixes such as `assertion-003: evidence`, verbose assigned local assertions such as `Local assertion: <assigned check>. Verified...`, and supplemental worker-only evidence as `{ "type": "local", "id": "..." }` or `local:<slug>`. Supplemental local evidence is preserved for reviewers but never satisfies global contract coverage.
 - The runner protects commit hygiene by excluding/removing common generated junk (`__pycache__`, `.pytest_cache`, `.venv`, `*.egg-info`, etc.) before staging and refusing junk in commits.
+- Resume uses a durable trusted checkpoint and immutable base commit. New plans resolve `baseRef` to a commit hash; resumed missions prefer the registry's stored `trustedBaseHead`. Trusted checkpoints are tied to a plan/contract/base fingerprint. If a trusted checkpoint exists and the mission branch has drifted, the runner backs up the current branch under `mission-backup/...` and resets the integration worktree back to the checkpoint before continuing. If no checkpoint exists and the branch contains untrusted commits while registry completion evidence exists, the runner fails early with a contaminated-branch artifact instead of letting workers inherit stale/unverified code. Fingerprinted trusted commits on the mission branch can be reused to skip features even when per-feature branches were pruned.
 - Monitor cancellation is cooperative through the thread-phase visualizer cancel file.
 - The runner emits operation-level watchdog telemetry in heartbeat events: current child PID, operation label, elapsed time, idle time since child stdout/stderr, hard timeout, and idle timeout. If an operation is silent longer than `PI_MISSION_WORKFLOW_WATCHDOG_STALE_MS` (default `2m`), it emits a `progress_watchdog` event.
 - The runner emits workflow-agnostic active I/O snapshots (`active_io` phase events) for Pi workers/validators and child processes. Projections expose these as `run.activeIo` and `phase.activeIo`; the monitor panel renders the latest component/status/byte-count details without mission-specific UI code. Snapshots are redacted/capped and can be disabled with `PI_THREAD_PHASE_ACTIVE_IO=0`; raw-ish previews are opt-in (`PI_THREAD_PHASE_ACTIVE_IO_PREVIEWS=1`, `PI_THREAD_PHASE_ACTIVE_IO_COMMANDS=1`, `PI_THREAD_PHASE_ACTIVE_IO_PROMPTS=1`).
@@ -83,7 +84,7 @@ Do not blindly relaunch a failed mission. First classify the failure:
 - **Runner/lifecycle failure**: stale/dead process, parser crash, unbounded output, cancellation issue, registry inconsistency, missing non-heartbeat progress, operation timeout. Patch/release the extension, validate, then resume.
 - **Strict handoff failure**: missing handoff, mismatched feature id, unknown assertion refs, changedFiles mismatch, generated junk. Inspect the raw handoff and invalid-handoff artifact; patch normalization only when the worker output is semantically valid.
 - **Validation/implementation failure**: command failure, adversarial must objection, coverage gap. Inspect validation and coverage artifacts and let targeted repairs run within `maxRepairIterations`.
-- **Git/worktree failure**: stale worktree/branch, ff-only merge failure, dirty generated files. Inspect worktree list/status and only remove stale failed feature worktrees/branches when safe.
+- **Git/worktree failure**: stale worktree/branch, ff-only merge failure, dirty generated files, or contaminated mission branch. Inspect worktree list/status and the contaminated-branch artifact. If a trusted checkpoint exists, resume will back up/reset drift automatically; if not, start a clean mission/registry or restore a known-good checkpoint.
 - **Plan/contract quality failure**: assertions not mapped to contract IDs, missing coverage, local assertions confused with global coverage. Patch the plan with backups and preserve local acceptance checks.
 
 For current dogfood state and exact auto_trading failure context, see `../docs/mission-workflow-continuation.md`.
@@ -91,7 +92,7 @@ For current dogfood state and exact auto_trading failure context, see `../docs/m
 ## Current limitations
 
 - This MVP is intentionally simple and should be dogfooded on small missions first.
-- Resume/reuse uses the durable registry and git branch ancestry; dynamic in-memory queues still restart from the current plan/milestone and rerun validation as needed.
+- Resume/reuse uses the durable registry, trusted checkpoints, and git proof trailers; dynamic in-memory repair queues still restart from the current plan/milestone and rerun validation as needed.
 - Worktree cleanup is best-effort.
 - Browser/computer-use QA is not implemented; user testing is command-based.
 - Repair planning currently creates generic corrective features from failed validators.

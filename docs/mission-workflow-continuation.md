@@ -72,23 +72,37 @@ mission/trading-automation-system-v1
 /home/velvet/.pi/agent/mission-workflow/worktrees/trading-automation-system-v1/integration
 ```
 
-Current active run after `v0.11.0` release/resume:
+Latest dogfood failure after `v0.11.0` release/resume:
 
 ```text
 mission-workflow-2026-06-04T23-24-17-413Z-8284068a
-pid: 1412093
-current observed feature: M2-F3
+failed at: M2-F4
 ```
 
-As of the connection-loss check, the mission process and child Pi worker were still alive. The run had skipped/validated M0 and M1, committed/recognized M2-F1 and M2-F2, and was re-running stale/unverified branch `M2-F3` with active I/O/watchdog telemetry visible in the thread-phase log.
-
-Most recent resolved failure before this run:
+The run skipped/validated M0 and M1, committed M2-F1/M2-F2/M2-F3, then failed strict handoff validation for M2-F4:
 
 ```text
-mission-workflow-2026-06-04T20-23-17-231Z-5ebe2499
+handoff.changedFiles listed files not changed in git status/diff:
+auto_trading/data/adapters.py, auto_trading/data/federation.py, tests/test_data_federation.py
 ```
 
-That run failed at `M2-F1` strict handoff validation because the worker-created `.mission/handoffs/M2-F1.json` was tracked from a stale branch and then removed by the runner, so git status only saw the handoff-file deletion while the handoff listed implementation files. `v0.10.9`/`v0.11.0` restored the handoff path after artifact extraction and hardened operation timeouts/watchdogs, allowing the later resume to pass M2-F1.
+Root cause: the mission branch already contained old/unverified legacy commits for future M2 features, including an older token-bucket implementation. Resume hardening stopped trusting branch ancestry, but workers still inherited the contaminated code in the integration branch. The M2-F4 worker found the feature already present and wrote a handoff claiming files it did not actually change. This is not caused by chat compaction; it is a mismatch between trusted resume bookkeeping and an untrusted legacy code state.
+
+Reset for fresh dogfood:
+
+- `/home/velvet/auto_trading` is back on `main` at baseline commit `66bd4fd` with only `specs.md` in the project tree.
+- Removed stale mission worktrees under `~/.pi/agent/mission-workflow/worktrees/trading-automation-system-v1`.
+- Removed stale durable registry `~/.pi/agent/mission-workflow/registry/trading-automation-system-v1`.
+- Deleted stale branches `mission/trading-automation-system-v1` and `mission-feature/trading-automation-system-v1/*`.
+- Fresh dogfood should generate a new plan/registry rather than resuming the old one.
+
+Current unreleased fix after this diagnosis:
+
+- new plans resolve `baseRef` to an immutable commit hash, and registry records `trustedBaseHead`, `trustedHead`, `trustedPlanFingerprint`, and `trustedCommits`;
+- resume resets branch drift back to an existing trusted checkpoint after backing up the previous mission branch under `mission-backup/...`;
+- if no trusted checkpoint exists and the branch contains untrusted commits while registry completion evidence exists, resume fails early with `state/contaminated-mission-branch.json` instead of letting workers inherit stale/unverified code;
+- if no registry completion evidence exists, a contaminated branch can be backed up/reset to the base and rerun cleanly;
+- worker prompts now explicitly instruct no-change completions to use `changedFiles: []` when the inherited trusted codebase already satisfies the feature.
 
 ## Failure-mode handling rules
 
@@ -107,8 +121,8 @@ When a mission fails, do **not** blindly relaunch. First classify the failure:
    - Action: inspect validation report, coverage report, and adversarial report. Let the mission create targeted repair features unless max repair iterations has been reached.
 
 4. **Git/worktree failure**
-   - Examples: stale worktree path, branch exists but not merged, failed ff-only merge, untracked generated junk.
-   - Action: inspect `git worktree list`, `git status`, and branch ancestry. Remove only stale failed feature worktrees/branches when safe; preserve mission integration branch.
+   - Examples: stale worktree path, branch exists but not merged, failed ff-only merge, untracked generated junk, contaminated mission branch.
+   - Action: inspect `git worktree list`, `git status`, branch ancestry, and any `state/contaminated-mission-branch.json` artifact. If a trusted checkpoint exists, resume should back up/reset branch drift automatically. If no trusted checkpoint exists and registry evidence is mixed with untrusted commits, start a fresh mission/registry or restore a known-good checkpoint rather than continuing on the contaminated branch.
 
 5. **Plan/contract quality failure**
    - Examples: feature assertions are prose not contract IDs, contract assertions have no `coveredBy`, local assertions accidentally satisfy final coverage.
@@ -116,16 +130,16 @@ When a mission fails, do **not** blindly relaunch. First classify the failure:
 
 ## Immediate recommended next step
 
-The working tree now contains the intended `v0.11.0` mission hardening:
+The working tree now contains the intended `v0.11.1` mission hardening:
 
 - handoff assertion canonicalization accepts strings like `assertion-003: detailed explanation` when the leading ID exists in the validation contract, accepts verbose assigned local assertions like `Local assertion: <assigned check>. Verified...`, and accepts supplemental worker-only local evidence either as `local:*` IDs or `{ type: "local", id: "..." }` objects without counting it as global contract coverage;
 - resume no longer treats branch ancestry alone as proof of feature completion, so stale failed feature branches at the mission head are rerun;
 - runner-owned commits now include `Mission-Feature-Id: <featureId>` and `Mission-Feature-Fingerprint: <fingerprint>` trailers;
-- branch-only resume recognizes completed features only with stronger proof: merged, not at the base head, runner-owned commit subject plus matching `Mission-Feature-Id` and `Mission-Feature-Fingerprint` trailers; fingerprint schema `pi-mission-feature-fingerprint/v2` includes the milestone id, feature metadata, assigned assertion ids, local assertion ids, and assigned validation-contract assertion descriptions/priorities/methods/coverage refs; registry-backed legacy commit records may still use subject plus `Mission-Feature-Id` when no fingerprint was historically recorded, but still require current milestone/assignment metadata; valid completed no-change handoff artifacts remain trusted for legacy/no-change work; subject-only legacy skipped records are no longer trusted;
+- branch-only resume recognizes completed features only with stronger proof: merged, not at the base head, runner-owned commit subject plus matching `Mission-Feature-Id` and `Mission-Feature-Fingerprint` trailers; fingerprint schema `pi-mission-feature-fingerprint/v2` includes the milestone id, feature metadata, assigned assertion ids, local assertion ids, and assigned validation-contract assertion descriptions/priorities/methods/coverage refs; registry/commit trust now requires feature-id and fingerprint trailers; verified trusted mission-branch commits can be reused as completion proof even if per-feature branches were pruned; trusted checkpoints are tied to a plan/contract/base fingerprint; valid no-change handoff artifacts are trusted only when they do not require inheriting an untrusted/contaminated mission branch;
 - failed worker diffs/status are preserved as artifacts before removing failed feature worktrees;
 - hard failures/cancellations mark the durable registry `failed`/`cancelled` on a best-effort basis, without downgrading an already `completed` mission registry;
 - operation-level watchdog telemetry is emitted on heartbeats, including child PID, operation label, elapsed time, idle time, hard timeout, and idle timeout; stale operations emit `progress_watchdog` events; Pi calls have hard and idle-output timeouts; validation/user-test shell commands now have explicit timeouts instead of being able to hang indefinitely;
 - workflow-agnostic active I/O snapshots are emitted via `active_io` phase events and projected as `run.activeIo`/`phase.activeIo`, so the monitor panel, tools, and debugging sessions can inspect current component status and byte counts without coupling mission-specific logic to the UI; active I/O is redacted/capped, can be disabled with `PI_THREAD_PHASE_ACTIVE_IO=0`, and raw-ish process/model previews are opt-in (`PI_THREAD_PHASE_ACTIVE_IO_PREVIEWS=1`, `PI_THREAD_PHASE_ACTIVE_IO_COMMANDS=1`, `PI_THREAD_PHASE_ACTIVE_IO_PROMPTS=1`);
-- smoke coverage was added for prefixed handoffs, stale branch rerun, completed-head skip with feature-id trailer, same-subject/no-trailer rerun, stale registry skipped/commit records, handoff-backed legacy skips, registry-failed marking, command timeout handling, and completed-registry non-downgrade/immutability.
+- smoke coverage was added for prefixed handoffs, stale branch rerun, trusted-checkpoint reset after contamination, trusted mission-branch commit reuse without feature branches, completed-head skip with feature-id trailer, same-subject/no-trailer rerun, stale registry skipped/commit records, contaminated legacy registry branches, registry-failed marking, command timeout handling, and completed-registry non-downgrade/immutability.
 
-`v0.11.0` has been committed/tagged/pushed (`2f703f9 Add active workflow IO snapshots`) and the approved auto_trading mission has already been resumed. If the current run fails or is cancelled, inspect the run artifacts first and classify the failure before resuming again.
+`v0.11.0` has been committed/tagged/pushed (`2f703f9 Add active workflow IO snapshots`). The current working tree is unreleased `v0.11.1` checkpoint/contamination hardening. Do not resume the old auto_trading mission; it has been intentionally reset for a clean dogfood run after `v0.11.1` is committed/released.

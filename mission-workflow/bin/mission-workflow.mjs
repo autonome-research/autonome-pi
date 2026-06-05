@@ -341,6 +341,10 @@ function defaultRegistryState(plan, patch = {}) {
     current: {},
     roleModels: { plan: plan.modelPlan, worker: plan.modelWorker, validator: plan.modelValidator },
     completedFeatures: [],
+    trustedBaseHead: patch.trustedBaseHead,
+    trustedHead: patch.trustedHead,
+    trustedPlanFingerprint: patch.trustedPlanFingerprint,
+    trustedCommits: [],
     validationReports: [],
     coverageReports: [],
     timestamps: { createdAt: now, updatedAt: now, startedAt: patch.startedAt },
@@ -393,7 +397,7 @@ function markMissionRegistryTerminalFromArgs(args, cwd, status, error) {
   updateRegistryState(plan, (state) => ({
     ...state,
     status: state.status === "completed" ? state.status : status,
-    planPath: state.status === "completed" ? state.planPath : planPath,
+    planPath: state.planPath || planPath,
     lastError: state.status === "completed" ? state.lastError : (error ? { message: String(error.message || error), stack: error.stack ? String(error.stack) : undefined, at, status } : state.lastError),
     ...(state.status === "completed" ? { [`last${status === "cancelled" ? "Cancelled" : "Failed"}Attempt`]: { at, message: error ? String(error.message || error) : undefined } } : {}),
     timestamps: { ...(state.timestamps || {}), ...(state.status === "completed" ? {} : { [`${status}At`]: at }) },
@@ -922,6 +926,7 @@ async function createPlan(args, cwd, run, ctx) {
     }
   }
   plan = normalizePlan(plan, { goal, cwd: repoRoot, args, repoRoot });
+  plan.baseRef = (await git(repoRoot, ["rev-parse", `${plan.baseRef || "HEAD"}^{commit}`], { signal: ctx.signal })).stdout.trim();
   const planPath = writeArtifact(run, "mission-plan.json", plan, "json", "Mission plan");
   const contractPath = writeArtifact(run, "validation-contract.json", plan.validationContract, "json", "Validation contract");
   const registry = persistRegistryPlan(plan, planPath);
@@ -965,21 +970,38 @@ function validatePlanForActivation(plan) {
 
 async function ensureMissionWorktrees(plan, ctx, run, options = {}) {
   const repoRoot = (await git(plan.cwd, ["rev-parse", "--show-toplevel"], { signal: ctx.signal })).stdout.trim();
-  const baseHead = (await git(repoRoot, ["rev-parse", plan.baseRef || "HEAD"], { signal: ctx.signal })).stdout.trim();
+  const registryState = readJsonFile(registryStatePath(plan.missionId), {});
   const missionBranch = `mission/${safeName(plan.missionId, "mission")}`;
+  const rawBaseRef = String(plan.baseRef || "HEAD");
+  let requestedBase = options.resume && registryState.trustedBaseHead ? String(registryState.trustedBaseHead) : rawBaseRef;
+  if (options.resume && !registryState.trustedBaseHead && await branchExists(repoRoot, missionBranch, ctx.signal) && !/^[0-9a-f]{40}$/i.test(rawBaseRef)) {
+    const mergeBase = await git(repoRoot, ["merge-base", missionBranch, rawBaseRef], { signal: ctx.signal, reject: false });
+    if (mergeBase.ok && mergeBase.stdout.trim()) requestedBase = mergeBase.stdout.trim();
+  }
+  const baseHead = (await git(repoRoot, ["rev-parse", requestedBase], { signal: ctx.signal })).stdout.trim();
   const root = resolve(plan.worktreeBaseDir || join(homedir(), ".pi", "agent", "mission-workflow", "worktrees", plan.missionId));
   const integrationPath = join(root, "integration");
   mkdirSync(root, { recursive: true });
   if (existsSync(integrationPath)) {
     if (!options.resume) throw new Error(`integration worktree already exists: ${integrationPath}`);
+    const integrationBranch = await git(integrationPath, ["symbolic-ref", "--short", "HEAD"], { signal: ctx.signal, reject: false });
+    if (!integrationBranch.ok || integrationBranch.stdout.trim() !== missionBranch) throw new Error(`integration worktree ${integrationPath} is not checked out on ${missionBranch}`);
     await ensureGeneratedJunkIgnored(integrationPath, ctx.signal);
     phaseEvent(run, "prepare-mission", { kind: "data", key: "missionBranch", value: missionBranch, message: `Resuming ${missionBranch}` });
     return { repoRoot, baseHead, missionBranch, root, integrationPath, resumed: true };
   }
-  await git(repoRoot, ["worktree", "add", "-B", missionBranch, integrationPath, baseHead], { signal: ctx.signal });
+  if (options.resume && await branchExists(repoRoot, missionBranch, ctx.signal)) {
+    await git(repoRoot, ["worktree", "add", integrationPath, missionBranch], { signal: ctx.signal });
+    await ensureGeneratedJunkIgnored(integrationPath, ctx.signal);
+    phaseEvent(run, "prepare-mission", { kind: "data", key: "missionBranch", value: missionBranch, message: `Attached existing ${missionBranch}` });
+    return { repoRoot, baseHead, missionBranch, root, integrationPath, resumed: true };
+  }
+  if (!options.resume && await branchExists(repoRoot, missionBranch, ctx.signal)) throw new Error(`mission branch already exists: ${missionBranch}; use resume or delete/rename the old mission branch`);
+  const startRef = options.resume && registryState.trustedHead ? String(registryState.trustedHead) : baseHead;
+  await git(repoRoot, ["worktree", "add", "-B", missionBranch, integrationPath, startRef], { signal: ctx.signal });
   await ensureGeneratedJunkIgnored(integrationPath, ctx.signal);
   phaseEvent(run, "prepare-mission", { kind: "data", key: "missionBranch", value: missionBranch, message: `Created ${missionBranch}` });
-  return { repoRoot, baseHead, missionBranch, root, integrationPath, resumed: false };
+  return { repoRoot, baseHead, missionBranch, root, integrationPath, resumed: Boolean(options.resume) };
 }
 
 async function branchExists(cwd, branch, signal) {
@@ -1006,6 +1028,29 @@ async function gitSubject(cwd, ref, signal) {
 function expectedFeatureCommitSubject(plan, feature, featureId) {
   const title = String(feature.title || featureId).replace(/\s+/g, " ").trim().slice(0, 160) || featureId;
   return `mission(${plan.missionId}): ${title}`;
+}
+
+function missionPlanFingerprint(plan, baseHead = "") {
+  const normalizedAssertions = (plan?.validationContract?.assertions || []).map((assertion) => ({
+    id: String(assertion.id || ""),
+    description: String(assertion.description || "").replace(/\s+/g, " ").trim(),
+    priority: String(assertion.priority || ""),
+    validationMethod: String(assertion.validationMethod || ""),
+    coveredBy: (assertion.coveredBy || []).map(String).sort(),
+  })).sort((a, b) => a.id.localeCompare(b.id));
+  const milestones = (plan?.milestones || []).map((milestone) => ({
+    id: String(milestone.id || ""),
+    title: String(milestone.title || "").replace(/\s+/g, " ").trim(),
+    features: (milestone.features || []).map((feature) => ({
+      id: safeName(feature.id || feature.title, "feature"),
+      title: String(feature.title || "").replace(/\s+/g, " ").trim(),
+      description: feature.repair ? "" : String(feature.description || "").replace(/\s+/g, " ").trim(),
+      repair: Boolean(feature.repair),
+      assertions: (feature.assertions || []).map(String).sort(),
+      localAssertions: (feature.localAssertions || []).map(String).sort(),
+    })),
+  }));
+  return createHash("sha256").update(JSON.stringify({ schema: "pi-mission-plan-fingerprint/v1", missionId: String(plan?.missionId || ""), baseHead: String(baseHead || ""), validationContract: normalizedAssertions, milestones })).digest("hex").slice(0, 24);
 }
 
 function featureFingerprint(plan, milestone, feature, featureId) {
@@ -1048,6 +1093,101 @@ async function gitCommitLooksCompleted(cwd, ref, baseHead, plan, milestone, feat
   const fingerprintMatch = body.stdout.match(/^Mission-Feature-Fingerprint: (\S+)$/m);
   if (!fingerprintMatch) return !options.requireFingerprint;
   return fingerprintMatch[1] === featureFingerprint(plan, milestone, feature, featureId);
+}
+
+function planFeatureContexts(plan) {
+  const rows = [];
+  for (const milestone of plan.milestones || []) for (const feature of milestone.features || []) {
+    const featureId = safeName(feature.id || feature.title, "feature");
+    rows.push({ milestone, feature, featureId });
+  }
+  return rows;
+}
+
+async function commitLooksTrustedByPlan(cwd, commit, baseHead, plan, signal) {
+  for (const { milestone, feature, featureId } of planFeatureContexts(plan)) {
+    if (await gitCommitLooksCompleted(cwd, commit, baseHead, plan, milestone, feature, featureId, signal, { requireFingerprint: true })) return true;
+  }
+  return false;
+}
+
+async function trustedRegistryCommitSet(plan, baseHead, signal) {
+  const state = readJsonFile(registryStatePath(plan.missionId), {});
+  const trusted = new Set();
+  const contexts = new Map(planFeatureContexts(plan).map((context) => [context.featureId, context]));
+  for (const record of state.completedFeatures || []) {
+    const context = contexts.get(String(record.featureId || ""));
+    if (!context) continue;
+    if (!recordMatchesCurrentFeature(record, plan, context.milestone, context.feature, context.featureId)) continue;
+    if (await gitCommitLooksCompleted(plan.cwd, String(record.commit || ""), baseHead, plan, context.milestone, context.feature, context.featureId, signal, { requireFingerprint: true })) trusted.add(String(record.commit));
+  }
+  return trusted;
+}
+
+async function missionBranchCommits(cwd, baseHead, missionBranch, signal) {
+  const result = await git(cwd, ["rev-list", "--reverse", `${baseHead}..${missionBranch}`], { signal, reject: false });
+  return result.ok ? result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : [];
+}
+
+async function backupAndResetMissionBranch(env, targetRef, reason, ctx, run) {
+  const current = await gitRef(env.repoRoot, env.missionBranch, ctx.signal);
+  if (current && current !== targetRef) {
+    const backupBranch = `mission-backup/${safeName(env.missionBranch, "mission")}/${new Date().toISOString().replace(/[^0-9A-Za-z-]/g, "-")}`;
+    await git(env.repoRoot, ["branch", backupBranch, current], { signal: ctx.signal });
+    phaseEvent(run, "prepare-mission", { kind: "data", key: "missionBranchBackup", value: backupBranch, message: `Backed up ${env.missionBranch} before trusted reset` });
+  }
+  await git(env.integrationPath, ["reset", "--hard", targetRef], { signal: ctx.signal });
+  await git(env.integrationPath, ["clean", "-fd", "--", "."], { signal: ctx.signal, reject: false });
+  phaseEvent(run, "prepare-mission", { kind: "data", key: "trustedReset", value: targetRef, message: reason });
+}
+
+async function enforceTrustedMissionBranch(plan, env, ctx, run, options = {}) {
+  const state = readJsonFile(registryStatePath(plan.missionId), {});
+  const currentHead = (await git(env.integrationPath, ["rev-parse", "HEAD"], { signal: ctx.signal })).stdout.trim();
+  const trustedHead = state.trustedHead ? String(state.trustedHead) : "";
+  const completedRecords = (state.completedFeatures || []).filter((record) => record.commit || record.handoffArtifact || record.skipped);
+  if (!options.resume) {
+    updateRegistryState(plan, (existing) => ({ ...existing, trustedBaseHead: env.baseHead, trustedHead: currentHead, trustedPlanFingerprint: missionPlanFingerprint(plan, env.baseHead), trustedCommits: existing.trustedCommits || [] }));
+    return;
+  }
+  if (trustedHead) {
+    const expectedPlanFingerprint = missionPlanFingerprint(plan, env.baseHead);
+    if (!state.trustedPlanFingerprint || String(state.trustedPlanFingerprint) !== expectedPlanFingerprint) {
+      writeArtifact(run, "state/contaminated-mission-branch.json", { schema: "pi-mission-workflow/contaminated-branch/v1", missionId: plan.missionId, branch: env.missionBranch, baseHead: env.baseHead, trustedHead, trustedPlanFingerprint: state.trustedPlanFingerprint, expectedPlanFingerprint, message: "Trusted checkpoint was created for a different mission plan, validation contract, or base commit." }, "json", "Contaminated mission branch");
+      throw new Error(`Trusted mission checkpoint for ${plan.missionId} does not match the current plan/contract/base; start a fresh mission or restore the matching plan.`);
+    }
+    const exists = await git(env.repoRoot, ["cat-file", "-e", `${trustedHead}^{commit}`], { signal: ctx.signal, reject: false });
+    if (!exists.ok) throw new Error(`Trusted mission checkpoint ${trustedHead} is missing from git; cannot safely resume ${plan.missionId}`);
+    await backupAndResetMissionBranch(env, trustedHead, currentHead === trustedHead ? `Cleaned ${env.missionBranch} at trusted checkpoint` : `Reset ${env.missionBranch} to trusted checkpoint`, ctx, run);
+    const commits = await missionBranchCommits(env.repoRoot, env.baseHead, env.missionBranch, ctx.signal);
+    const trustedCommits = [];
+    for (const commit of commits) if (await commitLooksTrustedByPlan(env.repoRoot, commit, env.baseHead, plan, ctx.signal)) trustedCommits.push(commit);
+    updateRegistryState(plan, (existing) => ({ ...existing, trustedBaseHead: existing.trustedBaseHead || env.baseHead, trustedHead, trustedPlanFingerprint: expectedPlanFingerprint, trustedCommits: Array.from(new Set([...(existing.trustedCommits || []), ...trustedCommits])) }));
+    return;
+  }
+  const commits = await missionBranchCommits(env.repoRoot, env.baseHead, env.missionBranch, ctx.signal);
+  if (!commits.length) {
+    updateRegistryState(plan, (existing) => ({ ...existing, trustedBaseHead: env.baseHead, trustedHead: currentHead, trustedPlanFingerprint: missionPlanFingerprint(plan, env.baseHead), trustedCommits: [] }));
+    return;
+  }
+  const registryTrusted = await trustedRegistryCommitSet(plan, env.baseHead, ctx.signal);
+  const untrusted = [];
+  for (const commit of commits) {
+    if (registryTrusted.has(commit)) continue;
+    if (await commitLooksTrustedByPlan(env.repoRoot, commit, env.baseHead, plan, ctx.signal)) continue;
+    untrusted.push(commit);
+  }
+  if (untrusted.length && completedRecords.length) {
+    writeArtifact(run, "state/contaminated-mission-branch.json", { schema: "pi-mission-workflow/contaminated-branch/v1", missionId: plan.missionId, branch: env.missionBranch, baseHead: env.baseHead, currentHead, untrustedCommits: untrusted, message: "Mission branch contains commits that are not backed by the trusted checkpoint, current registry fingerprints, or current plan feature fingerprints." }, "json", "Contaminated mission branch");
+    throw new Error(`Mission branch ${env.missionBranch} is contaminated with ${untrusted.length} untrusted commit(s) and no trusted checkpoint exists. Start a fresh mission/registry or restore a known-good checkpoint before resuming.`);
+  }
+  if (untrusted.length) {
+    await backupAndResetMissionBranch(env, env.baseHead, `Reset contaminated ${env.missionBranch} to base because no completed registry records were trusted`, ctx, run);
+    updateRegistryState(plan, (existing) => ({ ...existing, trustedBaseHead: env.baseHead, trustedHead: env.baseHead, trustedPlanFingerprint: missionPlanFingerprint(plan, env.baseHead), trustedCommits: [] }));
+    return;
+  }
+  await backupAndResetMissionBranch(env, currentHead, `Cleaned ${env.missionBranch} at verified trusted head`, ctx, run);
+  updateRegistryState(plan, (existing) => ({ ...existing, trustedBaseHead: env.baseHead, trustedHead: currentHead, trustedPlanFingerprint: missionPlanFingerprint(plan, env.baseHead), trustedCommits: Array.from(new Set([...(existing.trustedCommits || []), ...commits])) }));
 }
 
 function handoffArtifactLooksCompleted(artifactPath, featureId, feature, plan) {
@@ -1101,10 +1241,17 @@ async function completedFeatureRecord(plan, milestone, feature, featureId, featu
   for (const record of candidates) {
     if (!recordMatchesCurrentFeature(record, plan, milestone, feature, featureId)) continue;
     if (record.commit && await branchMerged(plan.cwd, String(record.commit), missionBranch, signal)) {
-      if (await gitCommitLooksCompleted(plan.cwd, String(record.commit), baseHead, plan, milestone, feature, featureId, signal, { requireFingerprint: Boolean(record.featureFingerprint) })) return record;
+      if (await gitCommitLooksCompleted(plan.cwd, String(record.commit), baseHead, plan, milestone, feature, featureId, signal, { requireFingerprint: true })) return record;
       continue;
     }
     if (record.handoffArtifact && handoffArtifactLooksCompleted(record.handoffArtifact, featureId, feature, plan) && handoffOnlyEvidenceIsNoChange(record) && await branchMerged(plan.cwd, featureBranch, missionBranch, signal)) return record;
+  }
+  for (const commit of state.trustedCommits || []) {
+    const ref = String(commit || "");
+    if (!ref || !(await branchMerged(plan.cwd, ref, missionBranch, signal))) continue;
+    if (await gitCommitLooksCompleted(plan.cwd, ref, baseHead, plan, milestone, feature, featureId, signal, { requireFingerprint: true })) {
+      return { featureId, milestoneId: milestone.id, branch: featureBranch, commit: ref, changedFiles: [], assertions: feature.assertions || [], localAssertions: feature.localAssertions || [], assignedAssertions: feature.assertions || [], assignedLocalAssertions: feature.localAssertions || [], featureFingerprint: featureFingerprint(plan, milestone, feature, featureId), skipped: true, trustedCommit: true };
+    }
   }
   return undefined;
 }
@@ -1254,6 +1401,7 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
       handoffRel,
       "The handoff JSON must include: featureId, completed, changedFiles, commandsRun[{command,exitCode}], assertionsAddressed, issuesDiscovered, leftUndone, notesForValidator.",
       "assertionsAddressed must include every assigned contract assertion and every assigned local assertion for this feature. Supplemental worker-only evidence may be included as objects with type:'local' or ids prefixed local:, but supplemental local evidence does not count toward global contract coverage.",
+      "changedFiles must list only files that are actually changed relative to git HEAD in this worktree. If the feature is already satisfied by the inherited codebase and you make no repository changes, write changedFiles: [] and explain the no-change completion in notesForValidator.",
       "Do not include the handoff file itself or generated junk (__pycache__, .pytest_cache, .venv, *.egg-info, etc.) in changedFiles.",
       "Mission goal:", plan.goal,
       "Before implementing, inspect relevant repository source/spec documents, especially specs.md, SPEC.md, requirements.md, README.md, docs/*.md, and any plan sourceDocs.",
@@ -1513,11 +1661,12 @@ async function activateMission(args, cwd, run, ctx) {
   ctx.modelValidator = args["model-validator"] || plan.modelValidator || ctx.modelValidator;
   const priorRegistry = readJsonFile(registryStatePath(plan.missionId), {});
   if (priorRegistry.status === "completed") throw new Error(`Mission ${plan.missionId} is already completed; review the final report or start a new mission.`);
-  persistRegistryPlan(plan, planPathAbs);
   const env = await ensureMissionWorktrees(plan, ctx, run, { resume: isTruthyFlag(args.resume) });
   if (isTruthyFlag(args.resume) && priorRegistry.branch && priorRegistry.branch !== env.missionBranch) throw new Error(`Registry branch ${priorRegistry.branch} does not match expected mission branch ${env.missionBranch}`);
+  await enforceTrustedMissionBranch(plan, env, ctx, run, { resume: isTruthyFlag(args.resume) });
+  const registryPlan = persistRegistryPlan(plan, planPathAbs);
   phaseEvent(run, "prepare-mission", { kind: "data", key: "registry", value: registryStatePath(plan.missionId), message: "Using durable mission registry" });
-  const registry = updateRegistryState(plan, (state) => ({ ...state, status: "running", planPath: planPathAbs, branch: env.missionBranch, repoRoot: env.repoRoot, worktree: env.integrationPath, worktreeBaseDir: env.root, roleModels: { plan: plan.modelPlan, worker: ctx.modelWorker, validator: ctx.modelValidator }, resumed: env.resumed, resumeCompletedFeatureCount: isTruthyFlag(args.resume) ? (priorRegistry.completedFeatures || []).length : undefined, timestamps: { ...(state.timestamps || {}), startedAt: state.timestamps?.startedAt || new Date().toISOString() } }));
+  const registry = updateRegistryState(plan, (state) => ({ ...state, status: "running", planPath: planPathAbs, branch: env.missionBranch, repoRoot: env.repoRoot, worktree: env.integrationPath, worktreeBaseDir: env.root, roleModels: { plan: plan.modelPlan, worker: ctx.modelWorker, validator: ctx.modelValidator }, resumed: env.resumed, resumeCompletedFeatureCount: isTruthyFlag(args.resume) ? (priorRegistry.completedFeatures || []).length : undefined, timestamps: { ...(state.timestamps || {}), ...(registryPlan.state.timestamps || {}), startedAt: state.timestamps?.startedAt || new Date().toISOString() } }));
   const missionState = { missionId: plan.missionId, missionBranch: env.missionBranch, integrationPath: env.integrationPath, baseHead: env.baseHead, registryPath: registry.statePath, modelWorker: ctx.modelWorker, modelValidator: ctx.modelValidator, resumed: env.resumed, milestones: [], startedAt: new Date().toISOString() };
   for (const milestone of plan.milestones) {
     currentHeartbeat = { phase: "execute-mission", missionId: plan.missionId, milestoneId: milestone.id, milestoneTitle: milestone.title, branch: env.missionBranch, worktree: env.integrationPath };
@@ -1537,7 +1686,8 @@ async function activateMission(args, cwd, run, ctx) {
         phaseEvent(run, "execute-mission", { kind: "progress", current: iterationState.features.length, total: queue.length, message: `Worker ${featureId}` });
         const result = await runWorkerForFeature(env, milestone, feature, plan, ctx, run);
         iterationState.features.push(result);
-        updateRegistryState(plan, (state) => ({ ...state, completedFeatures: [...(state.completedFeatures || []).filter((item) => !(item.featureId === result.featureId && item.milestoneId === milestone.id)), { featureId: result.featureId, milestoneId: milestone.id, iteration, branch: result.featureBranch, commit: result.commit, handoffArtifact: result.handoffArtifact, changedFiles: result.changedFiles || [], assertions: result.assertions || [], localAssertions: result.localAssertions || [], assignedAssertions: feature.assertions || [], assignedLocalAssertions: feature.localAssertions || [], featureFingerprint: result.featureFingerprint, skipped: Boolean(result.skipped), completedAt: new Date().toISOString() }] }));
+        const trustedHead = (await git(env.integrationPath, ["rev-parse", "HEAD"], { signal: ctx.signal })).stdout.trim();
+        updateRegistryState(plan, (state) => ({ ...state, trustedBaseHead: state.trustedBaseHead || env.baseHead, trustedHead, trustedPlanFingerprint: missionPlanFingerprint(plan, env.baseHead), trustedCommits: Array.from(new Set([...(state.trustedCommits || []), ...(result.commit ? [result.commit] : [])])), completedFeatures: [...(state.completedFeatures || []).filter((item) => !(item.featureId === result.featureId && item.milestoneId === milestone.id)), { featureId: result.featureId, milestoneId: milestone.id, iteration, branch: result.featureBranch, commit: result.commit, handoffArtifact: result.handoffArtifact, changedFiles: result.changedFiles || [], assertions: result.assertions || [], localAssertions: result.localAssertions || [], assignedAssertions: feature.assertions || [], assignedLocalAssertions: feature.localAssertions || [], featureFingerprint: result.featureFingerprint, skipped: Boolean(result.skipped), completedAt: new Date().toISOString() }] }));
       }
       queue = [];
       currentHeartbeat = { phase: "execute-mission", missionId: plan.missionId, milestoneId: milestone.id, iteration, validator: "adversarial-scrutiny", branch: env.missionBranch, worktree: env.integrationPath };

@@ -48,7 +48,7 @@ await mission_workflow({
 });
 ```
 
-Use `ctrl+shift+t` to monitor/cancel. Use `thread_phase_runs` to inspect artifacts. Durable mission state is under `~/.pi/agent/mission-workflow/registry/<missionId>/`. If an approved mission stopped unexpectedly, use `action: "resume"` with the same plan path and `approved: true`.
+Use `ctrl+shift+t` to monitor/cancel. Use `thread_phase_runs` to inspect artifacts. Durable mission state is under `~/.pi/agent/mission-workflow/registry/<missionId>/` and includes trusted resume checkpoints. If an approved mission stopped unexpectedly, use `action: "resume"` with the same plan path and `approved: true` only after classifying any failure artifacts.
 
 ## Important rules
 
@@ -62,7 +62,8 @@ Use `ctrl+shift+t` to monitor/cancel. Use `thread_phase_runs` to inspect artifac
 - The runner emits heartbeat, operation watchdog, and active I/O snapshot events. Stale runs can appear when the process is gone, heartbeats stop, or heartbeats continue without non-heartbeat operation progress.
 - On failure, classify the failure before relaunching: runner/lifecycle, strict handoff, validation/implementation, git/worktree, or plan/contract quality.
 - Strict handoff failures should be inspected via both the raw handoff artifact and the `*-invalid.json` artifact. Patch normalization only when the worker output is semantically valid but formatted differently than expected.
-- Handoff `assertionsAddressed` must cover assigned contract/local assertions. Supplemental worker-only local evidence is allowed as `local:<slug>` or `{ type: "local", id: "..." }`, but it must not be counted as global contract coverage.
+- If a run emits `state/contaminated-mission-branch.json`, do not blindly resume. The mission branch contains untrusted code relative to the durable checkpoint/registry/plan fingerprint. Either release a runner fix, restore the matching plan/checkpoint, or start a clean mission/registry.
+- Handoff `assertionsAddressed` must cover assigned contract/local assertions. Supplemental worker-only local evidence is allowed as `local:<slug>` or `{ type: "local", id: "..." }`, but it must not be counted as global contract coverage. Handoff `changedFiles` must match actual git changes; no-change completions must use `changedFiles: []`.
 
 ## Current limitations
 
