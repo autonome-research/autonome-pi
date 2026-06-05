@@ -1714,6 +1714,7 @@ async function runAdversarialValidator(env, plan, milestone, iterationState, com
     const validatorPromptPath = writeArtifact(run, `validation/${safeName(milestone.id)}-validator-prompt.md`, prompt, "markdown", `Validator prompt: ${milestone.id}`);
     const result = await runPi({ cwd: env.integrationPath, prompt, tools: ["read", "grep", "find", "ls"], model: ctx.modelValidator, signal: ctx.signal, operationLabel: `validator ${milestone.id}`, phase: `validator-${milestone.id}`, timeoutMs: ctx.piTimeoutMs, idleTimeoutMs: ctx.piIdleTimeoutMs });
     if (result.usage?.length) phaseEvent(run, `validator-${milestone.id}`, { kind: "usage", usage: result.usage, model: result.model });
+    if ((result.aborted && !result.timedOut && !result.idleTimedOut) || ctx.signal.aborted) throw abortError(ctx.signal.reason || result.error || "cancelled");
     if (!result.ok) raw = { passed: false, summary: "Validator agent failed.", objections: [{ level: "must", description: result.error || "validator failed", evidence: compactText(result.stderr || result.stdout || "", 4000), repairHint: "Rerun or repair validation environment." }], assertionResults: [] };
     else {
       try { raw = parseJsonFromText(result.text); }
@@ -1732,12 +1733,14 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
   const reports = [];
   for (const command of plan.validationCommands || []) {
     const result = await runProcess(command, [], { cwd: env.integrationPath, shell: true, signal: ctx.signal, timeoutMs: ctx.commandTimeoutMs, operationLabel: `validation command: ${command}`, phase: `validation-${milestone.id}` });
+    if ((result.aborted && !result.timedOut) || ctx.signal.aborted) throw abortError(ctx.signal.reason || result.error || "cancelled");
     const file = writeArtifact(run, `validation/${safeName(milestone.id)}-${safeName(command)}.txt`, [`$ ${command}`, result.error ? `# ${result.error}` : "", result.stdout, result.stderr].join("\n"), "file", `Validation command: ${command}`);
     reports.push({ validator: "scrutiny-command", command, passed: result.ok, exitCode: result.code, timedOut: Boolean(result.timedOut), artifact: file, stdoutExcerpt: compactText(result.stdout || "", 4000), stderrExcerpt: compactText(result.stderr || result.error || "", 4000) });
   }
   if (plan.userTestCommand) {
     const command = plan.userTestCommand;
     const result = await runProcess(command, [], { cwd: env.integrationPath, shell: true, signal: ctx.signal, timeoutMs: ctx.commandTimeoutMs, operationLabel: `user test command: ${command}`, phase: `validation-${milestone.id}` });
+    if ((result.aborted && !result.timedOut) || ctx.signal.aborted) throw abortError(ctx.signal.reason || result.error || "cancelled");
     const file = writeArtifact(run, `validation/${safeName(milestone.id)}-user-test.txt`, [`$ ${command}`, result.error ? `# ${result.error}` : "", result.stdout, result.stderr].join("\n"), "file", `User testing command: ${command}`);
     reports.push({ validator: "user-testing-command", command, passed: result.ok, exitCode: result.code, timedOut: Boolean(result.timedOut), artifact: file, stdoutExcerpt: compactText(result.stdout || "", 4000), stderrExcerpt: compactText(result.stderr || result.error || "", 4000) });
   }
@@ -1797,6 +1800,27 @@ function repairFeaturesFromReport(report, iteration) {
   }));
 }
 
+function latestPassedValidationReport(state, milestoneId) {
+  return [...(state.validationReports || [])].reverse().find((report) => String(report.milestoneId || "") === String(milestoneId) && report.passed === true);
+}
+
+function registryFeatureResultsForMilestone(state, milestone) {
+  return (state.completedFeatures || [])
+    .filter((record) => String(record.milestoneId || "") === String(milestone.id || ""))
+    .map((record) => ({
+      featureId: String(record.featureId || ""),
+      featureBranch: record.branch,
+      assertions: record.assertions || record.assignedAssertions || [],
+      localAssertions: record.localAssertions || record.assignedLocalAssertions || [],
+      skipped: true,
+      resumed: true,
+      commit: record.commit,
+      handoffArtifact: record.handoffArtifact,
+      changedFiles: record.changedFiles || [],
+      featureFingerprint: record.featureFingerprint,
+    }));
+}
+
 async function activateMission(args, cwd, run, ctx) {
   if (!isTruthyFlag(args.approved)) throw new Error("Activation requires --approved after the user reviews the mission plan.");
   if (!args["plan-path"]) throw new Error("--plan-path is required for activation");
@@ -1814,6 +1838,14 @@ async function activateMission(args, cwd, run, ctx) {
   const registry = updateRegistryState(plan, (state) => ({ ...state, status: "running", planPath: planPathAbs, branch: env.missionBranch, repoRoot: env.repoRoot, worktree: env.integrationPath, worktreeBaseDir: env.root, roleModels: { plan: plan.modelPlan, worker: ctx.modelWorker, validator: ctx.modelValidator }, resumed: env.resumed, resumeCompletedFeatureCount: isTruthyFlag(args.resume) ? (priorRegistry.completedFeatures || []).length : undefined, timestamps: { ...(state.timestamps || {}), ...(registryPlan.state.timestamps || {}), startedAt: state.timestamps?.startedAt || new Date().toISOString() } }));
   const missionState = { missionId: plan.missionId, missionBranch: env.missionBranch, integrationPath: env.integrationPath, baseHead: env.baseHead, registryPath: registry.statePath, modelWorker: ctx.modelWorker, modelValidator: ctx.modelValidator, resumed: env.resumed, milestones: [], startedAt: new Date().toISOString() };
   for (const milestone of plan.milestones) {
+    const resumeRegistryState = readJsonFile(registryStatePath(plan.missionId), {});
+    const passedValidation = isTruthyFlag(args.resume) ? latestPassedValidationReport(resumeRegistryState, milestone.id) : undefined;
+    if (passedValidation) {
+      const skippedFeatures = registryFeatureResultsForMilestone(resumeRegistryState, milestone);
+      missionState.milestones.push({ id: milestone.id, title: milestone.title, skippedOnResume: true, iterations: [{ iteration: passedValidation.iteration, features: skippedFeatures, validation: { artifact: passedValidation.artifact, passed: true, coveragePath: passedValidation.coveragePath } }] });
+      phaseEvent(run, "execute-mission", { kind: "data", key: "skippedMilestone", value: milestone.id, message: `Skipped completed milestone ${milestone.id}` });
+      continue;
+    }
     currentHeartbeat = { phase: "execute-mission", missionId: plan.missionId, milestoneId: milestone.id, milestoneTitle: milestone.title, branch: env.missionBranch, worktree: env.integrationPath };
     let iteration = 0;
     let queue = [...(milestone.features || [])];
@@ -1848,7 +1880,8 @@ async function activateMission(args, cwd, run, ctx) {
       iterationState.validation = { artifact: validation.artifact, passed: validation.passed, coveragePath: validation.coveragePath, objections: validation.validatorReport?.objections || [] };
       milestoneState.iterations.push(iterationState);
       const iterationPath = writeArtifact(run, `state/${safeName(milestone.id)}-iteration-${iteration}.json`, iterationState, "json", `Mission state: ${milestone.id} iteration ${iteration}`);
-      updateRegistryState(plan, (state) => ({ ...state, validationReports: [...(state.validationReports || []), { milestoneId: milestone.id, iteration, artifact: validation.artifact, coveragePath: validation.coveragePath, passed: validation.passed, completedAt: new Date().toISOString() }], coverageReports: [...(state.coverageReports || []), { milestoneId: milestone.id, iteration, artifact: validation.coveragePath }], current: { milestoneId: milestone.id, iteration, validationReport: validation.artifact }, lastIterationState: iterationPath }));
+      const validationTrustedHead = (await git(env.integrationPath, ["rev-parse", "HEAD"], { signal: ctx.signal })).stdout.trim();
+      updateRegistryState(plan, (state) => ({ ...state, validationReports: [...(state.validationReports || []), { milestoneId: milestone.id, iteration, artifact: validation.artifact, coveragePath: validation.coveragePath, passed: validation.passed, trustedHead: validationTrustedHead, completedAt: new Date().toISOString() }], coverageReports: [...(state.coverageReports || []), { milestoneId: milestone.id, iteration, artifact: validation.coveragePath }], current: { milestoneId: milestone.id, iteration, validationReport: validation.artifact }, lastIterationState: iterationPath }));
       if (validation.passed) break;
       if (iteration >= Number(plan.maxRepairIterations || DEFAULT_MAX_REPAIR_ITERATIONS)) throw new Error(`Mission ${plan.missionId} reached max repair iterations (${iteration}) for ${milestone.id}`);
       queue = repairFeaturesFromReport(validation, iteration);
