@@ -349,6 +349,68 @@ try {
   expectExit('mission workflow commits runner-derived uv.lock when dependency manifest changed', ['node', missionCli, 'activate', '--approved', '--plan-path', manifestLockPlanPath, '--cwd', manifestLockRepo], 0, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiManifestLock }, timeout: 60_000 });
   expectExit('manifest lock mission committed intentional uv.lock', ['git', 'cat-file', '-e', 'mission/manifest-lock-smoke:uv.lock'], 0, { cwd: manifestLockRepo });
 
+  const mergeLockRepo = join(tmp, 'merge-lock-repo');
+  mkdirSync(mergeLockRepo, { recursive: true });
+  expectExit('merge lock repo git init', ['git', 'init', '-q'], 0, { cwd: mergeLockRepo });
+  expectExit('merge lock repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: mergeLockRepo });
+  expectExit('merge lock repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: mergeLockRepo });
+  writeFileSync(join(mergeLockRepo, 'README.md'), 'merge lock\n');
+  expectExit('merge lock repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: mergeLockRepo });
+  const mergeLockTouch = join(tmp, 'merge-lock-touch.mjs');
+  writeFileSync(mergeLockTouch, `import { writeFileSync } from 'node:fs';\nwriteFileSync('uv.lock', 'transient integration lock\\n');\n`);
+  const mergeLockPlanPath = join(tmp, 'merge-lock-plan.json');
+  writeFileSync(mergeLockPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'merge-lock-smoke', goal: 'merge-blocking lock cleanup', cwd: mergeLockRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1,
+    worktreeBaseDir: join(tmp, 'merge-lock-worktrees'), validationCommands: [`node ${JSON.stringify(mergeLockTouch)}`], milestones: [
+      { id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'No Change Before Lock', description: 'f1', assertions: ['a1'] }] },
+      { id: 'm2', title: 'm2', features: [{ id: 'f2', title: 'Commit Lock After Manifest Change', description: 'f2', assertions: ['a2'] }] }
+    ],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }, { id: 'a2', description: 'a2', priority: 'must', coveredBy: ['f2'], validationMethod: 'both' }] }
+  }, null, 2));
+  const fakePiMergeLock = join(tmp, 'fake-pi-merge-lock.mjs');
+  writeFileSync(fakePiMergeLock, `#!/usr/bin/env node\nimport { basename, join } from 'node:path';\nimport { mkdirSync, writeFileSync } from 'node:fs';\nconst featureId = basename(process.cwd());\nmkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\nif (featureId === 'f2') {\n  writeFileSync(join(process.cwd(), 'pyproject.toml'), '[project]\\nname = "merge-lock-smoke"\\nversion = "0.1.0"\\ndependencies = ["pyarrow"]\\n');\n  writeFileSync(join(process.cwd(), 'uv.lock'), 'intentional tracked lock\\n');\n  writeFileSync(join(process.cwd(), '.mission', 'handoffs', 'f2.json'), JSON.stringify({ featureId: 'f2', completed: true, changedFiles: ['pyproject.toml', 'uv.lock'], commandsRun: [], assertionsAddressed: ['a2'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'intentional lock' }));\n} else if (featureId === 'f1') {\n  writeFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, outcome: 'already_satisfied', evidence: ['ok'], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'no change' }));\n}\nconst prompt = process.argv.includes('-p') ? process.argv[process.argv.indexOf('-p') + 1] : '';\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: prompt.includes('m2') ? 'm2' : 'm1', passed: true, summary: 'ok', objections: [], assertionResults: [{ assertionId: 'a1', status: 'pass', evidence: 'ok' }, { assertionId: 'a2', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-merge-lock', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
+  expectExit('fake pi merge lock is executable', ['chmod', '+x', fakePiMergeLock], 0);
+  const mergeLockActivate = expectExit('mission workflow cleans merge-blocking untracked uv.lock before intentional lock merge', ['node', missionCli, 'activate', '--approved', '--plan-path', mergeLockPlanPath, '--cwd', mergeLockRepo, '--model-validator', 'stable-validator'], 0, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiMergeLock }, timeout: 60_000 });
+  let mergeLockDetails;
+  try { mergeLockDetails = mergeLockActivate.stdout ? JSON.parse(mergeLockActivate.stdout) : undefined; } catch { mergeLockDetails = undefined; }
+  expectExit('merge lock mission committed intentional uv.lock', ['git', 'cat-file', '-e', 'mission/merge-lock-smoke:uv.lock'], 0, { cwd: mergeLockRepo });
+  const mergeLockAuditPath = mergeLockDetails?.runId ? join(store, 'artifacts', mergeLockDetails.runId, 'handoffs', 'f2-auto-cleaned-merge-blocking-transient-artifacts.json') : '';
+  log(Boolean(mergeLockAuditPath) && existsSync(mergeLockAuditPath), 'merge-blocking lock cleanup writes audit artifact');
+  const mergeLockAudit = mergeLockAuditPath && existsSync(mergeLockAuditPath) ? JSON.parse(readFileSync(mergeLockAuditPath, 'utf8')) : undefined;
+  const mergeLockBackup = mergeLockAudit?.quarantined?.[0]?.backupPath;
+  const mergeLockBackupBytes = mergeLockBackup && existsSync(mergeLockBackup) ? readFileSync(mergeLockBackup) : undefined;
+  log(Boolean(mergeLockBackupBytes) && mergeLockAudit.quarantined[0].bytes === mergeLockBackupBytes.length && mergeLockAudit.quarantined[0].sha256 === createHash('sha256').update(mergeLockBackupBytes).digest('hex'), 'merge-blocking lock quarantine records recoverable bytes and hash');
+
+  const symlinkLockRepo = join(tmp, 'symlink-lock-repo');
+  mkdirSync(symlinkLockRepo, { recursive: true });
+  expectExit('symlink lock repo git init', ['git', 'init', '-q'], 0, { cwd: symlinkLockRepo });
+  expectExit('symlink lock repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: symlinkLockRepo });
+  expectExit('symlink lock repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: symlinkLockRepo });
+  writeFileSync(join(symlinkLockRepo, 'README.md'), 'symlink lock\n');
+  expectExit('symlink lock repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: symlinkLockRepo });
+  const symlinkSecret = join(tmp, 'symlink-secret.txt');
+  writeFileSync(symlinkSecret, 'DO-NOT-COPY-SYMLINK-SECRET\n');
+  const symlinkLockTouch = join(tmp, 'symlink-lock-touch.mjs');
+  writeFileSync(symlinkLockTouch, `import { rmSync, symlinkSync } from 'node:fs';\nrmSync('uv.lock', { force: true });\nsymlinkSync(${JSON.stringify(symlinkSecret)}, 'uv.lock');\n`);
+  const symlinkLockPlanPath = join(tmp, 'symlink-lock-plan.json');
+  writeFileSync(symlinkLockPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'symlink-lock-smoke', goal: 'symlink lock safety', cwd: symlinkLockRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1,
+    worktreeBaseDir: join(tmp, 'symlink-lock-worktrees'), validationCommands: [`node ${JSON.stringify(symlinkLockTouch)}`], milestones: [
+      { id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'No Change Before Symlink', description: 'f1', assertions: ['a1'] }] },
+      { id: 'm2', title: 'm2', features: [{ id: 'f2', title: 'Commit Lock Against Symlink', description: 'f2', assertions: ['a2'] }] }
+    ],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }, { id: 'a2', description: 'a2', priority: 'must', coveredBy: ['f2'], validationMethod: 'both' }] }
+  }, null, 2));
+  const fakePiSymlinkLock = join(tmp, 'fake-pi-symlink-lock.mjs');
+  writeFileSync(fakePiSymlinkLock, `#!/usr/bin/env node\nimport { basename, join } from 'node:path';\nimport { mkdirSync, writeFileSync } from 'node:fs';\nconst featureId = basename(process.cwd());\nmkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\nif (featureId === 'f2') {\n  writeFileSync(join(process.cwd(), 'pyproject.toml'), '[project]\\nname = "symlink-lock-smoke"\\nversion = "0.1.0"\\n');\n  writeFileSync(join(process.cwd(), 'uv.lock'), 'intentional tracked lock\\n');\n  writeFileSync(join(process.cwd(), '.mission', 'handoffs', 'f2.json'), JSON.stringify({ featureId: 'f2', completed: true, changedFiles: ['pyproject.toml', 'uv.lock'], commandsRun: [], assertionsAddressed: ['a2'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'intentional lock' }));\n} else if (featureId === 'f1') {\n  writeFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, outcome: 'already_satisfied', evidence: ['ok'], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'no change' }));\n}\nconst prompt = process.argv.includes('-p') ? process.argv[process.argv.indexOf('-p') + 1] : '';\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: prompt.includes('m2') ? 'm2' : 'm1', passed: true, summary: 'ok', objections: [], assertionResults: [{ assertionId: 'a1', status: 'pass', evidence: 'ok' }, { assertionId: 'a2', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-symlink-lock', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
+  expectExit('fake pi symlink lock is executable', ['chmod', '+x', fakePiSymlinkLock], 0);
+  const symlinkLockResult = expectExit('mission workflow refuses to quarantine symlink merge-blocking uv.lock', ['node', missionCli, 'activate', '--approved', '--plan-path', symlinkLockPlanPath, '--cwd', symlinkLockRepo, '--model-validator', 'stable-validator'], 1, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiSymlinkLock }, timeout: 60_000 });
+  let symlinkLockDetails;
+  try { symlinkLockDetails = symlinkLockResult.stdout ? JSON.parse(symlinkLockResult.stdout) : undefined; } catch { symlinkLockDetails = undefined; }
+  const symlinkAuditPath = symlinkLockDetails?.runId ? join(store, 'artifacts', symlinkLockDetails.runId, 'handoffs', 'f2-auto-cleaned-merge-blocking-transient-artifacts.json') : '';
+  const symlinkAudit = symlinkAuditPath && existsSync(symlinkAuditPath) ? JSON.parse(readFileSync(symlinkAuditPath, 'utf8')) : undefined;
+  log(symlinkAudit?.quarantined?.length === 0 && symlinkAudit?.skipped?.some((entry) => entry.file === 'uv.lock' && entry.reason === 'symlink'), 'merge-blocking symlink lock is audited but not read/quarantined');
+
   const localContractCollisionRepo = join(tmp, 'local-contract-collision-repo');
   mkdirSync(localContractCollisionRepo, { recursive: true });
   expectExit('local contract collision repo git init', ['git', 'init', '-q'], 0, { cwd: localContractCollisionRepo });

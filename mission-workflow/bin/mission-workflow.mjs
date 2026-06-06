@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -29,6 +29,7 @@ const GENERATED_JUNK_PATTERNS = [
   ".mypy_cache/", ".ruff_cache/", ".tox/", ".coverage", "coverage/", "dist/", "build/",
 ];
 const TRANSIENT_LOCKFILE_PATHS = new Set(["uv.lock"]);
+const MAX_TRANSIENT_QUARANTINE_BYTES = 5 * 1024 * 1024;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const DEFAULT_PI_TIMEOUT_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_PI_TIMEOUT_MS, 30 * 60 * 1000);
 const DEFAULT_PI_IDLE_TIMEOUT_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_PI_IDLE_TIMEOUT_MS, 12 * 60 * 1000);
@@ -422,6 +423,16 @@ function writeArtifact(run, fileName, content, kind = "markdown", title = fileNa
   return file;
 }
 
+function writeBinaryArtifact(run, fileName, content, kind = "file", title = fileName) {
+  const dir = join(ARTIFACTS_DIR, run.runId);
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, fileName);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, content);
+  artifact(run, { kind, title, path: file });
+  return file;
+}
+
 function parseJsonFromText(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed) throw new Error("empty JSON text");
@@ -603,6 +614,75 @@ function isDependencyManifestPath(relPath) {
   const name = basename(normalized);
   return ["pyproject.toml", "setup.py", "setup.cfg", "Pipfile", "uv.toml"].includes(name)
     || /^requirements(?:[-_.].*)?\.txt$/i.test(name);
+}
+
+async function autoCleanMergeBlockingTransientArtifacts({ env, featureBranch, featureId, run, phase, signal }) {
+  const quarantined = [];
+  const skipped = [];
+  const root = resolve(env.integrationPath);
+  for (const file of TRANSIENT_LOCKFILE_PATHS) {
+    const targetHasFile = await git(env.repoRoot, ["ls-tree", "-r", "--name-only", featureBranch, "--", file], { signal, reject: false });
+    if (!targetHasFile.ok || !targetHasFile.stdout.split(/\r?\n/).map(normalizeRelPath).includes(file)) continue;
+    const untracked = await git(env.integrationPath, ["ls-files", "--others", "--exclude-standard", "--", file], { signal, reject: false });
+    if (!untracked.ok || !untracked.stdout.split(/\r?\n/).map(normalizeRelPath).includes(file)) continue;
+    const abs = resolve(env.integrationPath, file);
+    if (abs !== root && !abs.startsWith(`${root}/`)) {
+      skipped.push({ file, reason: "path outside integration worktree" });
+      continue;
+    }
+    let stat;
+    try { stat = lstatSync(abs); }
+    catch (error) {
+      skipped.push({ file, reason: `lstat failed: ${error.message}` });
+      continue;
+    }
+    if (!stat.isFile()) {
+      skipped.push({ file, reason: stat.isSymbolicLink() ? "symlink" : "not a regular file" });
+      continue;
+    }
+    if (stat.size > MAX_TRANSIENT_QUARANTINE_BYTES) {
+      skipped.push({ file, reason: `too large to quarantine safely (${stat.size} bytes)`, bytes: stat.size, maxBytes: MAX_TRANSIENT_QUARANTINE_BYTES });
+      continue;
+    }
+    let content;
+    try { content = readFileSync(abs); }
+    catch (error) {
+      skipped.push({ file, reason: `read failed: ${error.message}` });
+      continue;
+    }
+    const sha256 = createHash("sha256").update(content).digest("hex");
+    const backupPath = writeBinaryArtifact(run, `handoffs/${featureId}-quarantined-${safeName(file, "transient")}`, content, "file", `Quarantined transient artifact: ${featureId} ${file}`);
+    rmSync(abs, { force: true });
+    quarantined.push({ file, abs, backupPath, bytes: content.length, sha256 });
+  }
+  if (!quarantined.length && !skipped.length) return [];
+  try {
+    const artifactPath = writeArtifact(run, `handoffs/${featureId}-auto-cleaned-merge-blocking-transient-artifacts.json`, {
+      featureId,
+      featureBranch,
+      quarantined: quarantined.map(({ file, backupPath, bytes, sha256 }) => ({ file, backupPath, bytes, sha256 })),
+      skipped,
+      reason: "Quarantined untracked regular transient lockfile(s) from the integration worktree before merging a feature branch that tracks the same path; files are restored if merge fails. Symlinks, special files, and oversized files are not read or deleted.",
+    }, "json", `Auto-cleaned merge-blocking transient artifacts: ${featureId}`);
+    phaseEvent(run, phase, { kind: "data", key: "autoCleanedMergeBlockingTransientArtifacts", value: { quarantined: quarantined.map((item) => item.file), skipped }, artifactPath, message: quarantined.length ? `Quarantined merge-blocking transient artifact(s): ${quarantined.map((item) => item.file).join(", ")}` : `Skipped unsafe merge-blocking transient artifact(s): ${skipped.map((item) => item.file).join(", ")}` });
+    return quarantined;
+  } catch (error) {
+    restoreQuarantinedTransientArtifacts(quarantined);
+    throw error;
+  }
+}
+
+function restoreQuarantinedTransientArtifacts(records = []) {
+  for (const record of records) {
+    if (!record?.abs || !record?.backupPath || existsSync(record.abs)) continue;
+    try {
+      const content = readFileSync(record.backupPath);
+      const sha256 = createHash("sha256").update(content).digest("hex");
+      if (record.sha256 && sha256 !== record.sha256) continue;
+      mkdirSync(dirname(record.abs), { recursive: true });
+      writeFileSync(record.abs, content);
+    } catch { /* best-effort restore */ }
+  }
 }
 
 async function autoCleanOmittedTransientArtifacts({ cwd, handoff, changedFiles, run, phase, featureId, signal }) {
@@ -1645,7 +1725,13 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
     }
     await git(featurePath, ["commit", "-m", expectedFeatureCommitSubject(plan, feature, featureId), "-m", [`Mission-Feature-Id: ${featureId}`, `Mission-Feature-Fingerprint: ${featureFingerprint(plan, milestone, feature, featureId)}`].join("\n")], { signal: ctx.signal });
     const commit = (await git(featurePath, ["rev-parse", "HEAD"], { signal: ctx.signal })).stdout.trim();
-    await git(env.integrationPath, ["merge", "--ff-only", featureBranch], { signal: ctx.signal });
+    const quarantinedForMerge = await autoCleanMergeBlockingTransientArtifacts({ env, featureBranch, featureId, run, phase: `worker-${featureId}`, signal: ctx.signal });
+    try {
+      await git(env.integrationPath, ["merge", "--ff-only", featureBranch], { signal: ctx.signal });
+    } catch (error) {
+      restoreQuarantinedTransientArtifacts(quarantinedForMerge);
+      throw error;
+    }
     phaseEvent(run, `worker-${featureId}`, { kind: "data", key: "commit", value: commit, message: `Committed ${featureId}` });
     const output = { featureId, featureBranch, featurePath, assertions: handoffValidation.assertionsAddressed.length ? handoffValidation.assertionsAddressed.filter((id) => knownContractAssertionIds(plan).has(String(id))) : (feature.assertions || []), localAssertions: handoffValidation.assertionsAddressed.filter((id) => !knownContractAssertionIds(plan).has(String(id))), handoffArtifact, handoff: handoffSummary, changedFiles, commit, featureFingerprint: featureFingerprint(plan, milestone, feature, featureId) };
     completedSuccessfully = true;
