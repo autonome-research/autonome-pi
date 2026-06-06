@@ -104,6 +104,16 @@ Current unreleased fix after this diagnosis:
 - if no registry completion evidence exists, a contaminated branch can be backed up/reset to the base and rerun cleanly;
 - worker prompts now explicitly instruct no-change completions to use `changedFiles: []` when the inherited trusted codebase already satisfies the feature.
 
+## Why `uv.lock` kept causing failures
+
+The repeated `uv.lock` failures were not one bug recurring unchanged; they were the same file crossing different trust boundaries in the mission state machine:
+
+1. **Feature-worktree accidental transient (`v0.11.2`)**: a worker/validation command produced an untracked root `uv.lock` but did not change a dependency manifest. The runner treated omitted untracked files as real changed files and strict handoff failed. Fix: auto-clean omitted untracked root `uv.lock` only when no dependency manifest changed, with an audit artifact.
+2. **Intentional lockfile after manifest changes (`v0.11.5`)**: once handoff metadata became runner-owned, dependency manifest changes plus `uv.lock` should be committed even if the worker did not list `uv.lock` perfectly. Fix: runner-derived changed files/coverage made intentional lockfile commits possible and kept lockfiles out of generic-junk cleanup.
+3. **Integration-worktree transient blocking a later merge (`v0.11.8`)**: validation commands in the integration worktree created an untracked `uv.lock`; a later feature branch intentionally tracked `uv.lock` because it added dependencies. Git refused the ff-only merge because the untracked integration file would be overwritten. Fix: quarantine regular untracked integration `uv.lock` into artifacts with bytes/hash before merge, restore on merge failure, and refuse to read/delete symlinks/special/oversized files.
+
+The durable lesson: lockfiles are neither always junk nor always sacred. They are stateful artifacts whose handling depends on **where** they appear (feature vs integration worktree), **why** they appear (manifest changed or not), and **which transition** is happening (handoff validation vs runner commit vs integration merge). Future lockfile fixes should start by identifying that transition instead of adding a blanket cleanup rule.
+
 ## Failure-mode handling rules
 
 When a mission fails, do **not** blindly relaunch. First classify the failure:
@@ -121,8 +131,8 @@ When a mission fails, do **not** blindly relaunch. First classify the failure:
    - Action: inspect validation report, coverage report, and adversarial report. Let the mission create targeted repair features unless max repair iterations has been reached.
 
 4. **Git/worktree failure**
-   - Examples: stale worktree path, branch exists but not merged, failed ff-only merge, untracked generated junk, contaminated mission branch.
-   - Action: inspect `git worktree list`, `git status`, branch ancestry, and any `state/contaminated-mission-branch.json` artifact. If a trusted checkpoint exists, resume should back up/reset branch drift automatically. If no trusted checkpoint exists and registry evidence is mixed with untrusted commits, start a fresh mission/registry or restore a known-good checkpoint rather than continuing on the contaminated branch.
+   - Examples: stale worktree path, branch exists but not merged, failed ff-only merge, transient lockfile conflicts, untracked generated junk, contaminated mission branch.
+   - Action: inspect `git worktree list`, `git status`, branch ancestry, handoff cleanup/quarantine artifacts, and any `state/contaminated-mission-branch.json` artifact. If a trusted checkpoint exists, resume should back up/reset branch drift automatically. If no trusted checkpoint exists and registry evidence is mixed with untrusted commits, start a fresh mission/registry or restore a known-good checkpoint rather than continuing on the contaminated branch.
 
 5. **Plan/contract quality failure**
    - Examples: feature assertions are prose not contract IDs, contract assertions have no `coveredBy`, local assertions accidentally satisfy final coverage.
