@@ -358,6 +358,44 @@ export function readIndex({ limit = 200, workflow, cwd } = {}) {
   return events.slice(-limit);
 }
 
+function artifactIdentity(artifact) {
+  if (!artifact || typeof artifact !== "object") return undefined;
+  if (artifact.path) return `path:${artifact.path}`;
+  if (artifact.url) return `url:${artifact.url}`;
+  return undefined;
+}
+
+function dedupeArtifacts(artifacts = []) {
+  const byKey = new Map();
+  const out = [];
+  for (const artifact of artifacts) {
+    const key = artifactIdentity(artifact);
+    if (!key) {
+      out.push(artifact);
+      continue;
+    }
+    if (byKey.has(key)) {
+      const existingIndex = byKey.get(key);
+      out.splice(existingIndex, 1);
+      for (const [otherKey, index] of byKey.entries()) if (index > existingIndex) byKey.set(otherKey, index - 1);
+    }
+    byKey.set(key, out.length);
+    out.push(artifact);
+  }
+  return out;
+}
+
+function closeOpenPhasesForTerminalRun(summary, sawWorkflowEnd = false) {
+  if (!sawWorkflowEnd || summary.normalizedStatus === STATUSES.RUNNING) return;
+  const terminal = summary.normalizedStatus || STATUSES.UNKNOWN;
+  for (const phase of Object.values(summary.phaseMap || {})) {
+    if (phase.normalizedStatus !== STATUSES.RUNNING || phase.endedAt) continue;
+    phase.status = terminal;
+    phase.normalizedStatus = terminal;
+    phase.endedAt = summary.updatedAt;
+  }
+}
+
 export function projectRun(events = []) {
   const sorted = [...events].filter(Boolean).sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));
   const first = sorted[0] || {};
@@ -384,6 +422,7 @@ export function projectRun(events = []) {
     eventCount: sorted.length,
     events: sorted,
   };
+  let sawWorkflowEnd = false;
 
   for (const event of sorted) {
     summary.runId ||= event.runId;
@@ -397,9 +436,10 @@ export function projectRun(events = []) {
 
     if (event.type === EVENT_TYPES.WORKFLOW_START) {
       summary.status = event.status || STATUSES.RUNNING;
-      summary.normalizedStatus = normalizeStatus(event.status);
+      summary.normalizedStatus = normalizeStatus(event.status || STATUSES.RUNNING);
     }
     if (event.type === EVENT_TYPES.WORKFLOW_END) {
+      sawWorkflowEnd = true;
       summary.status = event.status || STATUSES.SUCCESS;
       summary.normalizedStatus = normalizeStatus(event.status || STATUSES.SUCCESS);
     }
@@ -466,6 +506,8 @@ export function projectRun(events = []) {
   }
 
   for (const phase of Object.values(summary.phaseMap)) finalizeFanout(phase);
+  closeOpenPhasesForTerminalRun(summary, sawWorkflowEnd);
+  summary.artifacts = dedupeArtifacts(summary.artifacts);
   summary.phases = Object.values(summary.phaseMap).sort((a, b) => String(a.startedAt || "").localeCompare(String(b.startedAt || "")));
   delete summary.phaseMap;
   if (summary.normalizedStatus !== STATUSES.FAILED && summary.errors.length > 0 && !sorted.some((e) => e.type === EVENT_TYPES.WORKFLOW_END)) {

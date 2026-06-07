@@ -41,11 +41,27 @@ function statusIcon(status: string | undefined): string {
 	return "✓";
 }
 
-function formatRunSummary(run: AnyEvent): string {
-	const phases = (run.phases || [])
-		.map((phase: AnyEvent) => `${statusIcon(phase.normalizedStatus)} ${phase.phase}`)
-		.join(", ");
+function compactPhaseSummary(run: AnyEvent): string {
+	const phases = run.phases || [];
+	if (!phases.length) return "";
+	const running = phases.filter((phase: AnyEvent) => phase.normalizedStatus === STATUSES.RUNNING).sort((a: AnyEvent, b: AnyEvent) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+	const failed = phases.filter((phase: AnyEvent) => phase.normalizedStatus === STATUSES.FAILED);
+	const interesting = running.length ? running.slice(0, 3) : failed.length ? failed.slice(0, 3) : phases.slice(-8);
+	const counts = `${phases.length} phase${phases.length === 1 ? "" : "s"}`;
+	const names = interesting.map((phase: AnyEvent) => `${statusIcon(phase.normalizedStatus)} ${phase.phase}`).join(", ");
+	const omitted = phases.length > interesting.length ? ` (+${phases.length - interesting.length} older)` : "";
+	return `${counts}: ${names}${omitted}`;
+}
+
+function compactArtifactSummary(run: AnyEvent): string[] {
 	const artifacts = (run.artifacts || []).map((a: AnyEvent) => a.path || a.title).filter(Boolean);
+	const visible = artifacts.slice(-8);
+	return artifacts.length > visible.length ? [...visible, `+${artifacts.length - visible.length} older artifact(s)`] : visible;
+}
+
+function formatRunSummary(run: AnyEvent): string {
+	const phases = compactPhaseSummary(run);
+	const artifacts = compactArtifactSummary(run);
 	return [
 		`- ${statusIcon(run.normalizedStatus)} ${run.workflow} (${run.runId})${run.stale ? ` [STALE: ${run.stale.reason}]` : ""}`,
 		`  updated: ${run.updatedAt}`,

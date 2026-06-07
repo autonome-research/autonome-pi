@@ -1,6 +1,6 @@
 {
   "name": "pi-thread-phase-tools",
-  "version": "0.11.8",
+  "version": "0.11.9",
   "private": true,
   "description": "Thread-phase workflow visualizer and workflow examples for Pi.",
   "scripts": {

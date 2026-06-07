@@ -2,6 +2,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
@@ -13,6 +14,8 @@ mkdirSync(testHome, { recursive: true });
 const realHome = process.env.HOME || '';
 const realThreadPhaseCorePath = process.env.THREAD_PHASE_CORE_PATH || join(realHome, '.npm-global', 'lib', 'node_modules', '@autonome-research', 'thread-phase-cli', 'node_modules', '@autonome-research', 'thread-phase', 'dist', 'index.js');
 const env = { ...process.env, HOME: testHome, PI_THREAD_PHASE_STORE_DIR: store, ...(existsSync(realThreadPhaseCorePath) ? { THREAD_PHASE_CORE_PATH: realThreadPhaseCorePath } : {}) };
+process.env.PI_THREAD_PHASE_STORE_DIR = store;
+const visualizerStore = await import(pathToFileURL(join(root, 'thread-phase-visualizer/lib/store.mjs')).href);
 let failures = 0;
 
 function log(ok, name, detail = '') {
@@ -30,6 +33,30 @@ function run(name, args, options = {}) {
   });
   return result;
 }
+
+const projectedTerminalRun = visualizerStore.projectRun([
+  { schema: 'thread-phase-ui/v1', eventId: 'e1', timestamp: '2026-01-01T00:00:00.000Z', runId: 'projection-smoke', workflow: 'smoke', type: 'workflow_start', status: 'running' },
+  { schema: 'thread-phase-ui/v1', eventId: 'e2', timestamp: '2026-01-01T00:00:01.000Z', runId: 'projection-smoke', workflow: 'smoke', type: 'phase_event', phase: 'worker-a', message: 'work' },
+  { schema: 'thread-phase-ui/v1', eventId: 'e3', timestamp: '2026-01-01T00:00:02.000Z', runId: 'projection-smoke', workflow: 'smoke', type: 'artifact', status: 'success', artifact: { kind: 'file', title: 'old', path: '/tmp/repeated-artifact.txt' } },
+  { schema: 'thread-phase-ui/v1', eventId: 'e4', timestamp: '2026-01-01T00:00:03.000Z', runId: 'projection-smoke', workflow: 'smoke', type: 'artifact', status: 'success', artifact: { kind: 'file', title: 'new', path: '/tmp/repeated-artifact.txt' } },
+  { schema: 'thread-phase-ui/v1', eventId: 'e5', timestamp: '2026-01-01T00:00:04.000Z', runId: 'projection-smoke', workflow: 'smoke', type: 'artifact', status: 'success', artifact: { kind: 'markdown', title: 'inline-a', content: `${'x'.repeat(500)}a` } },
+  { schema: 'thread-phase-ui/v1', eventId: 'e6', timestamp: '2026-01-01T00:00:05.000Z', runId: 'projection-smoke', workflow: 'smoke', type: 'artifact', status: 'success', artifact: { kind: 'markdown', title: 'inline-a', content: `${'x'.repeat(500)}b` } },
+  { schema: 'thread-phase-ui/v1', eventId: 'e7', timestamp: '2026-01-01T00:00:06.000Z', runId: 'projection-smoke', workflow: 'smoke', type: 'workflow_end', status: 'success' },
+]);
+log(projectedTerminalRun.phases?.[0]?.normalizedStatus === 'success', 'thread-phase projection closes open phase-event-only phases on successful workflows');
+log(projectedTerminalRun.artifacts?.filter((artifact) => artifact.path === '/tmp/repeated-artifact.txt')?.length === 1 && projectedTerminalRun.artifacts.find((artifact) => artifact.path === '/tmp/repeated-artifact.txt')?.title === 'new', 'thread-phase projection dedupes repeated artifact paths');
+log(projectedTerminalRun.artifacts?.filter((artifact) => artifact.title === 'inline-a')?.length === 2, 'thread-phase projection does not collapse distinct inline artifacts with shared prefixes');
+const projectedRunningRun = visualizerStore.projectRun([
+  { schema: 'thread-phase-ui/v1', eventId: 'r1', timestamp: '2026-01-01T00:00:00.000Z', runId: 'running-projection-smoke', workflow: 'smoke', type: 'workflow_start' },
+  { schema: 'thread-phase-ui/v1', eventId: 'r2', timestamp: '2026-01-01T00:00:01.000Z', runId: 'running-projection-smoke', workflow: 'smoke', type: 'phase_event', phase: 'worker-a', message: 'still running' },
+]);
+log(projectedRunningRun.normalizedStatus === 'running' && projectedRunningRun.phases?.[0]?.normalizedStatus === 'running', 'thread-phase projection keeps workflow_start-only runs running');
+const projectedUnknownEndRun = visualizerStore.projectRun([
+  { schema: 'thread-phase-ui/v1', eventId: 'u1', timestamp: '2026-01-01T00:00:00.000Z', runId: 'unknown-end-projection-smoke', workflow: 'smoke', type: 'workflow_start', status: 'running' },
+  { schema: 'thread-phase-ui/v1', eventId: 'u2', timestamp: '2026-01-01T00:00:01.000Z', runId: 'unknown-end-projection-smoke', workflow: 'smoke', type: 'phase_event', phase: 'worker-a', message: 'custom terminal' },
+  { schema: 'thread-phase-ui/v1', eventId: 'u3', timestamp: '2026-01-01T00:00:02.000Z', runId: 'unknown-end-projection-smoke', workflow: 'smoke', type: 'workflow_end', status: 'custom-terminal' },
+]);
+log(projectedUnknownEndRun.normalizedStatus === 'unknown' && projectedUnknownEndRun.phases?.[0]?.normalizedStatus === 'unknown', 'thread-phase projection does not coerce unknown terminal statuses to success');
 
 function featureFingerprint({ milestoneId, featureId, title, description = '', repair = false, assertions = [], localAssertions = [], contractAssertions = [] }) {
   const contract = new Map(contractAssertions.map((assertion) => [String(assertion.id), assertion]));
@@ -52,6 +79,7 @@ try {
   process.env.PI_THREAD_PHASE_STORE_DIR = store;
   const storeApi = await import('../thread-phase-visualizer/lib/store.mjs');
   const smokeRun = storeApi.createRun({ workflow: 'usage-test', cwd: root, metadata: { sessionId: 'test' } });
+  log(String(smokeRun.runFile || '').startsWith(store), 'thread-phase smoke store is isolated to temp directory', smokeRun.runFile || '');
   storeApi.phaseStart(smokeRun, 'agent');
   storeApi.phaseEvent(smokeRun, 'agent', { kind: 'usage', model: 'unit-model', usage: [{ input_tokens: 100, output_tokens: 25, cache_read_input_tokens: 10 }] });
   storeApi.phaseEvent(smokeRun, 'agent', { kind: 'active_io', componentId: 'agent-1', component: 'unit agent --token rawsecret', role: 'pi', status: 'running', inputPreview: 'hello TOKEN="supersecret" --password hunter2', outputPreview: 'world' });
@@ -494,6 +522,8 @@ try {
   log((checkpointBackups.stdout || '').includes('mission-backup/mission-trusted-checkpoint-smoke/'), 'trusted checkpoint reset preserved pre-reset branch');
   const checkpointReadme = expectExit('trusted checkpoint reset output excludes contamination', ['git', 'show', 'mission/trusted-checkpoint-smoke:README.md'], 0, { cwd: checkpointRepo });
   log((checkpointReadme.stdout || '').includes('trusted f1') && (checkpointReadme.stdout || '').includes('trusted f2') && !(checkpointReadme.stdout || '').includes('untrusted contamination'), 'trusted checkpoint reset discarded untrusted branch tail');
+  const checkpointRegistry = JSON.parse(readFileSync(join(testHome, '.pi', 'agent', 'mission-workflow', 'registry', 'trusted-checkpoint-smoke', 'state.json'), 'utf8'));
+  log(checkpointRegistry.status === 'completed' && !checkpointRegistry.lastError && checkpointRegistry.lastResolvedError?.resolvedBy, 'mission workflow clears stale lastError after successful resume');
 
   const resumeCursorRepo = join(tmp, 'resume-cursor-repo');
   mkdirSync(resumeCursorRepo, { recursive: true });

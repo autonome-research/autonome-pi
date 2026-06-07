@@ -194,8 +194,8 @@ const detail = getRunSummary(runs[0].runId);
 The projected run shape includes:
 
 - `normalizedStatus` for icon/color decisions
-- ordered `phases[]`
-- `artifacts[]`
+- ordered `phases[]`; if a workflow reaches a terminal status without explicit `phase_end` events for every phase, projection closes still-running phase-event-only phases with the workflow's terminal status so completed runs do not appear to have live historical phases
+- deduplicated `artifacts[]` for stable external targets (`path`/`url`), keeping the latest event for repeated artifact paths or URLs; inline/preview-only artifacts remain distinct to avoid collapsing large or truncated content
 - `errors[]`
 - `progress` by phase
 - latest `activeIo` snapshot for the run and per phase
@@ -230,7 +230,7 @@ The demo script is intentionally not exposed as a slash command. Larger workflow
 The first UI layer is implemented as generic custom message renderers:
 
 - `thread-phase-run`: collapsed one-line workflow status; expand with Pi's tool/message expansion key to show phases, errors, and summary artifact content.
-- live monitor overlay: session-scoped keyboard-driven progress view with animated live workflow glyphs, arrow/enter navigation across phases and artifacts in one detail view, cancellation (`x` for running workflows), markdown-rendered artifact content, and separate phase glyphs (`◆`, `◈`, `◇`) for quick visual scanning.
+- live monitor overlay: session-scoped keyboard-driven progress view with animated live workflow glyphs, compact recent/active phase summaries, arrow/enter navigation across phases and artifacts in one detail view, cancellation (`x` for running workflows), markdown-rendered artifact content, and separate phase glyphs (`◆`, `◈`, `◇`) for quick visual scanning.
 - session continuations: successful background/session-launched workflows can emit a normal follow-up user message for the current Pi session; if the main agent is still generating, the continuation is queued with Pi's follow-up delivery instead of interrupting the stream. Dynamic workflows opt in with `autoContinue: true`.
 - `thread_phase_runs` is session-scoped by default; unscoped historical/direct-CLI runs are only inspectable through an explicit matching cwd.
 

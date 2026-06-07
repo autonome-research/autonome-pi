@@ -46,7 +46,10 @@ function phaseGlyph(phase: PhaseSummary, theme: any): string {
 function deterministicPhaseLine(run: RunSummary, theme: any): string {
 	const phases: PhaseSummary[] = run.phases || [];
 	if (phases.length === 0) return theme.fg("dim", "○ no phases yet");
-	return phases.map((phase) => `${phaseGlyph(phase, theme)} ${phase.phase || "phase"}`).join(theme.fg("dim", " ─ "));
+	const running = phases.filter((phase) => phase.normalizedStatus === STATUSES.RUNNING).sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+	const visible = running.length ? running.slice(0, 10) : phases.slice(-10);
+	const prefix = phases.length > visible.length ? theme.fg("dim", `… ${phases.length - visible.length} older ─ `) : "";
+	return prefix + visible.map((phase) => `${phaseGlyph(phase, theme)} ${phase.phase || "phase"}`).join(theme.fg("dim", " ─ "));
 }
 
 function currentPhaseText(run: RunSummary): string {

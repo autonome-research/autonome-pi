@@ -406,6 +406,14 @@ function markMissionRegistryTerminalFromArgs(args, cwd, status, error) {
   }));
 }
 
+function clearResolvedRegistryError(state, reason, at = new Date().toISOString()) {
+  if (!state?.lastError) return { lastError: undefined };
+  return {
+    lastError: undefined,
+    lastResolvedError: { ...state.lastError, resolvedAt: at, resolvedBy: reason },
+  };
+}
+
 function splitList(value) {
   if (!value) return [];
   if (Array.isArray(value)) return value.flatMap(splitList);
@@ -2083,7 +2091,10 @@ async function activateMission(args, cwd, run, ctx) {
   await enforceTrustedMissionBranch(plan, env, ctx, run, { resume: isTruthyFlag(args.resume) });
   const registryPlan = persistRegistryPlan(plan, planPathAbs);
   phaseEvent(run, "prepare-mission", { kind: "data", key: "registry", value: registryStatePath(plan.missionId), message: "Using durable mission registry" });
-  const registry = updateRegistryState(plan, (state) => ({ ...state, status: "running", planPath: planPathAbs, branch: env.missionBranch, repoRoot: env.repoRoot, worktree: env.integrationPath, worktreeBaseDir: env.root, roleModels: { plan: plan.modelPlan, worker: ctx.modelWorker, validator: ctx.modelValidator }, resumed: env.resumed, resumeCompletedFeatureCount: isTruthyFlag(args.resume) ? (priorRegistry.completedFeatures || []).length : undefined, timestamps: { ...(state.timestamps || {}), ...(registryPlan.state.timestamps || {}), startedAt: state.timestamps?.startedAt || new Date().toISOString() } }));
+  const registry = updateRegistryState(plan, (state) => {
+    const startedAt = new Date().toISOString();
+    return { ...state, status: "running", planPath: planPathAbs, branch: env.missionBranch, repoRoot: env.repoRoot, worktree: env.integrationPath, worktreeBaseDir: env.root, roleModels: { plan: plan.modelPlan, worker: ctx.modelWorker, validator: ctx.modelValidator }, resumed: env.resumed, resumeCompletedFeatureCount: isTruthyFlag(args.resume) ? (priorRegistry.completedFeatures || []).length : undefined, timestamps: { ...(state.timestamps || {}), ...(registryPlan.state.timestamps || {}), startedAt: state.timestamps?.startedAt || startedAt } };
+  });
   const missionState = { missionId: plan.missionId, missionBranch: env.missionBranch, integrationPath: env.integrationPath, baseHead: env.baseHead, registryPath: registry.statePath, modelWorker: ctx.modelWorker, modelValidator: ctx.modelValidator, resumed: env.resumed, milestones: [], startedAt: new Date().toISOString() };
   for (const milestone of plan.milestones) {
     const passedValidation = isTruthyFlag(args.resume) ? await latestTrustedPassedValidationCursor(plan, env, milestone, ctx, run) : undefined;
@@ -2147,7 +2158,7 @@ async function activateMission(args, cwd, run, ctx) {
   missionState.completedAt = new Date().toISOString();
   missionState.finalCoveragePath = finalCoveragePath;
   const statePath = writeArtifact(run, "mission-state.json", missionState, "json", "Mission state");
-  updateRegistryState(plan, (state) => ({ ...state, status: "completed", current: {}, finalCoveragePath, statePath, validationReports: state.validationReports || lastValidationReports, coverageReports: [...(state.coverageReports || []), { scope: "final", artifact: finalCoveragePath }], timestamps: { ...(state.timestamps || {}), completedAt: missionState.completedAt } }));
+  updateRegistryState(plan, (state) => ({ ...state, status: "completed", current: {}, finalCoveragePath, statePath, validationReports: state.validationReports || lastValidationReports, coverageReports: [...(state.coverageReports || []), { scope: "final", artifact: finalCoveragePath }], ...clearResolvedRegistryError(state, "mission_completed", missionState.completedAt), timestamps: { ...(state.timestamps || {}), completedAt: missionState.completedAt } }));
   const final = [
     "# Mission complete",
     "",
