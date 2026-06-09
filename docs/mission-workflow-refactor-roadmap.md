@@ -89,7 +89,7 @@ Validation:
 
 ### 2026-06-09 — Typed completion normalization helpers
 
-Implemented in current working tree.
+Commit: `d71e522 Add typed mission completion normalizers`
 
 Added `mission-workflow/src/planning/completion.ts` with typed pure helpers matching current runner completion semantics:
 
@@ -98,13 +98,35 @@ Added `mission-workflow/src/planning/completion.ts` with typed pure helpers matc
 - `normalizeRequiredFor()`
 - `normalizeCompletionLevels()`
 
-Smoke coverage checks default target behavior, strict invalid-target rejection, target ordering, duplicate requiredFor dedupe, and object-shaped completion level preservation.
+Smoke coverage checks default target behavior, reserved `code_complete` recognition, strict invalid-target rejection, target ordering, duplicate requiredFor dedupe, and object-shaped completion level preservation.
+
+Post-commit review: `.git/pi-code-reviews/d71e522ba284.md`, verdict low risk.
+
+### 2026-06-09 — Typed deliverables/external-service/policy normalizers
+
+Implemented in current working tree.
+
+Added typed pure planning modules:
+
+- `mission-workflow/src/planning/deliverables.ts`
+- `mission-workflow/src/planning/external-services.ts`
+- `mission-workflow/src/planning/policies.ts`
+
+Covered helpers:
+
+- `normalizeDeliverables()`
+- `normalizeExternalServices()`
+- `normalizeRolePolicy()`
+- `normalizeCapabilityPolicy()`
+- `normalizePromptPolicy()`
+
+Smoke coverage checks deliverable array preservation, external-service generated/default fields and skip-policy rejection, role model override/default behavior, capability timeout fallback, and prompt default preservation.
 
 ## Active / next component
 
-### Planning and validation category normalization
+### Validation category normalization
 
-Goal: continue extracting pure plan/category normalization helpers from `mission-workflow/bin/mission-workflow.mjs` into typed modules while keeping activation behavior identical. Next candidates: deliverables/external services and role/capability/prompt policy normalizers.
+Goal: continue extracting pure validation category normalization helpers from `mission-workflow/bin/mission-workflow.mjs` into typed modules while keeping activation behavior identical. Next candidates: `normalizeValidationCategory()` and `normalizeValidationCategories()`.
 
 ## Refactor roadmap
 

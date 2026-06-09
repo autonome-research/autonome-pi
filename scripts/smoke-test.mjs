@@ -170,6 +170,9 @@ try {
     const missionCoreConstants = await import(pathToFileURL(join(root, 'mission-workflow/src/core/constants.ts')).href);
     const missionCoreTypes = await import(pathToFileURL(join(root, 'mission-workflow/src/core/types.ts')).href);
     const missionPlanningCompletion = await import(pathToFileURL(join(root, 'mission-workflow/src/planning/completion.ts')).href);
+    const missionPlanningDeliverables = await import(pathToFileURL(join(root, 'mission-workflow/src/planning/deliverables.ts')).href);
+    const missionPlanningPolicies = await import(pathToFileURL(join(root, 'mission-workflow/src/planning/policies.ts')).href);
+    const missionPlanningExternal = await import(pathToFileURL(join(root, 'mission-workflow/src/planning/external-services.ts')).href);
     log(missionCoreTime.parseMillis('2m', 1) === 120000 && missionCoreTime.parseMillis('250ms', 1) === 250 && missionCoreTime.parseMillis('bad', 42) === 42, 'mission core parseMillis handles units and fallback');
     const hasUnpairedSurrogate = (value) => {
       for (let i = 0; i < value.length; i++) {
@@ -196,6 +199,16 @@ try {
     try { missionPlanningCompletion.normalizeCompletionTarget('bogus', { strict: true }); } catch { strictCompletionThrows = true; }
     const completionLevels = missionPlanningCompletion.normalizeCompletionLevels({ operationally_ready: { required: false, note: 'manual' } }, 'deployment_ready');
     log(missionPlanningCompletion.normalizeCompletionTarget('', { strict: true }) === 'contract_validated' && missionPlanningCompletion.normalizeCompletionTarget('code_complete', { strict: true }) === 'code_complete' && strictCompletionThrows && missionPlanningCompletion.completionLevelAtLeast('deployment_ready', 'operationally_ready') && missionPlanningCompletion.normalizeRequiredFor(['operationally_ready', 'operationally_ready']).length === 1 && completionLevels.deployment_ready.required === true && completionLevels.operationally_ready.required === false && completionLevels.operationally_ready.note === 'manual', 'mission planning completion normalizers preserve target and requiredFor semantics');
+    const deliverables = missionPlanningDeliverables.normalizeDeliverables({ entrypoints: [{ name: 'cli' }], runtimeArtifacts: 'bad', runbooks: [{ path: 'README.md' }] });
+    log(deliverables.entrypoints.length === 1 && deliverables.runtimeArtifacts.length === 0 && deliverables.runbooks[0].path === 'README.md', 'mission planning deliverable normalizer preserves known arrays only');
+    const rolePolicy = missionPlanningPolicies.normalizeRolePolicy({ worker: { profile: 'custom' } }, { modelPlan: 'planner', modelWorker: 'worker', modelValidator: 'validator', modelDomain: 'domain', modelOps: 'ops' });
+    const capabilityPolicy = missionPlanningPolicies.normalizeCapabilityPolicy({ maxCommandTimeoutMs: -1, deployment: true });
+    const promptPolicy = missionPlanningPolicies.normalizePromptPolicy({ workerPromptVersion: 'worker/custom' });
+    log(rolePolicy.planner.model === 'planner' && rolePolicy.worker.profile === 'custom' && rolePolicy.worker.model === 'worker' && rolePolicy.domainCritic.model === 'domain' && capabilityPolicy.maxCommandTimeoutMs === missionCoreConstants.DEFAULT_CAPABILITY_POLICY.maxCommandTimeoutMs && capabilityPolicy.deployment === true && promptPolicy.workerPromptVersion === 'worker/custom' && promptPolicy.handoffSchema === 'pi-mission-worker-handoff/v3', 'mission planning policy normalizers preserve role capability and prompt defaults');
+    let badExternalSkipThrows = false;
+    try { missionPlanningExternal.normalizeExternalServices([{ skipPolicy: 'never' }]); } catch { badExternalSkipThrows = true; }
+    const externalServices = missionPlanningExternal.normalizeExternalServices([{ name: 'Demo API', purpose: 'quotes', requiredFor: ['deployment_ready'], credentialEnv: ['API_KEY'], healthCommand: 'npm run health', skipPolicy: 'explicit_skip_allowed', destructive: true }]);
+    log(badExternalSkipThrows && externalServices[0].id === 'Demo-API' && externalServices[0].requiredFor[0] === 'deployment_ready' && externalServices[0].credentialEnv[0] === 'API_KEY' && externalServices[0].skipPolicy === 'explicit_skip_allowed' && externalServices[0].destructive === true, 'mission planning external service normalizer preserves generated fields and rejects bad skip policy');
   } catch (error) {
     const code = error?.code || error?.message || String(error);
     log(code === 'ERR_UNKNOWN_FILE_EXTENSION', 'mission wrapper helper tests skipped only when Node lacks TypeScript module loading', String(code));
