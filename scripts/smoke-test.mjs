@@ -154,6 +154,20 @@ try {
   expectExit('structured shell workflow succeeds', ['node', cli, '--spec-file', shellSpec, '--cwd', root], 0);
 
   const missionCli = join(root, 'mission-workflow/bin/mission-workflow.mjs');
+  try {
+    const missionArgs = await import(pathToFileURL(join(root, 'mission-workflow/src/extension/args.ts')).href);
+    const missionCwd = await import(pathToFileURL(join(root, 'mission-workflow/src/extension/cwd.ts')).href);
+    const missionResult = await import(pathToFileURL(join(root, 'mission-workflow/src/extension/result.ts')).href);
+    log(missionArgs.splitList('alpha,beta; gamma').join('|') === 'alpha|beta|gamma' && missionArgs.splitList(['delta', 'epsilon']).join('|') === 'delta|epsilon', 'mission wrapper splitList handles scalar shorthand and explicit arrays');
+    const wrapperArgs = missionArgs.buildArgs({ action: 'status', cwd: '/repo', missionId: 'm1', completionTarget: 'deployment_ready', validationCommands: ['npm test', 'npm run lint'], background: true, modelPlan: 'planner-model', modelWorker: 'worker-model', modelValidator: 'validator-model' }, { cwd: '/repo', sessionManager: { getSessionId: () => 'sid', getSessionFile: () => '/tmp/session.json' } });
+    log(wrapperArgs.includes('--mission-id') && wrapperArgs.includes('m1') && wrapperArgs.includes('--completion-target') && wrapperArgs.includes('deployment_ready') && wrapperArgs.filter((arg) => arg === '--validation-command').length === 2 && wrapperArgs.includes('--session-id') && wrapperArgs.includes('sid') && wrapperArgs.includes('--model-plan') && wrapperArgs.includes('planner-model'), 'mission wrapper buildArgs preserves optional mission/session args');
+    log(missionCwd.parseSimpleCd('cd ~/repo;') === '~/repo' && missionCwd.parseSimpleCd('cd -') === '-' && missionCwd.parseSimpleCd('echo cd /tmp') === undefined && missionCwd.parseSimpleCd('cd a\\ b') === 'a b' && missionCwd.parseSimpleCd('cd "quoted path"') === 'quoted path', 'mission wrapper parseSimpleCd handles cd forms only');
+    log(missionCwd.resolveAgainstActive('/repo/base', 'subdir').endsWith('/repo/base/subdir') && missionCwd.resolveAgainstActive('/repo/base', '/abs/path') === '/abs/path' && missionCwd.resolveAgainstActive('/repo/base', '~').length > 0, 'mission wrapper resolveAgainstActive handles relative absolute and home paths');
+    log(missionResult.truncate('😀'.repeat(20), 10).includes('Tool output truncated') && missionResult.parseJsonObject('{"ok":true}')?.ok === true && missionResult.parseJsonObject('   ') === undefined, 'mission wrapper result helpers parse/truncate output');
+  } catch (error) {
+    const code = error?.code || error?.message || String(error);
+    log(code === 'ERR_UNKNOWN_FILE_EXTENSION', 'mission wrapper helper tests skipped only when Node lacks TypeScript module loading', String(code));
+  }
   const missionRepo = join(tmp, 'mission-repo');
   mkdirSync(missionRepo, { recursive: true });
   expectExit('mission smoke repo git init', ['git', 'init', '-q'], 0, { cwd: missionRepo });
