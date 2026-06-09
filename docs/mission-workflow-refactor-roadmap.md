@@ -157,11 +157,26 @@ Covered helpers:
 
 Smoke coverage checks safe registry paths, default completion/role/prompt fields, write/update behavior in an isolated temp registry root, current monolith-compatible fallback for corrupt state JSON, explicit return-only updater semantics, returned nested mutations, schema repair during persisted-state merge, malformed nested array/object field repair for completion/operatorDx/sharedMissionNotes and report arrays, preservation of scalar operator DX fields such as `sharedMissionNotesPath`, and merge preservation for existing completion/repair/shared-note state. Unlike the monolith's accidental shallow-copy behavior, the typed `updateRegistryState()` passes a cloned draft and requires callers to return the intended next state object.
 
+### 2026-06-09 — Typed git fingerprint helpers
+
+Implemented in current working tree.
+
+Added `mission-workflow/src/git/fingerprints.ts` with typed pure helpers:
+
+- `expectedFeatureCommitSubject()`
+- `missionPlanFingerprint()`
+- `featureFingerprint()`
+- `parseRepairSignatureFromId()`
+- `repairSignatureFromFeature()`
+- `repairSignatureFromRecord()`
+
+Smoke coverage checks commit subject normalization, 24-character plan fingerprints, feature fingerprint parity with the existing smoke-test implementation, and stable repair signature extraction.
+
 ## Active / next component
 
 ### Registry and trust model continuation
 
-Goal: continue extracting trusted checkpoint, validation cursor, plan fingerprint, and feature fingerprint helpers from `mission-workflow/bin/mission-workflow.mjs` while keeping runtime behavior stable.
+Goal: continue extracting trusted checkpoint and validation cursor helpers from `mission-workflow/bin/mission-workflow.mjs` while keeping runtime behavior stable.
 
 ## Refactor roadmap
 
