@@ -481,3 +481,15 @@ The current working tree adds an opt-in Factory-style scrutiny validator slice:
 - Smoke coverage verifies that a must-level per-feature review finding blocks activation and is recorded with repair context.
 
 This is intentionally opt-in for now to preserve existing mission behavior and avoid breaking stateful fake-Pi tests that assume exactly one validator call.
+
+## 2026-06-09 — Uncommitted strategic repair-plan slice
+
+The current working tree adds structured repair planning before repair workers are enqueued:
+
+- `planRepairsFromValidation()` writes `pi-mission-workflow/repair-plan/v1` artifacts under `validation/<milestone>-repair-plan-iteration-<n>.json`.
+- Deterministic fallback preserves existing `repairFeaturesFromReport()` behavior and stable content-addressed repair IDs.
+- `capabilityPolicy.strategicRepairPlanner=true` enables an optional read-only Pi repair-planner call; otherwise the artifact still records a deterministic repair decision and failure classes.
+- Registry `repairHistory[]` records milestone, iteration, repair-plan artifact, decision, failure classes, and repair IDs.
+- Smoke coverage verifies that a failed validation with later successful repair writes a repair-plan artifact before repair workers run.
+
+This implements the first negotiation/repair-planning layer while keeping the deterministic runner responsible for actual repair feature IDs and queueing.

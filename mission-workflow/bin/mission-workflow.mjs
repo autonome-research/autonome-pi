@@ -68,6 +68,7 @@ const DEFAULT_CAPABILITY_POLICY = Object.freeze({
   liveExternalActions: false,
   maxCommandTimeoutMs: DEFAULT_COMMAND_TIMEOUT_MS,
   featureReviewValidators: false,
+  strategicRepairPlanner: false,
 });
 
 async function loadThreadPhaseCore() {
@@ -2522,7 +2523,8 @@ function repairFeatureStableHash(report, iteration, feature, index, fallback) {
 }
 
 function repairFeatureStableId(report, iteration, feature, index, fallback) {
-  return `repair-${safeName(report.milestoneId)}-${iteration}-${repairFeatureStableHash(report, iteration, feature, index, fallback)}`;
+  const milestonePart = safeName(report.milestoneId, "milestone").slice(0, 40) || "milestone";
+  return `repair-${milestonePart}-${iteration}-${repairFeatureStableHash(report, iteration, feature, index, fallback)}`;
 }
 
 function repairFeaturesFromReport(report, iteration) {
@@ -2536,6 +2538,70 @@ function repairFeaturesFromReport(report, iteration) {
     assertions: Array.isArray(feature.assertions) && feature.assertions.length ? feature.assertions.map(String) : fallback.assertions,
     repair: true,
   }));
+}
+
+function validationFailureClasses(validation) {
+  return Array.from(new Set([
+    ...(validation.categoryResults || []).map((item) => item.failureClass).filter(Boolean),
+    ...(validation.featureReviewBlockers || []).map((item) => item.failureClass).filter(Boolean),
+    ...(validation.validatorReport?.objections || []).map((item) => item.failureClass).filter(Boolean),
+    ...(validation.reports || []).map((item) => item.failureClass).filter(Boolean),
+    ...((validation.coveragePath && (validation.assertionResults || []).some((item) => item.status === "fail")) ? ["missing_acceptance_test"] : []),
+  ].map((item) => normalizeFailureClass(item, "unknown"))));
+}
+
+function normalizeRepairPlan(raw, validation, iteration, plan = {}) {
+  const fallbackRepairs = repairFeaturesFromReport(validation, iteration);
+  const rawRepairs = Array.isArray(raw?.repairs) && raw.repairs.length ? raw.repairs.slice(0, 10) : undefined;
+  const knownAssertions = knownContractAssertionIds(plan);
+  const repairs = rawRepairs ? rawRepairs.map((feature, index) => {
+    const fallback = fallbackRepairs[index] || fallbackRepairs[0] || { title: `Repair ${validation.milestoneId}`, assertions: [] };
+    const plannerAssertions = Array.isArray(feature.assertions) && feature.assertions.length
+      ? feature.assertions.map((id) => canonicalAssertionId(id, plan.validationContract) || String(id)).filter((id) => knownAssertions.has(String(id)))
+      : [];
+    const assertions = plannerAssertions.length ? plannerAssertions : (fallback.assertions || []);
+    const hashInput = { ...feature, assertions, rationale: feature.rationale || fallback.rationale || "" };
+    return {
+      id: repairFeatureStableId(validation, iteration, hashInput, index, fallback),
+      repairSignature: repairFeatureStableHash(validation, iteration, hashInput, index, fallback),
+      title: String(feature.title || fallback.title || `Repair ${validation.milestoneId}`),
+      description: compactText(String(feature.description || fallback.description || feature.rationale || "Repair validation failure."), 8000),
+      assertions,
+      repair: true,
+    };
+  }) : fallbackRepairs;
+  const duplicateRepairIds = repairs.map((repair) => repair.id).filter((id, index, ids) => ids.indexOf(id) !== index);
+  if (duplicateRepairIds.length) throw new Error(`Repair planner produced duplicate runner-owned repair ids: ${Array.from(new Set(duplicateRepairIds)).join(", ")}`);
+  const repairCreatingDecisions = new Set(["create_repairs", "rerun_worker", "add_tests", "add_operational_tooling", "split_milestone"]);
+  const decision = rawRepairs && repairCreatingDecisions.has(String(raw?.decision || "")) ? String(raw.decision) : "create_repairs";
+  return { schema: "pi-mission-workflow/repair-plan/v1", milestoneId: validation.milestoneId, iteration, failureClasses: validationFailureClasses(validation), decision, rationale: String(raw?.rationale || "Deterministic repair planning fallback."), repairs, objectionMap: Array.isArray(raw?.objectionMap) ? raw.objectionMap.slice(0, 100) : [] };
+}
+
+async function planRepairsFromValidation(env, plan, milestone, validation, iteration, ctx, run) {
+  let raw = undefined;
+  if (plan.capabilityPolicy?.strategicRepairPlanner === true && String(plan.planner || "pi") !== "mock") {
+    const diffFiles = await git(env.integrationPath, ["diff", "--name-only", `${env.baseHead}..HEAD`], { signal: ctx.signal, reject: false });
+    const prompt = compactText([
+      "You are a read-only mission repair planner. Do not edit files or write commits.",
+      "Cluster validation failures into deliberate repair features. Avoid duplicate repairs for the same root cause.",
+      "Return ONLY JSON with schema, milestoneId, iteration, decision, rationale, repairs[{title,description,assertions,rationale}], objectionMap[].",
+      `Mission goal: ${plan.goal}`,
+      `Milestone: ${compactJson({ id: milestone.id, title: milestone.title, features: milestone.features }, 20000)}`,
+      `Validation summary: ${compactJson({ passed: validation.passed, contractValidated: validation.contractValidated, reports: validation.reports, featureReviews: validation.featureReviews, featureReviewBlockers: validation.featureReviewBlockers, categoryResults: validation.categoryResults, validatorReport: validation.validatorReport, coveragePath: validation.coveragePath, correctiveFeatures: validation.correctiveFeatures }, 60000)}`,
+      `Changed files since base:\n${compactText(diffFiles.stdout || diffFiles.stderr || "", 12000)}`,
+    ].join("\n\n"), MAX_PROMPT_CONTEXT_BYTES);
+    writeArtifact(run, `validation/${safeName(milestone.id)}-repair-planner-prompt-iteration-${iteration}.md`, prompt, "markdown", `Repair planner prompt: ${milestone.id} iteration ${iteration}`);
+    const result = await runPi({ cwd: env.integrationPath, prompt, tools: ["read", "grep", "find", "ls"], model: ctx.modelValidator, signal: ctx.signal, operationLabel: `repair planner ${milestone.id} iteration ${iteration}`, phase: `repair-planner-${milestone.id}-${iteration}`, timeoutMs: ctx.piTimeoutMs, idleTimeoutMs: ctx.piIdleTimeoutMs });
+    if (result.usage?.length) phaseEvent(run, `repair-planner-${milestone.id}-${iteration}`, { kind: "usage", usage: result.usage, model: result.model });
+    if ((result.aborted && !result.timedOut && !result.idleTimedOut) || ctx.signal.aborted) throw abortError(ctx.signal.reason || result.error || "cancelled");
+    if (result.ok) {
+      try { raw = parseJsonFromText(result.text); }
+      catch (error) { raw = { decision: "create_repairs", rationale: `Repair planner returned malformed JSON; using deterministic fallback: ${error.message}` }; }
+    } else raw = { decision: "create_repairs", rationale: `Repair planner failed; using deterministic fallback: ${result.error || "unknown error"}` };
+  }
+  const repairPlan = normalizeRepairPlan(raw, validation, iteration, plan);
+  const artifactPath = writeArtifact(run, `validation/${safeName(milestone.id)}-repair-plan-iteration-${iteration}.json`, repairPlan, "json", `Repair plan: ${milestone.id} iteration ${iteration}`);
+  return { ...repairPlan, artifact: artifactPath };
 }
 
 function firstNonEmptyArray(...values) {
@@ -2731,7 +2797,9 @@ async function activateMission(args, cwd, run, ctx) {
       updateRegistryState(plan, (state) => ({ ...state, validationReports: [...(state.validationReports || []), { milestoneId: milestone.id, iteration, artifact: validation.artifact, coveragePath: validation.coveragePath, passed: validation.passed, contractValidated: validation.contractValidated, featureReviews: validation.featureReviews || [], featureReviewBlockers: validation.featureReviewBlockers || [], categoryResults: validation.categoryResults || [], blockingCategoryResults: validation.blockingCategoryResults || [], correctiveFeatures: validation.correctiveFeatures || [], trustedHead: validationTrustedHead, validationCursorMetadata: cursorMetadata, validationCursorFingerprint: validationCursorFingerprint(plan, milestone, env.baseHead, cursorMetadata), validatedFeatures, completedAt: new Date().toISOString() }], coverageReports: [...(state.coverageReports || []), { milestoneId: milestone.id, iteration, artifact: validation.coveragePath }], completion: { ...(state.completion || {}), target: normalizeCompletionTarget(plan.completionTarget), level: validation.passed ? normalizeCompletionTarget(plan.completionTarget) : validation.contractValidated ? DEFAULT_COMPLETION_TARGET : "code_complete", categoryResults: validation.categoryResults || [], blockedBy: validation.passed ? [] : [...(validation.blockingCategoryResults || blockingCategoryResultsForTarget(validation.categoryResults || [], plan.completionTarget)).map((item) => ({ id: item.id, category: item.category, status: item.status, failureClass: item.failureClass, skipReason: item.skipReason })), ...(validation.featureReviewBlockers || []).map((item) => ({ id: item.id, category: item.category, status: item.status, failureClass: item.failureClass, featureId: item.featureId, assertionId: item.assertionId, skipReason: item.skipReason, artifact: item.artifact }))] }, current: { milestoneId: milestone.id, iteration, validationReport: validation.artifact }, lastIterationState: iterationPath }));
       if (validation.passed) break;
       if (iteration >= Number(plan.maxRepairIterations || DEFAULT_MAX_REPAIR_ITERATIONS)) throw new Error(`Mission ${plan.missionId} reached max repair iterations (${iteration}) for ${milestone.id}`);
-      queue = repairFeaturesFromReport(validation, iteration);
+      const repairPlan = await planRepairsFromValidation(env, plan, milestone, validation, iteration, ctx, run);
+      updateRegistryState(plan, (state) => ({ ...state, repairHistory: [...(state.repairHistory || []), { milestoneId: milestone.id, iteration, artifact: repairPlan.artifact, decision: repairPlan.decision, failureClasses: repairPlan.failureClasses, repairIds: (repairPlan.repairs || []).map((repair) => repair.id), createdAt: new Date().toISOString() }] }));
+      queue = repairPlan.repairs;
     }
     missionState.milestones.push(milestoneState);
   }
