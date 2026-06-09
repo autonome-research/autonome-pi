@@ -235,6 +235,65 @@ try {
   }, null, 2));
   expectExit('mission workflow blocks missing credential-gated validation category', ['node', missionCli, 'activate', '--approved', '--plan-path', credentialGatePlanPath, '--cwd', artifactGateRepo], 1, { env: { PI_MISSION_SMOKE_MISSING_CREDENTIAL: '' } });
 
+  const deliverableRepo = join(tmp, 'deliverable-category-repo');
+  mkdirSync(deliverableRepo, { recursive: true });
+  expectExit('deliverable category repo git init', ['git', 'init', '-q'], 0, { cwd: deliverableRepo });
+  expectExit('deliverable category repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: deliverableRepo });
+  expectExit('deliverable category repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: deliverableRepo });
+  writeFileSync(join(deliverableRepo, 'README.md'), 'deliverable category\n');
+  expectExit('deliverable category repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: deliverableRepo });
+  const missingDeliverablePlanPath = join(tmp, 'missing-deliverable-plan.json');
+  writeFileSync(missingDeliverablePlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'missing-deliverable-smoke', goal: 'missing deliverable smoke', cwd: deliverableRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'operationally_ready', deliverables: { runtimeArtifacts: [{ path: 'var/health-report.json', requiredFor: ['operationally_ready'] }] },
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow maps required runtime deliverables to artifact validation categories', ['node', missionCli, 'activate', '--approved', '--plan-path', missingDeliverablePlanPath, '--cwd', deliverableRepo], 1);
+  const emptyRequiredForDeliverablePlanPath = join(tmp, 'empty-required-for-deliverable-plan.json');
+  writeFileSync(emptyRequiredForDeliverablePlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'empty-required-for-deliverable-smoke', goal: 'empty requiredFor deliverable smoke', cwd: deliverableRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'contract_validated', deliverables: { runtimeArtifacts: [{ path: 'var/missing-operational-only.json', requiredFor: [] }] },
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow defaults empty deliverable requiredFor to operational readiness', ['node', missionCli, 'activate', '--approved', '--plan-path', emptyRequiredForDeliverablePlanPath, '--cwd', deliverableRepo], 0);
+  mkdirSync(join(deliverableRepo, 'a'), { recursive: true });
+  writeFileSync(join(deliverableRepo, 'a', 'b'), 'present colliding artifact\n');
+  expectExit('deliverable category repo commit colliding artifact base', ['sh', '-c', 'git add a/b && git commit -q -m colliding-artifact-base'], 0, { cwd: deliverableRepo });
+  const collidingDeliverablePlanPath = join(tmp, 'colliding-deliverable-plan.json');
+  writeFileSync(collidingDeliverablePlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'colliding-deliverable-smoke', goal: 'colliding deliverable smoke', cwd: deliverableRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'operationally_ready', deliverables: { runtimeArtifacts: [{ path: 'a/b', requiredFor: ['operationally_ready'] }, { path: 'a-b', requiredFor: ['operationally_ready'] }] },
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow keeps safeName-colliding generated deliverable categories distinct', ['node', missionCli, 'activate', '--approved', '--plan-path', collidingDeliverablePlanPath, '--cwd', deliverableRepo], 1);
+  const explicitGeneratedCollisionPlanPath = join(tmp, 'explicit-generated-collision-plan.json');
+  writeFileSync(explicitGeneratedCollisionPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'explicit-generated-collision-smoke', goal: 'explicit generated collision smoke', cwd: deliverableRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'operationally_ready', validationCategories: [{ id: 'deliverable-runtime-var-shadowed.json', category: 'operational', commands: ['true'], requiredFor: ['operationally_ready'] }], deliverables: { runtimeArtifacts: [{ path: 'var/shadowed.json', requiredFor: ['operationally_ready'] }] },
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow rejects explicit validation category collisions with generated categories', ['node', missionCli, 'activate', '--approved', '--plan-path', explicitGeneratedCollisionPlanPath, '--cwd', deliverableRepo], 1);
+  mkdirSync(join(deliverableRepo, 'var'), { recursive: true });
+  writeFileSync(join(deliverableRepo, 'var', 'health-report.json'), '{"ok":true}\n');
+  expectExit('deliverable category repo commit runtime artifact', ['sh', '-c', 'git add var/health-report.json && git commit -q -m runtime-artifact'], 0, { cwd: deliverableRepo });
+  const presentDeliverablePlanPath = join(tmp, 'present-deliverable-plan.json');
+  writeFileSync(presentDeliverablePlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'present-deliverable-smoke', goal: 'present deliverable smoke', cwd: deliverableRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'operationally_ready', deliverables: { runtimeArtifacts: [{ path: 'var/health-report.json', requiredFor: ['operationally_ready'] }], entrypoints: [{ name: 'health cli', validationCommand: 'true', requiredFor: ['operationally_ready'] }] },
+    externalServices: [{ id: 'demo-api', purpose: 'smoke external service category generation', requiredFor: ['operationally_ready'], credentialEnv: ['PI_MISSION_SMOKE_EXTERNAL_OK'], healthCommand: 'true' }],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  const presentDeliverable = expectExit('mission workflow validates deliverable and external service derived categories', ['node', missionCli, 'activate', '--approved', '--plan-path', presentDeliverablePlanPath, '--cwd', deliverableRepo], 0, { env: { PI_MISSION_SMOKE_EXTERNAL_OK: '1' } });
+  let presentDeliverableDetails;
+  try { presentDeliverableDetails = JSON.parse(presentDeliverable.stdout); } catch { presentDeliverableDetails = undefined; }
+  const presentDeliverableRegistry = presentDeliverableDetails?.registryPath ? JSON.parse(readFileSync(presentDeliverableDetails.registryPath, 'utf8')) : undefined;
+  log(presentDeliverableRegistry?.completion?.level === 'operationally_ready' && presentDeliverableRegistry.completion.categoryResults?.some((item) => item.id === 'external-demo-api-health' && item.status === 'pass') && presentDeliverableRegistry.completion.categoryResults?.some((item) => item.id === 'deliverable-runtime-var-health-report.json' && item.status === 'pass'), 'mission workflow records derived deliverable/external categories as passed');
+
   const optionalCategoryRepo = join(tmp, 'optional-category-repo');
   mkdirSync(optionalCategoryRepo, { recursive: true });
   expectExit('optional category repo git init', ['git', 'init', '-q'], 0, { cwd: optionalCategoryRepo });

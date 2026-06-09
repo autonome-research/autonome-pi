@@ -99,6 +99,15 @@ Supported values:
 
 Deployment categories require `capabilityPolicy.deployment: true`. Destructive/live external service actions remain unsupported and are rejected during activation.
 
+`externalServices[]` and `deliverables` also produce validation categories automatically when they contain executable/readable checks:
+
+- `externalServices[].healthCommand` becomes an `operational` category named `external-<id>-health`.
+- `externalServices[].smokeCommand` becomes an `integration` category named `external-<id>-smoke`.
+- `externalServices[].credentialEnv` maps to `credentialGates` for those generated categories.
+- `deliverables.entrypoints[].validationCommand` becomes an executable category.
+- `deliverables.runtimeArtifacts[].path` and `deliverables.runbooks[].path` become artifact-required categories, using `validationCommand` when provided or `true` as a sentinel command before checking the path.
+- Explicit `validationCategories[].id` values may not collide with generated external-service/deliverable category IDs; generated categories use unique suffixes when their own safe names collide.
+
 ## Safety model
 
 - `activate` requires `approved: true`; planning clarification artifacts (`pi-mission-workflow/planning-clarification/v1`) are not activation-ready and are rejected with a clear error.

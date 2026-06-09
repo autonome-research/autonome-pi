@@ -458,16 +458,20 @@ function normalizePromptPolicy(value = {}) {
 }
 
 function normalizeExternalServices(value = []) {
-  return (Array.isArray(value) ? value : []).map((service, index) => ({
-    id: safeName(service?.id || service?.name || `external-service-${index + 1}`, `external-service-${index + 1}`),
-    purpose: String(service?.purpose || ""),
-    requiredFor: normalizeRequiredFor(service?.requiredFor, ["operationally_ready"], { strict: true }),
-    credentialEnv: Array.isArray(service?.credentialEnv) ? service.credentialEnv.map(String).filter(Boolean) : [],
-    healthCommand: service?.healthCommand ? String(service.healthCommand) : undefined,
-    smokeCommand: service?.smokeCommand ? String(service.smokeCommand) : undefined,
-    destructive: Boolean(service?.destructive),
-    liveExternalAction: Boolean(service?.liveExternalAction),
-  }));
+  return (Array.isArray(value) ? value : []).map((service, index) => {
+    if (service?.skipPolicy !== undefined && service.skipPolicy !== null && service.skipPolicy !== "" && !VALIDATION_SKIP_POLICIES.includes(String(service.skipPolicy))) throw new Error(`Unknown external service skipPolicy: ${service.skipPolicy}`);
+    return {
+      id: safeName(service?.id || service?.name || `external-service-${index + 1}`, `external-service-${index + 1}`),
+      purpose: String(service?.purpose || ""),
+      requiredFor: normalizeRequiredFor(service?.requiredFor, ["operationally_ready"], { strict: true }),
+      credentialEnv: Array.isArray(service?.credentialEnv) ? service.credentialEnv.map(String).filter(Boolean) : [],
+      healthCommand: service?.healthCommand ? String(service.healthCommand) : undefined,
+      smokeCommand: service?.smokeCommand ? String(service.smokeCommand) : undefined,
+      skipPolicy: service?.skipPolicy ? String(service.skipPolicy) : "fail_when_skipped",
+      destructive: Boolean(service?.destructive),
+      liveExternalAction: Boolean(service?.liveExternalAction),
+    };
+  });
 }
 
 function normalizeValidationCategory(raw = {}, index = 0, source = "plan") {
@@ -522,10 +526,33 @@ function normalizeValidationCategories(plan = {}, options = {}) {
   const hasEquivalentLegacyUserTest = (command) => categories.some((category) => category.category === "behavior" && category.userTest === true && !category.adversarial && category.scope === "milestone" && category.skipPolicy !== "optional" && (category.requiredFor || []).includes(DEFAULT_COMPLETION_TARGET) && (category.commands || []).length === 1 && category.commands[0] === command);
   const explicitIds = new Set();
   (Array.isArray(plan.validationCategories) ? plan.validationCategories : []).forEach((category, index) => {
+    if (category && typeof category === "object" && category.generatedFrom) return;
     const normalized = normalizeValidationCategory(category, index, "plan");
     if (explicitIds.has(normalized.id)) throw new Error(`Duplicate validation category id: ${normalized.id}`);
     explicitIds.add(normalized.id);
     add(normalized);
+  });
+  const addGenerated = (category, generatedFrom) => {
+    if (explicitIds.has(category.id)) throw new Error(`Explicit validation category id conflicts with generated category: ${category.id}`);
+    add({ ...category, generatedFrom }, { forceUnique: true });
+  };
+  normalizeExternalServices(plan.externalServices).forEach((service, index) => {
+    if (service.healthCommand) addGenerated(normalizeValidationCategory({ id: `external-${service.id}-health`, category: "operational", title: `External service health: ${service.id}`, commands: [service.healthCommand], requiredFor: service.requiredFor, credentialGates: service.credentialEnv, skipPolicy: service.skipPolicy, adapter: "command" }, index, "external-service-health"), "externalServices.healthCommand");
+    if (service.smokeCommand) addGenerated(normalizeValidationCategory({ id: `external-${service.id}-smoke`, category: "integration", title: `External service smoke: ${service.id}`, commands: [service.smokeCommand], requiredFor: service.requiredFor, credentialGates: service.credentialEnv, skipPolicy: service.skipPolicy, adapter: "command" }, index, "external-service-smoke"), "externalServices.smokeCommand");
+  });
+  const deliverables = normalizeDeliverables(plan.deliverables);
+  const deliverableRequiredFor = (item) => normalizeRequiredFor(item?.requiredFor, ["operationally_ready"], { strict: true });
+  (deliverables.entrypoints || []).forEach((entrypoint, index) => {
+    if (!entrypoint?.validationCommand) return;
+    addGenerated(normalizeValidationCategory({ id: entrypoint.id || `deliverable-entrypoint-${safeName(entrypoint.name || index + 1, `entrypoint-${index + 1}`)}`, category: entrypoint.category || "operational", title: `Deliverable entrypoint: ${entrypoint.name || entrypoint.command || index + 1}`, commands: [String(entrypoint.validationCommand)], requiredFor: deliverableRequiredFor(entrypoint), skipPolicy: entrypoint.skipPolicy, adapter: "command" }, index, "deliverable-entrypoint"), "deliverables.entrypoints");
+  });
+  (deliverables.runtimeArtifacts || []).forEach((item, index) => {
+    if (!item?.path) return;
+    addGenerated(normalizeValidationCategory({ id: item.id || `deliverable-runtime-${safeName(item.path, `runtime-${index + 1}`)}`, category: item.category || "operational", title: `Runtime artifact: ${item.path}`, commands: [String(item.validationCommand || "true")], artifactsRequired: [String(item.path)], requiredFor: deliverableRequiredFor(item), skipPolicy: item.skipPolicy, adapter: "command" }, index, "deliverable-runtime-artifact"), "deliverables.runtimeArtifacts");
+  });
+  (deliverables.runbooks || []).forEach((item, index) => {
+    if (!item?.path) return;
+    addGenerated(normalizeValidationCategory({ id: item.id || `deliverable-runbook-${safeName(item.path, `runbook-${index + 1}`)}`, category: item.category || "operational", title: `Runbook artifact: ${item.path}`, commands: [String(item.validationCommand || "true")], artifactsRequired: [String(item.path)], requiredFor: deliverableRequiredFor(item), skipPolicy: item.skipPolicy, adapter: "command" }, index, "deliverable-runbook"), "deliverables.runbooks");
   });
   (Array.isArray(plan.validationCommands) ? plan.validationCommands : []).map(String).filter(Boolean).forEach((command, index) => { if (!hasEquivalentLegacyCommand(command)) add(normalizeValidationCategory({ category: "scrutiny", title: `Validation command: ${command}`, commands: [command] }, index, "legacy-validation-command"), { forceUnique: true }); });
   if (plan.userTestCommand && !hasEquivalentLegacyUserTest(String(plan.userTestCommand))) add(normalizeValidationCategory({ id: "user-test-command", category: "behavior", title: "User/behavior test command", commands: [String(plan.userTestCommand)], userTest: true, adapter: "command" }, 0, "legacy-user-test"), { forceUnique: true });
