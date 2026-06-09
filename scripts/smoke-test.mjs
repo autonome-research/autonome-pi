@@ -174,6 +174,8 @@ try {
     const missionPlanningPolicies = await import(pathToFileURL(join(root, 'mission-workflow/src/planning/policies.ts')).href);
     const missionPlanningExternal = await import(pathToFileURL(join(root, 'mission-workflow/src/planning/external-services.ts')).href);
     const missionValidationCategories = await import(pathToFileURL(join(root, 'mission-workflow/src/validation/categories.ts')).href);
+    const missionRegistryPaths = await import(pathToFileURL(join(root, 'mission-workflow/src/registry/paths.ts')).href);
+    const missionRegistryState = await import(pathToFileURL(join(root, 'mission-workflow/src/registry/state.ts')).href);
     log(missionCoreTime.parseMillis('2m', 1) === 120000 && missionCoreTime.parseMillis('250ms', 1) === 250 && missionCoreTime.parseMillis('bad', 42) === 42, 'mission core parseMillis handles units and fallback');
     const hasUnpairedSurrogate = (value) => {
       for (let i = 0; i < value.length; i++) {
@@ -217,6 +219,48 @@ try {
     try { missionValidationCategories.normalizeValidationCategories({ validationCategories: [null] }); } catch { malformedCategoryThrows = true; }
     const normalizedCategories = missionValidationCategories.normalizeValidationCategories({ completionTarget: 'contract_validated', validationCategories: [{ id: 'manual', category: 'scrutiny', commands: ['npm run check'] }], validationCommands: ['npm run check', 'npm run lint'], userTestCommand: 'npm run e2e', externalServices: [{ id: 'api', healthCommand: 'npm run health', credentialEnv: ['API_KEY'], skipPolicy: 'explicit_skip_allowed' }], deliverables: { runtimeArtifacts: [{ path: 'var/health.json', requiredFor: ['operationally_ready'] }] } }, { includeImplicitAdversarial: true });
     log(singleCategory.id === 'behavior-1' && singleCategory.adapter === 'command' && singleCategory.commands[0] === 'npm test' && singleCategory.timeoutMs === 123 && badCategoryThrows && malformedCategoryThrows && normalizedCategories.some((item) => item.id === 'manual') && normalizedCategories.some((item) => item.id === 'validation-command-002' && item.commands[0] === 'npm run lint') && !normalizedCategories.some((item) => item.id === 'validation-command-001') && normalizedCategories.some((item) => item.id === 'user-test-command' && item.userTest === true) && normalizedCategories.some((item) => item.id === 'external-api-health' && item.generatedFrom === 'externalServices.healthCommand') && normalizedCategories.some((item) => item.id === 'deliverable-runtime-var-health.json') && normalizedCategories.some((item) => item.id === 'adversarial-scrutiny' && item.adversarial === true), 'mission validation category normalizers preserve explicit legacy generated and adversarial categories');
+    const registryRoot = join(tmp, 'typed-registry-root');
+    const registryPlan = { missionId: 'Typed Registry Smoke!', goal: 'registry smoke', cwd: '/repo', completionTarget: 'operationally_ready', rolePolicy: { worker: { model: 'worker-model' } }, promptPolicy: { workerPromptVersion: 'worker/custom' }, modelPlan: 'planner-model' };
+    const registryPath = missionRegistryPaths.registryStatePath(registryPlan.missionId, registryRoot);
+    const registryRootFromHome = missionRegistryPaths.registryRoot(join(tmp, 'typed-home'));
+    const dotRegistryPath = missionRegistryPaths.registryStatePath('.', registryRoot);
+    const dotDotRegistryPath = missionRegistryPaths.registryStatePath('..', registryRoot);
+    const spacedDotRegistryPath = missionRegistryPaths.registryStatePath(' . ', registryRoot);
+    const prefixedDotRegistryPath = missionRegistryPaths.registryStatePath('../feature', registryRoot);
+    const ellipsisRegistryPath = missionRegistryPaths.registryStatePath('...', registryRoot);
+    const defaultRegistry = missionRegistryState.defaultRegistryState(registryPlan, { planPath: '/tmp/plan.json', trustedHead: 'abc123' });
+    const writtenRegistry = missionRegistryState.writeRegistryState(registryPlan, defaultRegistry, registryRoot);
+    const updatedRegistry = missionRegistryState.updateRegistryState(registryPlan, (state) => ({ ...state, status: 'running', completedFeatures: ['f1'] }), registryRoot);
+    let voidUpdaterThrows = false;
+    try { missionRegistryState.updateRegistryState(registryPlan, (state) => { state.status = 'cancelled'; }, registryRoot); } catch { voidUpdaterThrows = true; }
+    const stateAfterVoidUpdater = JSON.parse(readFileSync(registryPath, 'utf8'));
+    let arrayUpdaterThrows = false;
+    try { missionRegistryState.updateRegistryState(registryPlan, () => [], registryRoot); } catch { arrayUpdaterThrows = true; }
+    let promiseUpdaterThrows = false;
+    try { missionRegistryState.updateRegistryState(registryPlan, (state) => Promise.resolve(state), registryRoot); } catch { promiseUpdaterThrows = true; }
+    const returnedNestedRegistry = missionRegistryState.updateRegistryState(registryPlan, (state) => { state.completedFeatures.push('returned-nested'); return state; }, registryRoot);
+    const corruptPlan = { ...registryPlan, missionId: 'corrupt-registry-smoke' };
+    mkdirSync(missionRegistryPaths.registryDirFor(corruptPlan.missionId, registryRoot), { recursive: true });
+    const corruptStatePath = missionRegistryPaths.registryStatePath(corruptPlan.missionId, registryRoot);
+    writeFileSync(corruptStatePath, '{not json', 'utf8');
+    const repairedCorruptRegistry = missionRegistryState.updateRegistryState(corruptPlan, (state) => ({ ...state, status: 'running' }), registryRoot);
+    const malformedPlan = { ...registryPlan, missionId: 'malformed-registry-smoke' };
+    mkdirSync(missionRegistryPaths.registryDirFor(malformedPlan.missionId, registryRoot), { recursive: true });
+    const malformedStatePath = missionRegistryPaths.registryStatePath(malformedPlan.missionId, registryRoot);
+    writeFileSync(malformedStatePath, 'null', 'utf8');
+    const repairedMalformedRegistry = missionRegistryState.updateRegistryState(malformedPlan, (state) => ({ ...state, status: 'running' }), registryRoot);
+    const partialPlan = { ...registryPlan, missionId: 'partial-registry-smoke' };
+    mkdirSync(missionRegistryPaths.registryDirFor(partialPlan.missionId, registryRoot), { recursive: true });
+    const partialStatePath = missionRegistryPaths.registryStatePath(partialPlan.missionId, registryRoot);
+    writeFileSync(partialStatePath, JSON.stringify({ missionId: partialPlan.missionId, goal: partialPlan.goal, status: 'running' }), 'utf8');
+    const repairedPartialRegistry = missionRegistryState.updateRegistryState(partialPlan, (state) => ({ ...state, status: 'completed' }), registryRoot);
+    const operatorDxPathPlan = { ...registryPlan, missionId: 'operator-dx-path-smoke' };
+    mkdirSync(missionRegistryPaths.registryDirFor(operatorDxPathPlan.missionId, registryRoot), { recursive: true });
+    writeFileSync(missionRegistryPaths.registryStatePath(operatorDxPathPlan.missionId, registryRoot), JSON.stringify({ missionId: operatorDxPathPlan.missionId, goal: operatorDxPathPlan.goal, status: 'running', operatorDx: { sharedMissionNotesPath: '/tmp/notes.json', externalChecksSkipped: [] } }), 'utf8');
+    const operatorDxPathRegistry = missionRegistryState.updateRegistryState(operatorDxPathPlan, (state) => ({ ...state, status: 'completed' }), registryRoot);
+    const mergedRegistry = missionRegistryState.mergePersistedRegistryState(registryPlan, { schema: 'old', status: 'failed', completion: { level: 'code_complete', target: 'contract_validated', categoryResults: ['old'], blockedBy: [] }, repairHistory: ['repair'], operatorDx: { sharedMissionNotesPath: '/tmp/notes.json' }, sharedMissionNotes: { broadcastNotes: ['note'] } }, '/tmp/plan2.json');
+    const malformedMergedRegistry = missionRegistryState.mergePersistedRegistryState(registryPlan, { completion: { categoryResults: 'bad', blockedBy: {} }, completedFeatures: {}, trustedCommits: 'bad', validationReports: {}, coverageReports: null, operatorDx: { externalChecksSkipped: {}, entrypointsVerified: 'bad', sharedMissionNotesPath: '/tmp/notes.json' }, sharedMissionNotes: { broadcastNotes: 'bad', assumptions: {} } });
+    log(registryPath.endsWith('Typed-Registry-Smoke/state.json') && registryRootFromHome === join(tmp, 'typed-home', '.pi', 'agent', 'mission-workflow', 'registry') && dotRegistryPath === resolve(registryRoot, 'mission', 'state.json') && dotDotRegistryPath === resolve(registryRoot, 'mission', 'state.json') && spacedDotRegistryPath === resolve(registryRoot, 'mission', 'state.json') && prefixedDotRegistryPath === resolve(registryRoot, '..-feature', 'state.json') && ellipsisRegistryPath === resolve(registryRoot, '...', 'state.json') && existsSync(writtenRegistry.statePath) && updatedRegistry.state.status === 'running' && updatedRegistry.state.completedFeatures[0] === 'f1' && voidUpdaterThrows && stateAfterVoidUpdater.status === 'running' && arrayUpdaterThrows && promiseUpdaterThrows && returnedNestedRegistry.state.completedFeatures.includes('returned-nested') && repairedCorruptRegistry.state.status === 'running' && repairedMalformedRegistry.state.schema === 'pi-mission-workflow/registry/v1' && repairedPartialRegistry.state.status === 'completed' && repairedPartialRegistry.state.timestamps?.updatedAt && repairedPartialRegistry.state.completion?.categoryResults && operatorDxPathRegistry.state.operatorDx.sharedMissionNotesPath === '/tmp/notes.json' && JSON.parse(readFileSync(corruptStatePath, 'utf8')).status === 'running' && defaultRegistry.completion.target === 'operationally_ready' && defaultRegistry.roleModels.worker === 'worker-model' && defaultRegistry.promptVersions.workerPromptVersion === 'worker/custom' && mergedRegistry.schema === 'pi-mission-workflow/registry/v1' && mergedRegistry.status === 'failed' && mergedRegistry.completion.categoryResults[0] === 'old' && mergedRegistry.repairHistory[0] === 'repair' && mergedRegistry.operatorDx.sharedMissionNotesPath === '/tmp/notes.json' && mergedRegistry.sharedMissionNotes.broadcastNotes[0] === 'note' && Array.isArray(malformedMergedRegistry.completedFeatures) && Array.isArray(malformedMergedRegistry.trustedCommits) && Array.isArray(malformedMergedRegistry.validationReports) && Array.isArray(malformedMergedRegistry.coverageReports) && Array.isArray(malformedMergedRegistry.completion.categoryResults) && Array.isArray(malformedMergedRegistry.completion.blockedBy) && Array.isArray(malformedMergedRegistry.operatorDx.externalChecksSkipped) && Array.isArray(malformedMergedRegistry.operatorDx.entrypointsVerified) && malformedMergedRegistry.operatorDx.sharedMissionNotesPath === '/tmp/notes.json' && Array.isArray(malformedMergedRegistry.sharedMissionNotes.broadcastNotes) && Array.isArray(malformedMergedRegistry.sharedMissionNotes.assumptions), 'mission registry typed helpers preserve paths defaults writes updates corrupt-state and merge semantics');
   } catch (error) {
     const code = error?.code || error?.message || String(error);
     log(code === 'ERR_UNKNOWN_FILE_EXTENSION', 'mission wrapper helper tests skipped only when Node lacks TypeScript module loading', String(code));

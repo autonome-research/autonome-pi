@@ -135,11 +135,33 @@ The module composes the typed completion, deliverables, and external-service nor
 
 Post-commit review of `f2d32bc` found malformed `null` category entries were being silently normalized by the typed helper. The current working tree fixes that by rejecting null/non-object category entries with a clear error before these helpers are wired into runtime call sites.
 
+### 2026-06-09 — Typed registry path/default-state foundation
+
+Implemented in current working tree.
+
+Added typed registry modules:
+
+- `mission-workflow/src/registry/paths.ts`
+- `mission-workflow/src/registry/types.ts`
+- `mission-workflow/src/registry/state.ts`
+
+Covered helpers:
+
+- `registryRoot()`
+- `registryDirFor()`
+- `registryStatePath()`
+- `defaultRegistryState()`
+- `writeRegistryState()`
+- `updateRegistryState()`
+- `mergePersistedRegistryState()`
+
+Smoke coverage checks safe registry paths, default completion/role/prompt fields, write/update behavior in an isolated temp registry root, current monolith-compatible fallback for corrupt state JSON, explicit return-only updater semantics, returned nested mutations, schema repair during persisted-state merge, malformed nested array/object field repair for completion/operatorDx/sharedMissionNotes and report arrays, preservation of scalar operator DX fields such as `sharedMissionNotesPath`, and merge preservation for existing completion/repair/shared-note state. Unlike the monolith's accidental shallow-copy behavior, the typed `updateRegistryState()` passes a cloned draft and requires callers to return the intended next state object.
+
 ## Active / next component
 
-### Registry and trust model foundation
+### Registry and trust model continuation
 
-Goal: begin extracting registry path/default-state/trust helper types and pure path/default functions from `mission-workflow/bin/mission-workflow.mjs` while keeping runtime behavior stable.
+Goal: continue extracting trusted checkpoint, validation cursor, plan fingerprint, and feature fingerprint helpers from `mission-workflow/bin/mission-workflow.mjs` while keeping runtime behavior stable.
 
 ## Refactor roadmap
 
