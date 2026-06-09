@@ -141,10 +141,23 @@ try {
   expectExit('mission smoke repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: missionRepo });
   writeFileSync(join(missionRepo, 'README.md'), 'hello\n');
   expectExit('mission smoke repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: missionRepo });
-  const missionPlan = expectExit('mission workflow mock plan succeeds', ['node', missionCli, 'plan', '--planner', 'mock', '--goal', 'No-op smoke mission', '--cwd', missionRepo], 0);
+  const missionPlan = expectExit('mission workflow mock plan succeeds', ['node', missionCli, 'plan', '--planner', 'mock', '--goal', 'No-op smoke mission', '--validation-command', 'true', '--user-test-command', 'true', '--cwd', missionRepo], 0);
   let missionPlanDetails;
   try { missionPlanDetails = JSON.parse(missionPlan.stdout); } catch { missionPlanDetails = undefined; }
   log(Boolean(missionPlanDetails?.planPath), 'mission workflow plan emits planPath');
+  const normalizedMissionPlan = missionPlanDetails?.planPath ? JSON.parse(readFileSync(missionPlanDetails.planPath, 'utf8')) : undefined;
+  log(normalizedMissionPlan?.completionTarget === 'contract_validated', 'mission workflow normalizes default completionTarget to contract_validated');
+  log(Array.isArray(normalizedMissionPlan?.validationCategories) && normalizedMissionPlan.validationCategories.some((item) => item.category === 'scrutiny' && item.commands?.includes('true') && item.requiredFor?.includes('contract_validated')) && normalizedMissionPlan.validationCategories.some((item) => item.category === 'behavior' && item.userTest === true && item.adapter === 'command'), 'mission workflow maps legacy validationCommands/userTestCommand to validation categories');
+
+  const fakePlannerNoCommands = join(tmp, 'fake-pi-planner-no-commands.mjs');
+  writeFileSync(fakePlannerNoCommands, `#!/usr/bin/env node\nconst plan = { missionId: 'planner-no-commands-smoke', goal: 'Planner no commands', maxRepairIterations: 1, validationCommands: [], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }], validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] } };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-planner', usage: { input_tokens: 1, output_tokens: 1 }, content: [{ type: 'text', text: JSON.stringify(plan) }] } }));\n`);
+  expectExit('fake pi planner no commands is executable', ['chmod', '+x', fakePlannerNoCommands], 0);
+  const plannerNoCommands = expectExit('mission workflow planner output overrides cli validation commands', ['node', missionCli, 'plan', '--planner', 'pi', '--goal', 'Planner no commands', '--validation-command', 'false', '--cwd', missionRepo], 0, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePlannerNoCommands }, timeout: 60_000 });
+  let plannerNoCommandsDetails;
+  try { plannerNoCommandsDetails = JSON.parse(plannerNoCommands.stdout); } catch { plannerNoCommandsDetails = undefined; }
+  const plannerNoCommandsPlan = plannerNoCommandsDetails?.planPath ? JSON.parse(readFileSync(plannerNoCommandsDetails.planPath, 'utf8')) : undefined;
+  log(Array.isArray(plannerNoCommandsPlan?.validationCommands) && plannerNoCommandsPlan.validationCommands.length === 0 && Array.isArray(plannerNoCommandsPlan.validationCategories) && plannerNoCommandsPlan.validationCategories.length === 0, 'mission workflow does not preserve fallback validation categories when planner returns empty validationCommands');
+
   const missionActivate = missionPlanDetails?.planPath
     ? expectExit('mission workflow mock activate succeeds', ['node', missionCli, 'activate', '--approved', '--plan-path', missionPlanDetails.planPath, '--cwd', missionRepo], 0)
     : undefined;
@@ -154,7 +167,202 @@ try {
   log(Boolean(missionActivateDetails?.registryPath) && existsSync(missionActivateDetails.registryPath), 'mission workflow activation creates durable registry');
   const registryState = missionActivateDetails?.registryPath ? JSON.parse(readFileSync(missionActivateDetails.registryPath, 'utf8')) : undefined;
   log(registryState?.status === 'completed' && Array.isArray(registryState.completedFeatures), 'mission workflow registry records completed state');
+  log(registryState?.completion?.target === 'contract_validated' && Array.isArray(registryState.completion?.categoryResults) && registryState?.promptVersions?.workerPromptVersion && Array.isArray(registryState?.failureHistory), 'mission workflow registry initializes additive completion/prompt/failure defaults');
+  log(!registryState?.completion?.categoryResults?.some((item) => /-2$/.test(String(item.id || ''))), 'mission workflow normalization avoids duplicate legacy category ids after activation');
   log(Boolean(missionActivateDetails?.finalCoveragePath) && existsSync(missionActivateDetails.finalCoveragePath), 'mission workflow writes final coverage report');
+  const statusByMissionId = registryState?.missionId ? expectExit('mission workflow status accepts mission-id without plan path', ['node', missionCli, 'status', '--mission-id', registryState.missionId, '--cwd', missionRepo], 0) : undefined;
+  let statusByMissionIdDetails;
+  try { statusByMissionIdDetails = statusByMissionId?.stdout ? JSON.parse(statusByMissionId.stdout) : undefined; } catch { statusByMissionIdDetails = undefined; }
+  log(statusByMissionIdDetails?.missionId === registryState?.missionId && statusByMissionIdDetails?.registryStatus === 'completed', 'mission workflow status reports registry by mission-id');
+
+  const operationalRepo = join(tmp, 'operational-target-repo');
+  mkdirSync(operationalRepo, { recursive: true });
+  expectExit('operational target repo git init', ['git', 'init', '-q'], 0, { cwd: operationalRepo });
+  expectExit('operational target repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: operationalRepo });
+  expectExit('operational target repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: operationalRepo });
+  writeFileSync(join(operationalRepo, 'README.md'), 'operational target\n');
+  expectExit('operational target repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: operationalRepo });
+  const operationalPlanPath = join(tmp, 'operational-target-plan.json');
+  writeFileSync(operationalPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'operational-target-smoke', goal: 'operational target smoke', cwd: operationalRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'operationally_ready', validationCommands: [], validationCategories: [{ id: 'health-check', category: 'operational', title: 'Health check', requiredFor: ['operationally_ready'] }],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow does not complete operational target when required category is skipped', ['node', missionCli, 'activate', '--approved', '--plan-path', operationalPlanPath, '--cwd', operationalRepo], 1);
+
+  const operationalPassRepo = join(tmp, 'operational-pass-repo');
+  mkdirSync(operationalPassRepo, { recursive: true });
+  expectExit('operational pass repo git init', ['git', 'init', '-q'], 0, { cwd: operationalPassRepo });
+  expectExit('operational pass repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: operationalPassRepo });
+  expectExit('operational pass repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: operationalPassRepo });
+  writeFileSync(join(operationalPassRepo, 'README.md'), 'operational pass\n');
+  expectExit('operational pass repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: operationalPassRepo });
+  const operationalPassPlanPath = join(tmp, 'operational-pass-plan.json');
+  writeFileSync(operationalPassPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'operational-pass-smoke', goal: 'operational pass smoke', cwd: operationalPassRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'operationally_ready', validationCommands: ['true'], validationCategories: [{ id: 'health-check', category: 'operational', title: 'Health check', commands: ['true'], requiredFor: ['operationally_ready'] }],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  const operationalPass = expectExit('mission workflow satisfies explicit operational category command', ['node', missionCli, 'activate', '--approved', '--plan-path', operationalPassPlanPath, '--cwd', operationalPassRepo], 0);
+  let operationalPassDetails;
+  try { operationalPassDetails = JSON.parse(operationalPass.stdout); } catch { operationalPassDetails = undefined; }
+  const operationalPassRegistry = operationalPassDetails?.registryPath ? JSON.parse(readFileSync(operationalPassDetails.registryPath, 'utf8')) : undefined;
+  log(operationalPassRegistry?.completion?.level === 'operationally_ready' && operationalPassRegistry.completion.categoryResults?.some((item) => item.id === 'health-check' && item.status === 'pass'), 'mission workflow records achieved operational target from explicit category');
+
+  const artifactGateRepo = join(tmp, 'artifact-gate-repo');
+  mkdirSync(artifactGateRepo, { recursive: true });
+  expectExit('artifact gate repo git init', ['git', 'init', '-q'], 0, { cwd: artifactGateRepo });
+  expectExit('artifact gate repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: artifactGateRepo });
+  expectExit('artifact gate repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: artifactGateRepo });
+  writeFileSync(join(artifactGateRepo, 'README.md'), 'artifact gate\n');
+  expectExit('artifact gate repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: artifactGateRepo });
+  const missingArtifactPlanPath = join(tmp, 'missing-artifact-plan.json');
+  writeFileSync(missingArtifactPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'missing-artifact-smoke', goal: 'missing artifact smoke', cwd: artifactGateRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'operationally_ready', validationCategories: [{ id: 'artifact-check', category: 'operational', title: 'Artifact check', commands: ['true'], artifactsRequired: ['required-output.txt'], requiredFor: ['operationally_ready'] }],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow blocks missing required validation artifacts', ['node', missionCli, 'activate', '--approved', '--plan-path', missingArtifactPlanPath, '--cwd', artifactGateRepo], 1);
+  const credentialGatePlanPath = join(tmp, 'credential-gate-plan.json');
+  writeFileSync(credentialGatePlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'credential-gate-smoke', goal: 'credential gate smoke', cwd: artifactGateRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'operationally_ready', validationCategories: [{ id: 'credential-check', category: 'integration', title: 'Credential check', commands: ['true'], credentialGates: ['PI_MISSION_SMOKE_MISSING_CREDENTIAL'], requiredFor: ['operationally_ready'] }],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow blocks missing credential-gated validation category', ['node', missionCli, 'activate', '--approved', '--plan-path', credentialGatePlanPath, '--cwd', artifactGateRepo], 1, { env: { PI_MISSION_SMOKE_MISSING_CREDENTIAL: '' } });
+
+  const optionalCategoryRepo = join(tmp, 'optional-category-repo');
+  mkdirSync(optionalCategoryRepo, { recursive: true });
+  expectExit('optional category repo git init', ['git', 'init', '-q'], 0, { cwd: optionalCategoryRepo });
+  expectExit('optional category repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: optionalCategoryRepo });
+  expectExit('optional category repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: optionalCategoryRepo });
+  writeFileSync(join(optionalCategoryRepo, 'README.md'), 'optional category\n');
+  expectExit('optional category repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: optionalCategoryRepo });
+  const optionalCategoryPlanPath = join(tmp, 'optional-category-plan.json');
+  writeFileSync(optionalCategoryPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'optional-category-smoke', goal: 'optional category smoke', cwd: optionalCategoryRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'contract_validated', validationCommands: [], validationCategories: [{ id: 'optional-op-check', category: 'operational', title: 'Optional op check', commands: ['false'], requiredFor: ['operationally_ready'], skipPolicy: 'optional' }],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow ignores optional out-of-target failing category for contract target', ['node', missionCli, 'activate', '--approved', '--plan-path', optionalCategoryPlanPath, '--cwd', optionalCategoryRepo], 0);
+
+  const outOfTargetRepo = join(tmp, 'out-of-target-category-repo');
+  mkdirSync(outOfTargetRepo, { recursive: true });
+  expectExit('out-of-target category repo git init', ['git', 'init', '-q'], 0, { cwd: outOfTargetRepo });
+  expectExit('out-of-target category repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: outOfTargetRepo });
+  expectExit('out-of-target category repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: outOfTargetRepo });
+  writeFileSync(join(outOfTargetRepo, 'README.md'), 'out of target category\n');
+  expectExit('out-of-target category repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: outOfTargetRepo });
+  const outOfTargetSentinel = join(tmp, 'out-of-target-sentinel');
+  const outOfTargetPlanPath = join(tmp, 'out-of-target-category-plan.json');
+  writeFileSync(outOfTargetPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'out-of-target-category-smoke', goal: 'out of target category smoke', cwd: outOfTargetRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'contract_validated', validationCategories: [{ id: 'deploy-sentinel', category: 'deployment', title: 'Deployment sentinel', commands: [`node -e "require('fs').writeFileSync(${JSON.stringify(outOfTargetSentinel)}, 'bad')"`], requiredFor: ['deployment_ready'] }],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow ignores out-of-target deployment command for contract target', ['node', missionCli, 'activate', '--approved', '--plan-path', outOfTargetPlanPath, '--cwd', outOfTargetRepo], 0);
+  log(!existsSync(outOfTargetSentinel), 'out-of-target deployment command was not executed');
+
+  const deploymentRejectRepo = join(tmp, 'deployment-reject-repo');
+  mkdirSync(deploymentRejectRepo, { recursive: true });
+  expectExit('deployment reject repo git init', ['git', 'init', '-q'], 0, { cwd: deploymentRejectRepo });
+  expectExit('deployment reject repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: deploymentRejectRepo });
+  expectExit('deployment reject repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: deploymentRejectRepo });
+  writeFileSync(join(deploymentRejectRepo, 'README.md'), 'deployment reject\n');
+  expectExit('deployment reject repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: deploymentRejectRepo });
+  const deploymentRejectPlanPath = join(tmp, 'deployment-reject-plan.json');
+  writeFileSync(deploymentRejectPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'deployment-reject-smoke', goal: 'deployment reject smoke', cwd: deploymentRejectRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'deployment_ready', validationCategories: [{ id: 'health-check', category: 'operational', title: 'Health check', commands: ['true'], requiredFor: ['operationally_ready'] }],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow rejects deployment target without deployment category', ['node', missionCli, 'activate', '--approved', '--plan-path', deploymentRejectPlanPath, '--cwd', deploymentRejectRepo], 1);
+
+  const invalidTargetPlanPath = join(tmp, 'invalid-completion-target-plan.json');
+  writeFileSync(invalidTargetPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'invalid-target-smoke', goal: 'invalid target smoke', cwd: deploymentRejectRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'deployment-ready', milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow rejects invalid completion target spelling', ['node', missionCli, 'activate', '--approved', '--plan-path', invalidTargetPlanPath, '--cwd', deploymentRejectRepo], 1);
+  const codeCompletePlanPath = join(tmp, 'code-complete-target-plan.json');
+  writeFileSync(codeCompletePlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'code-complete-target-smoke', goal: 'code complete target smoke', cwd: deploymentRejectRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'code_complete', milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow rejects unsupported code_complete activation target', ['node', missionCli, 'activate', '--approved', '--plan-path', codeCompletePlanPath, '--cwd', deploymentRejectRepo], 1);
+  const invalidCategoryPlanPath = join(tmp, 'invalid-validation-category-plan.json');
+  writeFileSync(invalidCategoryPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'invalid-validation-category-smoke', goal: 'invalid validation category smoke', cwd: deploymentRejectRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    validationCategories: [{ id: 'bad-category', category: 'ops', commands: ['true'] }], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow rejects unknown validation category enum', ['node', missionCli, 'activate', '--approved', '--plan-path', invalidCategoryPlanPath, '--cwd', deploymentRejectRepo], 1);
+  const invalidSkipPolicyPlanPath = join(tmp, 'invalid-skip-policy-plan.json');
+  writeFileSync(invalidSkipPolicyPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'invalid-skip-policy-smoke', goal: 'invalid skip policy smoke', cwd: deploymentRejectRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    validationCategories: [{ id: 'bad-skip', category: 'scrutiny', commands: ['true'], skipPolicy: 'skip_if_missing' }], milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow rejects unknown validation skipPolicy enum', ['node', missionCli, 'activate', '--approved', '--plan-path', invalidSkipPolicyPlanPath, '--cwd', deploymentRejectRepo], 1);
+
+  const collisionRepo = join(tmp, 'validation-id-collision-repo');
+  mkdirSync(collisionRepo, { recursive: true });
+  expectExit('validation id collision repo git init', ['git', 'init', '-q'], 0, { cwd: collisionRepo });
+  expectExit('validation id collision repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: collisionRepo });
+  expectExit('validation id collision repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: collisionRepo });
+  writeFileSync(join(collisionRepo, 'README.md'), 'validation id collision\n');
+  expectExit('validation id collision repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: collisionRepo });
+  const collisionPlanPath = join(tmp, 'validation-id-collision-plan.json');
+  writeFileSync(collisionPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'validation-id-collision-smoke', goal: 'validation id collision smoke', cwd: collisionRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    validationCommands: ['false'], validationCategories: [{ id: 'validation-command-001', category: 'scrutiny', title: 'Shadow attempt', commands: ['true'], requiredFor: ['contract_validated'] }],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow still runs explicit validation command despite category id collision', ['node', missionCli, 'activate', '--approved', '--plan-path', collisionPlanPath, '--cwd', collisionRepo], 1);
+  const duplicateCategoryPlanPath = join(tmp, 'duplicate-category-id-plan.json');
+  writeFileSync(duplicateCategoryPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'duplicate-category-id-smoke', goal: 'duplicate category id smoke', cwd: collisionRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    validationCategories: [{ id: 'dup', category: 'scrutiny', commands: ['true'] }, { id: 'dup', category: 'scrutiny', commands: ['false'] }],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow rejects duplicate explicit validation category ids', ['node', missionCli, 'activate', '--approved', '--plan-path', duplicateCategoryPlanPath, '--cwd', collisionRepo], 1);
+
+  const explicitSkipPlanPath = join(tmp, 'explicit-skip-without-artifact-plan.json');
+  writeFileSync(explicitSkipPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'explicit-skip-without-artifact-smoke', goal: 'explicit skip without artifact smoke', cwd: collisionRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'operationally_ready', validationCategories: [{ id: 'manual-skip', category: 'operational', requiredFor: ['operationally_ready'], skipPolicy: 'explicit_skip_allowed' }],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow blocks explicit skip without validated skip artifact', ['node', missionCli, 'activate', '--approved', '--plan-path', explicitSkipPlanPath, '--cwd', collisionRepo], 1);
+
+  const unsupportedAdversarialRepo = join(tmp, 'unsupported-adversarial-repo');
+  mkdirSync(unsupportedAdversarialRepo, { recursive: true });
+  expectExit('unsupported adversarial repo git init', ['git', 'init', '-q'], 0, { cwd: unsupportedAdversarialRepo });
+  expectExit('unsupported adversarial repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: unsupportedAdversarialRepo });
+  expectExit('unsupported adversarial repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: unsupportedAdversarialRepo });
+  writeFileSync(join(unsupportedAdversarialRepo, 'README.md'), 'unsupported adversarial\n');
+  expectExit('unsupported adversarial repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: unsupportedAdversarialRepo });
+  const unsupportedAdversarialPlanPath = join(tmp, 'unsupported-adversarial-plan.json');
+  writeFileSync(unsupportedAdversarialPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'unsupported-adversarial-smoke', goal: 'unsupported adversarial smoke', cwd: unsupportedAdversarialRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'operationally_ready', validationCategories: [{ id: 'domain-critic', category: 'domain', title: 'Domain critic', adversarial: true, modelRole: 'domainCritic', requiredFor: ['operationally_ready'] }],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow rejects unsupported required adversarial categories', ['node', missionCli, 'activate', '--approved', '--plan-path', unsupportedAdversarialPlanPath, '--cwd', unsupportedAdversarialRepo], 1);
+
   const missionResume = missionPlanDetails?.planPath
     ? expectExit('mission workflow rejects resume after completed mission', ['node', missionCli, 'resume', '--approved', '--plan-path', missionPlanDetails.planPath, '--cwd', missionRepo], 1)
     : undefined;
@@ -177,7 +385,7 @@ try {
   const fakePiLarge = join(tmp, 'fake-pi-large-jsonl.mjs');
   writeFileSync(fakePiLarge, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nmkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\nwriteFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, changedFiles: [], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'ok' }));\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: true, summary: 'x'.repeat(300000), objections: [], assertionResults: [{ assertionId: 'a1', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-large', usage: { input_tokens: 1, output_tokens: 1 }, content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
   expectExit('fake pi large JSONL is executable', ['chmod', '+x', fakePiLarge], 0);
-  expectExit('mission workflow handles large Pi JSONL records', ['node', missionCli, 'activate', '--approved', '--plan-path', largePlanPath, '--cwd', largeRepo], 0, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiLarge }, timeout: 60_000 });
+  expectExit('mission workflow preserves legacy plan compatibility while handling large Pi JSONL records', ['node', missionCli, 'activate', '--approved', '--plan-path', largePlanPath, '--cwd', largeRepo], 0, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiLarge }, timeout: 60_000 });
 
   const unsafeRepo = join(tmp, 'unsafe-assertion-repo');
   mkdirSync(unsafeRepo, { recursive: true });

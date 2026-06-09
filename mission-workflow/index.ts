@@ -74,9 +74,11 @@ function buildArgs(params: Record<string, any>, ctx: any): string[] {
 	const args = [String(params.action || "plan"), "--cwd", params.cwd];
 	if (params.goal) args.push("--goal", params.goal);
 	if (params.planPath) args.push("--plan-path", params.planPath);
+	if (params.missionId) args.push("--mission-id", params.missionId);
 	if (params.approved) args.push("--approved");
 	if (params.background) args.push("--background");
 	if (params.planner) args.push("--planner", params.planner);
+	if (params.completionTarget) args.push("--completion-target", params.completionTarget);
 	if (params.modelPlan) args.push("--model-plan", params.modelPlan);
 	if (params.modelWorker) args.push("--model-worker", params.modelWorker);
 	if (params.modelValidator) args.push("--model-validator", params.modelValidator);
@@ -149,10 +151,12 @@ export default function missionWorkflow(pi: ExtensionAPI) {
 			action: Type.Optional(StringEnum(["plan", "activate", "resume", "status"] as const, { default: "plan" })),
 			goal: Type.Optional(Type.String({ description: "Mission goal. Required for action=plan." })),
 			cwd: Type.Optional(Type.String({ description: "Repository directory. Defaults to Pi's active cwd." })),
-			planPath: Type.Optional(Type.String({ description: "Path to an approved mission-plan.json for action=activate." })),
+			planPath: Type.Optional(Type.String({ description: "Path to an approved mission-plan.json for action=activate, resume, or status." })),
+			missionId: Type.Optional(Type.String({ description: "Mission id for action=status when no planPath is available." })),
 			approved: Type.Optional(Type.Boolean({ description: "Required true for action=activate; means the user approved the plan." })),
 			background: Type.Optional(Type.Boolean({ description: "Start activation in the background and return immediately." })),
 			planner: Type.Optional(StringEnum(["pi", "mock"] as const, { default: "pi", description: "Use pi planner/agents or deterministic mock planner for testing." })),
+			completionTarget: Type.Optional(StringEnum(["contract_validated", "operationally_ready", "deployment_ready"] as const, { default: "contract_validated", description: "Requested completion level for planned missions. Higher targets require corresponding validation categories in the approved plan." })),
 			validationCommands: Type.Optional(Type.Array(Type.String(), { description: "Scrutiny validation commands run after each milestone." })),
 			userTestCommand: Type.Optional(Type.String({ description: "Command-based user-testing validator, e.g. npm run test:e2e." })),
 			maxRepairIterations: Type.Optional(Type.Number({ description: "Max milestone repair iterations. Default 10." })),

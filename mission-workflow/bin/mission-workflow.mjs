@@ -40,6 +40,35 @@ const DEFAULT_WATCHDOG_STALE_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_WA
 const TERMINATION_GRACE_MS = parseMillis(process.env.PI_MISSION_WORKFLOW_TERMINATION_GRACE_MS, 5000);
 const ACTIVE_IO_INTERVAL_MS = parseMillis(process.env.PI_THREAD_PHASE_ACTIVE_IO_INTERVAL_MS, 5000);
 
+const COMPLETION_LEVELS = ["code_complete", "contract_validated", "operationally_ready", "deployment_ready"];
+const DEFAULT_COMPLETION_TARGET = "contract_validated";
+const VALIDATION_CATEGORIES = ["scrutiny", "behavior", "operational", "integration", "domain", "deployment"];
+const VALIDATION_SCOPES = ["feature", "milestone", "final"];
+const VALIDATION_SKIP_POLICIES = ["fail_when_skipped", "explicit_skip_allowed", "optional"];
+const BEHAVIOR_ADAPTERS = ["command", "http_flow", "browser_computer_use", "service_lifecycle", "workflow_replay"];
+const FAILURE_CLASSES = [
+  "implementation_bug", "missing_acceptance_test", "bad_plan_decomposition", "ambiguous_spec", "operational_gap",
+  "external_dependency_unavailable", "credential_missing", "validator_false_positive", "model_or_handoff_failure",
+  "runner_git_worktree_failure", "runner_lifecycle_failure", "capability_policy_block", "unknown",
+];
+const PLANNING_CLARIFICATION_SCHEMA = "pi-mission-workflow/planning-clarification/v1";
+const DEFAULT_PROMPT_POLICY = Object.freeze({
+  plannerPromptVersion: "mission-planner/v2",
+  workerPromptVersion: "mission-worker/v3",
+  validatorPromptVersion: "mission-validator/v3",
+  repairPlannerPromptVersion: "mission-repair-planner/v1",
+  handoffSchema: "pi-mission-worker-handoff/v3",
+  validationReportSchema: "pi-mission-workflow/milestone-validation/v2",
+});
+const DEFAULT_CAPABILITY_POLICY = Object.freeze({
+  network: "allowed_for_validation",
+  secrets: "env_only_redacted",
+  destructiveGit: false,
+  deployment: false,
+  liveExternalActions: false,
+  maxCommandTimeoutMs: DEFAULT_COMMAND_TIMEOUT_MS,
+});
+
 async function loadThreadPhaseCore() {
   try { return await import("@autonome-research/thread-phase"); }
   catch {
@@ -320,6 +349,190 @@ function readJsonFile(file, fallback = undefined) {
   catch { return fallback; }
 }
 
+function normalizeFailureClass(value, fallback = "unknown") {
+  const text = String(value || "").trim();
+  return FAILURE_CLASSES.includes(text) ? text : fallback;
+}
+
+function classifyCaughtError(error) {
+  const text = String(error?.message || error || "").toLowerCase();
+  if (!text) return "unknown";
+  if (/credential|secret|env var|environment variable/.test(text)) return "credential_missing";
+  if (/capability|policy|destructive|live external/.test(text)) return "capability_policy_block";
+  if (/coverage gap|missing acceptance/.test(text)) return "missing_acceptance_test";
+  if (/validator|handoff|malformed json|strict json/.test(text)) return "model_or_handoff_failure";
+  if (/git|worktree|branch|merge|commit|checkout|dirty|contaminated/.test(text)) return "runner_git_worktree_failure";
+  if (/timeout|cancel|abort|process|spawn|registry|runner/.test(text)) return "runner_lifecycle_failure";
+  return "unknown";
+}
+
+function classifyValidationFailure(item = {}) {
+  const text = JSON.stringify(item || {}).toLowerCase();
+  if (/credential|missing env|environment variable|secret/.test(text)) return "credential_missing";
+  if (/external|network|endpoint|service unavailable|connection/.test(text)) return "external_dependency_unavailable";
+  if (/capability|policy|destructive|live external/.test(text)) return "capability_policy_block";
+  if (/validator agent failed|malformed json|handoff/.test(text)) return "model_or_handoff_failure";
+  if (/coverage gap|no planned\/executed feature|missing acceptance/.test(text)) return "missing_acceptance_test";
+  if (/ambiguous|under.?specified|unclear/.test(text)) return "ambiguous_spec";
+  if (/operational|runbook|health|startup|deploy/.test(text)) return "operational_gap";
+  return "implementation_bug";
+}
+
+function isPlanningClarificationArtifact(value) {
+  return Boolean(value && typeof value === "object" && (value.schema === PLANNING_CLARIFICATION_SCHEMA || value.planningStatus === "needs_clarification"));
+}
+
+function normalizeCompletionTarget(value, options = {}) {
+  if (value === undefined || value === null || value === "") return DEFAULT_COMPLETION_TARGET;
+  const target = String(value).trim();
+  if (COMPLETION_LEVELS.includes(target)) return target;
+  if (options.strict) throw new Error(`Unknown completion target: ${target}`);
+  return DEFAULT_COMPLETION_TARGET;
+}
+
+function completionLevelAtLeast(value, target) {
+  return COMPLETION_LEVELS.indexOf(normalizeCompletionTarget(value)) >= COMPLETION_LEVELS.indexOf(normalizeCompletionTarget(target));
+}
+
+function normalizeRequiredFor(value, fallback = [DEFAULT_COMPLETION_TARGET], options = {}) {
+  const list = Array.isArray(value) ? value : value ? [value] : fallback;
+  const normalized = [];
+  for (const item of list) {
+    if (item === undefined || item === null || item === "") continue;
+    const text = String(item).trim();
+    if (!COMPLETION_LEVELS.includes(text)) {
+      if (options.strict) throw new Error(`Unknown completion level in requiredFor: ${text}`);
+      normalized.push(DEFAULT_COMPLETION_TARGET);
+    } else normalized.push(text);
+  }
+  return Array.from(new Set(normalized.length ? normalized : fallback));
+}
+
+function normalizeCompletionLevels(value, target = DEFAULT_COMPLETION_TARGET) {
+  const targetIndex = COMPLETION_LEVELS.indexOf(normalizeCompletionTarget(target));
+  const raw = value && typeof value === "object" ? value : {};
+  const out = {};
+  COMPLETION_LEVELS.forEach((level, index) => {
+    const existing = raw[level] && typeof raw[level] === "object" ? raw[level] : {};
+    out[level] = { ...existing, required: typeof existing.required === "boolean" ? existing.required : index <= targetIndex };
+  });
+  return out;
+}
+
+function normalizeDeliverables(value = {}) {
+  const raw = value && typeof value === "object" ? value : {};
+  return {
+    entrypoints: Array.isArray(raw.entrypoints) ? raw.entrypoints : [],
+    runtimeArtifacts: Array.isArray(raw.runtimeArtifacts) ? raw.runtimeArtifacts : [],
+    runbooks: Array.isArray(raw.runbooks) ? raw.runbooks : [],
+  };
+}
+
+function normalizeRolePolicy(value = {}, models = {}) {
+  const raw = value && typeof value === "object" ? value : {};
+  const role = (name, defaults = {}) => ({ ...(defaults || {}), ...(raw[name] && typeof raw[name] === "object" ? raw[name] : {}) });
+  const out = {
+    planner: role("planner", { profile: "high_reasoning" }),
+    worker: role("worker", { profile: "code_fluent" }),
+    validator: role("validator", { profile: "adversarial_precise" }),
+    domainCritic: role("domainCritic", { profile: "domain_specialist", enabled: false }),
+    opsCritic: role("opsCritic", { profile: "sre_operational", enabled: false }),
+  };
+  if (models.modelPlan) out.planner.model = String(models.modelPlan);
+  if (models.modelWorker) out.worker.model = String(models.modelWorker);
+  if (models.modelValidator) out.validator.model = String(models.modelValidator);
+  if (models.modelDomain) out.domainCritic.model = String(models.modelDomain);
+  if (models.modelOps) out.opsCritic.model = String(models.modelOps);
+  return out;
+}
+
+function normalizeCapabilityPolicy(value = {}) {
+  const raw = value && typeof value === "object" ? value : {};
+  const maxCommandTimeoutMs = Number(raw.maxCommandTimeoutMs || DEFAULT_CAPABILITY_POLICY.maxCommandTimeoutMs);
+  return { ...DEFAULT_CAPABILITY_POLICY, ...raw, maxCommandTimeoutMs: Number.isFinite(maxCommandTimeoutMs) && maxCommandTimeoutMs > 0 ? maxCommandTimeoutMs : DEFAULT_CAPABILITY_POLICY.maxCommandTimeoutMs };
+}
+
+function normalizePromptPolicy(value = {}) {
+  const raw = value && typeof value === "object" ? value : {};
+  return { ...DEFAULT_PROMPT_POLICY, ...raw };
+}
+
+function normalizeExternalServices(value = []) {
+  return (Array.isArray(value) ? value : []).map((service, index) => ({
+    id: safeName(service?.id || service?.name || `external-service-${index + 1}`, `external-service-${index + 1}`),
+    purpose: String(service?.purpose || ""),
+    requiredFor: normalizeRequiredFor(service?.requiredFor, ["operationally_ready"], { strict: true }),
+    credentialEnv: Array.isArray(service?.credentialEnv) ? service.credentialEnv.map(String).filter(Boolean) : [],
+    healthCommand: service?.healthCommand ? String(service.healthCommand) : undefined,
+    smokeCommand: service?.smokeCommand ? String(service.smokeCommand) : undefined,
+    destructive: Boolean(service?.destructive),
+    liveExternalAction: Boolean(service?.liveExternalAction),
+  }));
+}
+
+function normalizeValidationCategory(raw = {}, index = 0, source = "plan") {
+  if (raw.category !== undefined && raw.category !== null && raw.category !== "" && !VALIDATION_CATEGORIES.includes(String(raw.category))) throw new Error(`Unknown validation category: ${raw.category}`);
+  if (raw.scope !== undefined && raw.scope !== null && raw.scope !== "" && !VALIDATION_SCOPES.includes(String(raw.scope))) throw new Error(`Unknown validation category scope: ${raw.scope}`);
+  if (raw.adapter !== undefined && raw.adapter !== null && raw.adapter !== "" && !BEHAVIOR_ADAPTERS.includes(String(raw.adapter))) throw new Error(`Unknown validation category adapter: ${raw.adapter}`);
+  const category = raw.category ? String(raw.category) : "scrutiny";
+  const commands = Array.isArray(raw.commands) ? raw.commands.map(String).filter(Boolean) : raw.command ? [String(raw.command)] : [];
+  const userTest = Boolean(raw.userTest);
+  const idFallback = source === "legacy-validation-command" ? `validation-command-${String(index + 1).padStart(3, "0")}` : source === "legacy-user-test" ? "user-test-command" : `${category}-${index + 1}`;
+  if (raw.skipPolicy !== undefined && raw.skipPolicy !== null && raw.skipPolicy !== "" && !VALIDATION_SKIP_POLICIES.includes(String(raw.skipPolicy))) throw new Error(`Unknown validation category skipPolicy: ${raw.skipPolicy}`);
+  const skipPolicy = raw.skipPolicy ? String(raw.skipPolicy) : "fail_when_skipped";
+  const scope = raw.scope ? String(raw.scope) : "milestone";
+  const adapter = raw.adapter || (category === "behavior" ? "command" : undefined);
+  return {
+    id: safeName(raw.id || idFallback, idFallback),
+    category,
+    title: String(raw.title || (userTest ? "Run user/behavior test command" : commands[0] ? `Run ${category} validation command` : `${category} validation`)),
+    scope,
+    requiredFor: normalizeRequiredFor(raw.requiredFor, [DEFAULT_COMPLETION_TARGET], { strict: true }),
+    commands,
+    userTest,
+    adversarial: Boolean(raw.adversarial),
+    modelRole: String(raw.modelRole || (category === "domain" ? "domainCritic" : ["operational", "deployment"].includes(category) ? "opsCritic" : "validator")),
+    credentialGates: Array.isArray(raw.credentialGates) ? raw.credentialGates.map(String).filter(Boolean) : [],
+    skipPolicy,
+    timeoutMs: raw.timeoutMs === undefined || raw.timeoutMs === null ? null : (() => { const n = Number(raw.timeoutMs); if (!Number.isFinite(n) || n <= 0) throw new Error(`validation category ${raw.id || idFallback} timeoutMs must be a positive finite number`); return n; })(),
+    artifactsRequired: Array.isArray(raw.artifactsRequired) ? raw.artifactsRequired.map(String).filter(Boolean) : [],
+    ...(adapter && BEHAVIOR_ADAPTERS.includes(String(adapter)) ? { adapter: String(adapter) } : {}),
+  };
+}
+
+function normalizeValidationCategories(plan = {}, options = {}) {
+  const categories = [];
+  const uniqueId = (id) => {
+    let candidate = String(id || "validation-category");
+    let suffix = 2;
+    while (categories.some((item) => item.id === candidate)) candidate = `${id}-${suffix++}`;
+    return candidate;
+  };
+  const add = (category, opts = {}) => {
+    let key = String(category.id || "");
+    if (!key) return;
+    if (categories.some((item) => item.id === key)) {
+      if (!opts.forceUnique) return;
+      key = uniqueId(key);
+      category = { ...category, id: key };
+    }
+    categories.push(category);
+  };
+  const hasEquivalentLegacyCommand = (command) => categories.some((category) => category.category === "scrutiny" && !category.userTest && !category.adversarial && category.scope === "milestone" && category.skipPolicy !== "optional" && (category.requiredFor || []).includes(DEFAULT_COMPLETION_TARGET) && (category.commands || []).length === 1 && category.commands[0] === command);
+  const hasEquivalentLegacyUserTest = (command) => categories.some((category) => category.category === "behavior" && category.userTest === true && !category.adversarial && category.scope === "milestone" && category.skipPolicy !== "optional" && (category.requiredFor || []).includes(DEFAULT_COMPLETION_TARGET) && (category.commands || []).length === 1 && category.commands[0] === command);
+  const explicitIds = new Set();
+  (Array.isArray(plan.validationCategories) ? plan.validationCategories : []).forEach((category, index) => {
+    const normalized = normalizeValidationCategory(category, index, "plan");
+    if (explicitIds.has(normalized.id)) throw new Error(`Duplicate validation category id: ${normalized.id}`);
+    explicitIds.add(normalized.id);
+    add(normalized);
+  });
+  (Array.isArray(plan.validationCommands) ? plan.validationCommands : []).map(String).filter(Boolean).forEach((command, index) => { if (!hasEquivalentLegacyCommand(command)) add(normalizeValidationCategory({ category: "scrutiny", title: `Validation command: ${command}`, commands: [command] }, index, "legacy-validation-command"), { forceUnique: true }); });
+  if (plan.userTestCommand && !hasEquivalentLegacyUserTest(String(plan.userTestCommand))) add(normalizeValidationCategory({ id: "user-test-command", category: "behavior", title: "User/behavior test command", commands: [String(plan.userTestCommand)], userTest: true, adapter: "command" }, 0, "legacy-user-test"), { forceUnique: true });
+  if (options.includeImplicitAdversarial && completionLevelAtLeast(plan.completionTarget, DEFAULT_COMPLETION_TARGET)) add(normalizeValidationCategory({ id: "adversarial-scrutiny", category: "scrutiny", title: "Adversarial contract scrutiny", commands: [], adversarial: true, requiredFor: [DEFAULT_COMPLETION_TARGET], modelRole: "validator" }, categories.length, "implicit-adversarial"));
+  return categories;
+}
+
 function registryDirFor(missionId) {
   return join(REGISTRY_ROOT, safeName(missionId, "mission"));
 }
@@ -330,6 +543,9 @@ function registryStatePath(missionId) {
 
 function defaultRegistryState(plan, patch = {}) {
   const now = new Date().toISOString();
+  const completionTarget = normalizeCompletionTarget(plan.completionTarget);
+  const rolePolicy = normalizeRolePolicy(plan.rolePolicy, { modelPlan: plan.modelPlan, modelWorker: plan.modelWorker, modelValidator: plan.modelValidator });
+  const promptPolicy = normalizePromptPolicy(plan.promptPolicy);
   return {
     schema: "pi-mission-workflow/registry/v1",
     missionId: plan.missionId,
@@ -341,7 +557,13 @@ function defaultRegistryState(plan, patch = {}) {
     worktree: patch.worktree,
     worktreeBaseDir: plan.worktreeBaseDir,
     current: {},
-    roleModels: { plan: plan.modelPlan, worker: plan.modelWorker, validator: plan.modelValidator },
+    completion: { target: completionTarget, level: "code_complete", categoryResults: [], blockedBy: [] },
+    roleModels: { plan: plan.modelPlan, planner: rolePolicy.planner.model || plan.modelPlan, worker: rolePolicy.worker.model || plan.modelWorker, validator: rolePolicy.validator.model || plan.modelValidator, domainCritic: rolePolicy.domainCritic.model, opsCritic: rolePolicy.opsCritic.model },
+    roleMetrics: {},
+    promptVersions: promptPolicy,
+    failureHistory: [],
+    repairHistory: [],
+    operatorDx: { entrypointsVerified: [], runbooksVerified: [], externalChecksSkipped: [] },
     completedFeatures: [],
     trustedBaseHead: patch.trustedBaseHead,
     trustedHead: patch.trustedHead,
@@ -384,7 +606,13 @@ function persistRegistryPlan(plan, planPath) {
     missionId: plan.missionId,
     goal: plan.goal,
     planPath: planPath ? resolve(planPath) : existing.planPath,
+    completion: { ...base.completion, ...(existing.completion || {}), target: normalizeCompletionTarget(existing.completion?.target || plan.completionTarget) },
     roleModels: { ...base.roleModels, ...(existing.roleModels || {}) },
+    roleMetrics: { ...base.roleMetrics, ...(existing.roleMetrics || {}) },
+    promptVersions: { ...base.promptVersions, ...(existing.promptVersions || {}) },
+    failureHistory: Array.isArray(existing.failureHistory) ? existing.failureHistory : base.failureHistory,
+    repairHistory: Array.isArray(existing.repairHistory) ? existing.repairHistory : base.repairHistory,
+    operatorDx: { ...base.operatorDx, ...(existing.operatorDx || {}) },
     timestamps: { ...(base.timestamps || {}), ...(existing.timestamps || {}) },
     status: existing.status || "planned",
   });
@@ -396,12 +624,16 @@ function markMissionRegistryTerminalFromArgs(args, cwd, status, error) {
   const plan = readJsonFile(planPath, undefined);
   if (!plan?.missionId) return;
   const at = new Date().toISOString();
+  const failureClass = error ? classifyCaughtError(error) : undefined;
+  const errorRecord = error ? { message: String(error.message || error), stack: error.stack ? String(error.stack) : undefined, at, status, failureClass } : undefined;
   updateRegistryState(plan, (state) => ({
     ...state,
     status: state.status === "completed" ? state.status : status,
     planPath: state.planPath || planPath,
-    lastError: state.status === "completed" ? state.lastError : (error ? { message: String(error.message || error), stack: error.stack ? String(error.stack) : undefined, at, status } : state.lastError),
-    ...(state.status === "completed" ? { [`last${status === "cancelled" ? "Cancelled" : "Failed"}Attempt`]: { at, message: error ? String(error.message || error) : undefined } } : {}),
+    lastError: state.status === "completed" ? state.lastError : (errorRecord || state.lastError),
+    failureHistory: errorRecord && state.status !== "completed" ? [...(state.failureHistory || []), errorRecord] : (state.failureHistory || []),
+    completion: { ...(state.completion || {}), blockedBy: errorRecord && state.status !== "completed" ? [...(state.completion?.blockedBy || []), { failureClass, message: errorRecord.message, at }] : (state.completion?.blockedBy || []) },
+    ...(state.status === "completed" ? { [`last${status === "cancelled" ? "Cancelled" : "Failed"}Attempt`]: { at, message: error ? String(error.message || error) : undefined, failureClass } } : {}),
     timestamps: { ...(state.timestamps || {}), ...(state.status === "completed" ? {} : { [`${status}At`]: at }) },
   }));
 }
@@ -907,7 +1139,13 @@ function defaultPlan({ goal, cwd, args, repoRoot }) {
   const missionId = `mission-${new Date().toISOString().replace(/[:.]/g, "-")}`;
   const assertionId = "assertion-001";
   const featureId = "feature-001";
-  return {
+  const validationCommands = splitList(args["validation-command"]);
+  const userTestCommand = args["user-test-command"] ? String(args["user-test-command"]) : undefined;
+  const modelPlan = args["model-plan"] ? String(args["model-plan"]) : undefined;
+  const modelWorker = args["model-worker"] ? String(args["model-worker"]) : undefined;
+  const modelValidator = args["model-validator"] ? String(args["model-validator"]) : undefined;
+  const completionTarget = normalizeCompletionTarget(args["completion-target"] || DEFAULT_COMPLETION_TARGET, { strict: Boolean(args["completion-target"]) });
+  const plan = {
     schema: "pi-mission-workflow/v1",
     missionId,
     goal,
@@ -915,12 +1153,20 @@ function defaultPlan({ goal, cwd, args, repoRoot }) {
     baseRef: "HEAD",
     worktreeBaseDir: join(homedir(), ".pi", "agent", "mission-workflow", "worktrees", missionId),
     maxRepairIterations: Number(args["max-repair-iterations"] || DEFAULT_MAX_REPAIR_ITERATIONS),
-    validationCommands: splitList(args["validation-command"]),
-    userTestCommand: args["user-test-command"] ? String(args["user-test-command"]) : undefined,
+    completionTarget,
+    completionLevels: normalizeCompletionLevels(undefined, completionTarget),
+    validationCommands,
+    userTestCommand,
+    validationCategories: [],
+    externalServices: [],
+    deliverables: normalizeDeliverables(),
+    rolePolicy: normalizeRolePolicy({}, { modelPlan, modelWorker, modelValidator, modelDomain: args["model-domain"], modelOps: args["model-ops"] }),
+    capabilityPolicy: normalizeCapabilityPolicy(),
+    promptPolicy: normalizePromptPolicy(),
     planner: String(args.planner || "pi"),
-    modelPlan: args["model-plan"] ? String(args["model-plan"]) : undefined,
-    modelWorker: args["model-worker"] ? String(args["model-worker"]) : undefined,
-    modelValidator: args["model-validator"] ? String(args["model-validator"]) : undefined,
+    modelPlan,
+    modelWorker,
+    modelValidator,
     milestones: [{
       id: "milestone-001",
       title: "Implement requested mission goal",
@@ -930,6 +1176,8 @@ function defaultPlan({ goal, cwd, args, repoRoot }) {
       assertions: [{ id: assertionId, description: `The implementation satisfies the user goal: ${goal}`, coveredBy: [featureId], validationMethod: "both", priority: "must" }],
     },
   };
+  plan.validationCategories = normalizeValidationCategories(plan);
+  return plan;
 }
 
 function canonicalAssertionId(value, contract) {
@@ -992,14 +1240,23 @@ function normalizePlan(plan, { goal, cwd, args, repoRoot }) {
     baseRef: plan.baseRef || "HEAD",
     worktreeBaseDir: plan.worktreeBaseDir || join(homedir(), ".pi", "agent", "mission-workflow", "worktrees", missionId),
     maxRepairIterations: Number(plan.maxRepairIterations || args["max-repair-iterations"] || DEFAULT_MAX_REPAIR_ITERATIONS),
-    validationCommands: Array.isArray(plan.validationCommands) ? plan.validationCommands : fallback.validationCommands,
+    completionTarget: normalizeCompletionTarget(args["completion-target"] || plan.completionTarget || fallback.completionTarget, { strict: Boolean(args["completion-target"] || plan.completionTarget) }),
+    validationCommands: Array.isArray(plan.validationCommands) ? plan.validationCommands.map(String).filter(Boolean) : fallback.validationCommands,
     userTestCommand: plan.userTestCommand || fallback.userTestCommand,
+    validationCategories: Array.isArray(plan.validationCategories) ? plan.validationCategories : [],
     planner: String(args.planner || plan.planner || fallback.planner || "pi"),
     modelPlan: args["model-plan"] ? String(args["model-plan"]) : plan.modelPlan,
     modelWorker: args["model-worker"] ? String(args["model-worker"]) : plan.modelWorker,
     modelValidator: args["model-validator"] ? String(args["model-validator"]) : plan.modelValidator,
+    externalServices: normalizeExternalServices(plan.externalServices || fallback.externalServices),
+    deliverables: normalizeDeliverables(plan.deliverables || fallback.deliverables),
+    capabilityPolicy: normalizeCapabilityPolicy(plan.capabilityPolicy || fallback.capabilityPolicy),
+    promptPolicy: normalizePromptPolicy(plan.promptPolicy || fallback.promptPolicy),
     validationContract: normalizeValidationContract(plan.validationContract || fallback.validationContract, goal),
   };
+  normalized.completionLevels = normalizeCompletionLevels(plan.completionLevels || fallback.completionLevels, normalized.completionTarget);
+  normalized.rolePolicy = normalizeRolePolicy(plan.rolePolicy || fallback.rolePolicy, { modelPlan: normalized.modelPlan, modelWorker: normalized.modelWorker, modelValidator: normalized.modelValidator, modelDomain: args["model-domain"], modelOps: args["model-ops"] });
+  normalized.validationCategories = normalizeValidationCategories(normalized);
   if (!Array.isArray(normalized.milestones) || normalized.milestones.length === 0) normalized.milestones = fallback.milestones;
   const assertionIds = normalized.validationContract.assertions.map((assertion) => assertion.id);
   normalized.milestones = normalized.milestones.map((milestone, mIndex) => ({ 
@@ -1049,10 +1306,11 @@ async function createPlan(args, cwd, run, ctx) {
     const prompt = [
       "You are a mission orchestrator. Inspect the repository before planning, especially files named specs.md, SPEC.md, requirements.md, README.md, or docs/*.md.",
       "Create a JSON mission plan for a Droid/Missions-style software workflow. For large specs, decompose the whole spec into milestones and serial features rather than shrinking scope.",
-      "Return ONLY JSON with: missionId, goal, sourceDocs?, maxRepairIterations, validationCommands, userTestCommand, milestones[], validationContract.assertions[].",
+      "Return ONLY JSON with: missionId, goal, sourceDocs?, maxRepairIterations, completionTarget?, validationCommands, userTestCommand, validationCategories?, externalServices?, deliverables?, rolePolicy?, capabilityPolicy?, promptPolicy?, milestones[], validationContract.assertions[].",
       "Each milestone has id,title,features[]. Each feature has id,title,description,assertions[]. assertions[] must reference validationContract assertion IDs/descriptions.",
       "Optional localAssertions[] are feature-local acceptance checks; they supplement validator context but do not satisfy global/final contract coverage. Use localOnly:true only for feature-local work with no global contract assertion.",
       "Validation assertions must be written before implementation and independently define correctness.",
+      "Default completionTarget is contract_validated. Use operationally_ready/deployment_ready only when the plan also includes explicit behavior/operational/integration/domain/deployment validationCategories and runnable DX deliverables for that level.",
       `Goal: ${goal}`,
       `Default maxRepairIterations: ${args["max-repair-iterations"] || DEFAULT_MAX_REPAIR_ITERATIONS}`,
       `Validation commands: ${splitList(args["validation-command"]).join("; ") || "none provided"}`,
@@ -1066,6 +1324,13 @@ async function createPlan(args, cwd, run, ctx) {
       writeArtifact(run, "planner-output.md", result.text, "markdown", "Planner output");
       throw error;
     }
+  }
+  if (isPlanningClarificationArtifact(plan)) {
+    const clarification = { schema: PLANNING_CLARIFICATION_SCHEMA, planningStatus: "needs_clarification", goal, blockingAmbiguities: [], questions: [], assumptionsIfUnanswered: [], suggestedScopeOptions: [], recommendedNextAction: "answer_questions_then_replan", ...plan };
+    const clarificationPath = writeArtifact(run, "planning-clarification.json", clarification, "json", "Planning clarification");
+    const questions = Array.isArray(clarification.questions) ? clarification.questions : [];
+    const clarificationMarkdownPath = writeArtifact(run, "planning-clarification.md", ["# Planning clarification required", "", `Goal: ${goal}`, "", "## Questions", ...questions.map((q) => `- ${typeof q === "object" ? JSON.stringify(q) : q}`), "", "This artifact is not activation-ready; create a final mission-plan.json after clarification."].join("\n"), "markdown", "Planning clarification instructions");
+    return { planningStatus: "needs_clarification", clarificationPath, clarificationMarkdownPath };
   }
   plan = normalizePlan(plan, { goal, cwd: repoRoot, args, repoRoot });
   plan.baseRef = (await git(repoRoot, ["rev-parse", `${plan.baseRef || "HEAD"}^{commit}`], { signal: ctx.signal })).stdout.trim();
@@ -1090,10 +1355,12 @@ async function createPlan(args, cwd, run, ctx) {
 
 function validatePlanForActivation(plan) {
   if (!plan || typeof plan !== "object") throw new Error("plan must be a JSON object");
+  if (isPlanningClarificationArtifact(plan)) throw new Error("planning clarification artifacts cannot be activated; answer the questions and create a mission-plan.json first");
   if (!plan.missionId) throw new Error("plan.missionId is required");
   if (!Array.isArray(plan.milestones) || plan.milestones.length === 0) throw new Error("plan.milestones must be non-empty");
   if (!plan.validationContract?.assertions?.length) throw new Error("plan.validationContract.assertions must be non-empty");
   const normalized = normalizePlan(plan, { goal: plan.goal || plan.missionId, cwd: plan.cwd || process.cwd(), args: {}, repoRoot: plan.cwd || process.cwd() });
+  if (normalized.completionTarget === "code_complete") throw new Error("completionTarget=code_complete is not supported for activation; use contract_validated or a higher validated target");
   const known = new Set((normalized.validationContract?.assertions || []).map((assertion) => String(assertion.id)));
   const unknown = [];
   const localCollisions = [];
@@ -1107,6 +1374,25 @@ function validatePlanForActivation(plan) {
   }
   if (unknown.length) throw new Error(`Unknown feature assertion references: ${unknown.join(", ")}`);
   if (localCollisions.length) throw new Error(`Local assertions must not duplicate validation contract assertions: ${localCollisions.join(", ")}`);
+  const unsafeExternal = (normalized.externalServices || []).filter((service) => service.destructive || service.liveExternalAction);
+  if (unsafeExternal.length) throw new Error(`Plan requests unsupported destructive/live external service actions: ${unsafeExternal.map((service) => service.id).join(", ")}`);
+  const targetScopedCategories = normalizeValidationCategories(normalized).filter((category) => categoryResultRequiredForTarget(category, normalized.completionTarget) && category.skipPolicy !== "optional");
+  const unsupportedScopedCategories = targetScopedCategories.filter((category) => !category.adversarial && category.scope !== "milestone");
+  if (unsupportedScopedCategories.length) throw new Error(`Validation category scopes other than milestone are not implemented for required categories: ${unsupportedScopedCategories.map((category) => `${category.id}:${category.scope}`).join(", ")}`);
+  const unsupportedAdversarialCategories = targetScopedCategories.filter((category) => category.adversarial && !isImplementedAdversarialCategory(category));
+  if (unsupportedAdversarialCategories.length) throw new Error(`Required adversarial validation categories are not implemented in this compatibility slice: ${unsupportedAdversarialCategories.map((category) => `${category.id}:${category.category}:${category.modelRole}`).join(", ")}`);
+  const unsupportedAdapterCategories = targetScopedCategories.filter((category) => !category.adversarial && category.adapter && category.adapter !== "command");
+  if (unsupportedAdapterCategories.length) throw new Error(`Required validation adapters are not implemented in this compatibility slice: ${unsupportedAdapterCategories.map((category) => `${category.id}:${category.adapter}`).join(", ")}`);
+  const unsupportedExplicitSkips = targetScopedCategories.filter((category) => category.skipPolicy === "explicit_skip_allowed");
+  if (unsupportedExplicitSkips.length) throw new Error(`skipPolicy=explicit_skip_allowed is reserved but not implemented in this compatibility slice: ${unsupportedExplicitSkips.map((category) => category.id).join(", ")}`);
+  const commandlessRequiredCategories = targetScopedCategories.filter((category) => !category.adversarial && (!category.adapter || category.adapter === "command") && !category.commands?.length);
+  if (commandlessRequiredCategories.length) throw new Error(`Required command validation categories must declare commands: ${commandlessRequiredCategories.map((category) => category.id).join(", ")}`);
+  const missingCredentialCategories = targetScopedCategories.map((category) => ({ category, missing: (category.credentialGates || []).filter((name) => !process.env[String(name)]) })).filter((item) => item.missing.length);
+  if (missingCredentialCategories.length) throw new Error(`Required validation credential gates are missing: ${missingCredentialCategories.map((item) => `${item.category.id}(${item.missing.join(",")})`).join("; ")}`);
+  const missingLevels = missingRequiredCompletionLevels(normalized);
+  if (missingLevels.length) throw new Error(`completionTarget=${normalized.completionTarget} requires implemented validation categories for: ${missingLevels.join(", ")}`);
+  const deploymentCategories = targetScopedCategories.filter((category) => category.category === "deployment");
+  if (deploymentCategories.length && normalized.capabilityPolicy?.deployment !== true) throw new Error(`Required deployment validation categories require capabilityPolicy.deployment=true: ${deploymentCategories.map((category) => category.id).join(", ")}`);
   return normalized;
 }
 
@@ -1223,6 +1509,8 @@ function validationCursorMetadata(plan, requestedModel = "", actualModel = "", r
     commandTimeoutMs: runtime.commandTimeoutMs,
     piTimeoutMs: runtime.piTimeoutMs,
     piIdleTimeoutMs: runtime.piIdleTimeoutMs,
+    promptVersions: normalizePromptPolicy(plan.promptPolicy),
+    completionTarget: normalizeCompletionTarget(plan.completionTarget),
     stableIdentity: validatorMode === "mock" || Boolean(requested),
   };
 }
@@ -1261,6 +1549,10 @@ function validationCursorFingerprint(plan, milestone, baseHead = "", validator =
     piTimeoutMs: Number(validator.piTimeoutMs || 0),
     piIdleTimeoutMs: Number(validator.piIdleTimeoutMs || 0),
     validatorStableIdentity: Boolean(validator.stableIdentity),
+    completionTarget: normalizeCompletionTarget(plan.completionTarget),
+    promptVersions: normalizePromptPolicy(plan.promptPolicy),
+    validationCategories: normalizeValidationCategories(plan, { includeImplicitAdversarial: true }).map((category) => ({ id: category.id, category: category.category, scope: category.scope, requiredFor: category.requiredFor, commands: category.commands, userTest: category.userTest, adversarial: category.adversarial, modelRole: category.modelRole, credentialGates: category.credentialGates, skipPolicy: category.skipPolicy, adapter: category.adapter, timeoutMs: category.timeoutMs, artifactsRequired: category.artifactsRequired })),
+    capabilityPolicy: normalizeCapabilityPolicy(plan.capabilityPolicy),
     validationCommands: (plan.validationCommands || []).map(String),
     userTestCommand: String(plan.userTestCommand || ""),
     contractAssertions,
@@ -1596,6 +1888,9 @@ function summarizeHandoff(handoff, artifactPath) {
     evidence: Array.isArray(handoff.evidence) ? handoff.evidence.map((value) => compactText(typeof value === "object" && value ? JSON.stringify(value) : String(value), 1000)) : [],
     issuesDiscoveredCount: Array.isArray(handoff.issuesDiscovered) ? handoff.issuesDiscovered.length : 0,
     leftUndoneCount: Array.isArray(handoff.leftUndone) ? handoff.leftUndone.length : 0,
+    assumptionsCount: Array.isArray(handoff.assumptions) ? handoff.assumptions.length : 0,
+    operatorStepsCount: Array.isArray(handoff.operatorSteps) ? handoff.operatorSteps.length : 0,
+    risksNotAddressedCount: Array.isArray(handoff.risksNotAddressed) ? handoff.risksNotAddressed.length : 0,
     notesForValidator: compactText(String(handoff.notesForValidator || ""), 4000),
   };
 }
@@ -1614,7 +1909,7 @@ function validateHandoff({ handoff, featureId, feature, plan, changedFiles, stri
   if (typeof handoff.completed !== "boolean") errors.push("handoff.completed must be boolean");
   if (handoff.completed !== true) errors.push("handoff.completed must be true for runner-owned mission commits");
   for (const field of ["commandsRun", "issuesDiscovered", "leftUndone"]) if (!Array.isArray(handoff[field])) errors.push(`handoff.${field} must be an array`);
-  for (const field of ["changedFiles", "assertionsAddressed", "evidence"]) if (field in handoff && !Array.isArray(handoff[field])) errors.push(`handoff.${field} must be an array when present`);
+  for (const field of ["changedFiles", "assertionsAddressed", "evidence", "architecturalDecisions", "assumptions", "externalServiceAssumptions", "operatorSteps", "testsAdded", "risksNotAddressed", "broadcastNotes"]) if (field in handoff && !Array.isArray(handoff[field])) errors.push(`handoff.${field} must be an array when present`);
   const contractAssertions = Array.isArray(feature.assertions) ? feature.assertions.map(String) : [];
   const localAssertions = Array.isArray(feature.localAssertions) ? feature.localAssertions.map(String) : [];
   const featureAssertions = [...contractAssertions, ...localAssertions];
@@ -1661,13 +1956,13 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
     const handoffRel = join(".mission", "handoffs", `${featureId}.json`);
     const handoffPath = join(featurePath, handoffRel);
     mkdirSync(dirname(handoffPath), { recursive: true });
-    writeFileSync(handoffPath, JSON.stringify({ schema: "pi-mission-worker-handoff/v2", featureId, completed: false, outcome: "changed", evidence: [], commandsRun: [], issuesDiscovered: [], leftUndone: [], notesForValidator: "Fill this runner-provided handoff skeleton. Preserve featureId exactly. The runner derives changed files and assigned assertion coverage." }, null, 2), "utf8");
+    writeFileSync(handoffPath, JSON.stringify({ schema: plan.promptPolicy?.handoffSchema || DEFAULT_PROMPT_POLICY.handoffSchema, featureId, completed: false, outcome: "changed", evidence: [], commandsRun: [], issuesDiscovered: [], leftUndone: [], architecturalDecisions: [], assumptions: [], externalServiceAssumptions: [], operatorSteps: [], testsAdded: [], risksNotAddressed: [], broadcastNotes: [], notesForValidator: "Fill this runner-provided handoff skeleton. Preserve featureId exactly. The runner derives changed files and assigned assertion coverage." }, null, 2), "utf8");
     const prompt = [
       "You are a mission worker implementing exactly one feature in an isolated git worktree.",
       "Implement the requested feature. You may modify files. Do not ask for approval. Do not create commits; the runner commits after validating your handoff.",
       "Before finishing, update the runner-provided structured JSON handoff file at:",
       handoffRel,
-      "The handoff JSON must include: featureId, completed, outcome, evidence, commandsRun[{command,exitCode}], issuesDiscovered, leftUndone, notesForValidator. You may keep legacy changedFiles/assertionsAddressed fields if already present, but the runner derives actual changed files and assigned assertion coverage deterministically.",
+      "The handoff JSON must include: featureId, completed, outcome, evidence, commandsRun[{command,exitCode}], issuesDiscovered, leftUndone, notesForValidator. Optional v3 arrays may include architecturalDecisions, assumptions, externalServiceAssumptions, operatorSteps, testsAdded, risksNotAddressed, broadcastNotes. You may keep legacy changedFiles/assertionsAddressed fields if already present, but the runner derives actual changed files and assigned assertion coverage deterministically.",
       "Preserve the provided featureId exactly; do not retype, shorten, extend, or add punctuation to it.",
       "Write free-form evidence instead of relying on exact assertion id tags. The runner already knows this feature's assigned contract/local assertions and will attach your evidence to those assigned assertions only. Extra assertion mentions are treated as supplemental notes, not coverage.",
       "The runner derives changed files from git status/diff. If the feature is already satisfied by the inherited codebase and you make no repository changes, set outcome to already_satisfied and explain the no-change completion in notesForValidator.",
@@ -1679,6 +1974,7 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
       "Milestone:", `${milestone.id}: ${milestone.title}`,
       "Feature:", JSON.stringify(feature, null, 2),
       "Validation contract:", JSON.stringify(plan.validationContract, null, 2),
+      "Prompt/capability policy:", JSON.stringify({ promptPolicy: plan.promptPolicy, capabilityPolicy: plan.capabilityPolicy }, null, 2),
     ].join("\n");
     await ensureGeneratedJunkIgnored(featurePath, ctx.signal);
     const result = String(plan.planner || "pi") === "mock"
@@ -1687,7 +1983,7 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
     if (result.usage?.length) phaseEvent(run, `worker-${featureId}`, { kind: "usage", usage: result.usage, model: result.model });
     if (!result.ok) throw new Error(result.error || `worker failed for ${featureId}`);
     if (String(plan.planner || "pi") === "mock") {
-      writeFileSync(handoffPath, JSON.stringify({ schema: "pi-mission-worker-handoff/v2", featureId, completed: true, outcome: "already_satisfied", evidence: ["Mock worker completed with no repository changes."], commandsRun: [], issuesDiscovered: [], leftUndone: [], notesForValidator: "Mock worker completed with no repository changes." }, null, 2), "utf8");
+      writeFileSync(handoffPath, JSON.stringify({ schema: plan.promptPolicy?.handoffSchema || DEFAULT_PROMPT_POLICY.handoffSchema, featureId, completed: true, outcome: "already_satisfied", evidence: ["Mock worker completed with no repository changes."], commandsRun: [], issuesDiscovered: [], leftUndone: [], architecturalDecisions: [], assumptions: [], externalServiceAssumptions: [], operatorSteps: [], testsAdded: [], risksNotAddressed: [], broadcastNotes: [], notesForValidator: "Mock worker completed with no repository changes." }, null, 2), "utf8");
     }
     if (!existsSync(handoffPath)) {
       const failure = { featureId, passed: false, errors: [`Worker did not write required handoff file: ${handoffRel}`] };
@@ -1825,19 +2121,22 @@ function buildCoverageReport({ plan, milestone, iterationState, commandReports, 
 }
 
 function normalizeValidatorReport(raw, { plan, milestone, coverageGaps }) {
-  const objections = Array.isArray(raw?.objections) ? raw.objections.map((objection) => ({
-    level: ["must", "should", "nit"].includes(String(objection.level)) ? String(objection.level) : "must",
-    assertionId: objection.assertionId ? (canonicalAssertionId(objection.assertionId, plan.validationContract) || String(objection.assertionId)) : undefined,
-    description: String(objection.description || objection.summary || objection.message || "Validator objection"),
-    evidence: String(objection.evidence || ""),
-    repairHint: String(objection.repairHint || objection.repair || ""),
-  })) : [];
-  for (const gap of coverageGaps || []) objections.push({ level: "must", assertionId: gap.assertionId, description: `Coverage gap: ${gap.description}`, evidence: "Requirement/assertion coverage report", repairHint: "Add or repair a feature that directly satisfies this assertion." });
+  const objections = Array.isArray(raw?.objections) ? raw.objections.map((objection) => {
+    const normalized = {
+      level: ["must", "should", "nit"].includes(String(objection.level)) ? String(objection.level) : "must",
+      assertionId: objection.assertionId ? (canonicalAssertionId(objection.assertionId, plan.validationContract) || String(objection.assertionId)) : undefined,
+      description: String(objection.description || objection.summary || objection.message || "Validator objection"),
+      evidence: String(objection.evidence || ""),
+      repairHint: String(objection.repairHint || objection.repair || ""),
+    };
+    return { ...normalized, failureClass: normalizeFailureClass(objection.failureClass, classifyValidationFailure(normalized)) };
+  }) : [];
+  for (const gap of coverageGaps || []) objections.push({ level: "must", assertionId: gap.assertionId, description: `Coverage gap: ${gap.description}`, evidence: "Requirement/assertion coverage report", repairHint: "Add or repair a feature that directly satisfies this assertion.", failureClass: "missing_acceptance_test" });
   const scopedAssertions = milestoneCoverageAssertions(plan, milestone, "milestone");
   const scopedIds = new Set(scopedAssertions.map((assertion) => String(assertion.id)));
   const assertionResults = Array.isArray(raw?.assertionResults) ? raw.assertionResults.map((result) => ({ assertionId: canonicalAssertionId(result.assertionId || result, plan.validationContract) || String(result.assertionId || ""), status: String(result.status || "unknown"), evidence: String(result.evidence || "") })) : scopedAssertions.map((assertion) => ({ assertionId: assertion.id, status: objections.some((o) => o.assertionId === assertion.id && o.level === "must") ? "fail" : "pass", evidence: "Adversarial scrutiny completed." }));
   for (const assertion of scopedAssertions) if (!assertionResults.some((result) => String(result.assertionId) === String(assertion.id))) assertionResults.push({ assertionId: assertion.id, status: "unknown", evidence: "Validator omitted scoped assertion result." });
-  if (raw?.passed === false && !objections.some((objection) => objection.level === "must")) objections.push({ level: "must", assertionId: assertionResults.find((result) => scopedIds.has(String(result.assertionId)))?.assertionId, description: "Validator marked milestone as failed without a must-level objection.", evidence: String(raw?.summary || "validator passed=false"), repairHint: "Provide or repair the blocking validator objection." });
+  if (raw?.passed === false && !objections.some((objection) => objection.level === "must")) objections.push({ level: "must", assertionId: assertionResults.find((result) => scopedIds.has(String(result.assertionId)))?.assertionId, description: "Validator marked milestone as failed without a must-level objection.", evidence: String(raw?.summary || "validator passed=false"), repairHint: "Provide or repair the blocking validator objection.", failureClass: "model_or_handoff_failure" });
   const correctiveFeatures = Array.isArray(raw?.correctiveFeatures) ? raw.correctiveFeatures.map((feature) => ({ ...feature, assertions: normalizeAssertionReferences(feature.assertions || [], plan.validationContract) })) : objections.filter((o) => o.level === "must").map((objection) => ({ title: `Repair ${objection.assertionId || milestone.id}: ${objection.description}`.slice(0, 160), assertions: objection.assertionId ? [objection.assertionId] : scopedAssertions.map((assertion) => assertion.id), rationale: objection.evidence || objection.description }));
   return {
     schema: "pi-mission-workflow/adversarial-validation/v1",
@@ -1894,41 +2193,151 @@ async function runAdversarialValidator(env, plan, milestone, iterationState, com
   return { ...normalized, artifact: artifactPath };
 }
 
+function categoryResultFromCommandReport(category, reports) {
+  const commandReports = reports.filter((report) => report.categoryId === category.id);
+  const skipped = commandReports.length === 0 && !category.adversarial;
+  const passed = commandReports.length ? commandReports.every((report) => report.passed) : category.skipPolicy === "optional";
+  const failureClass = skipped ? (category.skipPolicy === "optional" ? null : "capability_policy_block") : passed ? null : normalizeFailureClass(commandReports.find((report) => report.failureClass)?.failureClass, "implementation_bug");
+  return { schema: "pi-mission-workflow/validation-category-result/v1", id: category.id, category: category.category, requiredFor: category.requiredFor, skipPolicy: category.skipPolicy, status: skipped ? "skip" : passed ? "pass" : "fail", passed, skipped, skipReason: skipped ? ((category.commands || []).length ? "Category execution is not implemented in this compatibility slice." : "No command configured for category.") : null, failureClass, commandReports, validatorReport: null, artifacts: commandReports.map((report) => report.artifact).filter(Boolean) };
+}
+
+function isImplementedAdversarialCategory(category) {
+  return Boolean(category?.adversarial && category.id === "adversarial-scrutiny" && category.category === "scrutiny" && category.scope === "milestone" && String(category.modelRole || "validator") === "validator");
+}
+
+function categoryResultFromValidatorReport(category, validatorReport) {
+  const objections = validatorReport?.objections || [];
+  const passed = Boolean(validatorReport && validatorReport.passed !== false && !objections.some((objection) => objection.level === "must"));
+  const failureClass = passed ? null : normalizeFailureClass(objections.find((objection) => objection.failureClass)?.failureClass, classifyValidationFailure(validatorReport));
+  return { schema: "pi-mission-workflow/validation-category-result/v1", id: category.id, category: category.category, requiredFor: category.requiredFor, skipPolicy: category.skipPolicy, status: passed ? "pass" : "fail", passed, skipped: false, skipReason: null, failureClass, commandReports: [], validatorReport: validatorReport ? { artifact: validatorReport.artifact, passed: validatorReport.passed, summary: validatorReport.summary, objections } : null, artifacts: validatorReport?.artifact ? [validatorReport.artifact] : [] };
+}
+
+function skippedUnsupportedAdversarialCategoryResult(category) {
+  return { schema: "pi-mission-workflow/validation-category-result/v1", id: category.id, category: category.category, requiredFor: category.requiredFor, skipPolicy: category.skipPolicy, status: "skip", passed: category.skipPolicy === "optional", skipped: true, skipReason: "This adversarial validation category is not implemented in the compatibility slice.", failureClass: "capability_policy_block", commandReports: [], validatorReport: null, artifacts: [] };
+}
+
+function categoryResultRequiredForTarget(result, target) {
+  return (Array.isArray(result?.requiredFor) ? result.requiredFor : [DEFAULT_COMPLETION_TARGET]).some((level) => completionLevelAtLeast(target, level));
+}
+
+function categoryResultBlocksTarget(result, target) {
+  if (!categoryResultRequiredForTarget(result, target)) return false;
+  if (result?.skipPolicy === "optional") return false;
+  return result?.passed !== true;
+}
+
+function blockingCategoryResultsForTarget(categoryResults, target) {
+  return (Array.isArray(categoryResults) ? categoryResults : []).filter((result) => categoryResultBlocksTarget(result, target));
+}
+
+function commandReportRelevantForTarget(report, target) {
+  if (!report?.categoryRequiredFor) return true;
+  if (report.skipPolicy === "optional") return false;
+  return categoryResultRequiredForTarget({ requiredFor: report.categoryRequiredFor }, target);
+}
+
+function categoryRequiredExactlyForLevel(category, level) {
+  const requiredFor = Array.isArray(category?.requiredFor) ? category.requiredFor : [DEFAULT_COMPLETION_TARGET];
+  return requiredFor.map(normalizeCompletionTarget).includes(normalizeCompletionTarget(level));
+}
+
+function categoriesRequiredForLevel(plan, level) {
+  const normalizedLevel = normalizeCompletionTarget(level);
+  if (["code_complete", DEFAULT_COMPLETION_TARGET].includes(normalizedLevel)) return [];
+  const categories = normalizeValidationCategories(plan).filter((category) => category.skipPolicy !== "optional" && categoryRequiredExactlyForLevel(category, normalizedLevel));
+  if (normalizedLevel === "operationally_ready") return categories.filter((category) => category.category !== "scrutiny");
+  if (normalizedLevel === "deployment_ready") return categories.filter((category) => category.category === "deployment");
+  return categories;
+}
+
+function missingRequiredCompletionLevels(plan) {
+  const target = normalizeCompletionTarget(plan.completionTarget);
+  return COMPLETION_LEVELS.filter((level) => completionLevelAtLeast(target, level) && completionLevelAtLeast(level, "operationally_ready") && categoriesRequiredForLevel(plan, level).length === 0);
+}
+
+function achievedCompletionLevelForResults(plan, categoryResults) {
+  let achieved = DEFAULT_COMPLETION_TARGET;
+  for (const level of ["operationally_ready", "deployment_ready"]) {
+    if (!completionLevelAtLeast(plan.completionTarget, level)) continue;
+    const required = categoriesRequiredForLevel(plan, level);
+    if (!required.length) break;
+    const blocked = required.some((category) => {
+      const result = (categoryResults || []).find((item) => item.id === category.id);
+      return !result || categoryResultBlocksTarget(result, level);
+    });
+    if (blocked) break;
+    achieved = level;
+  }
+  return achieved;
+}
+
 async function runValidation(env, plan, milestone, iterationState, ctx, run) {
   const reports = [];
-  for (const command of plan.validationCommands || []) {
-    const result = await runProcess(command, [], { cwd: env.integrationPath, shell: true, signal: ctx.signal, timeoutMs: ctx.commandTimeoutMs, operationLabel: `validation command: ${command}`, phase: `validation-${milestone.id}` });
-    if ((result.aborted && !result.timedOut) || ctx.signal.aborted) throw abortError(ctx.signal.reason || result.error || "cancelled");
-    const file = writeArtifact(run, `validation/${safeName(milestone.id)}-${safeName(command)}.txt`, [`$ ${command}`, result.error ? `# ${result.error}` : "", result.stdout, result.stderr].join("\n"), "file", `Validation command: ${command}`);
-    reports.push({ validator: "scrutiny-command", command, passed: result.ok, exitCode: result.code, timedOut: Boolean(result.timedOut), artifact: file, stdoutExcerpt: compactText(result.stdout || "", 4000), stderrExcerpt: compactText(result.stderr || result.error || "", 4000) });
-  }
-  if (plan.userTestCommand) {
-    const command = plan.userTestCommand;
-    const result = await runProcess(command, [], { cwd: env.integrationPath, shell: true, signal: ctx.signal, timeoutMs: ctx.commandTimeoutMs, operationLabel: `user test command: ${command}`, phase: `validation-${milestone.id}` });
-    if ((result.aborted && !result.timedOut) || ctx.signal.aborted) throw abortError(ctx.signal.reason || result.error || "cancelled");
-    const file = writeArtifact(run, `validation/${safeName(milestone.id)}-user-test.txt`, [`$ ${command}`, result.error ? `# ${result.error}` : "", result.stdout, result.stderr].join("\n"), "file", `User testing command: ${command}`);
-    reports.push({ validator: "user-testing-command", command, passed: result.ok, exitCode: result.code, timedOut: Boolean(result.timedOut), artifact: file, stdoutExcerpt: compactText(result.stdout || "", 4000), stderrExcerpt: compactText(result.stderr || result.error || "", 4000) });
+  const validationCategories = normalizeValidationCategories(plan, { includeImplicitAdversarial: true });
+  const commandTimeoutMs = Math.min(Number(ctx.commandTimeoutMs || DEFAULT_COMMAND_TIMEOUT_MS), Number(plan.capabilityPolicy?.maxCommandTimeoutMs || DEFAULT_COMMAND_TIMEOUT_MS));
+  const commandCategories = validationCategories.filter((item) => item.scope === "milestone" && !item.adversarial && item.skipPolicy !== "optional" && categoryResultRequiredForTarget(item, plan.completionTarget) && (item.commands || []).length && (!item.adapter || item.adapter === "command"));
+  const categoryBaseReport = (category) => ({ categoryId: category.id, validationCategory: category.category, categoryRequiredFor: category.requiredFor, skipPolicy: category.skipPolicy });
+  const artifactExists = (artifactPath) => {
+    const root = resolve(env.integrationPath);
+    const abs = resolve(env.integrationPath, String(artifactPath));
+    return (abs === root || abs.startsWith(`${root}/`)) && existsSync(abs);
+  };
+  for (const category of commandCategories) {
+    const missingCredentials = (category.credentialGates || []).filter((name) => !process.env[String(name)]);
+    if (missingCredentials.length) {
+      reports.push({ validator: `${category.category}-credential-gate`, ...categoryBaseReport(category), command: "credential gates", passed: false, exitCode: 1, timedOut: false, failureClass: "credential_missing", missingCredentials, stderrExcerpt: `Missing required credential env vars: ${missingCredentials.join(", ")}` });
+      continue;
+    }
+    for (const command of category.commands || []) {
+      const timeoutMs = category.timeoutMs ? Math.min(commandTimeoutMs, Number(category.timeoutMs) || commandTimeoutMs) : commandTimeoutMs;
+      const validatorName = category.userTest ? "user-testing-command" : category.category === "scrutiny" ? "scrutiny-command" : `${category.category}-command`;
+      const label = category.userTest ? `user test command: ${command}` : `${category.category} validation command: ${command}`;
+      const result = await runProcess(command, [], { cwd: env.integrationPath, shell: true, signal: ctx.signal, timeoutMs, operationLabel: label, phase: `validation-${milestone.id}` });
+      if ((result.aborted && !result.timedOut) || ctx.signal.aborted) throw abortError(ctx.signal.reason || result.error || "cancelled");
+      const file = writeArtifact(run, `validation/${safeName(milestone.id)}-${safeName(category.id)}-${safeName(command)}.txt`, [`$ ${command}`, result.error ? `# ${result.error}` : "", result.stdout, result.stderr].join("\n"), "file", `Validation command: ${category.id}`);
+      reports.push({ validator: validatorName, ...categoryBaseReport(category), command, passed: result.ok, exitCode: result.code, timedOut: Boolean(result.timedOut), failureClass: result.ok ? null : classifyValidationFailure({ command, result }), artifact: file, stdoutExcerpt: compactText(result.stdout || "", 4000), stderrExcerpt: compactText(result.stderr || result.error || "", 4000) });
+    }
+    const missingArtifacts = (category.artifactsRequired || []).filter((artifactPath) => !artifactExists(artifactPath));
+    if (missingArtifacts.length) {
+      reports.push({ validator: `${category.category}-artifact-requirements`, ...categoryBaseReport(category), command: "artifact requirements", passed: false, exitCode: 1, timedOut: false, failureClass: "operational_gap", missingArtifacts, stderrExcerpt: `Missing required validation artifacts: ${missingArtifacts.join(", ")}` });
+    }
   }
   if (reports.length === 0) reports.push({ validator: "scrutiny-command", command: "none", passed: true, note: "No validation commands configured." });
-  const coverageDraft = buildCoverageReport({ plan, milestone, iterationState, commandReports: reports, validatorReport: undefined, scope: "milestone" });
+  const contractCommandReports = reports.filter((report) => commandReportRelevantForTarget(report, DEFAULT_COMPLETION_TARGET));
+  const coverageDraft = buildCoverageReport({ plan, milestone, iterationState, commandReports: contractCommandReports, validatorReport: undefined, scope: "milestone" });
   const validatorReport = await runAdversarialValidator(env, plan, milestone, iterationState, reports, coverageDraft, ctx, run);
-  const coverage = buildCoverageReport({ plan, milestone, iterationState, commandReports: reports, validatorReport, scope: "milestone" });
+  const coverage = buildCoverageReport({ plan, milestone, iterationState, commandReports: contractCommandReports, validatorReport, scope: "milestone" });
   const coveragePath = writeArtifact(run, `coverage/${safeName(milestone.id)}-coverage.json`, coverage, "json", `Coverage: ${milestone.id}`);
-  const commandPassed = reports.every((report) => report.passed);
+  const commandCategoryResults = validationCategories.filter((category) => !category.adversarial).map((category) => categoryResultFromCommandReport(category, reports));
+  const implementedAdversarialCategory = validationCategories.find(isImplementedAdversarialCategory) || normalizeValidationCategory({ id: "adversarial-scrutiny", category: "scrutiny", adversarial: true }, 0, "implicit-adversarial");
+  const adversarialCategoryResults = validationCategories
+    .filter((category) => category.adversarial)
+    .map((category) => isImplementedAdversarialCategory(category) ? categoryResultFromValidatorReport(category, validatorReport) : skippedUnsupportedAdversarialCategoryResult(category));
+  if (!adversarialCategoryResults.some((result) => result.id === implementedAdversarialCategory.id)) adversarialCategoryResults.push(categoryResultFromValidatorReport(implementedAdversarialCategory, validatorReport));
+  const categoryResults = [...commandCategoryResults, ...adversarialCategoryResults];
+  const commandPassed = contractCommandReports.every((report) => report.passed);
   const mustObjections = validatorReport.objections.filter((objection) => objection.level === "must");
-  const passed = commandPassed && validatorReport.passed !== false && mustObjections.length === 0 && coverage.gaps.length === 0;
+  const contractValidated = commandPassed && validatorReport.passed !== false && mustObjections.length === 0 && coverage.gaps.length === 0;
+  const blockingCategoryResults = blockingCategoryResultsForTarget(categoryResults, plan.completionTarget);
+  const passed = contractValidated && blockingCategoryResults.length === 0;
   const assertionResults = coverage.assertions.map((row) => ({ assertionId: row.assertionId, status: row.status === "pass" ? "pass" : "fail", evidence: row.gaps.join("; ") || "Command and adversarial validators passed." }));
   const validatorCorrectiveFeatures = validatorReport.correctiveFeatures || [];
   const validatorCorrectiveAssertions = new Set(validatorCorrectiveFeatures.flatMap((feature) => Array.isArray(feature.assertions) ? feature.assertions.map(String) : []));
   const coverageGapFeatures = coverage.gaps
     .filter((gap) => !validatorCorrectiveAssertions.has(String(gap.assertionId)))
     .map((gap) => ({ title: `Close coverage gap for ${gap.assertionId}`, assertions: [gap.assertionId], rationale: gap.description }));
+  const categoryRepairFeatures = blockingCategoryResults.map((result) => ({ title: `Repair ${result.category} validation category ${result.id}`, assertions: assertionResults.map((r) => r.assertionId), rationale: result.skipReason || `${result.category} validation category ${result.id} did not pass for completion target ${normalizeCompletionTarget(plan.completionTarget)}.` }));
   const correctiveFeatures = passed ? [] : [
     ...validatorCorrectiveFeatures,
     ...coverageGapFeatures,
+    ...categoryRepairFeatures,
     ...(!commandPassed ? [{ title: `Repair validation command failures for ${milestone.title}`, assertions: assertionResults.map((r) => r.assertionId), rationale: "Validation command failed." }] : []),
   ];
-  const report = { schema: "pi-mission-workflow/milestone-validation/v1", milestoneId: milestone.id, passed, reports, validatorReport, coveragePath, assertionResults, correctiveFeatures };
+  const report = { schema: normalizePromptPolicy(plan.promptPolicy).validationReportSchema || "pi-mission-workflow/milestone-validation/v1", milestoneId: milestone.id, passed, contractValidated, reports, categoryResults, blockingCategoryResults, validatorReport, coveragePath, assertionResults, correctiveFeatures };
+  if (!passed) {
+    const failureClasses = Array.from(new Set(categoryResults.filter((item) => item.failureClass).map((item) => item.failureClass)));
+    phaseEvent(run, `validation-${milestone.id}`, { kind: "failure_classification", milestoneId: milestone.id, failureClasses, message: failureClasses.length ? `Validation failure classes: ${failureClasses.join(", ")}` : "Validation failed" });
+  }
   const reportPath = writeArtifact(run, `validation/${safeName(milestone.id)}-report.json`, report, "json", `Validation report: ${milestone.id}`);
   return { ...report, artifact: reportPath };
 }
@@ -2082,8 +2491,8 @@ async function activateMission(args, cwd, run, ctx) {
   if (!args["plan-path"]) throw new Error("--plan-path is required for activation");
   const planPathAbs = resolve(cwd, String(args["plan-path"]));
   const plan = validatePlanForActivation(JSON.parse(readFileSync(planPathAbs, "utf8")));
-  ctx.modelWorker = args["model-worker"] || plan.modelWorker || ctx.modelWorker;
-  ctx.modelValidator = args["model-validator"] || plan.modelValidator || ctx.modelValidator;
+  ctx.modelWorker = args["model-worker"] || plan.rolePolicy?.worker?.model || plan.modelWorker || ctx.modelWorker;
+  ctx.modelValidator = args["model-validator"] || plan.rolePolicy?.validator?.model || plan.modelValidator || ctx.modelValidator;
   const priorRegistry = readJsonFile(registryStatePath(plan.missionId), {});
   if (priorRegistry.status === "completed") throw new Error(`Mission ${plan.missionId} is already completed; review the final report or start a new mission.`);
   const env = await ensureMissionWorktrees(plan, ctx, run, { resume: isTruthyFlag(args.resume) });
@@ -2093,13 +2502,13 @@ async function activateMission(args, cwd, run, ctx) {
   phaseEvent(run, "prepare-mission", { kind: "data", key: "registry", value: registryStatePath(plan.missionId), message: "Using durable mission registry" });
   const registry = updateRegistryState(plan, (state) => {
     const startedAt = new Date().toISOString();
-    return { ...state, status: "running", planPath: planPathAbs, branch: env.missionBranch, repoRoot: env.repoRoot, worktree: env.integrationPath, worktreeBaseDir: env.root, roleModels: { plan: plan.modelPlan, worker: ctx.modelWorker, validator: ctx.modelValidator }, resumed: env.resumed, resumeCompletedFeatureCount: isTruthyFlag(args.resume) ? (priorRegistry.completedFeatures || []).length : undefined, timestamps: { ...(state.timestamps || {}), ...(registryPlan.state.timestamps || {}), startedAt: state.timestamps?.startedAt || startedAt } };
+    return { ...state, status: "running", planPath: planPathAbs, branch: env.missionBranch, repoRoot: env.repoRoot, worktree: env.integrationPath, worktreeBaseDir: env.root, completion: { ...(state.completion || {}), target: normalizeCompletionTarget(plan.completionTarget) }, roleModels: { ...(state.roleModels || {}), plan: plan.modelPlan, planner: plan.rolePolicy?.planner?.model || plan.modelPlan, worker: ctx.modelWorker, validator: ctx.modelValidator, domainCritic: plan.rolePolicy?.domainCritic?.model, opsCritic: plan.rolePolicy?.opsCritic?.model }, promptVersions: normalizePromptPolicy(plan.promptPolicy), resumed: env.resumed, resumeCompletedFeatureCount: isTruthyFlag(args.resume) ? (priorRegistry.completedFeatures || []).length : undefined, timestamps: { ...(state.timestamps || {}), ...(registryPlan.state.timestamps || {}), startedAt: state.timestamps?.startedAt || startedAt } };
   });
   const missionState = { missionId: plan.missionId, missionBranch: env.missionBranch, integrationPath: env.integrationPath, baseHead: env.baseHead, registryPath: registry.statePath, modelWorker: ctx.modelWorker, modelValidator: ctx.modelValidator, resumed: env.resumed, milestones: [], startedAt: new Date().toISOString() };
   for (const milestone of plan.milestones) {
     const passedValidation = isTruthyFlag(args.resume) ? await latestTrustedPassedValidationCursor(plan, env, milestone, ctx, run) : undefined;
     if (passedValidation) {
-      missionState.milestones.push({ id: milestone.id, title: milestone.title, skippedOnResume: true, trustedHead: passedValidation.trustedHead, iterations: [{ iteration: passedValidation.report.iteration, features: passedValidation.features, validation: { artifact: passedValidation.report.artifact, passed: true, coveragePath: passedValidation.report.coveragePath } }] });
+      missionState.milestones.push({ id: milestone.id, title: milestone.title, skippedOnResume: true, trustedHead: passedValidation.trustedHead, iterations: [{ iteration: passedValidation.report.iteration, features: passedValidation.features, validation: { artifact: passedValidation.report.artifact, passed: true, coveragePath: passedValidation.report.coveragePath, categoryResults: passedValidation.report.categoryResults || [], blockingCategoryResults: passedValidation.report.blockingCategoryResults || [] } }] });
       phaseEvent(run, "execute-mission", { kind: "data", key: "skippedMilestone", value: { milestoneId: milestone.id, trustedHead: passedValidation.trustedHead }, message: `Skipped completed milestone ${milestone.id} at trusted validation cursor` });
       continue;
     }
@@ -2134,13 +2543,13 @@ async function activateMission(args, cwd, run, ctx) {
       queue = [];
       currentHeartbeat = { phase: "execute-mission", missionId: plan.missionId, milestoneId: milestone.id, iteration, validator: "adversarial-scrutiny", branch: env.missionBranch, worktree: env.integrationPath };
       const validation = await runValidation(env, plan, milestone, iterationState, ctx, run);
-      iterationState.validation = { artifact: validation.artifact, passed: validation.passed, coveragePath: validation.coveragePath, objections: validation.validatorReport?.objections || [] };
+      iterationState.validation = { artifact: validation.artifact, passed: validation.passed, coveragePath: validation.coveragePath, categoryResults: validation.categoryResults || [], objections: validation.validatorReport?.objections || [] };
       milestoneState.iterations.push(iterationState);
       const iterationPath = writeArtifact(run, `state/${safeName(milestone.id)}-iteration-${iteration}.json`, iterationState, "json", `Mission state: ${milestone.id} iteration ${iteration}`);
       const validationTrustedHead = (await git(env.integrationPath, ["rev-parse", "HEAD"], { signal: ctx.signal })).stdout.trim();
       const cursorMetadata = validation.validatorReport?.validatorMetadata || validationCursorMetadata(plan, ctx.modelValidator, "", ctx);
       const validatedFeatures = milestoneState.iterations.flatMap((item) => item.features || []).map((item) => validationFeatureRecord(item, milestone.id));
-      updateRegistryState(plan, (state) => ({ ...state, validationReports: [...(state.validationReports || []), { milestoneId: milestone.id, iteration, artifact: validation.artifact, coveragePath: validation.coveragePath, passed: validation.passed, trustedHead: validationTrustedHead, validationCursorMetadata: cursorMetadata, validationCursorFingerprint: validationCursorFingerprint(plan, milestone, env.baseHead, cursorMetadata), validatedFeatures, completedAt: new Date().toISOString() }], coverageReports: [...(state.coverageReports || []), { milestoneId: milestone.id, iteration, artifact: validation.coveragePath }], current: { milestoneId: milestone.id, iteration, validationReport: validation.artifact }, lastIterationState: iterationPath }));
+      updateRegistryState(plan, (state) => ({ ...state, validationReports: [...(state.validationReports || []), { milestoneId: milestone.id, iteration, artifact: validation.artifact, coveragePath: validation.coveragePath, passed: validation.passed, contractValidated: validation.contractValidated, categoryResults: validation.categoryResults || [], blockingCategoryResults: validation.blockingCategoryResults || [], trustedHead: validationTrustedHead, validationCursorMetadata: cursorMetadata, validationCursorFingerprint: validationCursorFingerprint(plan, milestone, env.baseHead, cursorMetadata), validatedFeatures, completedAt: new Date().toISOString() }], coverageReports: [...(state.coverageReports || []), { milestoneId: milestone.id, iteration, artifact: validation.coveragePath }], completion: { ...(state.completion || {}), target: normalizeCompletionTarget(plan.completionTarget), level: validation.passed ? normalizeCompletionTarget(plan.completionTarget) : validation.contractValidated ? DEFAULT_COMPLETION_TARGET : "code_complete", categoryResults: validation.categoryResults || [], blockedBy: validation.passed ? [] : (validation.blockingCategoryResults || blockingCategoryResultsForTarget(validation.categoryResults || [], plan.completionTarget)).map((item) => ({ id: item.id, category: item.category, status: item.status, failureClass: item.failureClass, skipReason: item.skipReason })) }, current: { milestoneId: milestone.id, iteration, validationReport: validation.artifact }, lastIterationState: iterationPath }));
       if (validation.passed) break;
       if (iteration >= Number(plan.maxRepairIterations || DEFAULT_MAX_REPAIR_ITERATIONS)) throw new Error(`Mission ${plan.missionId} reached max repair iterations (${iteration}) for ${milestone.id}`);
       queue = repairFeaturesFromReport(validation, iteration);
@@ -2148,21 +2557,27 @@ async function activateMission(args, cwd, run, ctx) {
     missionState.milestones.push(milestoneState);
   }
   const allFeatureResults = missionState.milestones.flatMap((m) => m.iterations || []).flatMap((iteration) => iteration.features || []);
-  const lastValidationReports = missionState.milestones.flatMap((m) => (m.iterations || []).map((iteration) => iteration.validation).filter(Boolean));
+  const successfulMilestoneValidations = missionState.milestones.map((m) => [...(m.iterations || [])].reverse().find((iteration) => iteration.validation?.passed)?.validation).filter(Boolean);
   const finalCoverage = buildCoverageReport({ plan, milestone: undefined, iterationState: { features: allFeatureResults }, commandReports: [], validatorReport: undefined, scope: "final" });
   const finalCoveragePath = writeArtifact(run, "coverage/final-coverage.json", finalCoverage, "json", "Final requirement coverage");
   if (finalCoverage.gaps.length) {
-    writeArtifact(run, "validation/final-coverage-objections.json", { schema: "pi-mission-workflow/final-coverage-objections/v1", passed: false, objections: finalCoverage.gaps.map((gap) => ({ level: "must", assertionId: gap.assertionId, description: `Final coverage gap: ${gap.description}`, evidence: finalCoveragePath, repairHint: "Add or repair features until this assertion has coverage and validator evidence." })) }, "json", "Final coverage objections");
+    writeArtifact(run, "validation/final-coverage-objections.json", { schema: "pi-mission-workflow/final-coverage-objections/v1", passed: false, objections: finalCoverage.gaps.map((gap) => ({ level: "must", assertionId: gap.assertionId, description: `Final coverage gap: ${gap.description}`, evidence: finalCoveragePath, repairHint: "Add or repair features until this assertion has coverage and validator evidence.", failureClass: "missing_acceptance_test" })) }, "json", "Final coverage objections");
     throw new Error(`Mission ${plan.missionId} has final requirement coverage gaps: ${finalCoverage.gaps.map((gap) => `${gap.assertionId}: ${gap.description}`).join("; ")}`);
   }
   missionState.completedAt = new Date().toISOString();
   missionState.finalCoveragePath = finalCoveragePath;
   const statePath = writeArtifact(run, "mission-state.json", missionState, "json", "Mission state");
-  updateRegistryState(plan, (state) => ({ ...state, status: "completed", current: {}, finalCoveragePath, statePath, validationReports: state.validationReports || lastValidationReports, coverageReports: [...(state.coverageReports || []), { scope: "final", artifact: finalCoveragePath }], ...clearResolvedRegistryError(state, "mission_completed", missionState.completedAt), timestamps: { ...(state.timestamps || {}), completedAt: missionState.completedAt } }));
+  const latestCategoryResults = successfulMilestoneValidations.flatMap((report) => report.categoryResults || []);
+  const finalBlockingCategories = blockingCategoryResultsForTarget(latestCategoryResults, plan.completionTarget);
+  const achievedCompletionLevel = achievedCompletionLevelForResults(plan, latestCategoryResults);
+  updateRegistryState(plan, (state) => ({ ...state, status: "completed", current: {}, completion: { ...(state.completion || {}), target: normalizeCompletionTarget(plan.completionTarget), level: achievedCompletionLevel, categoryResults: latestCategoryResults, blockedBy: finalBlockingCategories.map((item) => ({ id: item.id, category: item.category, status: item.status, failureClass: item.failureClass, skipReason: item.skipReason })) }, finalCoveragePath, statePath, validationReports: state.validationReports || successfulMilestoneValidations, coverageReports: [...(state.coverageReports || []), { scope: "final", artifact: finalCoveragePath }], ...clearResolvedRegistryError(state, "mission_completed", missionState.completedAt), timestamps: { ...(state.timestamps || {}), completedAt: missionState.completedAt } }));
   const final = [
     "# Mission complete",
     "",
     `Mission: ${plan.missionId}`,
+    `Completion target: ${normalizeCompletionTarget(plan.completionTarget)}`,
+    `Achieved level: ${achievedCompletionLevel}`,
+    `Validation categories: ${latestCategoryResults.length ? latestCategoryResults.map((item) => `${item.id}=${item.status}`).join(", ") : "legacy command/adversarial validation"}`,
     `Branch: ${env.missionBranch}`,
     `Integration worktree: ${env.integrationPath}`,
     `Base HEAD: ${env.baseHead}`,
@@ -2180,12 +2595,39 @@ async function activateMission(args, cwd, run, ctx) {
     "```",
   ].join("\n");
   const finalPath = writeArtifact(run, "final-report.md", final, "markdown", "Final mission report");
-  return { plan: { missionId: plan.missionId }, env, registryPath: registry.statePath, statePath, finalPath, finalCoveragePath };
+  return { plan: { missionId: plan.missionId, completionTarget: normalizeCompletionTarget(plan.completionTarget) }, env, registryPath: registry.statePath, statePath, finalPath, finalCoveragePath, completion: { target: normalizeCompletionTarget(plan.completionTarget), achieved: achievedCompletionLevel } };
 }
 
 async function status(args, cwd) {
   const repo = await git(cwd, ["worktree", "list"], { reject: false });
-  return { ok: repo.ok, cwd, worktrees: repo.stdout };
+  const planPath = args?.["plan-path"] ? resolve(cwd, String(args["plan-path"])) : undefined;
+  const plan = planPath ? readJsonFile(planPath, undefined) : undefined;
+  const missionId = String(args?.["mission-id"] || plan?.missionId || "").trim();
+  const registry = missionId ? readJsonFile(registryStatePath(missionId), undefined) : undefined;
+  const latestValidation = Array.isArray(registry?.validationReports) && registry.validationReports.length ? registry.validationReports[registry.validationReports.length - 1] : undefined;
+  const categoryResults = registry?.completion?.categoryResults || latestValidation?.categoryResults || [];
+  const worktreePath = registry?.worktree;
+  const worktreeExists = worktreePath ? existsSync(String(worktreePath)) : undefined;
+  const resumability = registry?.status === "completed" ? "completed" : registry?.lastError ? "requires_revalidation" : registry?.status === "running" ? "safe" : registry ? "unknown" : undefined;
+  return {
+    ok: repo.ok,
+    cwd,
+    worktrees: repo.stdout,
+    ...(missionId ? { missionId } : {}),
+    ...(registry ? {
+      registryPath: registryStatePath(missionId),
+      registryStatus: registry.status,
+      current: registry.current || {},
+      completion: registry.completion || { target: normalizeCompletionTarget(plan?.completionTarget), level: undefined, categoryResults: [] },
+      latestFailure: registry.lastError ? { message: registry.lastError.message, failureClass: registry.lastError.failureClass, at: registry.lastError.at } : undefined,
+      validationCategorySummary: categoryResults.map((item) => ({ id: item.id, category: item.category, status: item.status, failureClass: item.failureClass || undefined })),
+      branch: registry.branch,
+      worktree: worktreePath,
+      worktreeExists,
+      trusted: { baseHead: registry.trustedBaseHead, head: registry.trustedHead, planFingerprint: registry.trustedPlanFingerprint },
+      resumability,
+    } : {}),
+  };
 }
 
 async function main() {
@@ -2193,7 +2635,7 @@ async function main() {
   const args = parseArgs(rawArgv);
   const action = String(args._[0] || args.action || "plan");
   if (["help", "--help", "-h"].includes(action)) {
-    console.log("Usage: mission-workflow.mjs plan --goal GOAL --cwd REPO | activate|resume --plan-path mission-plan.json --approved --cwd REPO [--background]");
+    console.log("Usage: mission-workflow.mjs plan --goal GOAL --cwd REPO [--completion-target contract_validated|operationally_ready|deployment_ready] | activate|resume --plan-path mission-plan.json --approved --cwd REPO [--background]");
     return;
   }
   const cwd = resolve(String(args.cwd || process.cwd()));
@@ -2233,7 +2675,7 @@ async function main() {
   try {
     let result;
     if (action === "plan") {
-      const phases = [{ name: "create-plan", async *run() { result = await createPlan(args, cwd, run, ctx); yield { type: "data", kind: "data", key: "planPath", value: result.planPath, message: "Mission plan created" }; } }];
+      const phases = [{ name: "create-plan", async *run() { result = await createPlan(args, cwd, run, ctx); yield { type: "data", kind: "data", key: result.planPath ? "planPath" : "planningStatus", value: result.planPath || result.planningStatus, message: result.planPath ? "Mission plan created" : "Planning clarification required" }; } }];
       for await (const _event of runPipeline(wrapPhases(phases, run), ctx, { signal: controller.signal })) {}
       completeRun(run, STATUSES.SUCCESS, { ok: true, planPath: result.planPath, contractPath: result.contractPath, registryPath: result.registryPath });
       finalizedRun = true;
@@ -2245,9 +2687,9 @@ async function main() {
         { name: "final-report", async *run() { yield { type: "data", kind: "data", key: "report", value: result.finalPath, message: "Final report written" }; } },
       ];
       for await (const _event of runPipeline(wrapPhases(phases, run), ctx, { signal: controller.signal })) {}
-      completeRun(run, STATUSES.SUCCESS, { ok: true, missionId: result.plan.missionId, branch: result.env.missionBranch, finalPath: result.finalPath, registryPath: result.registryPath, finalCoveragePath: result.finalCoveragePath });
+      completeRun(run, STATUSES.SUCCESS, { ok: true, missionId: result.plan.missionId, branch: result.env.missionBranch, finalPath: result.finalPath, registryPath: result.registryPath, finalCoveragePath: result.finalCoveragePath, completion: result.completion });
       finalizedRun = true;
-      console.log(JSON.stringify({ ok: true, action, runId: run.runId, cwd, missionId: result.plan.missionId, branch: result.env.missionBranch, finalPath: result.finalPath, registryPath: result.registryPath, finalCoveragePath: result.finalCoveragePath }, null, 2));
+      console.log(JSON.stringify({ ok: true, action, runId: run.runId, cwd, missionId: result.plan.missionId, branch: result.env.missionBranch, completion: result.completion, finalPath: result.finalPath, registryPath: result.registryPath, finalCoveragePath: result.finalCoveragePath }, null, 2));
     } else {
       throw new Error(`Unknown action: ${action}`);
     }
