@@ -172,6 +172,18 @@ Added `mission-workflow/src/git/fingerprints.ts` with typed pure helpers:
 
 Smoke coverage checks commit subject normalization, 24-character plan fingerprints, feature fingerprint parity with the existing smoke-test implementation, and stable repair signature extraction.
 
+### 2026-06-09 — Typed assertion reference helpers
+
+Implemented in current working tree.
+
+Added `mission-workflow/src/planning/assertions.ts` with typed pure helpers:
+
+- `canonicalAssertionId()`
+- `normalizeAssertionReferences()`
+- `normalizeLocalAssertions()`
+
+Smoke coverage checks contract assertion prefix matching, description-to-ID matching, fallback unknown references, and local assertion dedupe.
+
 ## Active / next component
 
 ### Registry and trust model continuation

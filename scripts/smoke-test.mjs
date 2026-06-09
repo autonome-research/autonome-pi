@@ -169,6 +169,7 @@ try {
     const missionCoreJson = await import(pathToFileURL(join(root, 'mission-workflow/src/core/json.ts')).href);
     const missionCoreConstants = await import(pathToFileURL(join(root, 'mission-workflow/src/core/constants.ts')).href);
     const missionCoreTypes = await import(pathToFileURL(join(root, 'mission-workflow/src/core/types.ts')).href);
+    const missionPlanningAssertions = await import(pathToFileURL(join(root, 'mission-workflow/src/planning/assertions.ts')).href);
     const missionPlanningCompletion = await import(pathToFileURL(join(root, 'mission-workflow/src/planning/completion.ts')).href);
     const missionPlanningDeliverables = await import(pathToFileURL(join(root, 'mission-workflow/src/planning/deliverables.ts')).href);
     const missionPlanningPolicies = await import(pathToFileURL(join(root, 'mission-workflow/src/planning/policies.ts')).href);
@@ -202,6 +203,8 @@ try {
     let strictCompletionThrows = false;
     try { missionPlanningCompletion.normalizeCompletionTarget('bogus', { strict: true }); } catch { strictCompletionThrows = true; }
     const completionLevels = missionPlanningCompletion.normalizeCompletionLevels({ operationally_ready: { required: false, note: 'manual' } }, 'deployment_ready');
+    const assertionContract = { assertions: [{ id: 'assertion-001', description: 'First assertion' }, { id: 'custom-id', description: 'Custom desc' }] };
+    log(missionPlanningAssertions.canonicalAssertionId('assertion-001: evidence', assertionContract) === 'assertion-001' && missionPlanningAssertions.canonicalAssertionId({ description: 'Custom desc' }, assertionContract) === 'custom-id' && missionPlanningAssertions.normalizeAssertionReferences(['assertion-001 — ok', { id: 'custom-id' }, 'unknown'], assertionContract).join('|') === 'assertion-001|custom-id|unknown' && missionPlanningAssertions.normalizeLocalAssertions([{ id: 'local-1' }, 'local text', 'local text']).join('|') === 'local-1|local text', 'mission planning assertion helpers canonicalize contract and local references');
     log(missionPlanningCompletion.normalizeCompletionTarget('', { strict: true }) === 'contract_validated' && missionPlanningCompletion.normalizeCompletionTarget('code_complete', { strict: true }) === 'code_complete' && strictCompletionThrows && missionPlanningCompletion.completionLevelAtLeast('deployment_ready', 'operationally_ready') && missionPlanningCompletion.normalizeRequiredFor(['operationally_ready', 'operationally_ready']).length === 1 && completionLevels.deployment_ready.required === true && completionLevels.operationally_ready.required === false && completionLevels.operationally_ready.note === 'manual', 'mission planning completion normalizers preserve target and requiredFor semantics');
     const deliverables = missionPlanningDeliverables.normalizeDeliverables({ entrypoints: [{ name: 'cli' }], runtimeArtifacts: 'bad', runbooks: [{ path: 'README.md' }] });
     log(deliverables.entrypoints.length === 1 && deliverables.runtimeArtifacts.length === 0 && deliverables.runbooks[0].path === 'README.md', 'mission planning deliverable normalizer preserves known arrays only');
