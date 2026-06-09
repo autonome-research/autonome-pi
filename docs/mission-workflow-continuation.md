@@ -390,3 +390,71 @@ Therefore the latest patch has **not** received a completed code-review verdict.
 - Be careful with completion semantics: `contract_validated` is the compatibility default. Higher targets must not be marked achieved unless their exact required categories pass.
 - `explicit_skip_allowed` is intentionally rejected for required categories until real skip evidence/artifact semantics exist.
 - Required categories with missing credentials, missing commands, unsupported adapters, unsupported adversarial roles, unsupported scopes, or missing artifacts should fail early or block clearly; they should not be silently treated as success.
+
+## 2026-06-09 — Foundation slice committed and extended
+
+The previously uncommitted foundation work has now been validated and committed in logical local commits. These commits are **not tagged or pushed** unless a later session does so explicitly.
+
+Latest local commits:
+
+```text
+fbc43dc Generate validation categories from mission deliverables
+a7d3bc3 Refine mission validation category reporting
+fe7d114 Update mission workflow continuation handoff
+0b76caf Add mission completion category foundations
+```
+
+Validation performed after the committed slices:
+
+```bash
+cd /home/velvet/.pi/agent/extensions
+npm test
+```
+
+Latest result observed after `fbc43dc`:
+
+```text
+All smoke tests passed.
+```
+
+Latest completed working-tree code review after `fbc43dc`:
+
+```text
+/home/velvet/.pi/agent/extensions/.git/pi-code-reviews/2026-06-09T03-29-40-515Z-working_tree.md
+verdict: ✅ low risk
+```
+
+### Additional behavior added after the first foundation commit
+
+Commit `a7d3bc3`:
+
+- reports out-of-target validation categories as `not_applicable` instead of confusing skipped failures;
+- adds a successful `deployment_ready` smoke case with explicit operational and deployment categories plus `capabilityPolicy.deployment=true`;
+- documents the full `validationCategories` schema in `mission-workflow/README.md`.
+
+Commit `fbc43dc`:
+
+- generates validation categories from `externalServices[]`:
+  - `healthCommand` -> `operational` category `external-<id>-health`;
+  - `smokeCommand` -> `integration` category `external-<id>-smoke`;
+  - `credentialEnv` -> generated category `credentialGates`.
+- generates validation categories from `deliverables`:
+  - `entrypoints[].validationCommand` -> executable category;
+  - `runtimeArtifacts[].path` and `runbooks[].path` -> artifact-required categories.
+- defaults empty/missing deliverable `requiredFor` to `operationally_ready` rather than accidentally falling back to `contract_validated`.
+- marks generated categories with `generatedFrom` so re-normalization regenerates them from source fields instead of treating them as user-authored explicit categories.
+- rejects explicit `validationCategories[].id` collisions with generated external-service/deliverable category IDs.
+- keeps safeName-colliding generated categories distinct via unique suffixes, so required generated checks are not silently dropped.
+- adds smoke coverage for missing/present deliverables, external-service derived categories, empty `requiredFor`, safeName collisions, explicit-generated ID collision rejection, deployment-ready success, and out-of-target `not_applicable` reports.
+
+### Current remaining roadmap themes
+
+The extension is still not "complete" against the full Factory/Droid-style roadmap. Good next implementation slices:
+
+1. Strategic repair planner: classify/cluster validator failures before generating repair features.
+2. Explicit skip evidence for `skipPolicy=explicit_skip_allowed` with durable skip artifacts.
+3. Per-feature read-only review validators and optional domain/ops critic routes.
+4. Behavioral adapter implementations beyond command adapters (`http_flow`, service lifecycle, workflow replay, browser/computer-use when available).
+5. Status/resume explain mode with normalized registry integrity checks and clearer operator diagnostics.
+6. Metrics/analytics artifacts for model roles, token/budget usage, repairs, validators, and category outcomes.
+7. Generated mission skills/shared mission notes for agent-X continuity across long missions.
