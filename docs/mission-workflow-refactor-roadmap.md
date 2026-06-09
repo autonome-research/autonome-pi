@@ -122,11 +122,24 @@ Covered helpers:
 
 Smoke coverage checks deliverable array preservation, external-service generated/default fields and skip-policy rejection, role model override/default behavior, capability timeout fallback, and prompt default preservation.
 
+### 2026-06-09 — Typed validation category normalizers
+
+Implemented in current working tree.
+
+Added `mission-workflow/src/validation/categories.ts` with typed pure helpers matching current runner category semantics:
+
+- `normalizeValidationCategory()`
+- `normalizeValidationCategories()`
+
+The module composes the typed completion, deliverables, and external-service normalizers. Smoke coverage checks single category defaults/errors, malformed category rejection, explicit category preservation, legacy validation command dedupe/unique IDs, user-test command generation, external-service and deliverable generated categories, and implicit adversarial category generation.
+
+Post-commit review of `f2d32bc` found malformed `null` category entries were being silently normalized by the typed helper. The current working tree fixes that by rejecting null/non-object category entries with a clear error before these helpers are wired into runtime call sites.
+
 ## Active / next component
 
-### Validation category normalization
+### Registry and trust model foundation
 
-Goal: continue extracting pure validation category normalization helpers from `mission-workflow/bin/mission-workflow.mjs` into typed modules while keeping activation behavior identical. Next candidates: `normalizeValidationCategory()` and `normalizeValidationCategories()`.
+Goal: begin extracting registry path/default-state/trust helper types and pure path/default functions from `mission-workflow/bin/mission-workflow.mjs` while keeping runtime behavior stable.
 
 ## Refactor roadmap
 

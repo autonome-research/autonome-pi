@@ -173,6 +173,7 @@ try {
     const missionPlanningDeliverables = await import(pathToFileURL(join(root, 'mission-workflow/src/planning/deliverables.ts')).href);
     const missionPlanningPolicies = await import(pathToFileURL(join(root, 'mission-workflow/src/planning/policies.ts')).href);
     const missionPlanningExternal = await import(pathToFileURL(join(root, 'mission-workflow/src/planning/external-services.ts')).href);
+    const missionValidationCategories = await import(pathToFileURL(join(root, 'mission-workflow/src/validation/categories.ts')).href);
     log(missionCoreTime.parseMillis('2m', 1) === 120000 && missionCoreTime.parseMillis('250ms', 1) === 250 && missionCoreTime.parseMillis('bad', 42) === 42, 'mission core parseMillis handles units and fallback');
     const hasUnpairedSurrogate = (value) => {
       for (let i = 0; i < value.length; i++) {
@@ -209,6 +210,13 @@ try {
     try { missionPlanningExternal.normalizeExternalServices([{ skipPolicy: 'never' }]); } catch { badExternalSkipThrows = true; }
     const externalServices = missionPlanningExternal.normalizeExternalServices([{ name: 'Demo API', purpose: 'quotes', requiredFor: ['deployment_ready'], credentialEnv: ['API_KEY'], healthCommand: 'npm run health', skipPolicy: 'explicit_skip_allowed', destructive: true }]);
     log(badExternalSkipThrows && externalServices[0].id === 'Demo-API' && externalServices[0].requiredFor[0] === 'deployment_ready' && externalServices[0].credentialEnv[0] === 'API_KEY' && externalServices[0].skipPolicy === 'explicit_skip_allowed' && externalServices[0].destructive === true, 'mission planning external service normalizer preserves generated fields and rejects bad skip policy');
+    const singleCategory = missionValidationCategories.normalizeValidationCategory({ category: 'behavior', command: 'npm test', userTest: true, timeoutMs: 123 }, 0, 'plan');
+    let badCategoryThrows = false;
+    try { missionValidationCategories.normalizeValidationCategory({ category: 'bogus' }, 0, 'plan'); } catch { badCategoryThrows = true; }
+    let malformedCategoryThrows = false;
+    try { missionValidationCategories.normalizeValidationCategories({ validationCategories: [null] }); } catch { malformedCategoryThrows = true; }
+    const normalizedCategories = missionValidationCategories.normalizeValidationCategories({ completionTarget: 'contract_validated', validationCategories: [{ id: 'manual', category: 'scrutiny', commands: ['npm run check'] }], validationCommands: ['npm run check', 'npm run lint'], userTestCommand: 'npm run e2e', externalServices: [{ id: 'api', healthCommand: 'npm run health', credentialEnv: ['API_KEY'], skipPolicy: 'explicit_skip_allowed' }], deliverables: { runtimeArtifacts: [{ path: 'var/health.json', requiredFor: ['operationally_ready'] }] } }, { includeImplicitAdversarial: true });
+    log(singleCategory.id === 'behavior-1' && singleCategory.adapter === 'command' && singleCategory.commands[0] === 'npm test' && singleCategory.timeoutMs === 123 && badCategoryThrows && malformedCategoryThrows && normalizedCategories.some((item) => item.id === 'manual') && normalizedCategories.some((item) => item.id === 'validation-command-002' && item.commands[0] === 'npm run lint') && !normalizedCategories.some((item) => item.id === 'validation-command-001') && normalizedCategories.some((item) => item.id === 'user-test-command' && item.userTest === true) && normalizedCategories.some((item) => item.id === 'external-api-health' && item.generatedFrom === 'externalServices.healthCommand') && normalizedCategories.some((item) => item.id === 'deliverable-runtime-var-health.json') && normalizedCategories.some((item) => item.id === 'adversarial-scrutiny' && item.adversarial === true), 'mission validation category normalizers preserve explicit legacy generated and adversarial categories');
   } catch (error) {
     const code = error?.code || error?.message || String(error);
     log(code === 'ERR_UNKNOWN_FILE_EXTENSION', 'mission wrapper helper tests skipped only when Node lacks TypeScript module loading', String(code));
