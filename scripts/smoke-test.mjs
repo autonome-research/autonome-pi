@@ -164,6 +164,33 @@ try {
     log(missionCwd.parseSimpleCd('cd ~/repo;') === '~/repo' && missionCwd.parseSimpleCd('cd -') === '-' && missionCwd.parseSimpleCd('echo cd /tmp') === undefined && missionCwd.parseSimpleCd('cd a\\ b') === 'a b' && missionCwd.parseSimpleCd('cd "quoted path"') === 'quoted path', 'mission wrapper parseSimpleCd handles cd forms only');
     log(missionCwd.resolveAgainstActive('/repo/base', 'subdir').endsWith('/repo/base/subdir') && missionCwd.resolveAgainstActive('/repo/base', '/abs/path') === '/abs/path' && missionCwd.resolveAgainstActive('/repo/base', '~').length > 0, 'mission wrapper resolveAgainstActive handles relative absolute and home paths');
     log(missionResult.truncate('😀'.repeat(20), 10).includes('Tool output truncated') && missionResult.parseJsonObject('{"ok":true}')?.ok === true && missionResult.parseJsonObject('   ') === undefined, 'mission wrapper result helpers parse/truncate output');
+    const missionCoreTime = await import(pathToFileURL(join(root, 'mission-workflow/src/core/time.ts')).href);
+    const missionCoreText = await import(pathToFileURL(join(root, 'mission-workflow/src/core/text.ts')).href);
+    const missionCoreJson = await import(pathToFileURL(join(root, 'mission-workflow/src/core/json.ts')).href);
+    const missionCoreConstants = await import(pathToFileURL(join(root, 'mission-workflow/src/core/constants.ts')).href);
+    const missionCoreTypes = await import(pathToFileURL(join(root, 'mission-workflow/src/core/types.ts')).href);
+    log(missionCoreTime.parseMillis('2m', 1) === 120000 && missionCoreTime.parseMillis('250ms', 1) === 250 && missionCoreTime.parseMillis('bad', 42) === 42, 'mission core parseMillis handles units and fallback');
+    const hasUnpairedSurrogate = (value) => {
+      for (let i = 0; i < value.length; i++) {
+        const code = value.charCodeAt(i);
+        if (code >= 0xd800 && code <= 0xdbff) {
+          const next = value.charCodeAt(i + 1);
+          if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+          i++;
+        } else if (code >= 0xdc00 && code <= 0xdfff) return true;
+      }
+      return false;
+    };
+    const compactEmoji = missionCoreText.compactText('😀'.repeat(8), 5);
+    const compactPrefix = compactEmoji.split('\n\n[truncated:')[0];
+    const boundedEmoji = missionCoreText.appendBounded('😀'.repeat(8), 'tail', 32);
+    log(missionCoreText.safeName(' A/B C ', 'fallback') === 'A-B-C' && missionCoreText.byteLength('é') === 2 && missionCoreText.compactText('x'.repeat(20), 5).includes('original output was 20 bytes') && !hasUnpairedSurrogate(compactEmoji) && Buffer.byteLength(compactPrefix, 'utf8') <= 5, 'mission core text helpers preserve naming byte and unicode semantics');
+    log(missionCoreText.appendBounded('old-', 'new-tail', 32).includes('tail') && missionCoreText.appendBounded('', 'small', 100) === 'small' && !hasUnpairedSurrogate(boundedEmoji) && Buffer.byteLength(boundedEmoji, 'utf8') <= 32, 'mission core appendBounded keeps bounded output tails');
+    const missingJson = join(tmp, 'missing-core-json.json');
+    let compactUndefinedThrows = false;
+    try { missionCoreJson.compactJson(undefined, 100); } catch { compactUndefinedThrows = true; }
+    log(missionCoreJson.compactJson({ ok: true }, 100).includes('"ok"') && compactUndefinedThrows && missionCoreJson.readJsonFile(missingJson, { fallback: true }).fallback === true, 'mission core json helpers compact and fallback safely');
+    log(missionCoreConstants.DEFAULT_COMPLETION_TARGET === 'contract_validated' && missionCoreConstants.VALIDATION_CATEGORIES.includes('deployment') && missionCoreConstants.DEFAULT_PROMPT_POLICY.handoffSchema === 'pi-mission-worker-handoff/v3' && missionCoreConstants.TRANSIENT_LOCKFILE_PATHS.has('uv.lock') && missionCoreConstants.DEFAULT_CAPABILITY_POLICY.maxCommandTimeoutMs > 0 && typeof missionCoreTypes === 'object', 'mission core constants/types expose mission enums and defaults with runner-compatible APIs');
   } catch (error) {
     const code = error?.code || error?.message || String(error);
     log(code === 'ERR_UNKNOWN_FILE_EXTENSION', 'mission wrapper helper tests skipped only when Node lacks TypeScript module loading', String(code));

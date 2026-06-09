@@ -59,17 +59,11 @@ Remaining test gap:
 
 - `runScript()` abort/process lifecycle coverage should be added once a stable helper-level test harness exists.
 
-## Active / next component
+### 2026-06-09 — Typed core/domain model foundation
 
-### Typed core/domain model
+Implemented in current working tree.
 
-Goal: add pure typed core modules and begin moving low-risk helper definitions from the monolithic mission runner without changing runtime behavior.
-
-## Refactor roadmap
-
-### Phase 1 — Typed core/domain model
-
-Add pure, typed modules before moving state-machine logic:
+Added pure typed core modules without changing the mission runner state machine:
 
 - `mission-workflow/src/core/constants.ts`
 - `mission-workflow/src/core/types.ts`
@@ -77,16 +71,33 @@ Add pure, typed modules before moving state-machine logic:
 - `mission-workflow/src/core/json.ts`
 - `mission-workflow/src/core/time.ts`
 
-Candidate extractions from `bin/mission-workflow.mjs`:
+Covered helpers/types:
 
 - `parseMillis`
 - `safeName`
-- `compactText`
+- `compactText` / `appendBounded` as UTF-8/surrogate-safe variants for future migration
 - `byteLength`
-- `appendBounded`
-- `compactJson`
+- `compactJson` with fail-fast handling for top-level non-JSON values
 - `readJsonFile`
-- shared enum/type definitions
+- mission plan, milestone, feature, validation contract, category, role/capability/prompt policy types
+- mission enum/default constants
+
+Validation:
+
+- `pi --no-extensions -e . --list-models` passed.
+- `npm test` passed.
+
+## Active / next component
+
+### Planning and validation category normalization
+
+Goal: extract pure plan/category normalization helpers from `mission-workflow/bin/mission-workflow.mjs` into typed modules while keeping activation behavior identical.
+
+## Refactor roadmap
+
+### Phase 1 — Typed core/domain model
+
+Status: implemented as foundation modules. The monolithic runner still owns runtime behavior until later slices switch call sites.
 
 ### Phase 2 — Planning and validation category normalization
 
