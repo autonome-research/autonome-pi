@@ -87,11 +87,24 @@ Validation:
 - `pi --no-extensions -e . --list-models` passed.
 - `npm test` passed.
 
+### 2026-06-09 — Typed completion normalization helpers
+
+Implemented in current working tree.
+
+Added `mission-workflow/src/planning/completion.ts` with typed pure helpers matching current runner completion semantics:
+
+- `normalizeCompletionTarget()`
+- `completionLevelAtLeast()`
+- `normalizeRequiredFor()`
+- `normalizeCompletionLevels()`
+
+Smoke coverage checks default target behavior, strict invalid-target rejection, target ordering, duplicate requiredFor dedupe, and object-shaped completion level preservation.
+
 ## Active / next component
 
 ### Planning and validation category normalization
 
-Goal: extract pure plan/category normalization helpers from `mission-workflow/bin/mission-workflow.mjs` into typed modules while keeping activation behavior identical.
+Goal: continue extracting pure plan/category normalization helpers from `mission-workflow/bin/mission-workflow.mjs` into typed modules while keeping activation behavior identical. Next candidates: deliverables/external services and role/capability/prompt policy normalizers.
 
 ## Refactor roadmap
 

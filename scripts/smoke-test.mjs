@@ -169,6 +169,7 @@ try {
     const missionCoreJson = await import(pathToFileURL(join(root, 'mission-workflow/src/core/json.ts')).href);
     const missionCoreConstants = await import(pathToFileURL(join(root, 'mission-workflow/src/core/constants.ts')).href);
     const missionCoreTypes = await import(pathToFileURL(join(root, 'mission-workflow/src/core/types.ts')).href);
+    const missionPlanningCompletion = await import(pathToFileURL(join(root, 'mission-workflow/src/planning/completion.ts')).href);
     log(missionCoreTime.parseMillis('2m', 1) === 120000 && missionCoreTime.parseMillis('250ms', 1) === 250 && missionCoreTime.parseMillis('bad', 42) === 42, 'mission core parseMillis handles units and fallback');
     const hasUnpairedSurrogate = (value) => {
       for (let i = 0; i < value.length; i++) {
@@ -191,6 +192,10 @@ try {
     try { missionCoreJson.compactJson(undefined, 100); } catch { compactUndefinedThrows = true; }
     log(missionCoreJson.compactJson({ ok: true }, 100).includes('"ok"') && compactUndefinedThrows && missionCoreJson.readJsonFile(missingJson, { fallback: true }).fallback === true, 'mission core json helpers compact and fallback safely');
     log(missionCoreConstants.DEFAULT_COMPLETION_TARGET === 'contract_validated' && missionCoreConstants.VALIDATION_CATEGORIES.includes('deployment') && missionCoreConstants.DEFAULT_PROMPT_POLICY.handoffSchema === 'pi-mission-worker-handoff/v3' && missionCoreConstants.TRANSIENT_LOCKFILE_PATHS.has('uv.lock') && missionCoreConstants.DEFAULT_CAPABILITY_POLICY.maxCommandTimeoutMs > 0 && typeof missionCoreTypes === 'object', 'mission core constants/types expose mission enums and defaults with runner-compatible APIs');
+    let strictCompletionThrows = false;
+    try { missionPlanningCompletion.normalizeCompletionTarget('bogus', { strict: true }); } catch { strictCompletionThrows = true; }
+    const completionLevels = missionPlanningCompletion.normalizeCompletionLevels({ operationally_ready: { required: false, note: 'manual' } }, 'deployment_ready');
+    log(missionPlanningCompletion.normalizeCompletionTarget('', { strict: true }) === 'contract_validated' && missionPlanningCompletion.normalizeCompletionTarget('code_complete', { strict: true }) === 'code_complete' && strictCompletionThrows && missionPlanningCompletion.completionLevelAtLeast('deployment_ready', 'operationally_ready') && missionPlanningCompletion.normalizeRequiredFor(['operationally_ready', 'operationally_ready']).length === 1 && completionLevels.deployment_ready.required === true && completionLevels.operationally_ready.required === false && completionLevels.operationally_ready.note === 'manual', 'mission planning completion normalizers preserve target and requiredFor semantics');
   } catch (error) {
     const code = error?.code || error?.message || String(error);
     log(code === 'ERR_UNKNOWN_FILE_EXTENSION', 'mission wrapper helper tests skipped only when Node lacks TypeScript module loading', String(code));
