@@ -685,7 +685,7 @@ try {
   expectExit('mission workflow treats per-feature read-only review findings as blocking', ['node', missionCli, 'activate', '--approved', '--plan-path', featureReviewPlanPath, '--cwd', featureReviewRepo], 1, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiFeatureReview }, timeout: 60_000 });
   const featureReviewRegistry = JSON.parse(readFileSync(join(testHome, '.pi', 'agent', 'mission-workflow', 'registry', 'feature-review-smoke', 'state.json'), 'utf8'));
   const featureReviewReport = (featureReviewRegistry.validationReports || []).find((report) => report.milestoneId === 'm1');
-  log(featureReviewReport?.featureReviews?.[0]?.findings?.[0]?.assertionId === 'a1' && featureReviewReport?.featureReviews?.[0]?.artifact && featureReviewReport?.correctiveFeatures?.some((item) => /feature review/i.test(`${item.title || ''} ${item.rationale || ''}`) && item.assertions?.includes('a1')), 'feature review findings are canonicalized and recorded with corrective repair context');
+  log(featureReviewReport?.featureReviews?.[0]?.findings?.[0]?.assertionId === 'a1' && featureReviewReport?.featureReviewBlockers?.some((item) => item.category === 'feature_review') && featureReviewRegistry.completion?.blockedBy?.some((item) => item.category === 'feature_review') && featureReviewReport?.correctiveFeatures?.some((item) => /feature review/i.test(`${item.title || ''} ${item.rationale || ''}`) && item.assertions?.includes('a1')), 'feature review findings are canonicalized and recorded with corrective repair context');
 
   const featureReviewNitRepo = join(tmp, 'feature-review-nit-repo');
   mkdirSync(featureReviewNitRepo, { recursive: true });
