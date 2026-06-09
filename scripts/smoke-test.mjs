@@ -75,6 +75,26 @@ function expectExit(name, args, expected, options = {}) {
   return result;
 }
 
+function initSmokeRepo(name, readme = name) {
+  const repo = join(tmp, name);
+  mkdirSync(repo, { recursive: true });
+  expectExit(`${name} git init`, ['git', 'init', '-q'], 0, { cwd: repo });
+  expectExit(`${name} git config email`, ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: repo });
+  expectExit(`${name} git config name`, ['git', 'config', 'user.name', 'Test'], 0, { cwd: repo });
+  writeFileSync(join(repo, 'README.md'), `${readme}\n`);
+  expectExit(`${name} initial commit`, ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: repo });
+  return repo;
+}
+
+function smokePlan({ missionId, cwd, validationCategories, externalServices, completionTarget = 'operationally_ready' }) {
+  return {
+    schema: 'pi-mission-workflow/v1', missionId, goal: `${missionId} goal`, cwd, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget, validationCommands: [], validationCategories: validationCategories || [], externalServices: externalServices || [],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  };
+}
+
 try {
   process.env.PI_THREAD_PHASE_STORE_DIR = store;
   const storeApi = await import('../thread-phase-visualizer/lib/store.mjs');
@@ -234,6 +254,74 @@ try {
     validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
   }, null, 2));
   expectExit('mission workflow blocks missing credential-gated validation category', ['node', missionCli, 'activate', '--approved', '--plan-path', credentialGatePlanPath, '--cwd', artifactGateRepo], 1, { env: { PI_MISSION_SMOKE_MISSING_CREDENTIAL: '' } });
+
+  const explicitSkipMissingRepo = initSmokeRepo('explicit-skip-missing-repo', 'explicit skip missing');
+  const explicitSkipMissingPlanPath = join(tmp, 'explicit-skip-missing-plan.json');
+  writeFileSync(explicitSkipMissingPlanPath, JSON.stringify(smokePlan({
+    missionId: 'explicit-skip-missing-smoke', cwd: explicitSkipMissingRepo,
+    validationCategories: [{ id: 'external-demo-health', category: 'integration', commands: ['printf ran > skip-sentinel.txt'], credentialGates: ['PI_MISSION_SMOKE_EXPLICIT_SKIP_MISSING'], skipPolicy: 'explicit_skip_allowed', requiredFor: ['operationally_ready'] }]
+  }), null, 2));
+  const explicitSkipMissing = expectExit('mission workflow writes credential skip artifact for missing explicit credentials', ['node', missionCli, 'activate', '--approved', '--plan-path', explicitSkipMissingPlanPath, '--cwd', explicitSkipMissingRepo], 0, { env: { PI_MISSION_SMOKE_EXPLICIT_SKIP_MISSING: '' } });
+  let explicitSkipMissingDetails;
+  try { explicitSkipMissingDetails = JSON.parse(explicitSkipMissing.stdout); } catch { explicitSkipMissingDetails = undefined; }
+  const explicitSkipMissingRegistry = explicitSkipMissingDetails?.registryPath ? JSON.parse(readFileSync(explicitSkipMissingDetails.registryPath, 'utf8')) : undefined;
+  const explicitSkipResult = explicitSkipMissingRegistry?.completion?.categoryResults?.find((item) => item.id === 'external-demo-health');
+  log(explicitSkipResult?.status === 'skip' && explicitSkipResult?.passed === true && explicitSkipResult?.skipped === true && explicitSkipResult?.failureClass === null && explicitSkipResult?.artifacts?.length > 0 && explicitSkipResult.artifacts.every((artifactPath) => existsSync(artifactPath)), 'mission workflow records credential explicit skip as visible passed skip with artifact');
+  log(!existsSync(join(explicitSkipMissingRegistry?.worktree || explicitSkipMissingRepo, 'skip-sentinel.txt')), 'mission workflow does not run credential-skipped validation command');
+
+  const explicitSkipPresentRepo = initSmokeRepo('explicit-skip-present-repo', 'explicit skip present');
+  const explicitSkipPresentPlanPath = join(tmp, 'explicit-skip-present-plan.json');
+  writeFileSync(explicitSkipPresentPlanPath, JSON.stringify(smokePlan({
+    missionId: 'explicit-skip-present-smoke', cwd: explicitSkipPresentRepo,
+    validationCategories: [{ id: 'external-demo-health', category: 'integration', commands: ['printf ran > skip-sentinel.txt'], credentialGates: ['PI_MISSION_SMOKE_EXPLICIT_SKIP_PRESENT'], skipPolicy: 'explicit_skip_allowed', requiredFor: ['operationally_ready'] }]
+  }), null, 2));
+  const explicitSkipPresent = expectExit('mission workflow runs explicit-skip command when credential is present', ['node', missionCli, 'activate', '--approved', '--plan-path', explicitSkipPresentPlanPath, '--cwd', explicitSkipPresentRepo], 0, { env: { PI_MISSION_SMOKE_EXPLICIT_SKIP_PRESENT: '1' } });
+  let explicitSkipPresentDetails;
+  try { explicitSkipPresentDetails = JSON.parse(explicitSkipPresent.stdout); } catch { explicitSkipPresentDetails = undefined; }
+  const explicitSkipPresentRegistry = explicitSkipPresentDetails?.registryPath ? JSON.parse(readFileSync(explicitSkipPresentDetails.registryPath, 'utf8')) : undefined;
+  const explicitSkipPresentResult = explicitSkipPresentRegistry?.completion?.categoryResults?.find((item) => item.id === 'external-demo-health');
+  log(explicitSkipPresentResult?.status === 'pass' && explicitSkipPresentResult?.skipped === false && existsSync(join(explicitSkipPresentRegistry?.worktree || '', 'skip-sentinel.txt')), 'mission workflow does not skip explicit category when credential is present');
+
+  const explicitSkipFailRepo = initSmokeRepo('explicit-skip-fail-repo', 'explicit skip fail');
+  const explicitSkipFailPlanPath = join(tmp, 'explicit-skip-fail-plan.json');
+  writeFileSync(explicitSkipFailPlanPath, JSON.stringify(smokePlan({
+    missionId: 'explicit-skip-fail-smoke', cwd: explicitSkipFailRepo,
+    validationCategories: [{ id: 'external-demo-health', category: 'integration', commands: ['sh -c "printf ran > skip-sentinel.txt; exit 7"'], credentialGates: ['PI_MISSION_SMOKE_EXPLICIT_SKIP_FAIL'], skipPolicy: 'explicit_skip_allowed', requiredFor: ['operationally_ready'] }]
+  }), null, 2));
+  expectExit('mission workflow does not mask explicit-skip command failure when credential is present', ['node', missionCli, 'activate', '--approved', '--plan-path', explicitSkipFailPlanPath, '--cwd', explicitSkipFailRepo], 1, { env: { PI_MISSION_SMOKE_EXPLICIT_SKIP_FAIL: '1' } });
+
+  const externalSkipRepo = initSmokeRepo('external-skip-repo', 'external skip');
+  const externalSkipPlanPath = join(tmp, 'external-skip-plan.json');
+  writeFileSync(externalSkipPlanPath, JSON.stringify(smokePlan({
+    missionId: 'external-skip-smoke', cwd: externalSkipRepo,
+    externalServices: [{ id: 'demo-api', purpose: 'credential gated demo', requiredFor: ['operationally_ready'], credentialEnv: ['PI_MISSION_SMOKE_EXTERNAL_SKIP'], healthCommand: 'printf ran > external-sentinel.txt', skipPolicy: 'explicit_skip_allowed' }]
+  }), null, 2));
+  const externalSkip = expectExit('mission workflow generated external service category writes credential skip artifact', ['node', missionCli, 'activate', '--approved', '--plan-path', externalSkipPlanPath, '--cwd', externalSkipRepo], 0, { env: { PI_MISSION_SMOKE_EXTERNAL_SKIP: '' } });
+  let externalSkipDetails;
+  try { externalSkipDetails = JSON.parse(externalSkip.stdout); } catch { externalSkipDetails = undefined; }
+  const externalSkipRegistry = externalSkipDetails?.registryPath ? JSON.parse(readFileSync(externalSkipDetails.registryPath, 'utf8')) : undefined;
+  const externalSkipResult = externalSkipRegistry?.completion?.categoryResults?.find((item) => item.id === 'external-demo-api-health');
+  log(externalSkipResult?.status === 'skip' && externalSkipResult?.artifacts?.some((artifactPath) => existsSync(artifactPath)) && !existsSync(join(externalSkipRegistry?.worktree || externalSkipRepo, 'external-sentinel.txt')), 'mission workflow generated external service explicit skip is visible and command is not run');
+
+  const explicitSkipResumeRepo = initSmokeRepo('explicit-skip-resume-repo', 'explicit skip resume');
+  const explicitSkipResumePlanPath = join(tmp, 'explicit-skip-resume-plan.json');
+  writeFileSync(explicitSkipResumePlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'explicit-skip-resume-smoke', goal: 'explicit skip resume smoke', cwd: explicitSkipResumeRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1, worktreeBaseDir: join(tmp, 'explicit-skip-resume-worktrees'), completionTarget: 'operationally_ready',
+    validationCategories: [{ id: 'external-demo-health', category: 'integration', commands: ['sh -c "printf reran > credential-reran.txt"'], credentialGates: ['PI_MISSION_SMOKE_SKIP_RESUME'], skipPolicy: 'explicit_skip_allowed', requiredFor: ['operationally_ready'] }],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }, { id: 'm2', title: 'm2', features: [{ id: 'f2', title: 'f2', description: 'f2', assertions: ['a2'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }, { id: 'a2', description: 'a2', priority: 'must', coveredBy: ['f2'], validationMethod: 'both' }] }
+  }, null, 2));
+  const fakePiExplicitSkipResume = join(tmp, 'fake-pi-explicit-skip-resume.mjs');
+  writeFileSync(fakePiExplicitSkipResume, `#!/usr/bin/env node\nimport { basename, join } from 'node:path';\nimport { mkdirSync, writeFileSync } from 'node:fs';\nconst featureId = basename(process.cwd());\nconst prompt = process.argv.includes('-p') ? process.argv[process.argv.indexOf('-p') + 1] : '';\nif (prompt.includes('mission worker')) {\n  mkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\n  if (featureId === 'f1') writeFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, outcome: 'already_satisfied', evidence: ['ok'], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'f1 ok' }));\n  if (featureId === 'f2') writeFileSync(join(process.cwd(), '.mission', 'handoffs', 'f2.json'), JSON.stringify({ featureId: 'f2', completed: false, outcome: 'blocked', commandsRun: [], issuesDiscovered: ['synthetic failure'], leftUndone: ['f2'], notesForValidator: 'fail after m1 cursor' }));\n}\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: prompt.includes('m2') ? 'm2' : 'm1', passed: true, summary: 'ok', objections: [], assertionResults: [{ assertionId: 'a1', status: 'pass', evidence: 'ok' }, { assertionId: 'a2', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-explicit-skip-resume', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
+  expectExit('fake pi explicit skip resume is executable', ['chmod', '+x', fakePiExplicitSkipResume], 0);
+  expectExit('mission workflow creates explicit-skip validation cursor before later failure', ['node', missionCli, 'activate', '--approved', '--plan-path', explicitSkipResumePlanPath, '--cwd', explicitSkipResumeRepo], 1, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiExplicitSkipResume, PI_MISSION_SMOKE_SKIP_RESUME: '' }, timeout: 60_000 });
+  const explicitSkipResumeRegistryPath = join(testHome, '.pi', 'agent', 'mission-workflow', 'registry', 'explicit-skip-resume-smoke', 'state.json');
+  const explicitSkipResumeBefore = JSON.parse(readFileSync(explicitSkipResumeRegistryPath, 'utf8'));
+  const explicitSkipResumeReportsBefore = (explicitSkipResumeBefore.validationReports || []).filter((report) => report.milestoneId === 'm1').length;
+  expectExit('mission workflow invalidates explicit-skip cursor when credential becomes available', ['node', missionCli, 'resume', '--approved', '--plan-path', explicitSkipResumePlanPath, '--cwd', explicitSkipResumeRepo], 1, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiExplicitSkipResume, PI_MISSION_SMOKE_SKIP_RESUME: '1' }, timeout: 60_000 });
+  const explicitSkipResumeAfter = JSON.parse(readFileSync(explicitSkipResumeRegistryPath, 'utf8'));
+  const explicitSkipResumeReportsAfter = (explicitSkipResumeAfter.validationReports || []).filter((report) => report.milestoneId === 'm1').length;
+  log(explicitSkipResumeReportsAfter > explicitSkipResumeReportsBefore && existsSync(join(explicitSkipResumeAfter.worktree || '', 'credential-reran.txt')), 'explicit-skip resume reruns validation when credential becomes available');
 
   const deliverableRepo = join(tmp, 'deliverable-category-repo');
   mkdirSync(deliverableRepo, { recursive: true });
@@ -428,11 +516,11 @@ try {
   const explicitSkipPlanPath = join(tmp, 'explicit-skip-without-artifact-plan.json');
   writeFileSync(explicitSkipPlanPath, JSON.stringify({
     schema: 'pi-mission-workflow/v1', missionId: 'explicit-skip-without-artifact-smoke', goal: 'explicit skip without artifact smoke', cwd: collisionRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
-    completionTarget: 'operationally_ready', validationCategories: [{ id: 'manual-skip', category: 'operational', requiredFor: ['operationally_ready'], skipPolicy: 'explicit_skip_allowed' }],
+    completionTarget: 'operationally_ready', validationCategories: [{ id: 'manual-skip', category: 'operational', commands: ['true'], requiredFor: ['operationally_ready'], skipPolicy: 'explicit_skip_allowed' }],
     milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
     validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
   }, null, 2));
-  expectExit('mission workflow blocks explicit skip without validated skip artifact', ['node', missionCli, 'activate', '--approved', '--plan-path', explicitSkipPlanPath, '--cwd', collisionRepo], 1);
+  expectExit('mission workflow rejects explicit skip without credential gates', ['node', missionCli, 'activate', '--approved', '--plan-path', explicitSkipPlanPath, '--cwd', collisionRepo], 1);
 
   const unsupportedAdversarialRepo = join(tmp, 'unsupported-adversarial-repo');
   mkdirSync(unsupportedAdversarialRepo, { recursive: true });

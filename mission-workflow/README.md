@@ -92,8 +92,8 @@ Supported values:
 - `adapter`: only `command` is executable today. `http_flow`, `browser_computer_use`, `service_lifecycle`, and `workflow_replay` are reserved and rejected when required.
 - `commands`: shell commands run from the mission integration worktree after each milestone. Required command categories must declare at least one command.
 - `requiredFor`: completion levels this category is required for. Higher targets require explicit categories for their exact level; `deployment_ready` also requires a `deployment` category.
-- `skipPolicy`: `fail_when_skipped` or `optional`. `explicit_skip_allowed` is reserved but rejected for required categories until signed skip evidence/artifacts are implemented.
-- `credentialGates`: env var names that must be present before a required category can run. Missing credentials fail activation as `credential_missing` instead of spawning repair workers.
+- `skipPolicy`: `fail_when_skipped`, `explicit_skip_allowed`, or `optional`. `explicit_skip_allowed` is supported only for required milestone-scoped command categories with `credentialGates`; when env vars are absent, the runner writes a credential-skip artifact, reports the category as `status: "skip"`/`passed: true`, and does not run commands or enforce `artifactsRequired`. It does not mask command/artifact failures when credentials are present.
+- `credentialGates`: env var names that must be present before a required category can run. Missing credentials fail activation as `credential_missing` for `fail_when_skipped`, or create explicit skip evidence for `explicit_skip_allowed`.
 - `artifactsRequired`: relative paths that must exist under the integration worktree after the category commands run. Missing files fail the category as `operational_gap`.
 - `timeoutMs`: optional per-category command timeout, capped by `capabilityPolicy.maxCommandTimeoutMs`.
 
@@ -139,6 +139,6 @@ For current dogfood state and exact auto_trading failure context, see `../docs/m
 - This MVP is intentionally simple and should be dogfooded on small missions first.
 - Resume/reuse uses the durable registry, trusted checkpoints, and git proof trailers; dynamic in-memory repair queues still restart from the current plan/milestone and rerun validation as needed.
 - Worktree cleanup is best-effort.
-- Browser/computer-use QA is not implemented; user testing is command-based. Completion targets above `contract_validated` require explicit behavior/operational/integration/domain/deployment validation categories and will not be marked achieved when required categories are skipped or failed.
+- Browser/computer-use QA is not implemented; user testing is command-based. Completion targets above `contract_validated` require explicit behavior/operational/integration/domain/deployment validation categories and will not be marked achieved when required categories are failed or unsupported. Credential-gated `explicit_skip_allowed` categories are reported as visible passed skips only when durable skip evidence is written.
 - Repair planning currently creates generic corrective features from failed validators.
 - Final merge is manual.

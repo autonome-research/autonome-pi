@@ -258,9 +258,9 @@ Implemented foundations:
 - Required deployment categories require `capabilityPolicy.deployment=true`; otherwise activation fails.
 - Required unsupported adversarial categories (domain/ops critic placeholders) are rejected until real execution exists.
 - Required unsupported non-command adapters are rejected until implemented.
-- `skipPolicy=explicit_skip_allowed` is reserved but rejected for required categories until real skip evidence/artifacts are implemented.
+- `skipPolicy=explicit_skip_allowed` was initially reserved in the foundation slice; the later explicit credential skip slice supports it narrowly for credential-gated milestone command categories with durable skip artifacts.
 - Required command categories with no `commands` are rejected before workers run.
-- Required credential-gated categories are rejected at activation if their env vars are missing; command execution also records `credential_missing` if reached.
+- Required credential-gated `fail_when_skipped` categories are rejected at activation if their env vars are missing; `explicit_skip_allowed` categories may activate and skip during validation with evidence.
 - `artifactsRequired` is enforced after category command execution relative to the integration worktree.
 - Validation cursor fingerprints now include broader normalized category execution fields and capability policy.
 - Trusted resume skipped milestones preserve `categoryResults` and `blockingCategoryResults` from the trusted report.
@@ -388,8 +388,8 @@ Therefore the latest patch has **not** received a completed code-review verdict.
 - Do not claim this is released. Package version is still `0.11.9` and the working tree is uncommitted.
 - Do not reintroduce workflow-specific visualizer logic; this slice stays inside `mission-workflow` plus smoke tests/docs.
 - Be careful with completion semantics: `contract_validated` is the compatibility default. Higher targets must not be marked achieved unless their exact required categories pass.
-- `explicit_skip_allowed` is intentionally rejected for required categories until real skip evidence/artifact semantics exist.
-- Required categories with missing credentials, missing commands, unsupported adapters, unsupported adversarial roles, unsupported scopes, or missing artifacts should fail early or block clearly; they should not be silently treated as success.
+- `explicit_skip_allowed` must stay limited to credential-gated milestone command categories with durable skip artifacts; do not broaden it to manual/general skips without new evidence semantics.
+- Required categories with missing commands, unsupported adapters, unsupported adversarial roles, unsupported scopes, missing artifacts, or non-skippable missing credentials should fail early or block clearly; they should not be silently treated as success.
 
 ## 2026-06-09 — Foundation slice committed and extended
 
@@ -447,14 +447,23 @@ Commit `fbc43dc`:
 - keeps safeName-colliding generated categories distinct via unique suffixes, so required generated checks are not silently dropped.
 - adds smoke coverage for missing/present deliverables, external-service derived categories, empty `requiredFor`, safeName collisions, explicit-generated ID collision rejection, deployment-ready success, and out-of-target `not_applicable` reports.
 
+### 2026-06-09 — Uncommitted explicit credential skip slice
+
+The current working tree adds the next roadmap slice for credential-gated validation categories:
+
+- required milestone-scoped command categories may use `skipPolicy: "explicit_skip_allowed"` only when they declare `credentialGates` and commands;
+- missing credential env vars for those categories no longer block activation; validation writes `pi-mission-workflow/credential-skip/v1` artifacts, records visible `status: "skip"`/`passed: true` category results, and does not run the gated commands or enforce `artifactsRequired`;
+- when credentials are present, commands and artifact requirements run normally, so explicit skip does not mask real validation failures;
+- trusted validation cursor reuse now requires explicit-skip artifact refs to still exist;
+- smoke coverage covers missing/present/failing explicit-skip command categories, no-credential-gate rejection, and generated external-service explicit skips.
+
 ### Current remaining roadmap themes
 
 The extension is still not "complete" against the full Factory/Droid-style roadmap. Good next implementation slices:
 
 1. Strategic repair planner: classify/cluster validator failures before generating repair features.
-2. Explicit skip evidence for `skipPolicy=explicit_skip_allowed` with durable skip artifacts.
-3. Per-feature read-only review validators and optional domain/ops critic routes.
-4. Behavioral adapter implementations beyond command adapters (`http_flow`, service lifecycle, workflow replay, browser/computer-use when available).
-5. Status/resume explain mode with normalized registry integrity checks and clearer operator diagnostics.
-6. Metrics/analytics artifacts for model roles, token/budget usage, repairs, validators, and category outcomes.
-7. Generated mission skills/shared mission notes for agent-X continuity across long missions.
+2. Per-feature read-only review validators and optional domain/ops critic routes.
+3. Behavioral adapter implementations beyond command adapters (`http_flow`, service lifecycle, workflow replay, browser/computer-use when available).
+4. Status/resume explain mode with normalized registry integrity checks and clearer operator diagnostics.
+5. Metrics/analytics artifacts for model roles, token/budget usage, repairs, validators, and category outcomes.
+6. Generated mission skills/shared mission notes for agent-X continuity across long missions.

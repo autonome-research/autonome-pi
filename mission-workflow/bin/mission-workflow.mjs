@@ -560,6 +560,37 @@ function normalizeValidationCategories(plan = {}, options = {}) {
   return categories;
 }
 
+function credentialGateStatus(category, env = process.env) {
+  const missing = (category?.credentialGates || []).map(String).filter(Boolean).filter((name) => !env?.[name]);
+  return {
+    missing,
+    runnable: missing.length === 0,
+    skipAllowed: missing.length > 0 && category?.skipPolicy === "explicit_skip_allowed",
+  };
+}
+
+function isCredentialExplicitSkip(category, missing = credentialGateStatus(category).missing) {
+  return category?.skipPolicy === "explicit_skip_allowed" && Array.isArray(missing) && missing.length > 0 && !category?.adversarial && category?.scope === "milestone" && (!category?.adapter || category.adapter === "command") && (category.commands || []).length > 0 && (category.credentialGates || []).length > 0;
+}
+
+function writeCredentialSkipArtifact(run, plan, milestone, iterationState, category, missing) {
+  const artifactBody = {
+    schema: "pi-mission-workflow/credential-skip/v1",
+    missionId: String(plan.missionId || ""),
+    milestoneId: String(milestone?.id || ""),
+    iteration: Number(iterationState?.iteration || 0),
+    categoryId: String(category.id || ""),
+    category: String(category.category || ""),
+    requiredFor: Array.isArray(category.requiredFor) ? category.requiredFor.map(String) : [DEFAULT_COMPLETION_TARGET],
+    skipPolicy: "explicit_skip_allowed",
+    missingCredentials: (missing || []).map(String),
+    commandsSkipped: (category.commands || []).map(String),
+    reason: "Required credential env vars were absent and explicit credential skip is allowed by the plan.",
+    createdAt: new Date().toISOString(),
+  };
+  return writeArtifact(run, `validation/credential-skips/${safeName(milestone?.id || "milestone")}-iteration-${Number(iterationState?.iteration || 0)}-${safeName(category.id || "category")}.json`, artifactBody, "json", `Credential skip: ${category.id}`);
+}
+
 function registryDirFor(missionId) {
   return join(REGISTRY_ROOT, safeName(missionId, "mission"));
 }
@@ -1410,11 +1441,13 @@ function validatePlanForActivation(plan) {
   if (unsupportedAdversarialCategories.length) throw new Error(`Required adversarial validation categories are not implemented in this compatibility slice: ${unsupportedAdversarialCategories.map((category) => `${category.id}:${category.category}:${category.modelRole}`).join(", ")}`);
   const unsupportedAdapterCategories = targetScopedCategories.filter((category) => !category.adversarial && category.adapter && category.adapter !== "command");
   if (unsupportedAdapterCategories.length) throw new Error(`Required validation adapters are not implemented in this compatibility slice: ${unsupportedAdapterCategories.map((category) => `${category.id}:${category.adapter}`).join(", ")}`);
-  const unsupportedExplicitSkips = targetScopedCategories.filter((category) => category.skipPolicy === "explicit_skip_allowed");
-  if (unsupportedExplicitSkips.length) throw new Error(`skipPolicy=explicit_skip_allowed is reserved but not implemented in this compatibility slice: ${unsupportedExplicitSkips.map((category) => category.id).join(", ")}`);
+  const unsupportedExplicitSkips = targetScopedCategories.filter((category) => category.skipPolicy === "explicit_skip_allowed" && (category.adversarial || category.scope !== "milestone" || (category.adapter && category.adapter !== "command")));
+  if (unsupportedExplicitSkips.length) throw new Error(`skipPolicy=explicit_skip_allowed is only implemented for required milestone-scoped command validation categories: ${unsupportedExplicitSkips.map((category) => category.id).join(", ")}`);
+  const explicitSkipsWithoutCredentials = targetScopedCategories.filter((category) => category.skipPolicy === "explicit_skip_allowed" && !(category.credentialGates || []).length);
+  if (explicitSkipsWithoutCredentials.length) throw new Error(`skipPolicy=explicit_skip_allowed requires credentialGates in this slice: ${explicitSkipsWithoutCredentials.map((category) => category.id).join(", ")}`);
   const commandlessRequiredCategories = targetScopedCategories.filter((category) => !category.adversarial && (!category.adapter || category.adapter === "command") && !category.commands?.length);
   if (commandlessRequiredCategories.length) throw new Error(`Required command validation categories must declare commands: ${commandlessRequiredCategories.map((category) => category.id).join(", ")}`);
-  const missingCredentialCategories = targetScopedCategories.map((category) => ({ category, missing: (category.credentialGates || []).filter((name) => !process.env[String(name)]) })).filter((item) => item.missing.length);
+  const missingCredentialCategories = targetScopedCategories.map((category) => ({ category, ...credentialGateStatus(category) })).filter((item) => item.missing.length && item.category.skipPolicy !== "explicit_skip_allowed");
   if (missingCredentialCategories.length) throw new Error(`Required validation credential gates are missing: ${missingCredentialCategories.map((item) => `${item.category.id}(${item.missing.join(",")})`).join("; ")}`);
   const missingLevels = missingRequiredCompletionLevels(normalized);
   if (missingLevels.length) throw new Error(`completionTarget=${normalized.completionTarget} requires implemented validation categories for: ${missingLevels.join(", ")}`);
@@ -2225,10 +2258,20 @@ function categoryResultFromCommandReport(category, reports, target = DEFAULT_COM
   if (!categoryResultRequiredForTarget(category, target)) {
     return { schema: "pi-mission-workflow/validation-category-result/v1", id: category.id, category: category.category, requiredFor: category.requiredFor, skipPolicy: category.skipPolicy, status: "not_applicable", passed: true, skipped: true, skipReason: `Category is not required for completion target ${normalizeCompletionTarget(target)}.`, failureClass: null, commandReports, validatorReport: null, artifacts: commandReports.map((report) => report.artifact).filter(Boolean) };
   }
+  const artifacts = commandReports.flatMap((report) => [report.artifact, report.skipArtifact, ...(Array.isArray(report.artifacts) ? report.artifacts : [])]).filter(Boolean);
+  const failedReport = commandReports.find((report) => report.passed === false);
+  const explicitSkipReports = commandReports.filter((report) => report.skipped === true && report.skipPolicy === "explicit_skip_allowed");
+  if (failedReport) {
+    return { schema: "pi-mission-workflow/validation-category-result/v1", id: category.id, category: category.category, requiredFor: category.requiredFor, skipPolicy: category.skipPolicy, status: "fail", passed: false, skipped: false, skipReason: null, failureClass: normalizeFailureClass(failedReport.failureClass, "implementation_bug"), commandReports, validatorReport: null, artifacts };
+  }
+  if (explicitSkipReports.length && explicitSkipReports.length === commandReports.length) {
+    const missingCredentials = Array.from(new Set(explicitSkipReports.flatMap((report) => report.missingCredentials || []).map(String))).sort();
+    return { schema: "pi-mission-workflow/validation-category-result/v1", id: category.id, category: category.category, requiredFor: category.requiredFor, skipPolicy: category.skipPolicy, status: "skip", passed: true, skipped: true, skipReason: `Missing credential env vars: ${missingCredentials.join(", ")}`, failureClass: null, missingCredentials, skipArtifact: explicitSkipReports.find((report) => report.skipArtifact)?.skipArtifact, commandReports, validatorReport: null, artifacts };
+  }
   const skipped = commandReports.length === 0 && !category.adversarial;
   const passed = commandReports.length ? commandReports.every((report) => report.passed) : category.skipPolicy === "optional";
   const failureClass = skipped ? (category.skipPolicy === "optional" ? null : "capability_policy_block") : passed ? null : normalizeFailureClass(commandReports.find((report) => report.failureClass)?.failureClass, "implementation_bug");
-  return { schema: "pi-mission-workflow/validation-category-result/v1", id: category.id, category: category.category, requiredFor: category.requiredFor, skipPolicy: category.skipPolicy, status: skipped ? "skip" : passed ? "pass" : "fail", passed, skipped, skipReason: skipped ? ((category.commands || []).length ? "Category execution is not implemented in this compatibility slice." : "No command configured for category.") : null, failureClass, commandReports, validatorReport: null, artifacts: commandReports.map((report) => report.artifact).filter(Boolean) };
+  return { schema: "pi-mission-workflow/validation-category-result/v1", id: category.id, category: category.category, requiredFor: category.requiredFor, skipPolicy: category.skipPolicy, status: skipped ? "skip" : passed ? "pass" : "fail", passed, skipped, skipReason: skipped ? ((category.commands || []).length ? "Category execution is not implemented in this compatibility slice." : "No command configured for category.") : null, failureClass, commandReports, validatorReport: null, artifacts };
 }
 
 function isImplementedAdversarialCategory(category) {
@@ -2314,9 +2357,15 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
     return (abs === root || abs.startsWith(`${root}/`)) && existsSync(abs);
   };
   for (const category of commandCategories) {
-    const missingCredentials = (category.credentialGates || []).filter((name) => !process.env[String(name)]);
-    if (missingCredentials.length) {
-      reports.push({ validator: `${category.category}-credential-gate`, ...categoryBaseReport(category), command: "credential gates", passed: false, exitCode: 1, timedOut: false, failureClass: "credential_missing", missingCredentials, stderrExcerpt: `Missing required credential env vars: ${missingCredentials.join(", ")}` });
+    const gateStatus = credentialGateStatus(category, process.env);
+    if (gateStatus.missing.length) {
+      if (isCredentialExplicitSkip(category, gateStatus.missing)) {
+        const skipArtifact = writeCredentialSkipArtifact(run, plan, milestone, iterationState, category, gateStatus.missing);
+        reports.push({ validator: `${category.category}-credential-gate`, ...categoryBaseReport(category), command: "credential gates", passed: true, skipped: true, exitCode: 0, timedOut: false, failureClass: null, missingCredentials: gateStatus.missing, skipReason: `Missing credential env vars: ${gateStatus.missing.join(", ")}`, skipArtifact, artifacts: [skipArtifact], stderrExcerpt: "" });
+        phaseEvent(run, `validation-${milestone.id}`, { kind: "validation_category_end", categoryId: category.id, status: "skip", skipped: true, missingCredentials: gateStatus.missing, artifact: skipArtifact, message: `Skipped ${category.id}: missing credential env vars ${gateStatus.missing.join(", ")}` });
+        continue;
+      }
+      reports.push({ validator: `${category.category}-credential-gate`, ...categoryBaseReport(category), command: "credential gates", passed: false, exitCode: 1, timedOut: false, failureClass: "credential_missing", missingCredentials: gateStatus.missing, stderrExcerpt: `Missing required credential env vars: ${gateStatus.missing.join(", ")}` });
       continue;
     }
     for (const command of category.commands || []) {
@@ -2483,6 +2532,17 @@ async function verifiedValidationFeaturesAtCursor(plan, env, milestone, report, 
   return results;
 }
 
+function validationCursorExplicitSkipsStillValid(report, env = process.env) {
+  const skipped = (report?.categoryResults || []).filter((result) => result?.skipPolicy === "explicit_skip_allowed" && result?.status === "skip" && result?.skipped === true);
+  for (const result of skipped) {
+    const missingCredentials = Array.isArray(result.missingCredentials) ? result.missingCredentials.map(String).filter(Boolean) : [];
+    if (!missingCredentials.length || missingCredentials.some((name) => env?.[name])) return false;
+    const artifactRefs = Array.from(new Set([result.skipArtifact, ...(Array.isArray(result.artifacts) ? result.artifacts : [])].filter(Boolean).map(String)));
+    if (!artifactRefs.length || artifactRefs.some((artifactPath) => !existsSync(artifactPath))) return false;
+  }
+  return true;
+}
+
 async function latestTrustedPassedValidationCursor(plan, env, milestone, ctx, run) {
   const state = readJsonFile(registryStatePath(plan.missionId), {});
   for (const report of [...(state.validationReports || [])].reverse()) {
@@ -2505,6 +2565,10 @@ async function latestTrustedPassedValidationCursor(plan, env, milestone, ctx, ru
     const expectedFingerprint = validationCursorFingerprint(plan, milestone, env.baseHead, expectedMetadata);
     if (!report.validationCursorFingerprint || String(report.validationCursorFingerprint) !== expectedFingerprint) {
       phaseEvent(run, "execute-mission", { kind: "data", key: "ignoredResumeCursor", value: { milestoneId: milestone.id, trustedHead: cursorHead, reason: "validation-fingerprint-mismatch" }, message: `Ignored passed validation cursor for ${milestone.id}: validation configuration changed or cursor is legacy` });
+      continue;
+    }
+    if (!validationCursorExplicitSkipsStillValid(report)) {
+      phaseEvent(run, "execute-mission", { kind: "data", key: "ignoredResumeCursor", value: { milestoneId: milestone.id, trustedHead: cursorHead, reason: "stale-explicit-skip-evidence" }, message: `Ignored passed validation cursor for ${milestone.id}: explicit skip evidence is missing or credentials are now available` });
       continue;
     }
     const features = await verifiedValidationFeaturesAtCursor(plan, env, milestone, report, cursorHead, ctx.signal);
@@ -2601,7 +2665,8 @@ async function activateMission(args, cwd, run, ctx) {
   const latestCategoryResults = successfulMilestoneValidations.flatMap((report) => report.categoryResults || []);
   const finalBlockingCategories = blockingCategoryResultsForTarget(latestCategoryResults, plan.completionTarget);
   const achievedCompletionLevel = achievedCompletionLevelForResults(plan, latestCategoryResults);
-  updateRegistryState(plan, (state) => ({ ...state, status: "completed", current: {}, completion: { ...(state.completion || {}), target: normalizeCompletionTarget(plan.completionTarget), level: achievedCompletionLevel, categoryResults: latestCategoryResults, blockedBy: finalBlockingCategories.map((item) => ({ id: item.id, category: item.category, status: item.status, failureClass: item.failureClass, skipReason: item.skipReason })) }, finalCoveragePath, statePath, validationReports: state.validationReports || successfulMilestoneValidations, coverageReports: [...(state.coverageReports || []), { scope: "final", artifact: finalCoveragePath }], ...clearResolvedRegistryError(state, "mission_completed", missionState.completedAt), timestamps: { ...(state.timestamps || {}), completedAt: missionState.completedAt } }));
+  const explicitCredentialSkips = latestCategoryResults.filter((item) => item.skipPolicy === "explicit_skip_allowed" && item.status === "skip" && item.skipped === true).map((item) => ({ id: item.id, category: item.category, skipReason: item.skipReason, missingCredentials: item.missingCredentials || [], artifacts: item.artifacts || [] }));
+  updateRegistryState(plan, (state) => ({ ...state, status: "completed", current: {}, completion: { ...(state.completion || {}), target: normalizeCompletionTarget(plan.completionTarget), level: achievedCompletionLevel, categoryResults: latestCategoryResults, blockedBy: finalBlockingCategories.map((item) => ({ id: item.id, category: item.category, status: item.status, failureClass: item.failureClass, skipReason: item.skipReason })) }, operatorDx: { ...(state.operatorDx || {}), externalChecksSkipped: explicitCredentialSkips }, finalCoveragePath, statePath, validationReports: state.validationReports || successfulMilestoneValidations, coverageReports: [...(state.coverageReports || []), { scope: "final", artifact: finalCoveragePath }], ...clearResolvedRegistryError(state, "mission_completed", missionState.completedAt), timestamps: { ...(state.timestamps || {}), completedAt: missionState.completedAt } }));
   const final = [
     "# Mission complete",
     "",
