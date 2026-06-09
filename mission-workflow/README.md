@@ -56,7 +56,8 @@ await mission_workflow({
 - The runner commits each feature and fast-forwards the mission branch.
 - Plans are normalized with additive schema fields for `completionTarget` (default `contract_validated`), completion levels, validation categories, role/capability/prompt policy, deliverables, and external services. Legacy plans without these fields still activate through normal normalization.
 - Command validators run configured `validationCommands` after each milestone; these are also represented as `scrutiny` validation categories. `userTestCommand` is represented as a command-based `behavior` category. The execution path remains the legacy command/adversarial flow for now, and required non-executed categories block the requested completion target instead of being reported as achieved.
-- A fresh read-only adversarial Pi validator agent then reviews source/spec docs, the validation contract, worker handoffs, git diff, and command outputs. It uses `modelValidator` when provided and writes structured JSON reports.
+- When `capabilityPolicy.featureReviewValidators=true`, the scrutiny path runs fresh read-only per-feature review validators before milestone adversarial validation. These reviewers inspect a single completed feature/handoff with `read`/`grep`/`find`/`ls`; must-level findings block the milestone and become repair context.
+- A fresh read-only adversarial Pi validator agent then reviews source/spec docs, the validation contract, worker handoffs, per-feature review reports, git diff, and command outputs. It uses `modelValidator` when provided and writes structured JSON reports.
 - Must-level validator objections or requirement coverage gaps fail milestone validation and enqueue targeted repair features up to `maxRepairIterations` (default `10`).
 - User-testing validator starts as a configured command (`userTestCommand`).
 - Heartbeat events record compact current milestone/feature/branch/worktree pointers and child process ids for stale-run detection.
@@ -139,6 +140,6 @@ For current dogfood state and exact auto_trading failure context, see `../docs/m
 - This MVP is intentionally simple and should be dogfooded on small missions first.
 - Resume/reuse uses the durable registry, trusted checkpoints, and git proof trailers; dynamic in-memory repair queues still restart from the current plan/milestone and rerun validation as needed.
 - Worktree cleanup is best-effort.
-- Browser/computer-use QA is not implemented; user testing is command-based. Completion targets above `contract_validated` require explicit behavior/operational/integration/domain/deployment validation categories and will not be marked achieved when required categories are failed or unsupported. Credential-gated `explicit_skip_allowed` categories are reported as visible passed skips only when durable skip evidence is written.
+- Browser/computer-use QA is not implemented; user testing is command-based. Per-feature read-only review validators are opt-in via `capabilityPolicy.featureReviewValidators=true`. Completion targets above `contract_validated` require explicit behavior/operational/integration/domain/deployment validation categories and will not be marked achieved when required categories are failed or unsupported. Credential-gated `explicit_skip_allowed` categories are reported as visible passed skips only when durable skip evidence is written.
 - Repair planning currently creates generic corrective features from failed validators.
 - Final merge is manual.

@@ -67,6 +67,7 @@ const DEFAULT_CAPABILITY_POLICY = Object.freeze({
   deployment: false,
   liveExternalActions: false,
   maxCommandTimeoutMs: DEFAULT_COMMAND_TIMEOUT_MS,
+  featureReviewValidators: false,
 });
 
 async function loadThreadPhaseCore() {
@@ -2209,7 +2210,80 @@ function normalizeValidatorReport(raw, { plan, milestone, coverageGaps }) {
   };
 }
 
-async function runAdversarialValidator(env, plan, milestone, iterationState, commandReports, coverageDraft, ctx, run) {
+function normalizeFeatureReviewReport(raw, { plan, featureId, feature, artifact }) {
+  const findings = Array.isArray(raw?.findings) ? raw.findings : Array.isArray(raw?.objections) ? raw.objections : [];
+  const normalizedFindings = findings.map((finding) => {
+    const rawLevel = String(finding?.level || "must").trim().toLowerCase();
+    const level = ["must", "should", "note", "nit"].includes(rawLevel) ? rawLevel : "must";
+    const rawAssertionId = finding?.assertionId ? String(finding.assertionId) : "";
+    const assertionId = rawAssertionId ? canonicalAssertionId(rawAssertionId, plan?.validationContract) : undefined;
+    return {
+      level,
+      assertionId: assertionId || undefined,
+      rawAssertionId: assertionId ? undefined : rawAssertionId || undefined,
+      description: String(finding?.description || finding?.summary || "Feature review finding"),
+      evidence: String(finding?.evidence || artifact || ""),
+      repairHint: finding?.repairHint ? String(finding.repairHint) : undefined,
+      failureClass: normalizeFailureClass(finding?.failureClass, "implementation_bug"),
+    };
+  });
+  if (raw?.passed === false && !normalizedFindings.some((finding) => finding.level === "must")) {
+    normalizedFindings.push({ level: "must", assertionId: undefined, rawAssertionId: undefined, description: String(raw?.summary || "Feature review reported failed without a must finding."), evidence: String(artifact || "feature review report"), repairHint: "Inspect the failed feature review and repair the reviewed feature or validator output.", failureClass: "model_or_handoff_failure" });
+  }
+  const passed = raw?.passed === false ? false : !normalizedFindings.some((finding) => finding.level === "must");
+  return {
+    schema: "pi-mission-workflow/feature-review/v1",
+    featureId,
+    title: String(feature?.title || featureId),
+    passed,
+    summary: String(raw?.summary || (passed ? "Feature review passed." : "Feature review found blocking issues.")),
+    findings: normalizedFindings,
+    correctiveFeatures: Array.isArray(raw?.correctiveFeatures) ? raw.correctiveFeatures : [],
+    artifact,
+  };
+}
+
+async function runFeatureReviewValidators(env, plan, milestone, iterationState, ctx, run) {
+  if (!plan.capabilityPolicy?.featureReviewValidators) return [];
+  const outputs = [];
+  const featureById = new Map((milestone.features || []).map((feature) => [safeName(feature.id || feature.title, "feature"), feature]));
+  for (const featureResult of iterationState.features || []) {
+    const featureId = String(featureResult.featureId || "");
+    const feature = featureById.get(featureId) || { id: featureId, title: featureId, assertions: featureResult.assertions || [] };
+    let raw;
+    if (String(plan.planner || "pi") === "mock") raw = { passed: true, summary: "Mock feature review passed.", findings: [], correctiveFeatures: [] };
+    else {
+      const prompt = compactText([
+        "You are a fresh read-only feature review validator. Do not edit files or write commits. You may only inspect with read/grep/find/ls.",
+        "Review exactly one completed mission feature for correctness, maintainability, regression risk, and alignment with assigned assertions.",
+        "Return ONLY JSON with schema, featureId, passed, summary, findings[{level,assertionId,description,evidence,repairHint,failureClass}], correctiveFeatures[{title,description,assertions,rationale}].",
+        `Mission goal: ${plan.goal}`,
+        `Milestone: ${compactJson({ id: milestone.id, title: milestone.title }, 4000)}`,
+        `Feature: ${compactJson(feature, 12000)}`,
+        `Worker result: ${compactJson({ featureId, commit: featureResult.commit, skipped: featureResult.skipped, changedFiles: featureResult.changedFiles, handoffArtifact: featureResult.handoffArtifact, handoff: featureResult.handoff }, 16000)}`,
+        `Validation contract: ${compactJson(plan.validationContract, 30000)}`,
+      ].join("\n\n"), MAX_PROMPT_CONTEXT_BYTES);
+      const promptPath = writeArtifact(run, `validation/feature-reviews/${safeName(milestone.id)}-${safeName(featureId)}-prompt.md`, prompt, "markdown", `Feature review prompt: ${featureId}`);
+      const result = await runPi({ cwd: env.integrationPath, prompt, tools: ["read", "grep", "find", "ls"], model: ctx.modelValidator, signal: ctx.signal, operationLabel: `feature review ${featureId}`, phase: `feature-review-${milestone.id}-${featureId}`, timeoutMs: ctx.piTimeoutMs, idleTimeoutMs: ctx.piIdleTimeoutMs });
+      if (result.usage?.length) phaseEvent(run, `feature-review-${milestone.id}-${featureId}`, { kind: "usage", usage: result.usage, model: result.model });
+      if ((result.aborted && !result.timedOut && !result.idleTimedOut) || ctx.signal.aborted) throw abortError(ctx.signal.reason || result.error || "cancelled");
+      if (!result.ok) raw = { passed: false, summary: "Feature review agent failed.", findings: [{ level: "must", description: result.error || "feature review failed", evidence: compactText(result.stderr || result.stdout || "", 4000), repairHint: "Rerun or repair feature review environment.", failureClass: "model_or_handoff_failure" }] };
+      else {
+        try { raw = parseJsonFromText(result.text); }
+        catch (error) {
+          writeArtifact(run, `validation/feature-reviews/${safeName(milestone.id)}-${safeName(featureId)}-raw-output.md`, result.text, "markdown", `Feature review raw output: ${featureId}`);
+          raw = { passed: false, summary: "Feature review returned malformed JSON.", findings: [{ level: "must", description: error.message, evidence: promptPath, repairHint: "Return strict JSON feature review report.", failureClass: "model_or_handoff_failure" }] };
+        }
+      }
+    }
+    const normalized = normalizeFeatureReviewReport(raw, { plan, featureId, feature });
+    const artifactPath = writeArtifact(run, `validation/feature-reviews/${safeName(milestone.id)}-${safeName(featureId)}.json`, normalized, "json", `Feature review: ${featureId}`);
+    outputs.push({ ...normalized, artifact: artifactPath });
+  }
+  return outputs;
+}
+
+async function runAdversarialValidator(env, plan, milestone, iterationState, commandReports, coverageDraft, ctx, run, featureReviews = []) {
   let raw;
   let validatorMetadata = validationCursorMetadata(plan, ctx.modelValidator, "", ctx);
   if (String(plan.planner || "pi") === "mock") {
@@ -2230,6 +2304,7 @@ async function runAdversarialValidator(env, plan, milestone, iterationState, com
       `Milestone: ${compactJson({ id: milestone.id, title: milestone.title, features: milestone.features }, 30000)}`,
       `Worker handoffs and commits: ${compactJson(iterationState.features.map((feature) => ({ featureId: feature.featureId, commit: feature.commit, skipped: feature.skipped, handoffArtifact: feature.handoffArtifact, handoff: feature.handoff, changedFiles: feature.changedFiles })), 30000)}`,
       `Command validation reports: ${compactJson(commandReports, 30000)}`,
+      `Per-feature read-only review reports: ${compactJson(featureReviews, 30000)}`,
       `Coverage draft: ${compactJson(coverageDraft, 30000)}`,
       `Git diff stat ${env.baseHead}..HEAD:\n${compactText(diffStat.stdout || diffStat.stderr || "", 12000)}`,
       `Git diff files ${env.baseHead}..HEAD:\n${compactText(diffFiles.stdout || diffFiles.stderr || "", 12000)}`,
@@ -2383,9 +2458,11 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
     }
   }
   if (reports.length === 0) reports.push({ validator: "scrutiny-command", command: "none", passed: true, note: "No validation commands configured." });
+  const featureReviews = await runFeatureReviewValidators(env, plan, milestone, iterationState, ctx, run);
+  const featureReviewMustFindings = featureReviews.flatMap((review) => (review.findings || []).filter((finding) => finding.level === "must").map((finding) => ({ ...finding, featureId: review.featureId, reviewArtifact: review.artifact })));
   const contractCommandReports = reports.filter((report) => commandReportRelevantForTarget(report, DEFAULT_COMPLETION_TARGET));
   const coverageDraft = buildCoverageReport({ plan, milestone, iterationState, commandReports: contractCommandReports, validatorReport: undefined, scope: "milestone" });
-  const validatorReport = await runAdversarialValidator(env, plan, milestone, iterationState, reports, coverageDraft, ctx, run);
+  const validatorReport = await runAdversarialValidator(env, plan, milestone, iterationState, reports, coverageDraft, ctx, run, featureReviews);
   const coverage = buildCoverageReport({ plan, milestone, iterationState, commandReports: contractCommandReports, validatorReport, scope: "milestone" });
   const coveragePath = writeArtifact(run, `coverage/${safeName(milestone.id)}-coverage.json`, coverage, "json", `Coverage: ${milestone.id}`);
   const commandCategoryResults = validationCategories.filter((category) => !category.adversarial).map((category) => categoryResultFromCommandReport(category, reports, plan.completionTarget));
@@ -2397,7 +2474,7 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
   const categoryResults = [...commandCategoryResults, ...adversarialCategoryResults];
   const commandPassed = contractCommandReports.every((report) => report.passed);
   const mustObjections = validatorReport.objections.filter((objection) => objection.level === "must");
-  const contractValidated = commandPassed && validatorReport.passed !== false && mustObjections.length === 0 && coverage.gaps.length === 0;
+  const contractValidated = commandPassed && validatorReport.passed !== false && mustObjections.length === 0 && featureReviewMustFindings.length === 0 && coverage.gaps.length === 0;
   const blockingCategoryResults = blockingCategoryResultsForTarget(categoryResults, plan.completionTarget);
   const passed = contractValidated && blockingCategoryResults.length === 0;
   const assertionResults = coverage.assertions.map((row) => ({ assertionId: row.assertionId, status: row.status === "pass" ? "pass" : "fail", evidence: row.gaps.join("; ") || "Command and adversarial validators passed." }));
@@ -2407,13 +2484,17 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
     .filter((gap) => !validatorCorrectiveAssertions.has(String(gap.assertionId)))
     .map((gap) => ({ title: `Close coverage gap for ${gap.assertionId}`, assertions: [gap.assertionId], rationale: gap.description }));
   const categoryRepairFeatures = blockingCategoryResults.map((result) => ({ title: `Repair ${result.category} validation category ${result.id}`, assertions: assertionResults.map((r) => r.assertionId), rationale: result.skipReason || `${result.category} validation category ${result.id} did not pass for completion target ${normalizeCompletionTarget(plan.completionTarget)}.` }));
+  const featureReviewProvidedRepairs = featureReviews.flatMap((review) => (review.correctiveFeatures || []).map((feature) => ({ ...feature, assertions: Array.isArray(feature.assertions) && feature.assertions.length ? feature.assertions.map((id) => canonicalAssertionId(id, plan.validationContract) || String(id)).filter((id) => knownContractAssertionIds(plan).has(String(id))) : (review.findings || []).map((finding) => finding.assertionId).filter(Boolean), rationale: feature.rationale || `Provided by feature review ${review.featureId}` })));
+  const featureReviewRepairFeatures = featureReviewMustFindings.map((finding) => ({ title: `Repair feature review finding for ${finding.featureId}`, description: finding.repairHint || finding.description, assertions: finding.assertionId ? [finding.assertionId] : assertionResults.map((r) => r.assertionId), rationale: `${finding.description}\nEvidence: ${finding.evidence || finding.reviewArtifact || "feature review"}` }));
   const correctiveFeatures = passed ? [] : [
     ...validatorCorrectiveFeatures,
+    ...featureReviewProvidedRepairs,
+    ...featureReviewRepairFeatures,
     ...coverageGapFeatures,
     ...categoryRepairFeatures,
     ...(!commandPassed ? [{ title: `Repair validation command failures for ${milestone.title}`, assertions: assertionResults.map((r) => r.assertionId), rationale: "Validation command failed." }] : []),
   ];
-  const report = { schema: normalizePromptPolicy(plan.promptPolicy).validationReportSchema || "pi-mission-workflow/milestone-validation/v1", milestoneId: milestone.id, passed, contractValidated, reports, categoryResults, blockingCategoryResults, validatorReport, coveragePath, assertionResults, correctiveFeatures };
+  const report = { schema: normalizePromptPolicy(plan.promptPolicy).validationReportSchema || "pi-mission-workflow/milestone-validation/v1", milestoneId: milestone.id, passed, contractValidated, reports, featureReviews, categoryResults, blockingCategoryResults, validatorReport, coveragePath, assertionResults, correctiveFeatures };
   if (!passed) {
     const failureClasses = Array.from(new Set(categoryResults.filter((item) => item.failureClass).map((item) => item.failureClass)));
     phaseEvent(run, `validation-${milestone.id}`, { kind: "failure_classification", milestoneId: milestone.id, failureClasses, message: failureClasses.length ? `Validation failure classes: ${failureClasses.join(", ")}` : "Validation failed" });
@@ -2638,13 +2719,13 @@ async function activateMission(args, cwd, run, ctx) {
       queue = [];
       currentHeartbeat = { phase: "execute-mission", missionId: plan.missionId, milestoneId: milestone.id, iteration, validator: "adversarial-scrutiny", branch: env.missionBranch, worktree: env.integrationPath };
       const validation = await runValidation(env, plan, milestone, iterationState, ctx, run);
-      iterationState.validation = { artifact: validation.artifact, passed: validation.passed, coveragePath: validation.coveragePath, categoryResults: validation.categoryResults || [], objections: validation.validatorReport?.objections || [] };
+      iterationState.validation = { artifact: validation.artifact, passed: validation.passed, coveragePath: validation.coveragePath, featureReviews: validation.featureReviews || [], categoryResults: validation.categoryResults || [], objections: validation.validatorReport?.objections || [] };
       milestoneState.iterations.push(iterationState);
       const iterationPath = writeArtifact(run, `state/${safeName(milestone.id)}-iteration-${iteration}.json`, iterationState, "json", `Mission state: ${milestone.id} iteration ${iteration}`);
       const validationTrustedHead = (await git(env.integrationPath, ["rev-parse", "HEAD"], { signal: ctx.signal })).stdout.trim();
       const cursorMetadata = validation.validatorReport?.validatorMetadata || validationCursorMetadata(plan, ctx.modelValidator, "", ctx);
       const validatedFeatures = milestoneState.iterations.flatMap((item) => item.features || []).map((item) => validationFeatureRecord(item, milestone.id));
-      updateRegistryState(plan, (state) => ({ ...state, validationReports: [...(state.validationReports || []), { milestoneId: milestone.id, iteration, artifact: validation.artifact, coveragePath: validation.coveragePath, passed: validation.passed, contractValidated: validation.contractValidated, categoryResults: validation.categoryResults || [], blockingCategoryResults: validation.blockingCategoryResults || [], trustedHead: validationTrustedHead, validationCursorMetadata: cursorMetadata, validationCursorFingerprint: validationCursorFingerprint(plan, milestone, env.baseHead, cursorMetadata), validatedFeatures, completedAt: new Date().toISOString() }], coverageReports: [...(state.coverageReports || []), { milestoneId: milestone.id, iteration, artifact: validation.coveragePath }], completion: { ...(state.completion || {}), target: normalizeCompletionTarget(plan.completionTarget), level: validation.passed ? normalizeCompletionTarget(plan.completionTarget) : validation.contractValidated ? DEFAULT_COMPLETION_TARGET : "code_complete", categoryResults: validation.categoryResults || [], blockedBy: validation.passed ? [] : (validation.blockingCategoryResults || blockingCategoryResultsForTarget(validation.categoryResults || [], plan.completionTarget)).map((item) => ({ id: item.id, category: item.category, status: item.status, failureClass: item.failureClass, skipReason: item.skipReason })) }, current: { milestoneId: milestone.id, iteration, validationReport: validation.artifact }, lastIterationState: iterationPath }));
+      updateRegistryState(plan, (state) => ({ ...state, validationReports: [...(state.validationReports || []), { milestoneId: milestone.id, iteration, artifact: validation.artifact, coveragePath: validation.coveragePath, passed: validation.passed, contractValidated: validation.contractValidated, featureReviews: validation.featureReviews || [], categoryResults: validation.categoryResults || [], blockingCategoryResults: validation.blockingCategoryResults || [], correctiveFeatures: validation.correctiveFeatures || [], trustedHead: validationTrustedHead, validationCursorMetadata: cursorMetadata, validationCursorFingerprint: validationCursorFingerprint(plan, milestone, env.baseHead, cursorMetadata), validatedFeatures, completedAt: new Date().toISOString() }], coverageReports: [...(state.coverageReports || []), { milestoneId: milestone.id, iteration, artifact: validation.coveragePath }], completion: { ...(state.completion || {}), target: normalizeCompletionTarget(plan.completionTarget), level: validation.passed ? normalizeCompletionTarget(plan.completionTarget) : validation.contractValidated ? DEFAULT_COMPLETION_TARGET : "code_complete", categoryResults: validation.categoryResults || [], blockedBy: validation.passed ? [] : (validation.blockingCategoryResults || blockingCategoryResultsForTarget(validation.categoryResults || [], plan.completionTarget)).map((item) => ({ id: item.id, category: item.category, status: item.status, failureClass: item.failureClass, skipReason: item.skipReason })) }, current: { milestoneId: milestone.id, iteration, validationReport: validation.artifact }, lastIterationState: iterationPath }));
       if (validation.passed) break;
       if (iteration >= Number(plan.maxRepairIterations || DEFAULT_MAX_REPAIR_ITERATIONS)) throw new Error(`Mission ${plan.missionId} reached max repair iterations (${iteration}) for ${milestone.id}`);
       queue = repairFeaturesFromReport(validation, iteration);

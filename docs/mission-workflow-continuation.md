@@ -467,3 +467,17 @@ The extension is still not "complete" against the full Factory/Droid-style roadm
 4. Status/resume explain mode with normalized registry integrity checks and clearer operator diagnostics.
 5. Metrics/analytics artifacts for model roles, token/budget usage, repairs, validators, and category outcomes.
 6. Generated mission skills/shared mission notes for agent-X continuity across long missions.
+
+## 2026-06-09 — Uncommitted per-feature review validator slice
+
+The current working tree adds an opt-in Factory-style scrutiny validator slice:
+
+- `capabilityPolicy.featureReviewValidators=true` enables fresh read-only per-feature review validators after workers finish and before the milestone adversarial validator runs.
+- Each review is scoped to one completed feature/handoff and may use only `read`, `grep`, `find`, and `ls`.
+- Review artifacts use schema `pi-mission-workflow/feature-review/v1` and are written under `validation/feature-reviews/`.
+- Must-level feature review findings block the milestone, make `contractValidated=false`, and are converted into corrective repair features.
+- The milestone adversarial validator prompt includes the per-feature review reports.
+- Feature review enablement is part of `capabilityPolicy`, which is already included in validation cursor fingerprints, so toggling it invalidates old trusted validation cursors.
+- Smoke coverage verifies that a must-level per-feature review finding blocks activation and is recorded with repair context.
+
+This is intentionally opt-in for now to preserve existing mission behavior and avoid breaking stateful fake-Pi tests that assume exactly one validator call.
