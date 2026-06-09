@@ -266,8 +266,13 @@ try {
     milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
     validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
   }, null, 2));
-  expectExit('mission workflow ignores out-of-target deployment command for contract target', ['node', missionCli, 'activate', '--approved', '--plan-path', outOfTargetPlanPath, '--cwd', outOfTargetRepo], 0);
+  const outOfTargetActivate = expectExit('mission workflow ignores out-of-target deployment command for contract target', ['node', missionCli, 'activate', '--approved', '--plan-path', outOfTargetPlanPath, '--cwd', outOfTargetRepo], 0);
   log(!existsSync(outOfTargetSentinel), 'out-of-target deployment command was not executed');
+  let outOfTargetDetails;
+  try { outOfTargetDetails = JSON.parse(outOfTargetActivate.stdout); } catch { outOfTargetDetails = undefined; }
+  const outOfTargetReportPath = outOfTargetDetails?.runId ? join(store, 'artifacts', outOfTargetDetails.runId, 'validation', 'm1-report.json') : '';
+  const outOfTargetReport = outOfTargetReportPath && existsSync(outOfTargetReportPath) ? JSON.parse(readFileSync(outOfTargetReportPath, 'utf8')) : undefined;
+  log(outOfTargetReport?.categoryResults?.some((item) => item.id === 'deploy-sentinel' && item.status === 'not_applicable' && item.passed === true) && !outOfTargetReport?.blockingCategoryResults?.some((item) => item.id === 'deploy-sentinel'), 'out-of-target deployment category is reported as not_applicable');
 
   const deploymentRejectRepo = join(tmp, 'deployment-reject-repo');
   mkdirSync(deploymentRejectRepo, { recursive: true });
@@ -284,6 +289,29 @@ try {
     validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
   }, null, 2));
   expectExit('mission workflow rejects deployment target without deployment category', ['node', missionCli, 'activate', '--approved', '--plan-path', deploymentRejectPlanPath, '--cwd', deploymentRejectRepo], 1);
+  const deploymentPassRepo = join(tmp, 'deployment-pass-repo');
+  mkdirSync(deploymentPassRepo, { recursive: true });
+  expectExit('deployment pass repo git init', ['git', 'init', '-q'], 0, { cwd: deploymentPassRepo });
+  expectExit('deployment pass repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: deploymentPassRepo });
+  expectExit('deployment pass repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: deploymentPassRepo });
+  writeFileSync(join(deploymentPassRepo, 'README.md'), 'deployment pass\n');
+  expectExit('deployment pass repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: deploymentPassRepo });
+  const deploymentPassPlanPath = join(tmp, 'deployment-pass-plan.json');
+  writeFileSync(deploymentPassPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'deployment-pass-smoke', goal: 'deployment pass smoke', cwd: deploymentPassRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    completionTarget: 'deployment_ready', capabilityPolicy: { deployment: true },
+    validationCategories: [
+      { id: 'health-check', category: 'operational', title: 'Health check', commands: ['true'], requiredFor: ['operationally_ready'] },
+      { id: 'deploy-check', category: 'deployment', title: 'Deployment check', commands: ['true'], requiredFor: ['deployment_ready'] }
+    ],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  const deploymentPass = expectExit('mission workflow satisfies deployment_ready when required categories pass', ['node', missionCli, 'activate', '--approved', '--plan-path', deploymentPassPlanPath, '--cwd', deploymentPassRepo], 0);
+  let deploymentPassDetails;
+  try { deploymentPassDetails = JSON.parse(deploymentPass.stdout); } catch { deploymentPassDetails = undefined; }
+  const deploymentPassRegistry = deploymentPassDetails?.registryPath ? JSON.parse(readFileSync(deploymentPassDetails.registryPath, 'utf8')) : undefined;
+  log(deploymentPassRegistry?.completion?.level === 'deployment_ready' && deploymentPassRegistry.completion.categoryResults?.some((item) => item.id === 'deploy-check' && item.status === 'pass'), 'mission workflow records achieved deployment_ready target from explicit categories');
 
   const invalidTargetPlanPath = join(tmp, 'invalid-completion-target-plan.json');
   writeFileSync(invalidTargetPlanPath, JSON.stringify({

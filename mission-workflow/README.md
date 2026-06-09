@@ -64,6 +64,41 @@ await mission_workflow({
 - Per-milestone and final coverage artifacts map assertion -> features -> commits -> validators -> status.
 - Final merge into the user's target branch is manual by default.
 
+## Validation category schema
+
+Plans may include `validationCategories[]` to request completion beyond the compatibility default. The current compatibility slice is intentionally strict: unknown enum values and required categories that cannot be executed are rejected at activation instead of being allowed to waste repair iterations.
+
+```json
+{
+  "id": "health-check",
+  "category": "operational",
+  "title": "Health check",
+  "scope": "milestone",
+  "adapter": "command",
+  "commands": ["npm run health:dry-run"],
+  "requiredFor": ["operationally_ready"],
+  "skipPolicy": "fail_when_skipped",
+  "credentialGates": ["API_KEY"],
+  "artifactsRequired": ["var/health-report.json"],
+  "timeoutMs": 120000
+}
+```
+
+Supported values:
+
+- `completionTarget`: `contract_validated` (default), `operationally_ready`, or `deployment_ready`. `code_complete` is reserved but not activation-ready in this extension because missions must validate contracts.
+- `category`: `scrutiny`, `behavior`, `operational`, `integration`, `domain`, or `deployment`.
+- `scope`: only `milestone` is executable for required categories in this slice; `feature` and `final` are reserved and rejected when required for the requested target.
+- `adapter`: only `command` is executable today. `http_flow`, `browser_computer_use`, `service_lifecycle`, and `workflow_replay` are reserved and rejected when required.
+- `commands`: shell commands run from the mission integration worktree after each milestone. Required command categories must declare at least one command.
+- `requiredFor`: completion levels this category is required for. Higher targets require explicit categories for their exact level; `deployment_ready` also requires a `deployment` category.
+- `skipPolicy`: `fail_when_skipped` or `optional`. `explicit_skip_allowed` is reserved but rejected for required categories until signed skip evidence/artifacts are implemented.
+- `credentialGates`: env var names that must be present before a required category can run. Missing credentials fail activation as `credential_missing` instead of spawning repair workers.
+- `artifactsRequired`: relative paths that must exist under the integration worktree after the category commands run. Missing files fail the category as `operational_gap`.
+- `timeoutMs`: optional per-category command timeout, capped by `capabilityPolicy.maxCommandTimeoutMs`.
+
+Deployment categories require `capabilityPolicy.deployment: true`. Destructive/live external service actions remain unsupported and are rejected during activation.
+
 ## Safety model
 
 - `activate` requires `approved: true`; planning clarification artifacts (`pi-mission-workflow/planning-clarification/v1`) are not activation-ready and are rejected with a clear error.

@@ -2193,8 +2193,11 @@ async function runAdversarialValidator(env, plan, milestone, iterationState, com
   return { ...normalized, artifact: artifactPath };
 }
 
-function categoryResultFromCommandReport(category, reports) {
+function categoryResultFromCommandReport(category, reports, target = DEFAULT_COMPLETION_TARGET) {
   const commandReports = reports.filter((report) => report.categoryId === category.id);
+  if (!categoryResultRequiredForTarget(category, target)) {
+    return { schema: "pi-mission-workflow/validation-category-result/v1", id: category.id, category: category.category, requiredFor: category.requiredFor, skipPolicy: category.skipPolicy, status: "not_applicable", passed: true, skipped: true, skipReason: `Category is not required for completion target ${normalizeCompletionTarget(target)}.`, failureClass: null, commandReports, validatorReport: null, artifacts: commandReports.map((report) => report.artifact).filter(Boolean) };
+  }
   const skipped = commandReports.length === 0 && !category.adversarial;
   const passed = commandReports.length ? commandReports.every((report) => report.passed) : category.skipPolicy === "optional";
   const failureClass = skipped ? (category.skipPolicy === "optional" ? null : "capability_policy_block") : passed ? null : normalizeFailureClass(commandReports.find((report) => report.failureClass)?.failureClass, "implementation_bug");
@@ -2212,7 +2215,8 @@ function categoryResultFromValidatorReport(category, validatorReport) {
   return { schema: "pi-mission-workflow/validation-category-result/v1", id: category.id, category: category.category, requiredFor: category.requiredFor, skipPolicy: category.skipPolicy, status: passed ? "pass" : "fail", passed, skipped: false, skipReason: null, failureClass, commandReports: [], validatorReport: validatorReport ? { artifact: validatorReport.artifact, passed: validatorReport.passed, summary: validatorReport.summary, objections } : null, artifacts: validatorReport?.artifact ? [validatorReport.artifact] : [] };
 }
 
-function skippedUnsupportedAdversarialCategoryResult(category) {
+function skippedUnsupportedAdversarialCategoryResult(category, target = DEFAULT_COMPLETION_TARGET) {
+  if (!categoryResultRequiredForTarget(category, target)) return { schema: "pi-mission-workflow/validation-category-result/v1", id: category.id, category: category.category, requiredFor: category.requiredFor, skipPolicy: category.skipPolicy, status: "not_applicable", passed: true, skipped: true, skipReason: `Category is not required for completion target ${normalizeCompletionTarget(target)}.`, failureClass: null, commandReports: [], validatorReport: null, artifacts: [] };
   return { schema: "pi-mission-workflow/validation-category-result/v1", id: category.id, category: category.category, requiredFor: category.requiredFor, skipPolicy: category.skipPolicy, status: "skip", passed: category.skipPolicy === "optional", skipped: true, skipReason: "This adversarial validation category is not implemented in the compatibility slice.", failureClass: "capability_policy_block", commandReports: [], validatorReport: null, artifacts: [] };
 }
 
@@ -2308,11 +2312,11 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
   const validatorReport = await runAdversarialValidator(env, plan, milestone, iterationState, reports, coverageDraft, ctx, run);
   const coverage = buildCoverageReport({ plan, milestone, iterationState, commandReports: contractCommandReports, validatorReport, scope: "milestone" });
   const coveragePath = writeArtifact(run, `coverage/${safeName(milestone.id)}-coverage.json`, coverage, "json", `Coverage: ${milestone.id}`);
-  const commandCategoryResults = validationCategories.filter((category) => !category.adversarial).map((category) => categoryResultFromCommandReport(category, reports));
+  const commandCategoryResults = validationCategories.filter((category) => !category.adversarial).map((category) => categoryResultFromCommandReport(category, reports, plan.completionTarget));
   const implementedAdversarialCategory = validationCategories.find(isImplementedAdversarialCategory) || normalizeValidationCategory({ id: "adversarial-scrutiny", category: "scrutiny", adversarial: true }, 0, "implicit-adversarial");
   const adversarialCategoryResults = validationCategories
     .filter((category) => category.adversarial)
-    .map((category) => isImplementedAdversarialCategory(category) ? categoryResultFromValidatorReport(category, validatorReport) : skippedUnsupportedAdversarialCategoryResult(category));
+    .map((category) => isImplementedAdversarialCategory(category) ? categoryResultFromValidatorReport(category, validatorReport) : skippedUnsupportedAdversarialCategoryResult(category, plan.completionTarget));
   if (!adversarialCategoryResults.some((result) => result.id === implementedAdversarialCategory.id)) adversarialCategoryResults.push(categoryResultFromValidatorReport(implementedAdversarialCategory, validatorReport));
   const categoryResults = [...commandCategoryResults, ...adversarialCategoryResults];
   const commandPassed = contractCommandReports.every((report) => report.passed);
