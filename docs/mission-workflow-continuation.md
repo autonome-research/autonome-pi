@@ -493,3 +493,14 @@ The current working tree adds structured repair planning before repair workers a
 - Smoke coverage verifies that a failed validation with later successful repair writes a repair-plan artifact before repair workers run.
 
 This implements the first negotiation/repair-planning layer while keeping the deterministic runner responsible for actual repair feature IDs and queueing.
+
+## 2026-06-09 — Uncommitted shared mission notes slice
+
+The current working tree adds durable shared mission notes for agent-X continuity:
+
+- Worker handoff v3 arrays (`architecturalDecisions`, `assumptions`, `externalServiceAssumptions`, `operatorSteps`, `testsAdded`, `risksNotAddressed`, `broadcastNotes`) are copied into runner-owned `sharedMissionNotes` in the mission registry.
+- The runner writes a `pi-mission-workflow/shared-mission-notes/v1` artifact at `state/shared-mission-notes.json` and records the path in `operatorDx.sharedMissionNotesPath`.
+- Later worker prompts include compact shared notes from previous workers, giving serial agents a bounded broadcast channel without trusting them for changed files or coverage metadata.
+- Smoke coverage verifies a note from feature `f1` appears in feature `f2`'s prompt and is persisted in the registry/artifact.
+
+This is intentionally lightweight and append-only/deduplicated for now; future slices can split public broadcast notes from operator-only runbook notes and surface them in status/explain output.
