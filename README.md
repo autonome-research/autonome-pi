@@ -52,7 +52,7 @@ Recent changes:
 - Hardened `mission_workflow` with adversarial post-milestone validation, runner-owned handoff metadata, durable trusted checkpoints for resume, strict validation-cursor fingerprints/evidence checks, merge-blocking transient lockfile quarantine, stale `lastError` archival after successful resume/completion, cancellation-safe validation, contaminated-branch detection/reset, assertion coverage reports, generated-junk protection, transient `uv.lock` cleanup with audit artifacts, short content-addressed repair IDs, runner-provided handoff skeletons, compact result payloads, and capped repair loops.
 - The generic visualizer now deduplicates repeated artifact paths, closes phase-event-only phases when a workflow reaches a terminal status, and keeps compact run/monitor summaries focused on recent or active phases instead of dumping every historical phase/artifact.
 - Thread-phase dependency is `^4.1.0`; global `@autonome-research/thread-phase-cli` was updated to `4.1.0` for improved cancellation/error/fanout primitives.
-- Mission continuation/failure-mode notes are in `docs/mission-workflow-continuation.md`; read `/home/velvet/droid_flows.md` first for Droid/Missions design context.
+- Mission continuation/failure-mode notes are in `docs/mission-workflow-continuation.md`; the DX/agent-X roadmap for making missions closer to a full software production pipeline is in `docs/mission-workflow-completeness-roadmap.md`. Read `/home/velvet/droid_flows.md` first for Droid/Missions design context.
 
 ## Remaining work
 
@@ -63,7 +63,7 @@ High-value follow-ups:
 - Usage budgets: optionally fail/stop workflows when projected token usage exceeds configured limits.
 - Saved workflow templates: support reusable specs/harnesses under a Pi workflow directory.
 - Resume support: allow structured/dynamic workflows to resume/reuse completed phase artifacts after interruption.
-- Mission workflow follow-ups: smarter repair planning, browser/computer-use QA adapters, final merge policy options, and larger dogfood tests.
+- Mission workflow follow-ups: validation categories/completion levels, operational-readiness contracts, heterogeneous model role policy, smarter repair planning, richer agent handoffs/shared mission notes, registry integrity/resume explain mode, external integration test conventions, and larger dogfood tests.
 
 ## Notes
 
