@@ -506,6 +506,270 @@ For the `auto_trading` follow-up mission, the target project should expose comma
 
 The mission extension should be able to plan and verify similar command surfaces for any project, not hard-code trading-specific behavior.
 
+## Pre-plan scoping and ambiguity resolution
+
+Factory-style missions are not only one-shot plan generation. The orchestrator should be able to identify unclear scope, ask blocking questions, and record assumptions before producing an approval-ready plan.
+
+Current implementation:
+
+- `createPlan()` in `mission-workflow/bin/mission-workflow.mjs` always produces a plan artifact for non-empty `--goal`.
+- `mission-workflow/index.ts` exposes only `action: "plan" | "activate" | "resume" | "status"`.
+
+Needed design:
+
+- Add planner output mode that can return `needs_clarification` instead of a full activation-ready plan.
+- Preserve the current simple path for clear goals.
+- Do not activate from a clarification artifact; require a final `mission-plan.json`.
+
+Suggested scoping artifact:
+
+```json
+{
+  "schema": "pi-mission-workflow/planning-clarification/v1",
+  "planningStatus": "needs_clarification",
+  "goal": "...",
+  "blockingAmbiguities": [],
+  "questions": [],
+  "assumptionsIfUnanswered": [],
+  "suggestedScopeOptions": [],
+  "recommendedNextAction": "answer_questions_then_replan"
+}
+```
+
+Implementation locations:
+
+- `createPlan()`:
+  - Update planner prompt to request either a clarification JSON object or an activation-ready plan.
+  - If `planningStatus === "needs_clarification"`, write `planning-clarification.json` and `planning-clarification.md`, complete the planning run successfully, but do not call `persistRegistryPlan()` as if a mission were planned.
+- `normalizePlan()` and `validatePlanForActivation()`:
+  - Reject clarification artifacts for activation with a clear error.
+- `mission-workflow/index.ts`:
+  - Keep the tool API simple initially; no new action is required.
+  - Later optional flags could include `planningMode: "auto" | "force_plan" | "ask_first"`.
+
+## Per-feature read-only review validators
+
+Factory scrutiny validation includes dedicated code review agents for each completed feature. The roadmap should make this explicit instead of relying only on one milestone-level adversarial validator.
+
+Needed design:
+
+- Add a `scrutiny` validation category subtype: `feature_review`.
+- For each feature completed in the milestone, run a fresh read-only reviewer over:
+  - feature description;
+  - assigned global/local assertions;
+  - runner-owned changed files;
+  - feature commit/diff;
+  - worker handoff summary;
+  - relevant source docs and shared mission notes.
+- Feature reviewers must use read-only tools only: `read`, `grep`, `find`, `ls`.
+- Feature review reports are inputs to the milestone adversarial validator and repair planner.
+
+Implementation locations:
+
+- Add helper `runFeatureReviewValidators(env, plan, milestone, iterationState, ctx, run)` near `runAdversarialValidator()`.
+- Call it from future category-aware `runValidation()` before milestone adversarial validation.
+- Fold results into `categoryResults[]` and `buildCoverageReport()` validators.
+- Emit artifacts under `validation/<milestone>-feature-reviews/<featureId>.json`.
+
+Feature review report shape:
+
+```json
+{
+  "schema": "pi-mission-workflow/feature-review/v1",
+  "milestoneId": "M1",
+  "featureId": "M1-F2",
+  "passed": true,
+  "summary": "...",
+  "objections": [],
+  "assertionResults": [],
+  "changedFilesReviewed": []
+}
+```
+
+Internal parallelization policy:
+
+- Overall mission execution remains serial for mutating work.
+- Feature review validators may run with bounded parallelism because they are read-only.
+- Bounded concurrency should be configurable by env/CLI later, defaulting conservatively.
+- No parallel write workers, commits, mission-branch merges, registry mutation, or repair execution.
+
+## Behavioral validation adapters
+
+The existing `userTestCommand` is useful but too narrow. Factory's user-testing validator is best understood as behavioral end-to-end verification, not necessarily UI testing.
+
+Needed design:
+
+- Treat `behavior` as a first-class validation category that can run:
+  - CLI flows;
+  - API flows;
+  - browser/computer-use flows;
+  - service lifecycle flows;
+  - workflow replay scripts;
+  - paper/simulation runs.
+- Keep command-based behavior validation as the first implementation.
+- Add adapter metadata without hard-coding any one UI/computer-use provider.
+
+Behavior category extension:
+
+```json
+{
+  "id": "paper-forward-dry-run",
+  "category": "behavior",
+  "adapter": "command",
+  "commands": ["auto-trading-paper-forward-once --dry-run"],
+  "requiredFor": ["operationally_ready"],
+  "artifactsRequired": []
+}
+```
+
+Future adapter values:
+
+- `command`
+- `http_flow`
+- `browser_computer_use`
+- `service_lifecycle`
+- `workflow_replay`
+
+Implementation locations:
+
+- `normalizeValidationCategories(plan)` should convert legacy `userTestCommand` to `category: "behavior", adapter: "command"`.
+- `runValidationCategory()` should dispatch on `adapter`.
+- `runProcess()` remains the first backend for `adapter: "command"`.
+
+## Targeted internal parallelism policy
+
+The transcript emphasizes serial feature execution with targeted internal parallelization for read-only work. The extension should encode that policy explicitly.
+
+Policy:
+
+- Mutating phases are serial:
+  - worker implementation;
+  - runner commit;
+  - mission branch merge;
+  - repair worker execution;
+  - registry writes.
+- Read-only phases may be parallelized:
+  - repository/source-doc exploration during planning;
+  - per-feature code review validators;
+  - static read-only domain/ops critiques;
+  - report summarization and analytics.
+- Any parallel phase must:
+  - declare `readOnly: true`;
+  - use read-only tool lists;
+  - write artifacts through runner-controlled deterministic paths;
+  - avoid direct registry mutation from subagents.
+
+Implementation locations:
+
+- Use future helpers around `runPi()` or thread-phase fanout APIs only for read-only work.
+- `runValidationCategory()` should be the first place to add bounded fanout.
+- Add env/CLI controls later:
+  - `PI_MISSION_WORKFLOW_READONLY_CONCURRENCY`
+  - `--readonly-concurrency`
+
+## Prompt caching, budget policy, and economics
+
+Factory reports prompt caching and budget burn as production concerns. The extension already records some usage from `runPi()`, but the spec should require cacheable prompt structure and budget policy.
+
+Needed design:
+
+- Split prompts into stable cacheable blocks and volatile blocks:
+  - stable: mission goal, source docs summaries, validation contract, role skill text;
+  - volatile: current feature, latest diff, command output, active repair objections.
+- Fingerprint stable prompt blocks and persist fingerprints in artifacts/registry.
+- Track budget by role and mission:
+  - wall-clock;
+  - token usage when available;
+  - model identity;
+  - cacheable prompt fingerprint;
+  - validation/repair counts.
+- Add soft and hard budget limits later.
+
+Implementation locations:
+
+- `runPi()`:
+  - Record resolved model and usage in a normalized role metric, not only phase events.
+- `createPlan()`, `runWorkerForFeature()`, `runAdversarialValidator()`, future `planRepairsFromValidation()`:
+  - Build prompts from named blocks and write prompt artifacts with block fingerprints.
+- `defaultRegistryState()`:
+  - Add `budget` and `promptCache` fields.
+- `activateMission()`:
+  - Include budget burn in final report and analytics artifact.
+
+Suggested budget schema:
+
+```json
+{
+  "budget": {
+    "limits": { "wallClockMs": null, "tokens": null, "costUsd": null },
+    "usage": { "wallClockMs": 0, "tokens": 0, "byRole": {} },
+    "promptCache": { "stableBlocks": [] }
+  }
+}
+```
+
+## Generated mission skills
+
+Factory's implementation leans on mission-specific skills/instructions rather than encoding every strategy in the state machine. This extension should generate per-mission role instructions as artifacts and feed them to agents.
+
+Needed design:
+
+- During planning, produce mission-specific skill artifacts:
+  - worker skill;
+  - validator skill;
+  - domain critic skill when enabled;
+  - ops critic skill when enabled;
+  - repair planner skill.
+- Skills should contain:
+  - project constraints;
+  - coding conventions;
+  - validation contract interpretation rules;
+  - handoff rules;
+  - capability/secrets/network restrictions;
+  - domain-specific pitfalls.
+- Skills are artifacts, not authoritative state. Runner-owned schema and validation still control safety-critical transitions.
+
+Implementation locations:
+
+- `createPlan()`:
+  - Ask planner for `roleInstructions` or generate them deterministically from plan fields.
+  - Write artifacts under `skills/mission-worker-skill.md`, `skills/mission-validator-skill.md`, etc.
+- `runWorkerForFeature()` and `runAdversarialValidator()`:
+  - Include compact skill text or artifact path/summary in prompts.
+- `missionPlanFingerprint()` / validation cursor fingerprint:
+  - Include skill fingerprints if they affect worker/validator behavior.
+- `docs/mission-workflow-continuation.md` and `skills/mission-workflow/SKILL.md`:
+  - Document that generated mission skills should be preserved as artifacts.
+
+## Mission benchmark and production metrics
+
+Smoke tests prove deterministic behavior, but Factory-style production improvement also needs mission-level benchmarks and analytics.
+
+Metrics to add beyond basic role metrics:
+
+- first-pass validation rate by milestone;
+- repair rate and repair iterations by milestone;
+- repeated objection signatures;
+- time/token distribution by role;
+- test-code ratio where detectable;
+- changed-files and lines-changed distribution;
+- coverage percentage when project tooling reports it;
+- validator disagreement rate;
+- credential-gated skip count;
+- model-role success/failure comparison.
+
+Implementation locations:
+
+- `activateMission()`:
+  - Aggregate metrics at mission completion.
+- `recordRoleMetric()` / registry updates:
+  - Persist model-role metrics incrementally.
+- `scripts/smoke-test.mjs`:
+  - Add deterministic fixture metrics assertions.
+- Final artifacts:
+  - `analytics/mission-analytics.json`
+  - `analytics/mission-benchmark-summary.md`
+
 ## Resume, status, and registry integrity design
 
 The current resume logic is strong but hard to inspect. Improve mission-operator DX without adding approval gates after activation.
@@ -617,18 +881,23 @@ Add an explicit mission-workflow eval harness to `scripts/smoke-test.mjs`. These
 Required evals:
 
 1. Plan normalization keeps legacy plans working.
-2. New validation category fields normalize from legacy `validationCommands`/`userTestCommand`.
-3. `completionTarget=contract_validated` preserves current behavior.
-4. `completionTarget=operationally_ready` fails or skips honestly when required credentials are absent.
-5. Credential-gated skip writes an artifact and appears in final report.
-6. Repair planner clusters duplicate objections and uses stable repair IDs.
-7. Failure taxonomy is attached to command failures, validator objections, and terminal registry errors.
-8. Handoff v2 remains accepted; handoff v3 optional arrays are summarized.
-9. Shared mission notes are compacted and included in later prompts.
-10. Registry status/explain reports trusted cursor decisions.
-11. Cancellation during category validation does not synthesize repair objections.
-12. Unknown/legacy registry fields do not break resume.
-13. Generic event projections still render without mission-specific visualizer code.
+2. Planner clarification artifacts cannot be activated as mission plans.
+3. New validation category fields normalize from legacy `validationCommands`/`userTestCommand`.
+4. `completionTarget=contract_validated` preserves current behavior.
+5. `completionTarget=operationally_ready` fails or skips honestly when required credentials are absent.
+6. Credential-gated skip writes an artifact and appears in final report.
+7. Per-feature review validator results aggregate into milestone validation without mutating the repo.
+8. Behavior `adapter: "command"` preserves current `userTestCommand` behavior.
+9. Repair planner clusters duplicate objections and uses stable repair IDs.
+10. Failure taxonomy is attached to command failures, validator objections, and terminal registry errors.
+11. Handoff v2 remains accepted; handoff v3 optional arrays are summarized.
+12. Shared mission notes are compacted and included in later prompts.
+13. Generated skill fingerprints are persisted and affect validation cursor reuse when configured.
+14. Budget/prompt-cache metrics are recorded without requiring provider-specific usage fields.
+15. Registry status/explain reports trusted cursor decisions.
+16. Cancellation during category validation does not synthesize repair objections.
+17. Unknown/legacy registry fields do not break resume.
+18. Generic event projections still render without mission-specific visualizer code.
 
 Optional Pi-backed evals can run separately under an opt-in env var; default smoke tests should stay deterministic.
 
@@ -636,33 +905,41 @@ Optional Pi-backed evals can run separately under an opt-in env var; default smo
 
 1. Add constants and schema normalizers in `mission-workflow/bin/mission-workflow.mjs`:
    - completion levels;
-   - validation categories;
+   - validation categories and behavior adapters;
    - role policy;
    - capability policy;
    - prompt versions;
-   - failure taxonomy.
-2. Extend `defaultPlan()`, `createPlan()`, `normalizePlan()`, and `validatePlanForActivation()` for additive plan fields.
-3. Extend `defaultRegistryState()` and registry updates for completion/category/role/failure fields.
-4. Refactor `runValidation()` into category-aware helpers while preserving legacy command/adversarial behavior.
-5. Add skip artifacts and credential-gated validation semantics.
-6. Replace direct `repairFeaturesFromReport()` usage with `planRepairsFromValidation()` plus deterministic fallback.
-7. Extend worker handoff skeleton to v3 and add shared mission notes.
-8. Add role/model/prompt metrics and final analytics artifact.
-9. Improve `status()` and optionally add resume-explain behavior.
-10. Emit richer generic phase events; only then update `thread-phase-visualizer/lib/store.mjs` if projections need stable generic fields.
-11. Add smoke/eval coverage in `scripts/smoke-test.mjs`.
-12. Update `mission-workflow/README.md`, `docs/mission-workflow-continuation.md`, and `skills/mission-workflow/SKILL.md`.
-13. Dogfood on a narrow `auto_trading` operational-readiness mission.
+   - failure taxonomy;
+   - budget/prompt-cache identities.
+2. Extend `defaultPlan()`, `createPlan()`, `normalizePlan()`, and `validatePlanForActivation()` for additive plan fields, including scoping/clarification handling.
+3. Add generated mission skill artifacts from planning and include their fingerprints in plan/validation cursor identity where needed.
+4. Extend `defaultRegistryState()` and registry updates for completion/category/role/failure/budget/skill fields.
+5. Refactor `runValidation()` into category-aware helpers while preserving legacy command/adversarial behavior.
+6. Add skip artifacts and credential-gated validation semantics.
+7. Add per-feature read-only review validators with bounded internal parallelism.
+8. Add behavior validation adapter support, starting with `adapter: "command"`.
+9. Replace direct `repairFeaturesFromReport()` usage with `planRepairsFromValidation()` plus deterministic fallback.
+10. Extend worker handoff skeleton to v3 and add shared mission notes.
+11. Add role/model/prompt/budget metrics and final analytics/benchmark artifacts.
+12. Improve `status()` and optionally add resume-explain behavior.
+13. Emit richer generic phase events; only then update `thread-phase-visualizer/lib/store.mjs` if projections need stable generic fields.
+14. Add smoke/eval/benchmark coverage in `scripts/smoke-test.mjs`.
+15. Update `mission-workflow/README.md`, `docs/mission-workflow-continuation.md`, and `skills/mission-workflow/SKILL.md`.
+16. Dogfood on a narrow `auto_trading` operational-readiness mission.
 
 ## Success criteria
 
 The extension should be considered substantially more complete when a mission can:
 
+- detect unclear goals and emit a clarification artifact before creating an activation-ready plan;
 - produce a plan that explicitly includes implementation, validation, operationalization, and documentation/runbook deliverables;
 - target and report a completion level beyond simple code completion;
-- use heterogeneous models by role with recorded prompt/model/usage metrics;
+- use heterogeneous models by role with recorded prompt/model/usage/budget metrics;
+- generate mission-specific worker/validator/repair skills and preserve their fingerprints;
 - run categorized validators with honest credential-gated skip artifacts;
+- run per-feature read-only review validators and fold their results into milestone validation;
+- run behavior validation adapters for CLI/API/service/workflow flows, starting with command adapters;
 - prove not just that code passes tests, but that delivered software can be configured and run safely for the requested target level;
 - generate coherent repair plans from clustered and classified validator objections;
 - resume safely with explainable trust decisions and artifact validation;
-- leave behind enough plan, registry, handoff, validation, analytics, and DX artifacts for a new agent or developer to continue without chat context.
+- leave behind enough plan, registry, handoff, validation, skill, benchmark, analytics, and DX artifacts for a new agent or developer to continue without chat context.
