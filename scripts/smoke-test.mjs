@@ -177,6 +177,7 @@ try {
     const missionValidationCategories = await import(pathToFileURL(join(root, 'mission-workflow/src/validation/categories.ts')).href);
     const missionRegistryPaths = await import(pathToFileURL(join(root, 'mission-workflow/src/registry/paths.ts')).href);
     const missionRegistryState = await import(pathToFileURL(join(root, 'mission-workflow/src/registry/state.ts')).href);
+    const missionRegistryCursors = await import(pathToFileURL(join(root, 'mission-workflow/src/registry/cursors.ts')).href);
     const missionGitFingerprints = await import(pathToFileURL(join(root, 'mission-workflow/src/git/fingerprints.ts')).href);
     log(missionCoreTime.parseMillis('2m', 1) === 120000 && missionCoreTime.parseMillis('250ms', 1) === 250 && missionCoreTime.parseMillis('bad', 42) === 42, 'mission core parseMillis handles units and fallback');
     const hasUnpairedSurrogate = (value) => {
@@ -269,6 +270,14 @@ try {
     const featureHash = missionGitFingerprints.featureFingerprint(fingerprintPlan, fingerprintPlan.milestones[0], fingerprintPlan.milestones[0].features[0], 'f1');
     const localFeatureHash = featureFingerprint({ milestoneId: 'm1', featureId: 'f1', title: ' Feature  One ', description: 'Does work', assertions: ['a1'], localAssertions: ['local'], contractAssertions: fingerprintPlan.validationContract.assertions });
     log(missionGitFingerprints.expectedFeatureCommitSubject({ missionId: 'm1' }, { title: '  hello   world  ' }, 'f1') === 'mission(m1): hello world' && missionGitFingerprints.missionPlanFingerprint(fingerprintPlan, 'base').length === 24 && featureHash === localFeatureHash && missionGitFingerprints.parseRepairSignatureFromId('repair-m1-2-abcdef1234-title') === 'abcdef1234' && missionGitFingerprints.repairSignatureFromFeature({ repair: true, repairSignature: 'ABCDEF1234' }, 'repair-m1-2-deadbeef00') === 'abcdef1234' && missionGitFingerprints.repairSignatureFromRecord({ featureId: 'repair-m1-2-deadbeef00-title' }) === 'deadbeef00', 'mission git fingerprint helpers preserve commit subjects feature hashes and repair signatures');
+    const cursorHome = join(tmp, 'cursor-home');
+    mkdirSync(join(cursorHome, '.npm-global', 'bin'), { recursive: true });
+    writeFileSync(join(cursorHome, '.npm-global', 'bin', 'pi'), '#!/bin/sh\n');
+    const mockCursor = missionRegistryCursors.validationCursorMetadata({ planner: 'mock', completionTarget: 'deployment_ready', promptPolicy: { validatorPromptVersion: 'validator/custom' } }, '', '', { commandTimeoutMs: 11 }, '/custom/pi');
+    const piCursor = missionRegistryCursors.validationCursorMetadata({ planner: 'pi', completionTarget: 'contract_validated' }, 'validator-model', 'actual-model', { piTimeoutMs: 22, piIdleTimeoutMs: 33 }, '/custom/pi');
+    const unstablePiCursor = missionRegistryCursors.validationCursorMetadata({ planner: 'pi' }, '', '', {}, '/custom/pi');
+    const validationFeature = missionRegistryCursors.validationFeatureRecord({ featureId: 'f1', featureBranch: 'branch', commit: 'abc', handoffArtifact: '/handoff.json', changedFiles: ['a'], assertions: ['a1'], localAssertions: ['l1'], featureFingerprint: 'fp' }, 'm1');
+    log(missionRegistryCursors.defaultPiBin(cursorHome, { PI_MISSION_WORKFLOW_PI_BIN: '/env/pi' }) === '/env/pi' && missionRegistryCursors.defaultPiBin(cursorHome, {}) === join(cursorHome, '.npm-global', 'bin', 'pi') && missionRegistryCursors.defaultPiBin(join(tmp, 'missing-cursor-home'), {}) === 'pi' && mockCursor.validatorMode === 'mock' && mockCursor.stableIdentity === true && mockCursor.piBin === undefined && mockCursor.commandTimeoutMs === 11 && mockCursor.promptVersions.validatorPromptVersion === 'validator/custom' && piCursor.validatorMode === 'pi' && piCursor.stableIdentity === true && unstablePiCursor.stableIdentity === false && piCursor.piBin === '/custom/pi' && piCursor.actualModel === 'actual-model' && piCursor.piTimeoutMs === 22 && validationFeature.featureId === 'f1' && validationFeature.milestoneId === 'm1' && validationFeature.changedFiles[0] === 'a', 'mission registry cursor helpers preserve validator metadata and feature records');
   } catch (error) {
     const code = error?.code || error?.message || String(error);
     log(code === 'ERR_UNKNOWN_FILE_EXTENSION', 'mission wrapper helper tests skipped only when Node lacks TypeScript module loading', String(code));

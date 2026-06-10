@@ -184,11 +184,23 @@ Added `mission-workflow/src/planning/assertions.ts` with typed pure helpers:
 
 Smoke coverage checks contract assertion prefix matching, description-to-ID matching, fallback unknown references, and local assertion dedupe.
 
+### 2026-06-09 — Typed validation cursor metadata helpers
+
+Implemented in current working tree.
+
+Added `mission-workflow/src/registry/cursors.ts` with typed helpers:
+
+- `defaultPiBin()`
+- `validationCursorMetadata()`
+- `validationFeatureRecord()`
+
+Smoke coverage checks mock/pi validator metadata behavior, stable identity semantics, prompt policy preservation, timeout fields, Pi binary selection, actual model capture, and feature-record shape.
+
 ## Active / next component
 
 ### Registry and trust model continuation
 
-Goal: continue extracting trusted checkpoint and validation cursor helpers from `mission-workflow/bin/mission-workflow.mjs` while keeping runtime behavior stable.
+Goal: continue extracting trusted checkpoint and validation cursor fingerprint helpers from `mission-workflow/bin/mission-workflow.mjs` while keeping runtime behavior stable.
 
 ## Refactor roadmap
 
