@@ -2000,11 +2000,21 @@ function summarizeHandoff(handoff, artifactPath) {
 
 const SHARED_NOTE_FIELDS = ["architecturalDecisions", "assumptions", "externalServiceAssumptions", "operatorSteps", "testsAdded", "risksNotAddressed", "broadcastNotes"];
 
+function sharedNoteText(value) {
+  if (typeof value === "string") return value.trim() || undefined;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    for (const key of ["note", "text", "description", "summary"]) {
+      if (typeof value[key] === "string" && value[key].trim()) return value[key].trim();
+    }
+  }
+  return undefined;
+}
+
 function normalizeSharedNoteValues(values) {
   return (Array.isArray(values) ? values : [])
-    .filter((value) => typeof value === "string")
-    .map((value) => compactText(value.trim(), 1000))
-    .filter(Boolean);
+    .map((value) => sharedNoteText(value))
+    .filter(Boolean)
+    .map((value) => compactText(value, 1000));
 }
 
 function normalizeSharedMissionNotes(existing = {}) {
@@ -2059,7 +2069,7 @@ function validateHandoff({ handoff, featureId, feature, plan, changedFiles, stri
   for (const field of SHARED_NOTE_FIELDS) {
     if (Array.isArray(handoff[field])) {
       handoff[field].forEach((value, index) => {
-        if (typeof value !== "string" || !value.trim()) errors.push(`handoff.${field}[${index}] must be a non-empty string`);
+        if (sharedNoteText(value) === undefined) errors.push(`handoff.${field}[${index}] must be a non-empty string (or an object with a non-empty string note/text/description/summary)`);
       });
     }
   }
@@ -2160,6 +2170,7 @@ async function runWorkerForFeature(env, milestone, feature, plan, ctx, run) {
     }
     if (Array.isArray(handoff.assertionsAddressed)) handoff.workerAssertionsAddressed = handoff.assertionsAddressed;
     handoff.assertionsAddressed = handoffValidation.assertionsAddressed;
+    for (const field of SHARED_NOTE_FIELDS) if (Array.isArray(handoff[field])) handoff[field] = normalizeSharedNoteValues(handoff[field]);
     const handoffArtifact = writeArtifact(run, `handoffs/${featureId}.json`, handoff, "json", `Worker handoff: ${featureId}`);
     const handoffSummary = summarizeHandoff(handoff, handoffArtifact);
     if (!changedFiles.length) {
@@ -2390,7 +2401,7 @@ async function runAdversarialValidator(env, plan, milestone, iterationState, com
       diffStat: compactText(diffStat.stdout || diffStat.stderr || "", 12000),
       diffFiles: compactText(diffFiles.stdout || diffFiles.stderr || "", 12000),
     }), MAX_PROMPT_CONTEXT_BYTES);
-    const validatorPromptPath = writeArtifact(run, `validation/${safeName(milestone.id)}-validator-prompt.md`, prompt, "markdown", `Validator prompt: ${milestone.id}`);
+    const validatorPromptPath = writeArtifact(run, `validation/${safeName(milestone.id)}-iteration-${Number(iterationState?.iteration || 0)}-validator-prompt.md`, prompt, "markdown", `Validator prompt: ${milestone.id}`);
     const result = await runPi({ cwd: env.integrationPath, prompt, tools: ["read", "grep", "find", "ls"], model: ctx.modelValidator, signal: ctx.signal, operationLabel: `validator ${milestone.id}`, phase: `validator-${milestone.id}`, timeoutMs: ctx.piTimeoutMs, idleTimeoutMs: ctx.piIdleTimeoutMs });
     validatorMetadata = validationCursorMetadata(plan, ctx.modelValidator, result.model, ctx);
     if (result.usage?.length) phaseEvent(run, `validator-${milestone.id}`, { kind: "usage", usage: result.usage, model: result.model });
@@ -2399,13 +2410,13 @@ async function runAdversarialValidator(env, plan, milestone, iterationState, com
     else {
       try { raw = parseJsonFromText(result.text); }
       catch (error) {
-        writeArtifact(run, `validation/${safeName(milestone.id)}-validator-output.md`, result.text, "markdown", `Validator raw output: ${milestone.id}`);
+        writeArtifact(run, `validation/${safeName(milestone.id)}-iteration-${Number(iterationState?.iteration || 0)}-validator-output.md`, result.text, "markdown", `Validator raw output: ${milestone.id}`);
         raw = { passed: false, summary: "Validator returned malformed JSON.", objections: [{ level: "must", description: error.message, evidence: validatorPromptPath, repairHint: "Return strict JSON validation report." }], assertionResults: [] };
       }
     }
   }
   const normalized = { ...normalizeValidatorReport(raw, { plan, milestone, coverageGaps: coverageDraft.gaps }), validatorMetadata };
-  const artifactPath = writeArtifact(run, `validation/${safeName(milestone.id)}-adversarial-report.json`, normalized, "json", `Adversarial validation report: ${milestone.id}`);
+  const artifactPath = writeArtifact(run, `validation/${safeName(milestone.id)}-iteration-${Number(iterationState?.iteration || 0)}-adversarial-report.json`, normalized, "json", `Adversarial validation report: ${milestone.id}`);
   return { ...normalized, artifact: artifactPath };
 }
 
@@ -2530,7 +2541,7 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
       const label = category.userTest ? `user test command: ${command}` : `${category.category} validation command: ${command}`;
       const result = await runProcess(command, [], { cwd: env.integrationPath, shell: true, signal: ctx.signal, timeoutMs, operationLabel: label, phase: `validation-${milestone.id}` });
       if ((result.aborted && !result.timedOut) || ctx.signal.aborted) throw abortError(ctx.signal.reason || result.error || "cancelled");
-      const file = writeArtifact(run, `validation/${safeName(milestone.id)}-${safeName(category.id)}-${safeName(command)}.txt`, [`$ ${command}`, result.error ? `# ${result.error}` : "", result.stdout, result.stderr].join("\n"), "file", `Validation command: ${category.id}`);
+      const file = writeArtifact(run, `validation/${safeName(milestone.id)}-iteration-${Number(iterationState?.iteration || 0)}-${safeName(category.id)}-${safeName(command)}.txt`, [`$ ${command}`, result.error ? `# ${result.error}` : "", result.stdout, result.stderr].join("\n"), "file", `Validation command: ${category.id}`);
       reports.push({ validator: validatorName, ...categoryBaseReport(category), command, passed: result.ok, exitCode: result.code, timedOut: Boolean(result.timedOut), failureClass: result.ok ? null : classifyValidationFailure({ command, result }), artifact: file, stdoutExcerpt: compactText(result.stdout || "", 4000), stderrExcerpt: compactText(result.stderr || result.error || "", 4000) });
     }
     const missingArtifacts = (category.artifactsRequired || []).filter((artifactPath) => !artifactExists(artifactPath));
@@ -2545,7 +2556,7 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
   const coverageDraft = buildCoverageReport({ plan, milestone, iterationState, commandReports: contractCommandReports, validatorReport: undefined, scope: "milestone" });
   const validatorReport = await runAdversarialValidator(env, plan, milestone, iterationState, reports, coverageDraft, ctx, run, featureReviews);
   const coverage = buildCoverageReport({ plan, milestone, iterationState, commandReports: contractCommandReports, validatorReport, scope: "milestone" });
-  const coveragePath = writeArtifact(run, `coverage/${safeName(milestone.id)}-coverage.json`, coverage, "json", `Coverage: ${milestone.id}`);
+  const coveragePath = writeArtifact(run, `coverage/${safeName(milestone.id)}-iteration-${Number(iterationState?.iteration || 0)}-coverage.json`, coverage, "json", `Coverage: ${milestone.id}`);
   const commandCategoryResults = validationCategories.filter((category) => !category.adversarial).map((category) => categoryResultFromCommandReport(category, reports, plan.completionTarget));
   const implementedAdversarialCategory = validationCategories.find(isImplementedAdversarialCategory) || normalizeValidationCategory({ id: "adversarial-scrutiny", category: "scrutiny", adversarial: true }, 0, "implicit-adversarial");
   const adversarialCategoryResults = validationCategories
@@ -2583,7 +2594,7 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
     const failureClasses = Array.from(new Set(categoryResults.filter((item) => item.failureClass).map((item) => item.failureClass)));
     phaseEvent(run, `validation-${milestone.id}`, { kind: "failure_classification", milestoneId: milestone.id, failureClasses, message: failureClasses.length ? `Validation failure classes: ${failureClasses.join(", ")}` : "Validation failed" });
   }
-  const reportPath = writeArtifact(run, `validation/${safeName(milestone.id)}-report.json`, report, "json", `Validation report: ${milestone.id}`);
+  const reportPath = writeArtifact(run, `validation/${safeName(milestone.id)}-iteration-${Number(iterationState?.iteration || 0)}-report.json`, report, "json", `Validation report: ${milestone.id}`);
   return { ...report, artifact: reportPath };
 }
 

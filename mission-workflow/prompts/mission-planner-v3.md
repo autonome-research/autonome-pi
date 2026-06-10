@@ -5,6 +5,8 @@ Each milestone has id,title,features[]. Each feature has id,title,description,as
 Optional localAssertions[] are feature-local acceptance checks; they supplement validator context but do not satisfy global/final contract coverage. Use localOnly:true only for feature-local work with no global contract assertion.
 Optional workerProcedures is a plain-text block of mission-specific procedures every worker must follow (conventions, test expectations, architectural constraints, commands to run before finishing). Write it when the mission benefits from explicit working agreements; workers are instructed to follow it and report compliance in their handoffs.
 Validation assertions must be written before implementation and independently define correctness.
+Only include validationCategories entries that declare at least one runnable command in commands[]; required command categories without commands are rejected at activation. Do not emit placeholder categories: adversarial contract scrutiny is added automatically, and validationCommands/userTestCommand are mapped to categories automatically.
+Milestone validation runs every validation command and the user test command after EVERY milestone, so each milestone must leave the repository in a state where those commands can pass; if the user test command needs artifacts from several features, put those features in the same milestone.
 Default completionTarget is contract_validated. Use operationally_ready/deployment_ready only when the plan also includes explicit behavior/operational/integration/domain/deployment validationCategories and runnable DX deliverables for that level.
 Goal: {{goal}}
 Default maxRepairIterations: {{maxRepairIterations}}

@@ -524,3 +524,16 @@ Compatibility notes for operators:
 - Plans generated before this slice pin legacy prompt versions in their normalized `promptPolicy` (`mission-planner/v2`, `mission-worker/v3`, `mission-validator/v3`). `loadPromptTemplate()` aliases those to the current templates when no exact template file exists, so old plans stay activatable; truly unknown versions fail with an error listing available templates. To freeze legacy semantics instead, add a matching template file under `mission-workflow/prompts/`.
 
 Next step: M1 of `docs/mission-kernel-design.md` — extract kernel verbs into `src/kernel/*.mjs` (+`.d.ts`) behavior-stable and switch `bin/mission-workflow.mjs` call sites slice by slice.
+
+## 2026-06-10 — Live dogfood: stats-kata mission (gpt-5.5 via headless pi)
+
+Mission `stats-kata-implementation` in `/home/velvet/mission-dogfood-stats` (spec-driven Node ESM stats CLI kata, 11 contract assertions) ran end-to-end with real pi agents and completed at `contract_validated` with 11/11 final coverage and `node --test` 11/11 green, verified independently in the integration worktree. The run exercised: externalized v4 prompts, default-on per-feature reviews (6 reviews M1, 2 per M4 iteration), `workerProcedures`, strict-handoff failure → runner patch → `resume` (F1.1 skipped via trusted registry/commit trailers), a live repair loop (M4 iteration 1 failed on a real README gap caught by the adversarial validator, repaired in iteration 2), and `lastError` → `lastResolvedError` archival on completion.
+
+Findings and fixes from this dogfood (all committed with smoke coverage where applicable):
+
+1. **Planner emitted commandless placeholder scrutiny categories** → activation correctly rejected them (strict gate working); `mission-planner-v3.md` now forbids placeholder categories and explains automatic category mapping.
+2. **Planner decomposed milestones whose validation commands could not pass yet** (user-test command needed artifacts from later milestones) → caught at plan review; `mission-planner-v3.md` now states milestone validation runs after every milestone and feature placement must keep commands satisfiable.
+3. **Worker wrote shared-note arrays as `{note: "..."}` objects** → strict handoff failed on semantically valid output; narrow canonicalization added (`sharedNoteText()` accepts string or object with string `note`/`text`/`description`/`summary`), handoff artifacts are canonicalized to strings before persistence, worker prompt now says entries must be plain strings, smoke covers the object form.
+4. **Per-milestone validation artifacts were overwritten across iterations** (`<milestone>-report.json`, `-adversarial-report.json`, coverage, command outputs, validator prompt/raw output), destroying failed-iteration evidence that registry records pointed at → all are now iteration-suffixed (`<milestone>-iteration-<n>-...`), matching the repair-plan artifact convention.
+
+Operational notes: planner+8 workers+10 reviews+3 adversarial validations on gpt-5.5 completed in ~12 minutes wall clock across the two activation attempts; the strict activation gate and plan review caught both plan-quality issues before any worker tokens were spent.
