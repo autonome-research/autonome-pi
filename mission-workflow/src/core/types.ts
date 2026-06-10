@@ -116,6 +116,7 @@ export interface PromptPolicy {
 	plannerPromptVersion?: string;
 	workerPromptVersion?: string;
 	validatorPromptVersion?: string;
+	featureReviewPromptVersion?: string;
 	repairPlannerPromptVersion?: string;
 	handoffSchema?: string;
 	validationReportSchema?: string;
@@ -126,6 +127,7 @@ export interface MissionPlan {
 	missionId: string;
 	goal: string;
 	sourceDocs?: string[];
+	workerProcedures?: string;
 	cwd: string;
 	baseRef?: string;
 	worktreeBaseDir?: string;

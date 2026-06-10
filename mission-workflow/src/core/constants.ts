@@ -35,9 +35,10 @@ export const FAILURE_CLASSES = Object.freeze([
 
 export const PLANNING_CLARIFICATION_SCHEMA = "pi-mission-workflow/planning-clarification/v1";
 export const DEFAULT_PROMPT_POLICY = Object.freeze({
-	plannerPromptVersion: "mission-planner/v2",
-	workerPromptVersion: "mission-worker/v3",
-	validatorPromptVersion: "mission-validator/v3",
+	plannerPromptVersion: "mission-planner/v3",
+	workerPromptVersion: "mission-worker/v4",
+	validatorPromptVersion: "mission-validator/v4",
+	featureReviewPromptVersion: "mission-feature-review/v1",
 	repairPlannerPromptVersion: "mission-repair-planner/v1",
 	handoffSchema: "pi-mission-worker-handoff/v3",
 	validationReportSchema: "pi-mission-workflow/milestone-validation/v2",
@@ -49,6 +50,6 @@ export const DEFAULT_CAPABILITY_POLICY = Object.freeze({
 	deployment: false,
 	liveExternalActions: false,
 	maxCommandTimeoutMs: DEFAULT_COMMAND_TIMEOUT_MS,
-	featureReviewValidators: false,
+	featureReviewValidators: true,
 	strategicRepairPlanner: false,
 });

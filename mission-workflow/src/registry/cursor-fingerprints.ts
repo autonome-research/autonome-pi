@@ -35,6 +35,7 @@ export function validationCursorFingerprint(plan: Partial<MissionPlan>, mileston
 		missionId: String(plan.missionId || ""),
 		baseHead: String(baseHead || ""),
 		goal: normalizedText(plan.goal),
+		workerProcedures: normalizedText(plan.workerProcedures),
 		sourceDocs: (plan.sourceDocs || []).map(String).sort(),
 		milestoneId: String(milestone.id || ""),
 		milestoneTitle: normalizedText(milestone.title),

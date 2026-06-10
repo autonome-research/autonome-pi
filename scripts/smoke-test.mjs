@@ -154,6 +154,8 @@ try {
   expectExit('structured shell workflow succeeds', ['node', cli, '--spec-file', shellSpec, '--cwd', root], 0);
 
   const missionCli = join(root, 'mission-workflow/bin/mission-workflow.mjs');
+  const missionPromptVersions = ['mission-planner-v3', 'mission-worker-v4', 'mission-validator-v4', 'mission-feature-review-v1', 'mission-repair-planner-v1'];
+  log(missionPromptVersions.every((name) => existsSync(join(root, 'mission-workflow', 'prompts', `${name}.md`))), 'mission prompt templates exist for default prompt policy versions');
   try {
     const missionArgs = await import(pathToFileURL(join(root, 'mission-workflow/src/extension/args.ts')).href);
     const missionCwd = await import(pathToFileURL(join(root, 'mission-workflow/src/extension/cwd.ts')).href);
@@ -331,6 +333,16 @@ try {
   let statusByMissionIdDetails;
   try { statusByMissionIdDetails = statusByMissionId?.stdout ? JSON.parse(statusByMissionId.stdout) : undefined; } catch { statusByMissionIdDetails = undefined; }
   log(statusByMissionIdDetails?.missionId === registryState?.missionId && statusByMissionIdDetails?.registryStatus === 'completed', 'mission workflow status reports registry by mission-id');
+
+  const legacyPromptPlanPath = join(tmp, 'legacy-prompt-version-plan.json');
+  writeFileSync(legacyPromptPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'legacy-prompt-version-smoke', goal: 'legacy prompt versions alias to current templates', cwd: missionRepo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    worktreeBaseDir: join(tmp, 'legacy-prompt-version-worktrees'), validationCommands: [],
+    promptPolicy: { plannerPromptVersion: 'mission-planner/v2', workerPromptVersion: 'mission-worker/v3', validatorPromptVersion: 'mission-validator/v3' },
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  expectExit('mission workflow aliases legacy prompt versions to current templates', ['node', missionCli, 'activate', '--approved', '--plan-path', legacyPromptPlanPath, '--cwd', missionRepo], 0);
 
   const sharedNotesRepo = join(tmp, 'shared-notes-repo');
   mkdirSync(sharedNotesRepo, { recursive: true });
@@ -820,6 +832,24 @@ try {
   writeFileSync(fakePiValidatorOmitted, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nmkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\nwriteFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, changedFiles: [], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'ok' }));\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: true, summary: 'omitted assertion result', objections: [], assertionResults: [], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-omitted', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
   expectExit('fake pi validator omitted is executable', ['chmod', '+x', fakePiValidatorOmitted], 0);
   expectExit('mission workflow treats omitted validator assertion results as blocking', ['node', missionCli, 'activate', '--approved', '--plan-path', omittedValidatorPlanPath, '--cwd', omittedValidatorRepo], 1, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiValidatorOmitted }, timeout: 60_000 });
+
+  const missingResultsRepo = join(tmp, 'missing-validator-results-repo');
+  mkdirSync(missingResultsRepo, { recursive: true });
+  expectExit('missing validator results repo git init', ['git', 'init', '-q'], 0, { cwd: missingResultsRepo });
+  expectExit('missing validator results repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: missingResultsRepo });
+  expectExit('missing validator results repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: missingResultsRepo });
+  writeFileSync(join(missingResultsRepo, 'README.md'), 'validator missing results\n');
+  expectExit('missing validator results repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: missingResultsRepo });
+  const missingResultsPlanPath = join(tmp, 'missing-validator-results-plan.json');
+  writeFileSync(missingResultsPlanPath, JSON.stringify({
+    schema: 'pi-mission-workflow/v1', missionId: 'missing-validator-results-smoke', goal: 'lazy validator without assertionResults must not rubber-stamp', cwd: missingResultsRepo, baseRef: 'HEAD', planner: 'pi', maxRepairIterations: 1,
+    worktreeBaseDir: join(tmp, 'missing-validator-results-worktrees'), validationCommands: [], capabilityPolicy: { featureReviewValidators: false }, milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  }, null, 2));
+  const fakePiValidatorMissingResults = join(tmp, 'fake-pi-validator-missing-results.mjs');
+  writeFileSync(fakePiValidatorMissingResults, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nmkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true });\nwriteFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, changedFiles: [], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'ok' }));\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: true, summary: 'looks good', objections: [], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-missing-results', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`);
+  expectExit('fake pi validator missing results is executable', ['chmod', '+x', fakePiValidatorMissingResults], 0);
+  expectExit('mission workflow treats missing validator assertionResults as unverified and blocking', ['node', missionCli, 'activate', '--approved', '--plan-path', missingResultsPlanPath, '--cwd', missingResultsRepo], 1, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiValidatorMissingResults }, timeout: 60_000 });
 
   const featureReviewRepo = join(tmp, 'feature-review-repo');
   mkdirSync(featureReviewRepo, { recursive: true });

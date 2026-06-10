@@ -18,7 +18,7 @@ A mission is a long-running software-delivery workflow inspired by Droid/Factory
 3. Activated execution runs without more approval until success, failure, or cancellation.
 4. Workers implement features serially in isolated git worktrees.
 5. The runner commits each feature and advances a mission integration branch.
-6. Command validators and a fresh read-only adversarial Pi validator run at milestone boundaries.
+6. Command validators, per-feature read-only review validators (default-on; disable with `capabilityPolicy.featureReviewValidators=false`), and a fresh read-only adversarial Pi validator run at milestone boundaries. Adversarial validators must return explicit per-assertion `assertionResults`; omitted results count as unverified and block.
 7. Assertion coverage artifacts map requirements to features, commits, validators, and status.
 8. Must-level objections or coverage gaps create targeted repair features up to a capped iteration count.
 
@@ -56,7 +56,8 @@ Use `ctrl+shift+t` to monitor/cancel. Use `thread_phase_runs` to inspect artifac
 - Once activated with `approved: true`, do not insert new human approval gates unless the mission fails or is cancelled.
 - Workers are serial, not parallel.
 - Missing/malformed worker handoffs are failures; do not claim success without a valid handoff artifact.
-- Must-level adversarial validator objections and coverage gaps fail milestone validation.
+- Must-level adversarial validator objections, must-level per-feature review findings, and coverage gaps fail milestone validation.
+- Role prompts are versioned template files under `mission-workflow/prompts/` selected by `promptPolicy` versions; plans may carry orchestrator-authored `workerProcedures` text that every worker must follow and report compliance on in `notesForValidator`.
 - Final merge is manual by default; do not assume the mission branch is merged into the user's current branch.
 - Default `maxRepairIterations` is 10; it is configurable.
 - The runner emits heartbeat, operation watchdog, and active I/O snapshot events. Stale runs can appear when the process is gone, heartbeats stop, or heartbeats continue without non-heartbeat operation progress. Passed milestone validation reports are resume cursors only when their trusted head, validation fingerprint, artifacts, and exact validated feature evidence verify. Legacy/ambiguous cursors should be revalidated instead of trusted. Cancellation during validation should abort without generating failed validation reports or repair features from the cancel reason.

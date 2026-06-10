@@ -56,14 +56,28 @@ await mission_workflow({
 - The runner commits each feature and fast-forwards the mission branch.
 - Plans are normalized with additive schema fields for `completionTarget` (default `contract_validated`), completion levels, validation categories, role/capability/prompt policy, deliverables, and external services. Legacy plans without these fields still activate through normal normalization.
 - Command validators run configured `validationCommands` after each milestone; these are also represented as `scrutiny` validation categories. `userTestCommand` is represented as a command-based `behavior` category. The execution path remains the legacy command/adversarial flow for now, and required non-executed categories block the requested completion target instead of being reported as achieved.
-- When `capabilityPolicy.featureReviewValidators=true`, the scrutiny path runs fresh read-only per-feature review validators before milestone adversarial validation. These reviewers inspect a single completed feature/handoff with `read`/`grep`/`find`/`ls`; must-level findings block the milestone and become repair context.
-- A fresh read-only adversarial Pi validator agent then reviews source/spec docs, the validation contract, worker handoffs, per-feature review reports, git diff, and command outputs. It uses `modelValidator` when provided and writes structured JSON reports.
+- Per-feature review validators are enabled by default (set `capabilityPolicy.featureReviewValidators=false` to opt out): the scrutiny path runs fresh read-only per-feature review validators before milestone adversarial validation. These reviewers inspect a single completed feature/handoff with `read`/`grep`/`find`/`ls`; must-level findings block the milestone and become repair context.
+- A fresh read-only adversarial Pi validator agent then reviews source/spec docs, the validation contract, worker handoffs, per-feature review reports, git diff, and command outputs. It uses `modelValidator` when provided and writes structured JSON reports. The report must include explicit per-assertion `assertionResults`; if a validator omits the array entirely, scoped assertions are treated as unverified (`status: "unknown"`) and fail coverage, so a bare `{"passed": true}` report can never rubber-stamp a milestone.
 - Must-level validator objections, per-feature review blockers, command/category failures, or requirement coverage gaps fail milestone validation. Before repair workers run, the runner writes a structured `pi-mission-workflow/repair-plan/v1` artifact that clusters failure context into deterministic repair features; an opt-in Pi repair planner can be enabled with `capabilityPolicy.strategicRepairPlanner=true`.
 - User-testing validator starts as a configured command (`userTestCommand`).
 - Heartbeat events record compact current milestone/feature/branch/worktree pointers and child process ids for stale-run detection.
 - Durable mission state is persisted under `~/.pi/agent/mission-workflow/registry/<missionId>/` with plan path, branch, worktree, completed features, validation/coverage reports, current work item, completion/category results, role models, prompt versions, shared mission notes, failure/repair history, trusted base/head checkpoints, trusted plan fingerprint, trusted runner-owned commits, and timestamps.
 - Per-milestone and final coverage artifacts map assertion -> features -> commits -> validators -> status.
 - Final merge into the user's target branch is manual by default.
+
+## Prompts
+
+Role prompts live as versioned template files under `mission-workflow/prompts/`, not in runner code. `promptPolicy` versions resolve to files as `safeName(version) + ".md"` (e.g. `workerPromptVersion: "mission-worker/v4"` → `prompts/mission-worker-v4.md`); templates use strict `{{placeholder}}` substitution, and unknown versions or unresolved placeholders fail activation loudly. Current defaults:
+
+- `plannerPromptVersion: mission-planner/v3`
+- `workerPromptVersion: mission-worker/v4`
+- `validatorPromptVersion: mission-validator/v4`
+- `featureReviewPromptVersion: mission-feature-review/v1`
+- `repairPlannerPromptVersion: mission-repair-planner/v1`
+
+Prompt versions participate in validation cursor fingerprints, so editing or repointing prompts revalidates previously passed milestones instead of trusting stale cursors. Plans generated before externalization pin legacy versions (`mission-planner/v2`, `mission-worker/v3`, `mission-validator/v3`); those alias to the current templates when no exact template file exists, so old plans stay activatable. Truly unknown versions fail with an error listing the available templates.
+
+Plans may also carry `workerProcedures` (plain text, capped at 8000 bytes; `--worker-procedures` on the CLI): orchestrator-authored, mission-specific working agreements injected into every worker prompt with an instruction to report compliance or deliberate deviations in `notesForValidator`. `workerProcedures` is part of validation cursor fingerprints but intentionally not part of the mission plan fingerprint, so adding it to a new plan does not contaminate unrelated resume state.
 
 ## Validation category schema
 
@@ -140,6 +154,6 @@ For current dogfood state and exact auto_trading failure context, see `../docs/m
 - This MVP is intentionally simple and should be dogfooded on small missions first.
 - Resume/reuse uses the durable registry, trusted checkpoints, and git proof trailers; dynamic in-memory repair queues still restart from the current plan/milestone and rerun validation as needed.
 - Worktree cleanup is best-effort.
-- Browser/computer-use QA is not implemented; user testing is command-based. Per-feature read-only review validators are opt-in via `capabilityPolicy.featureReviewValidators=true`. Completion targets above `contract_validated` require explicit behavior/operational/integration/domain/deployment validation categories and will not be marked achieved when required categories are failed or unsupported. Credential-gated `explicit_skip_allowed` categories are reported as visible passed skips only when durable skip evidence is written.
+- Browser/computer-use QA is not implemented; user testing is command-based. Per-feature read-only review validators run by default and can be disabled via `capabilityPolicy.featureReviewValidators=false`. Completion targets above `contract_validated` require explicit behavior/operational/integration/domain/deployment validation categories and will not be marked achieved when required categories are failed or unsupported. Credential-gated `explicit_skip_allowed` categories are reported as visible passed skips only when durable skip evidence is written.
 - Repair planning writes structured repair-plan artifacts with deterministic fallback. Model-authored strategic repair planning is opt-in via `capabilityPolicy.strategicRepairPlanner=true`.
 - Final merge is manual.
