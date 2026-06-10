@@ -178,6 +178,7 @@ try {
     const missionRegistryPaths = await import(pathToFileURL(join(root, 'mission-workflow/src/registry/paths.ts')).href);
     const missionRegistryState = await import(pathToFileURL(join(root, 'mission-workflow/src/registry/state.ts')).href);
     const missionRegistryCursors = await import(pathToFileURL(join(root, 'mission-workflow/src/registry/cursors.ts')).href);
+    const missionCursorFingerprints = await import(pathToFileURL(join(root, 'mission-workflow/src/registry/cursor-fingerprints.ts')).href);
     const missionGitFingerprints = await import(pathToFileURL(join(root, 'mission-workflow/src/git/fingerprints.ts')).href);
     const missionCoverageAssertions = await import(pathToFileURL(join(root, 'mission-workflow/src/validation/coverage-assertions.ts')).href);
     log(missionCoreTime.parseMillis('2m', 1) === 120000 && missionCoreTime.parseMillis('250ms', 1) === 250 && missionCoreTime.parseMillis('bad', 42) === 42, 'mission core parseMillis handles units and fallback');
@@ -282,6 +283,10 @@ try {
     const unstablePiCursor = missionRegistryCursors.validationCursorMetadata({ planner: 'pi' }, '', '', {}, '/custom/pi');
     const validationFeature = missionRegistryCursors.validationFeatureRecord({ featureId: 'f1', featureBranch: 'branch', commit: 'abc', handoffArtifact: '/handoff.json', changedFiles: ['a'], assertions: ['a1'], localAssertions: ['l1'], featureFingerprint: 'fp' }, 'm1');
     log(missionRegistryCursors.defaultPiBin(cursorHome, { PI_MISSION_WORKFLOW_PI_BIN: '/env/pi' }) === '/env/pi' && missionRegistryCursors.defaultPiBin(cursorHome, {}) === join(cursorHome, '.npm-global', 'bin', 'pi') && missionRegistryCursors.defaultPiBin(join(tmp, 'missing-cursor-home'), {}) === 'pi' && mockCursor.validatorMode === 'mock' && mockCursor.stableIdentity === true && mockCursor.piBin === undefined && mockCursor.commandTimeoutMs === 11 && mockCursor.promptVersions.validatorPromptVersion === 'validator/custom' && piCursor.validatorMode === 'pi' && piCursor.stableIdentity === true && unstablePiCursor.stableIdentity === false && piCursor.piBin === '/custom/pi' && piCursor.actualModel === 'actual-model' && piCursor.piTimeoutMs === 22 && validationFeature.featureId === 'f1' && validationFeature.milestoneId === 'm1' && validationFeature.changedFiles[0] === 'a' && coverageRows.some((row) => row.id === 'local-1' && row.local === true) && finalCoverageRows.some((row) => row.id === 'a1') && finalCoverageRows.every((row) => !row.local), 'mission registry cursor helpers preserve validator metadata feature records and coverage assertions');
+    const cursorHash = missionCursorFingerprints.validationCursorFingerprint(cursorFingerprintPlan, cursorFingerprintPlan.milestones[0], 'base', piCursor);
+    const cursorHashChangedCommand = missionCursorFingerprints.validationCursorFingerprint({ ...cursorFingerprintPlan, validationCommands: ['npm run changed'] }, cursorFingerprintPlan.milestones[0], 'base', piCursor);
+    const cursorHashChangedValidator = missionCursorFingerprints.validationCursorFingerprint(cursorFingerprintPlan, cursorFingerprintPlan.milestones[0], 'base', { ...piCursor, requestedModel: 'other-validator' });
+    log(cursorHash.length === 24 && cursorHash !== cursorHashChangedCommand && cursorHash !== cursorHashChangedValidator, 'mission registry cursor fingerprint helper tracks validation commands and validator identity');
   } catch (error) {
     const code = error?.code || error?.message || String(error);
     log(code === 'ERR_UNKNOWN_FILE_EXTENSION', 'mission wrapper helper tests skipped only when Node lacks TypeScript module loading', String(code));

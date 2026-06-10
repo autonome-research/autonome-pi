@@ -209,6 +209,16 @@ Added `mission-workflow/src/validation/coverage-assertions.ts` with typed helper
 
 Smoke coverage checks milestone-local assertion inclusion and final-scope local assertion exclusion.
 
+### 2026-06-09 — Typed validation cursor fingerprint helpers
+
+Implemented in current working tree.
+
+Added `mission-workflow/src/registry/cursor-fingerprints.ts` with typed helper:
+
+- `validationCursorFingerprint()`
+
+Smoke coverage checks stable 24-character fingerprints and fingerprint changes when validation commands or validator identity change.
+
 ## Active / next component
 
 ### Registry and trust model continuation
