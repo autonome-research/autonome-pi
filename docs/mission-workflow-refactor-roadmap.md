@@ -221,9 +221,11 @@ Smoke coverage checks stable 24-character fingerprints and fingerprint changes w
 
 ## Active / next component
 
-### Registry and trust model continuation
+### Mission kernel extraction (architecture inversion)
 
-Goal: continue extracting trusted checkpoint helpers and then move into process/observability extraction while keeping runtime behavior stable.
+The plan of record for everything beyond the completed typed foundation slices is now `docs/mission-kernel-design.md`: extract a deterministic enforcement kernel into `src/kernel/*.mjs` (+`.d.ts`), move strategy decisions to a model-driven orchestrator with kernel-validated decision schemas, and add amendment-aware trust lineage. Phases 4–8 below are kept for reference but are superseded by migration phases M1–M5 in that document.
+
+Completed toward the inversion on 2026-06-10: prompts externalized to `mission-workflow/prompts/` with versioned templates, strict validator `assertionResults` semantics, default-on per-feature review validators, and the `workerProcedures` plan field.
 
 ## Refactor roadmap
 

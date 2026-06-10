@@ -504,3 +504,23 @@ The current working tree adds durable shared mission notes for agent-X continuit
 - Smoke coverage verifies a note from feature `f1` appears in feature `f2`'s prompt and is persisted in the registry/artifact.
 
 This is intentionally lightweight and append-only/deduplicated for now; future slices can split public broadcast notes from operator-only runbook notes and surface them in status/explain output.
+
+## 2026-06-10 — Missions-alignment slice: prompt externalization, strict validators, default feature reviews, kernel design
+
+This working-tree slice starts the architecture inversion described in `docs/mission-kernel-design.md` (which now supersedes phases 4–8 of the refactor roadmap):
+
+- Role prompts are externalized to `mission-workflow/prompts/<version>.md` and resolved through `promptPolicy` versions (`safeName(version) + ".md"`), rendered with strict `{{placeholder}}` substitution (unknown versions and unresolved placeholders fail loudly). Default versions bumped: planner `mission-planner/v3`, worker `mission-worker/v4`, validator `mission-validator/v4`, plus new `featureReviewPromptVersion: mission-feature-review/v1`. Prompt-version changes flow into validation cursor fingerprints automatically, so old passed-validation cursors are revalidated rather than trusted.
+- Adversarial validators can no longer rubber-stamp: when a validator report omits the `assertionResults` array entirely, scoped assertions are normalized to `status: "unknown"` and fail coverage instead of being synthesized as passes. The validator prompt now states assertionResults is mandatory per scoped assertion. Smoke: "mission workflow treats missing validator assertionResults as unverified and blocking".
+- `capabilityPolicy.featureReviewValidators` now defaults to `true` (per-feature read-only reviews are core scrutiny, matching the Droid/Missions reference); opt out with `featureReviewValidators: false`. Flipping the default changes capability-policy cursor fingerprints, which benignly invalidates pre-existing passed-validation cursors.
+- Plans may carry orchestrator-authored `workerProcedures` (plain text, capped 8000 bytes; also `--worker-procedures` CLI flag). It is injected into worker prompts with an instruction to report compliance in `notesForValidator`, included in validation cursor fingerprints (monolith + `src/registry/cursor-fingerprints.ts`), and deliberately NOT in `missionPlanFingerprint` so existing missions keep resumable trusted checkpoints across this upgrade.
+- Typed mirrors updated in the same slice to prevent drift: `src/core/constants.ts` (capability + prompt policy defaults), `src/core/types.ts` (`featureReviewPromptVersion`, `workerProcedures`), `src/registry/cursor-fingerprints.ts`.
+- Smoke additions: prompt template files exist for all default prompt versions; missing-assertionResults mission blocks with exit 1.
+
+Validation: `npm test` fully green; `pi --no-extensions -e . --list-models` loads the extension.
+
+Compatibility notes for operators:
+
+- Resume of missions created before this slice still verifies trusted checkpoints (plan fingerprints unchanged), but passed-validation cursors revalidate once because prompt/capability fingerprints changed. That is intended behavior, not a regression.
+- Plans generated before this slice pin legacy prompt versions in their normalized `promptPolicy` (`mission-planner/v2`, `mission-worker/v3`, `mission-validator/v3`). `loadPromptTemplate()` aliases those to the current templates when no exact template file exists, so old plans stay activatable; truly unknown versions fail with an error listing available templates. To freeze legacy semantics instead, add a matching template file under `mission-workflow/prompts/`.
+
+Next step: M1 of `docs/mission-kernel-design.md` — extract kernel verbs into `src/kernel/*.mjs` (+`.d.ts`) behavior-stable and switch `bin/mission-workflow.mjs` call sites slice by slice.
