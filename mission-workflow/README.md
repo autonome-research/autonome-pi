@@ -59,7 +59,7 @@ await mission_workflow({
 - Per-feature review validators are enabled by default (set `capabilityPolicy.featureReviewValidators=false` to opt out): the scrutiny path runs fresh read-only per-feature review validators before milestone adversarial validation. These reviewers inspect a single completed feature/handoff with `read`/`grep`/`find`/`ls`; must-level findings block the milestone and become repair context.
 - A fresh read-only adversarial Pi validator agent then reviews source/spec docs, the validation contract, worker handoffs, per-feature review reports, git diff, and command outputs. It uses `modelValidator` when provided and writes structured JSON reports. The report must include explicit per-assertion `assertionResults`; if a validator omits the array entirely, scoped assertions are treated as unverified (`status: "unknown"`) and fail coverage, so a bare `{"passed": true}` report can never rubber-stamp a milestone.
 - Must-level validator objections, per-feature review blockers, command/category failures, or requirement coverage gaps fail milestone validation. Before repair workers run, the runner writes a structured `pi-mission-workflow/repair-plan/v1` artifact that clusters failure context into deterministic repair features; an opt-in Pi repair planner can be enabled with `capabilityPolicy.strategicRepairPlanner=true`.
-- User-testing validator starts as a configured command (`userTestCommand`).
+- Live user-testing validator (Factory's "user testing validator", in command form): a behavior/integration/operational category may declare `successCriteria` (deterministic `mustMatch`/`mustNotMatch` regexes evaluated against the command's REAL output) and/or an `expectation` (a one-line description of the behavior that must actually occur). A fresh user-testing validator agent then judges the live command output against the `expectation` and decides whether the primary path fired or the software merely degraded to a safe fallback while exiting 0. It is live by definition — it only judges categories that executed live this milestone, never mock-passes, and produces honest skip evidence when credential-gated and unreachable. Enabled by default; disable with `capabilityPolicy.userTestingValidator=false`. The deterministic `successCriteria` always runs (even in mock-planner/offline test mode); the judging agent runs whenever an `expectation` is declared and the planner is not `mock`. Failures are classed `behavior_liveness_gap` and become repair context. `userTestCommand` remains the simple command-based starting point; add `expectation`/`successCriteria` to a category to make it a live-judged user test.
 - Heartbeat events record compact current milestone/feature/branch/worktree pointers and child process ids for stale-run detection.
 - Durable mission state is persisted under `~/.pi/agent/mission-workflow/registry/<missionId>/` with plan path, branch, worktree, completed features, validation/coverage reports, current work item, completion/category results, role models, prompt versions, shared mission notes, failure/repair history, trusted base/head checkpoints, trusted plan fingerprint, trusted runner-owned commits, and timestamps.
 - Per-milestone and final coverage artifacts map assertion -> features -> commits -> validators -> status.
@@ -95,9 +95,13 @@ Plans may include `validationCategories[]` to request completion beyond the comp
   "skipPolicy": "fail_when_skipped",
   "credentialGates": ["API_KEY"],
   "artifactsRequired": ["var/health-report.json"],
-  "timeoutMs": 120000
+  "timeoutMs": 120000,
+  "expectation": "The health check reports the live data feed as connected, not a cached/degraded fallback.",
+  "successCriteria": { "mustMatch": ["\"feed\": \"live\""], "mustNotMatch": ["degraded", "cached"] }
 }
 ```
+
+`expectation` and `successCriteria` are the live user-testing fields described under the execution model. `successCriteria` is a deterministic gate (regexes over the command's real combined stdout/stderr); `expectation` drives the fresh user-testing validator agent's semantic judgment of the live output. Both operate only on output the category actually produced this milestone.
 
 Supported values:
 

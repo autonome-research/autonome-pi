@@ -172,3 +172,14 @@ Each slice follows the existing validation protocol (`pi --no-extensions -e . --
 - No ground-up rewrite; kernel code moves, it is not reauthored.
 - No parallel workers; serial features with read-only internal fanout only.
 - No weakening of any invariant listed above to make orchestration easier.
+
+## 2026-06-11 — Live user-testing validator (liveness gap closed)
+
+Implemented the live user-testing validator — Factory's "user testing validator" in command form, and the fix for the gap exposed by the auto_trading LLM-tier bug (a subsystem that degraded to a safe no-op while exiting 0 passed every mocked test and the mission's own validators).
+
+- Validation categories gained `expectation` (one-line behavioral expectation) and `successCriteria` ({mustMatch, mustNotMatch} regexes). `successCriteria` is a deterministic gate over the command's REAL combined output, pushed as a report line so existing category gating/repair machinery applies unchanged. `expectation` drives a fresh `user-testing-judge` agent (prompt `mission-user-testing-validator/v1`) that reads the live output and decides whether the primary path fired or the software degraded; its verdict is also pushed as a report line.
+- Live by definition: the agent only judges categories that executed live this milestone (`liveOutputByCategory`), never mock-passes, and relies on the deterministic criterion in mock-planner/offline test mode. Credential-gated + unreachable → honest skip evidence via existing machinery, never a pass. Failures are classed `behavior_liveness_gap`.
+- Capability-gated `capabilityPolicy.userTestingValidator` (default true; only activates per-category when `expectation`/`successCriteria` are declared). `expectation`+`successCriteria` are hashed into the validation-cursor fingerprint. Typed mirrors updated (constants/types/categories/cursor-fingerprints). Planner prompt instructs declaring liveness for degrade-to-safe subsystems.
+- Smoke acceptance (deterministic, fake-pi): exit-0-but-degraded output fails `successCriteria` and blocks; healthy output passes; fresh agent rejects degraded live behavior and blocks; fresh agent accepts genuine behavior and passes.
+
+Maps onto the kernel design: `successCriteria` extends `kernel/validation.mjs`; the user-testing judge is a new role through `kernel/agents.mjs`. Supersedes the earlier roadmap note that behavior validators need a liveness assertion — that assertion now exists.

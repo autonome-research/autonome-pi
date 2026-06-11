@@ -39,6 +39,7 @@ export const DEFAULT_PROMPT_POLICY = Object.freeze({
 	workerPromptVersion: "mission-worker/v4",
 	validatorPromptVersion: "mission-validator/v4",
 	featureReviewPromptVersion: "mission-feature-review/v1",
+	userTestingValidatorPromptVersion: "mission-user-testing-validator/v1",
 	repairPlannerPromptVersion: "mission-repair-planner/v1",
 	handoffSchema: "pi-mission-worker-handoff/v3",
 	validationReportSchema: "pi-mission-workflow/milestone-validation/v2",
@@ -51,5 +52,6 @@ export const DEFAULT_CAPABILITY_POLICY = Object.freeze({
 	liveExternalActions: false,
 	maxCommandTimeoutMs: DEFAULT_COMMAND_TIMEOUT_MS,
 	featureReviewValidators: true,
+	userTestingValidator: true,
 	strategicRepairPlanner: false,
 });

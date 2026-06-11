@@ -49,7 +49,7 @@ const BEHAVIOR_ADAPTERS = ["command", "http_flow", "browser_computer_use", "serv
 const FAILURE_CLASSES = [
   "implementation_bug", "missing_acceptance_test", "bad_plan_decomposition", "ambiguous_spec", "operational_gap",
   "external_dependency_unavailable", "credential_missing", "validator_false_positive", "model_or_handoff_failure",
-  "runner_git_worktree_failure", "runner_lifecycle_failure", "capability_policy_block", "unknown",
+  "runner_git_worktree_failure", "runner_lifecycle_failure", "capability_policy_block", "behavior_liveness_gap", "unknown",
 ];
 const PLANNING_CLARIFICATION_SCHEMA = "pi-mission-workflow/planning-clarification/v1";
 const DEFAULT_PROMPT_POLICY = Object.freeze({
@@ -57,6 +57,7 @@ const DEFAULT_PROMPT_POLICY = Object.freeze({
   workerPromptVersion: "mission-worker/v4",
   validatorPromptVersion: "mission-validator/v4",
   featureReviewPromptVersion: "mission-feature-review/v1",
+  userTestingValidatorPromptVersion: "mission-user-testing-validator/v1",
   repairPlannerPromptVersion: "mission-repair-planner/v1",
   handoffSchema: "pi-mission-worker-handoff/v3",
   validationReportSchema: "pi-mission-workflow/milestone-validation/v2",
@@ -69,6 +70,7 @@ const DEFAULT_CAPABILITY_POLICY = Object.freeze({
   liveExternalActions: false,
   maxCommandTimeoutMs: DEFAULT_COMMAND_TIMEOUT_MS,
   featureReviewValidators: true,
+  userTestingValidator: true,
   strategicRepairPlanner: false,
 });
 
@@ -524,6 +526,7 @@ function normalizeValidationCategory(raw = {}, index = 0, source = "plan") {
   const skipPolicy = raw.skipPolicy ? String(raw.skipPolicy) : "fail_when_skipped";
   const scope = raw.scope ? String(raw.scope) : "milestone";
   const adapter = raw.adapter || (category === "behavior" ? "command" : undefined);
+  const expectation = raw.expectation === undefined || raw.expectation === null ? "" : String(raw.expectation).trim();
   return {
     id: safeName(raw.id || idFallback, idFallback),
     category,
@@ -538,8 +541,44 @@ function normalizeValidationCategory(raw = {}, index = 0, source = "plan") {
     skipPolicy,
     timeoutMs: raw.timeoutMs === undefined || raw.timeoutMs === null ? null : (() => { const n = Number(raw.timeoutMs); if (!Number.isFinite(n) || n <= 0) throw new Error(`validation category ${raw.id || idFallback} timeoutMs must be a positive finite number`); return n; })(),
     artifactsRequired: Array.isArray(raw.artifactsRequired) ? raw.artifactsRequired.map(String).filter(Boolean) : [],
+    // Live user-testing fields: a deterministic gate on the REAL command output
+    // (successCriteria) and a natural-language behavioral expectation judged by a
+    // fresh user-testing validator agent. Both operate on live output only.
+    expectation,
+    successCriteria: normalizeSuccessCriteria(raw.successCriteria, raw.id || idFallback),
     ...(adapter && BEHAVIOR_ADAPTERS.includes(String(adapter)) ? { adapter: String(adapter) } : {}),
   };
+}
+
+function normalizeSuccessCriteria(raw, categoryId = "category") {
+  if (raw === undefined || raw === null) return { mustMatch: [], mustNotMatch: [] };
+  if (typeof raw !== "object" || Array.isArray(raw)) throw new Error(`validation category ${categoryId} successCriteria must be an object with mustMatch/mustNotMatch arrays`);
+  const patterns = (value, field) => {
+    if (value === undefined || value === null) return [];
+    const list = Array.isArray(value) ? value : [value];
+    return list.map((item) => {
+      const pattern = String(item);
+      try { new RegExp(pattern); } catch (error) { throw new Error(`validation category ${categoryId} successCriteria.${field} has an invalid regex (${pattern}): ${error.message}`); }
+      return pattern;
+    });
+  };
+  return { mustMatch: patterns(raw.mustMatch, "mustMatch"), mustNotMatch: patterns(raw.mustNotMatch, "mustNotMatch") };
+}
+
+function evaluateSuccessCriteria(criteria, text) {
+  const failures = [];
+  const haystack = String(text || "");
+  for (const pattern of criteria?.mustMatch || []) {
+    if (!new RegExp(pattern).test(haystack)) failures.push(`required output pattern not found: /${pattern}/`);
+  }
+  for (const pattern of criteria?.mustNotMatch || []) {
+    if (new RegExp(pattern).test(haystack)) failures.push(`forbidden output pattern present: /${pattern}/`);
+  }
+  return failures;
+}
+
+function categoryHasLiveJudgment(category) {
+  return Boolean(category && !category.adversarial && (category.expectation || (category.successCriteria?.mustMatch || []).length || (category.successCriteria?.mustNotMatch || []).length));
 }
 
 function normalizeValidationCategories(plan = {}, options = {}) {
@@ -1647,7 +1686,7 @@ function validationCursorFingerprint(plan, milestone, baseHead = "", validator =
     validatorStableIdentity: Boolean(validator.stableIdentity),
     completionTarget: normalizeCompletionTarget(plan.completionTarget),
     promptVersions: normalizePromptPolicy(plan.promptPolicy),
-    validationCategories: normalizeValidationCategories(plan, { includeImplicitAdversarial: true }).map((category) => ({ id: category.id, category: category.category, scope: category.scope, requiredFor: category.requiredFor, commands: category.commands, userTest: category.userTest, adversarial: category.adversarial, modelRole: category.modelRole, credentialGates: category.credentialGates, skipPolicy: category.skipPolicy, adapter: category.adapter, timeoutMs: category.timeoutMs, artifactsRequired: category.artifactsRequired })),
+    validationCategories: normalizeValidationCategories(plan, { includeImplicitAdversarial: true }).map((category) => ({ id: category.id, category: category.category, scope: category.scope, requiredFor: category.requiredFor, commands: category.commands, userTest: category.userTest, adversarial: category.adversarial, modelRole: category.modelRole, credentialGates: category.credentialGates, skipPolicy: category.skipPolicy, adapter: category.adapter, timeoutMs: category.timeoutMs, artifactsRequired: category.artifactsRequired, expectation: category.expectation, successCriteria: category.successCriteria })),
     capabilityPolicy: normalizeCapabilityPolicy(plan.capabilityPolicy),
     validationCommands: (plan.validationCommands || []).map(String),
     userTestCommand: String(plan.userTestCommand || ""),
@@ -2390,6 +2429,48 @@ async function runFeatureReviewValidators(env, plan, milestone, iterationState, 
   return outputs;
 }
 
+// Live user-testing validator: Factory's "user testing validator" in command form.
+// A fresh agent judges the REAL output of a behavior category against a declared
+// expectation, deciding whether the primary path actually fired or the software
+// merely degraded-to-safe while exiting 0. Live by definition — it only runs over
+// categories that executed live this milestone (mock-planner missions skip the
+// agent and rely on the deterministic successCriteria instead; nothing mock-passes).
+async function runUserTestingValidators(env, plan, milestone, liveOutputByCategory, ctx, run) {
+  if (plan.capabilityPolicy?.userTestingValidator === false) return [];
+  if (String(plan.planner || "pi") === "mock") return [];
+  const promptVersion = normalizePromptPolicy(plan.promptPolicy).userTestingValidatorPromptVersion;
+  const outputs = [];
+  for (const { category, liveOutputs } of liveOutputByCategory.values()) {
+    if (!category.expectation) continue;
+    const base = { categoryId: category.id, category: category.category, requiredFor: category.requiredFor, skipPolicy: category.skipPolicy };
+    const prompt = compactText(renderPrompt(promptVersion, {
+      goal: plan.goal,
+      milestone: compactJson({ id: milestone.id, title: milestone.title }, 4000),
+      categoryId: category.id,
+      expectation: category.expectation,
+      liveOutput: compactJson(liveOutputs, 40000),
+    }), MAX_PROMPT_CONTEXT_BYTES);
+    const promptPath = writeArtifact(run, `validation/user-testing/${safeName(milestone.id)}-${safeName(category.id)}-prompt.md`, prompt, "markdown", `User-testing prompt: ${category.id}`);
+    const result = await runPi({ cwd: env.integrationPath, prompt, tools: ["read", "grep", "find", "ls"], model: ctx.modelValidator, signal: ctx.signal, operationLabel: `user-testing ${category.id}`, phase: `user-testing-${milestone.id}-${category.id}`, timeoutMs: ctx.piTimeoutMs, idleTimeoutMs: ctx.piIdleTimeoutMs });
+    if (result.usage?.length) phaseEvent(run, `user-testing-${milestone.id}-${category.id}`, { kind: "usage", usage: result.usage, model: result.model });
+    if ((result.aborted && !result.timedOut && !result.idleTimedOut) || ctx.signal.aborted) throw abortError(ctx.signal.reason || result.error || "cancelled");
+    let raw;
+    if (!result.ok) raw = { passed: false, summary: "User-testing validator agent failed.", failureReason: result.error || "user-testing validator failed" };
+    else {
+      try { raw = parseJsonFromText(result.text); }
+      catch (error) {
+        writeArtifact(run, `validation/user-testing/${safeName(milestone.id)}-${safeName(category.id)}-raw-output.md`, result.text, "markdown", `User-testing raw output: ${category.id}`);
+        raw = { passed: false, summary: "User-testing validator returned malformed JSON.", failureReason: error.message };
+      }
+    }
+    const passed = raw?.passed === true;
+    const normalized = { schema: "pi-mission-workflow/user-testing/v1", categoryId: category.id, expectation: category.expectation, passed, summary: String(raw?.summary || (passed ? "Live behavior matched the expectation." : "Live behavior did not match the expectation.")), failureReason: passed ? "" : String(raw?.failureReason || raw?.summary || "User-testing validator rejected the live behavior."), evidence: compactText(typeof raw?.evidence === "object" ? JSON.stringify(raw.evidence) : String(raw?.evidence || promptPath), 4000) };
+    const artifactPath = writeArtifact(run, `validation/user-testing/${safeName(milestone.id)}-${safeName(category.id)}.json`, normalized, "json", `User-testing validation: ${category.id}`);
+    outputs.push({ ...base, ...normalized, artifact: artifactPath });
+  }
+  return outputs;
+}
+
 async function runAdversarialValidator(env, plan, milestone, iterationState, commandReports, coverageDraft, ctx, run, featureReviews = []) {
   let raw;
   let validatorMetadata = validationCursorMetadata(plan, ctx.modelValidator, "", ctx);
@@ -2534,6 +2615,10 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
     const abs = resolve(env.integrationPath, String(artifactPath));
     return (abs === root || abs.startsWith(`${root}/`)) && existsSync(abs);
   };
+  // Live output per category, captured for the user-testing validator agent. Only
+  // categories that actually executed live (not credential-skipped) get an entry,
+  // so the agent never judges a path that did not run — no mock-pass.
+  const liveOutputByCategory = new Map();
   for (const category of commandCategories) {
     const gateStatus = credentialGateStatus(category, process.env);
     if (gateStatus.missing.length) {
@@ -2546,6 +2631,7 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
       reports.push({ validator: `${category.category}-credential-gate`, ...categoryBaseReport(category), command: "credential gates", passed: false, exitCode: 1, timedOut: false, failureClass: "credential_missing", missingCredentials: gateStatus.missing, stderrExcerpt: `Missing required credential env vars: ${gateStatus.missing.join(", ")}` });
       continue;
     }
+    const liveOutputs = [];
     for (const command of category.commands || []) {
       const timeoutMs = category.timeoutMs ? Math.min(commandTimeoutMs, Number(category.timeoutMs) || commandTimeoutMs) : commandTimeoutMs;
       const validatorName = category.userTest ? "user-testing-command" : category.category === "scrutiny" ? "scrutiny-command" : `${category.category}-command`;
@@ -2554,11 +2640,25 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
       if ((result.aborted && !result.timedOut) || ctx.signal.aborted) throw abortError(ctx.signal.reason || result.error || "cancelled");
       const file = writeArtifact(run, `validation/${safeName(milestone.id)}-iteration-${Number(iterationState?.iteration || 0)}-${safeName(category.id)}-${safeName(command)}.txt`, [`$ ${command}`, result.error ? `# ${result.error}` : "", result.stdout, result.stderr].join("\n"), "file", `Validation command: ${category.id}`);
       reports.push({ validator: validatorName, ...categoryBaseReport(category), command, passed: result.ok, exitCode: result.code, timedOut: Boolean(result.timedOut), failureClass: result.ok ? null : classifyValidationFailure({ command, result }), artifact: file, stdoutExcerpt: compactText(result.stdout || "", 4000), stderrExcerpt: compactText(result.stderr || result.error || "", 4000) });
+      liveOutputs.push({ command, exitCode: result.code, stdout: compactText(result.stdout || "", 12000), stderr: compactText(result.stderr || result.error || "", 4000) });
     }
+    // Deterministic liveness gate on the REAL combined output. Catches the
+    // exit-0-but-degraded case (e.g. an LLM tier reporting "degraded") that exit
+    // codes alone miss. Becomes a report line so existing category gating applies.
+    const criteriaText = liveOutputs.map((item) => `${item.stdout}\n${item.stderr}`).join("\n");
+    const criteriaFailures = evaluateSuccessCriteria(category.successCriteria, criteriaText);
+    if (criteriaFailures.length) {
+      reports.push({ validator: `${category.category}-success-criteria`, ...categoryBaseReport(category), command: "success criteria", passed: false, exitCode: 1, timedOut: false, failureClass: "behavior_liveness_gap", criteriaFailures, stderrExcerpt: criteriaFailures.join("; ") });
+    }
+    if (categoryHasLiveJudgment(category)) liveOutputByCategory.set(category.id, { category, liveOutputs });
     const missingArtifacts = (category.artifactsRequired || []).filter((artifactPath) => !artifactExists(artifactPath));
     if (missingArtifacts.length) {
       reports.push({ validator: `${category.category}-artifact-requirements`, ...categoryBaseReport(category), command: "artifact requirements", passed: false, exitCode: 1, timedOut: false, failureClass: "operational_gap", missingArtifacts, stderrExcerpt: `Missing required validation artifacts: ${missingArtifacts.join(", ")}` });
     }
+  }
+  const userTestingReviews = await runUserTestingValidators(env, plan, milestone, liveOutputByCategory, ctx, run);
+  for (const review of userTestingReviews) {
+    reports.push({ validator: "user-testing-judge", categoryId: review.categoryId, validationCategory: review.category, categoryRequiredFor: review.requiredFor, skipPolicy: review.skipPolicy, command: "user-testing-judge", passed: review.passed, exitCode: review.passed ? 0 : 1, timedOut: false, failureClass: review.passed ? null : "behavior_liveness_gap", artifact: review.artifact, stderrExcerpt: review.passed ? "" : compactText(review.failureReason || review.summary || "User-testing validator rejected live behavior.", 4000) });
   }
   if (reports.length === 0) reports.push({ validator: "scrutiny-command", command: "none", passed: true, note: "No validation commands configured." });
   const featureReviews = await runFeatureReviewValidators(env, plan, milestone, iterationState, ctx, run);
@@ -2600,7 +2700,7 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
     ...categoryRepairFeatures,
     ...(!commandPassed ? [{ title: `Repair validation command failures for ${milestone.title}`, assertions: assertionResults.map((r) => r.assertionId), rationale: "Validation command failed." }] : []),
   ];
-  const report = { schema: normalizePromptPolicy(plan.promptPolicy).validationReportSchema || "pi-mission-workflow/milestone-validation/v1", milestoneId: milestone.id, passed, contractValidated, reports, featureReviews, featureReviewBlockers, categoryResults, blockingCategoryResults, validatorReport, coveragePath, assertionResults, correctiveFeatures };
+  const report = { schema: normalizePromptPolicy(plan.promptPolicy).validationReportSchema || "pi-mission-workflow/milestone-validation/v1", milestoneId: milestone.id, passed, contractValidated, reports, featureReviews, featureReviewBlockers, userTestingReviews, categoryResults, blockingCategoryResults, validatorReport, coveragePath, assertionResults, correctiveFeatures };
   if (!passed) {
     const failureClasses = Array.from(new Set(categoryResults.filter((item) => item.failureClass).map((item) => item.failureClass)));
     phaseEvent(run, `validation-${milestone.id}`, { kind: "failure_classification", milestoneId: milestone.id, failureClasses, message: failureClasses.length ? `Validation failure classes: ${failureClasses.join(", ")}` : "Validation failed" });

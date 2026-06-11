@@ -49,7 +49,7 @@ export function validationCursorFingerprint(plan: Partial<MissionPlan>, mileston
 		validatorStableIdentity: Boolean(validator.stableIdentity),
 		completionTarget: normalizeCompletionTarget(plan.completionTarget),
 		promptVersions: normalizePromptPolicy(plan.promptPolicy),
-		validationCategories: normalizeValidationCategories(plan, { includeImplicitAdversarial: true }).map((category) => ({ id: category.id, category: category.category, scope: category.scope, requiredFor: category.requiredFor, commands: category.commands, userTest: category.userTest, adversarial: category.adversarial, modelRole: category.modelRole, credentialGates: category.credentialGates, skipPolicy: category.skipPolicy, adapter: category.adapter, timeoutMs: category.timeoutMs, artifactsRequired: category.artifactsRequired })),
+		validationCategories: normalizeValidationCategories(plan, { includeImplicitAdversarial: true }).map((category) => ({ id: category.id, category: category.category, scope: category.scope, requiredFor: category.requiredFor, commands: category.commands, userTest: category.userTest, adversarial: category.adversarial, modelRole: category.modelRole, credentialGates: category.credentialGates, skipPolicy: category.skipPolicy, adapter: category.adapter, timeoutMs: category.timeoutMs, artifactsRequired: category.artifactsRequired, expectation: category.expectation, successCriteria: category.successCriteria })),
 		capabilityPolicy: normalizeCapabilityPolicy(plan.capabilityPolicy),
 		validationCommands: (plan.validationCommands || []).map(String),
 		userTestCommand: String(plan.userTestCommand || ""),

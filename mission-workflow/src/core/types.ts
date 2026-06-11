@@ -54,6 +54,8 @@ export interface ValidationCategory {
 	credentialGates?: string[];
 	artifactsRequired?: string[];
 	timeoutMs?: number | null;
+	expectation?: string;
+	successCriteria?: { mustMatch: string[]; mustNotMatch: string[] };
 	generatedFrom?: string;
 }
 
@@ -109,6 +111,7 @@ export interface CapabilityPolicy {
 	liveExternalActions?: boolean;
 	maxCommandTimeoutMs?: number;
 	featureReviewValidators?: boolean;
+	userTestingValidator?: boolean;
 	strategicRepairPlanner?: boolean;
 }
 
@@ -117,6 +120,7 @@ export interface PromptPolicy {
 	workerPromptVersion?: string;
 	validatorPromptVersion?: string;
 	featureReviewPromptVersion?: string;
+	userTestingValidatorPromptVersion?: string;
 	repairPlannerPromptVersion?: string;
 	handoffSchema?: string;
 	validationReportSchema?: string;

@@ -9,6 +9,22 @@ function objectRecord(value: unknown): Record<string, any> {
 	return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : {};
 }
 
+export function normalizeSuccessCriteria(raw: unknown, categoryId = "category"): { mustMatch: string[]; mustNotMatch: string[] } {
+	if (raw === undefined || raw === null) return { mustMatch: [], mustNotMatch: [] };
+	if (typeof raw !== "object" || Array.isArray(raw)) throw new Error(`validation category ${categoryId} successCriteria must be an object with mustMatch/mustNotMatch arrays`);
+	const source = raw as Record<string, unknown>;
+	const patterns = (value: unknown, field: string): string[] => {
+		if (value === undefined || value === null) return [];
+		const list = Array.isArray(value) ? value : [value];
+		return list.map((item) => {
+			const pattern = String(item);
+			try { new RegExp(pattern); } catch (error) { throw new Error(`validation category ${categoryId} successCriteria.${field} has an invalid regex (${pattern}): ${(error as Error).message}`); }
+			return pattern;
+		});
+	};
+	return { mustMatch: patterns(source.mustMatch, "mustMatch"), mustNotMatch: patterns(source.mustNotMatch, "mustNotMatch") };
+}
+
 export type ValidationCategorySource =
 	| "plan"
 	| "legacy-validation-command"
@@ -43,6 +59,8 @@ export function normalizeValidationCategory(rawValue: unknown = {}, index = 0, s
 		if (!Number.isFinite(n) || n <= 0) throw new Error(`validation category ${raw.id || idFallback} timeoutMs must be a positive finite number`);
 		return n;
 	})();
+	const expectation = raw.expectation === undefined || raw.expectation === null ? "" : String(raw.expectation).trim();
+	const successCriteria = normalizeSuccessCriteria(raw.successCriteria, String(raw.id || idFallback));
 	return {
 		id: safeName(raw.id || idFallback, idFallback),
 		category,
@@ -57,6 +75,8 @@ export function normalizeValidationCategory(rawValue: unknown = {}, index = 0, s
 		skipPolicy,
 		timeoutMs,
 		artifactsRequired: Array.isArray(raw.artifactsRequired) ? raw.artifactsRequired.map(String).filter(Boolean) : [],
+		expectation,
+		successCriteria,
 		...(adapter && BEHAVIOR_ADAPTERS.includes(String(adapter) as BehaviorAdapter) ? { adapter: String(adapter) as BehaviorAdapter } : {}),
 	};
 }

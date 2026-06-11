@@ -68,8 +68,7 @@ Use `ctrl+shift+t` to monitor/cancel. Use `thread_phase_runs` to inspect artifac
 
 ## Current limitations
 
-- User-testing is command-based only.
+- User-testing has a live judging layer: a behavior/integration/operational category may declare `successCriteria` (deterministic regexes over the command's real output) and/or an `expectation` (judged by a fresh live user-testing validator agent), so a subsystem that degrades to a safe no-op while exiting 0 (e.g. an LLM tier falling back to neutral) blocks instead of passing. Live by definition — never mock-passes; honest-skip when credential-gated and unreachable. Default-on (`capabilityPolicy.userTestingValidator=false` to disable). Browser/computer-use QA adapters are still not implemented.
 - Dynamic repair queue reconstruction should become smarter.
-- Browser/computer-use QA adapters are not implemented.
 - Worktree cleanup is best-effort.
 - Use small missions first while dogfooding.

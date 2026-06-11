@@ -955,6 +955,56 @@ try {
   expectExit('fake pi local fail is executable', ['chmod', '+x', fakePiLocalFail], 0);
   expectExit('mission workflow blocks on explicitly failed local assertions', ['node', missionCli, 'activate', '--approved', '--plan-path', localFailPlanPath, '--cwd', localFailRepo], 1, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiLocalFail }, timeout: 60_000 });
 
+  // --- Live user-testing validator: deterministic successCriteria (no agent) ---
+  const livenessRepo = (name) => {
+    const repo = join(tmp, name);
+    mkdirSync(repo, { recursive: true });
+    expectExit(`${name} git init`, ['git', 'init', '-q'], 0, { cwd: repo });
+    expectExit(`${name} git config email`, ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: repo });
+    expectExit(`${name} git config name`, ['git', 'config', 'user.name', 'Test'], 0, { cwd: repo });
+    writeFileSync(join(repo, 'README.md'), `${name}\n`);
+    expectExit(`${name} initial commit`, ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: repo });
+    return repo;
+  };
+  const livenessPlan = (missionId, repo, command, category) => ({
+    schema: 'pi-mission-workflow/v1', missionId, goal: 'liveness gate', cwd: repo, baseRef: 'HEAD', planner: 'mock', maxRepairIterations: 1,
+    worktreeBaseDir: join(tmp, `${missionId}-worktrees`), validationCommands: [],
+    validationCategories: [{ id: 'llm-liveness', category: 'behavior', title: 'LLM liveness', commands: [command], ...category }],
+    milestones: [{ id: 'm1', title: 'm1', features: [{ id: 'f1', title: 'f1', description: 'f1', assertions: ['a1'] }] }],
+    validationContract: { assertions: [{ id: 'a1', description: 'a1', priority: 'must', coveredBy: ['f1'], validationMethod: 'both' }] }
+  });
+
+  const criteriaFailRepo = livenessRepo('criteria-fail-repo');
+  const criteriaFailPlan = join(tmp, 'criteria-fail-plan.json');
+  writeFileSync(criteriaFailPlan, JSON.stringify(livenessPlan('criteria-fail-smoke', criteriaFailRepo, "printf '{\"status\": \"degraded\"}\\n'", { successCriteria: { mustMatch: ['healthy'], mustNotMatch: ['degraded'] } }), null, 2));
+  expectExit('mission workflow blocks on exit-0 command that fails liveness successCriteria', ['node', missionCli, 'activate', '--approved', '--plan-path', criteriaFailPlan, '--cwd', criteriaFailRepo], 1, { timeout: 60_000 });
+
+  const criteriaPassRepo = livenessRepo('criteria-pass-repo');
+  const criteriaPassPlan = join(tmp, 'criteria-pass-plan.json');
+  writeFileSync(criteriaPassPlan, JSON.stringify(livenessPlan('criteria-pass-smoke', criteriaPassRepo, "printf '{\"status\": \"healthy\"}\\n'", { successCriteria: { mustMatch: ['healthy'], mustNotMatch: ['degraded'] } }), null, 2));
+  expectExit('mission workflow passes when liveness successCriteria are satisfied', ['node', missionCli, 'activate', '--approved', '--plan-path', criteriaPassPlan, '--cwd', criteriaPassRepo], 0, { timeout: 60_000 });
+
+  // --- Live user-testing validator: fresh agent judges real output ---
+  const userTestingPlan = (missionId, repo) => JSON.stringify(livenessPlan(missionId, repo, "printf '{\"status\": \"degraded\"}\\n'", { expectation: 'The LLM tier returns a genuine assessment, not a degraded fallback.' }), null, 2)
+    .replace('"planner": "mock"', '"planner": "pi"');
+  const fakePiUserTesting = (verdict) => `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nconst prompt = process.argv.includes('-p') ? process.argv[process.argv.indexOf('-p') + 1] : '';\nif (prompt.includes('mission worker')) { mkdirSync(join(process.cwd(), '.mission', 'handoffs'), { recursive: true }); writeFileSync(join(process.cwd(), '.mission', 'handoffs', 'f1.json'), JSON.stringify({ featureId: 'f1', completed: true, outcome: 'already_satisfied', evidence: ['ok'], commandsRun: [], assertionsAddressed: ['a1'], issuesDiscovered: [], leftUndone: [], notesForValidator: 'ok' })); process.exit(0); }\nif (prompt.includes('fresh user-testing validator')) { console.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-ut', content: [{ type: 'text', text: JSON.stringify(${JSON.stringify(verdict)}) }] } })); process.exit(0); }\nif (prompt.includes('feature review validator')) { console.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-ut', content: [{ type: 'text', text: JSON.stringify({ schema: 'pi-mission-workflow/feature-review/v1', featureId: 'f1', passed: true, summary: 'ok', findings: [], correctiveFeatures: [] }) }] } })); process.exit(0); }\nconst report = { schema: 'pi-mission-workflow/adversarial-validation/v1', milestoneId: 'm1', passed: true, summary: 'ok', objections: [], assertionResults: [{ assertionId: 'a1', status: 'pass', evidence: 'ok' }], correctiveFeatures: [] };\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-ut', content: [{ type: 'text', text: JSON.stringify(report) }] } }));\n`;
+
+  const utRejectRepo = livenessRepo('ut-reject-repo');
+  const utRejectPlan = join(tmp, 'ut-reject-plan.json');
+  writeFileSync(utRejectPlan, userTestingPlan('ut-reject-smoke', utRejectRepo));
+  const fakePiUtReject = join(tmp, 'fake-pi-ut-reject.mjs');
+  writeFileSync(fakePiUtReject, fakePiUserTesting({ schema: 'pi-mission-workflow/user-testing/v1', categoryId: 'llm-liveness', passed: false, summary: 'degraded fallback observed', failureReason: 'output reports status degraded, not a genuine assessment' }));
+  expectExit('fake pi ut reject is executable', ['chmod', '+x', fakePiUtReject], 0);
+  expectExit('user-testing validator blocks when fresh agent rejects live behavior', ['node', missionCli, 'activate', '--approved', '--plan-path', utRejectPlan, '--cwd', utRejectRepo], 1, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiUtReject }, timeout: 60_000 });
+
+  const utPassRepo = livenessRepo('ut-pass-repo');
+  const utPassPlan = join(tmp, 'ut-pass-plan.json');
+  writeFileSync(utPassPlan, userTestingPlan('ut-pass-smoke', utPassRepo));
+  const fakePiUtPass = join(tmp, 'fake-pi-ut-pass.mjs');
+  writeFileSync(fakePiUtPass, fakePiUserTesting({ schema: 'pi-mission-workflow/user-testing/v1', categoryId: 'llm-liveness', passed: true, summary: 'genuine assessment observed', failureReason: '', evidence: 'status present' }));
+  expectExit('fake pi ut pass is executable', ['chmod', '+x', fakePiUtPass], 0);
+  expectExit('user-testing validator passes when fresh agent accepts live behavior', ['node', missionCli, 'activate', '--approved', '--plan-path', utPassPlan, '--cwd', utPassRepo], 0, { env: { PI_MISSION_WORKFLOW_PI_BIN: fakePiUtPass }, timeout: 60_000 });
+
   const canonicalFeatureIdRepo = join(tmp, 'canonical-feature-id-repo');
   mkdirSync(canonicalFeatureIdRepo, { recursive: true });
   expectExit('canonical feature id repo git init', ['git', 'init', '-q'], 0, { cwd: canonicalFeatureIdRepo });
