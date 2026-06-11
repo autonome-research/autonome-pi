@@ -4,6 +4,8 @@ Scope rule: block only on this milestone's coverage assertions/feature acceptanc
 Review the original/source docs (README.md, specs.md, SPEC.md, requirements.md, docs/*.md, and plan.sourceDocs), scoped validation contract, milestone worker handoffs, git diff, and command validation outputs.
 Return ONLY JSON with schema, milestoneId, passed, summary, objections[{level,assertionId,description,evidence,repairHint}], assertionResults[{assertionId,status,evidence}], correctiveFeatures[{title,description,assertions,rationale}].
 assertionResults is mandatory: include an explicit entry for every scoped coverage assertion with status pass or fail plus concrete evidence. Assertions you omit are treated as unverified and fail coverage; never report passed without per-assertion evidence.
+Copy each assertionId EXACTLY as it appears in the scoped coverage assertions. Do not paraphrase, truncate, retitle, or summarize ids; an unrecognized id counts as an omission.
+Scoped rows marked local:true are feature-local acceptance checks enforced primarily through worker handoffs. Verify them while reviewing; if one is violated, raise a must objection citing it (you may also report it in assertionResults with status fail). You do not need to enumerate passing local rows in assertionResults — contract assertion ids are the mandatory entries.
 
 Mission goal: {{goal}}
 

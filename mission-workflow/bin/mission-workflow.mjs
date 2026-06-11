@@ -2271,7 +2271,16 @@ function buildCoverageReport({ plan, milestone, iterationState, commandReports, 
     const gaps = [];
     if (!features.length) { status = "gap"; gaps.push("No planned/executed feature maps to assertion."); }
     if (!commandPassed) { status = "fail"; gaps.push("One or more command validators failed."); }
-    if (validatorReport && !isPassedAssertionStatus(validator?.status)) { status = "fail"; gaps.push(validator?.evidence || "Adversarial validator did not explicitly pass this assertion."); }
+    if (validatorReport && !isPassedAssertionStatus(validator?.status)) {
+      if (assertion.local && !isFailedAssertionStatus(validator?.status)) {
+        // Local acceptance checks are enforced at the worker/handoff layer; validators verdict them
+        // explicitly or not at all. Only an explicit fail blocks coverage for local rows.
+        if (status === "pass") status = "unknown";
+      } else {
+        status = "fail";
+        gaps.push(validator?.evidence || "Adversarial validator did not explicitly pass this assertion.");
+      }
+    }
     if (validatorReport === null) { status = status === "pass" ? "unknown" : status; gaps.push("No adversarial validator report available."); }
     return { assertionId: assertion.id, description: assertion.description, priority: assertion.priority || "must", local: Boolean(assertion.local), features, commits: features.map((f) => f.commit).filter(Boolean), validators, status, gaps };
   });
@@ -2280,10 +2289,14 @@ function buildCoverageReport({ plan, milestone, iterationState, commandReports, 
 }
 
 function normalizeValidatorReport(raw, { plan, milestone, coverageGaps }) {
+  const scopedAssertions = milestoneCoverageAssertions(plan, milestone, "milestone");
+  const scopedIds = new Set(scopedAssertions.map((assertion) => String(assertion.id)));
+  const scopedLocalIds = scopedAssertions.filter((assertion) => assertion.local).map((assertion) => String(assertion.id));
+  const canonicalScopedAssertionId = (value) => canonicalAssertionId(value, plan.validationContract) || canonicalLocalAssertionId(value, scopedLocalIds);
   const objections = Array.isArray(raw?.objections) ? raw.objections.map((objection) => {
     const normalized = {
       level: ["must", "should", "nit"].includes(String(objection.level)) ? String(objection.level) : "must",
-      assertionId: objection.assertionId ? (canonicalAssertionId(objection.assertionId, plan.validationContract) || String(objection.assertionId)) : undefined,
+      assertionId: objection.assertionId ? (canonicalScopedAssertionId(objection.assertionId) || String(objection.assertionId)) : undefined,
       description: String(objection.description || objection.summary || objection.message || "Validator objection"),
       evidence: String(objection.evidence || ""),
       repairHint: String(objection.repairHint || objection.repair || ""),
@@ -2291,9 +2304,7 @@ function normalizeValidatorReport(raw, { plan, milestone, coverageGaps }) {
     return { ...normalized, failureClass: normalizeFailureClass(objection.failureClass, classifyValidationFailure(normalized)) };
   }) : [];
   for (const gap of coverageGaps || []) objections.push({ level: "must", assertionId: gap.assertionId, description: `Coverage gap: ${gap.description}`, evidence: "Requirement/assertion coverage report", repairHint: "Add or repair a feature that directly satisfies this assertion.", failureClass: "missing_acceptance_test" });
-  const scopedAssertions = milestoneCoverageAssertions(plan, milestone, "milestone");
-  const scopedIds = new Set(scopedAssertions.map((assertion) => String(assertion.id)));
-  const assertionResults = Array.isArray(raw?.assertionResults) ? raw.assertionResults.map((result) => ({ assertionId: canonicalAssertionId(result.assertionId || result, plan.validationContract) || String(result.assertionId || ""), status: String(result.status || "unknown"), evidence: String(result.evidence || "") })) : scopedAssertions.map((assertion) => ({ assertionId: assertion.id, status: objections.some((o) => o.assertionId === assertion.id && o.level === "must") ? "fail" : "unknown", evidence: "Validator did not provide per-assertion assertionResults; scoped assertion is unverified." }));
+  const assertionResults = Array.isArray(raw?.assertionResults) ? raw.assertionResults.map((result) => ({ assertionId: canonicalScopedAssertionId(result.assertionId || result) || String(result.assertionId || ""), status: String(result.status || "unknown"), evidence: String(result.evidence || "") })) : scopedAssertions.map((assertion) => ({ assertionId: assertion.id, status: objections.some((o) => o.assertionId === assertion.id && o.level === "must") ? "fail" : "unknown", evidence: "Validator did not provide per-assertion assertionResults; scoped assertion is unverified." }));
   for (const assertion of scopedAssertions) if (!assertionResults.some((result) => String(result.assertionId) === String(assertion.id))) assertionResults.push({ assertionId: assertion.id, status: "unknown", evidence: "Validator omitted scoped assertion result." });
   if (raw?.passed === false && !objections.some((objection) => objection.level === "must")) objections.push({ level: "must", assertionId: assertionResults.find((result) => scopedIds.has(String(result.assertionId)))?.assertionId, description: "Validator marked milestone as failed without a must-level objection.", evidence: String(raw?.summary || "validator passed=false"), repairHint: "Provide or repair the blocking validator objection.", failureClass: "model_or_handoff_failure" });
   const correctiveFeatures = Array.isArray(raw?.correctiveFeatures) ? raw.correctiveFeatures.map((feature) => ({ ...feature, assertions: normalizeAssertionReferences(feature.assertions || [], plan.validationContract) })) : objections.filter((o) => o.level === "must").map((objection) => ({ title: `Repair ${objection.assertionId || milestone.id}: ${objection.description}`.slice(0, 160), assertions: objection.assertionId ? [objection.assertionId] : scopedAssertions.map((assertion) => assertion.id), rationale: objection.evidence || objection.description }));
@@ -2569,7 +2580,7 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
   const contractValidated = commandPassed && validatorReport.passed !== false && mustObjections.length === 0 && featureReviewMustFindings.length === 0 && coverage.gaps.length === 0;
   const blockingCategoryResults = blockingCategoryResultsForTarget(categoryResults, plan.completionTarget);
   const passed = contractValidated && blockingCategoryResults.length === 0;
-  const assertionResults = coverage.assertions.map((row) => ({ assertionId: row.assertionId, status: row.status === "pass" ? "pass" : "fail", evidence: row.gaps.join("; ") || "Command and adversarial validators passed." }));
+  const assertionResults = coverage.assertions.map((row) => ({ assertionId: row.assertionId, status: row.status === "pass" ? "pass" : row.local && row.status === "unknown" ? "unknown" : "fail", evidence: row.gaps.join("; ") || (row.status === "unknown" ? "Local acceptance check not explicitly verdicted by the validator; enforced via strict worker handoff." : "Command and adversarial validators passed.") }));
   const validatorCorrectiveFeatures = validatorReport.correctiveFeatures || [];
   const validatorCorrectiveAssertions = new Set(validatorCorrectiveFeatures.flatMap((feature) => Array.isArray(feature.assertions) ? feature.assertions.map(String) : []));
   const coverageGapFeatures = coverage.gaps
