@@ -14,7 +14,7 @@ Private Pi package for thread-phase workflow visualization and example workflows
 ## Install
 
 ```bash
-pi install git:git@github.com:Code4me2/pi-thread-phase-tools@v0.11.9
+pi install git:git@github.com:Code4me2/pi-thread-phase-tools@v0.12.0
 ```
 
 For active development:
@@ -36,7 +36,7 @@ pi install git:git@github.com:Code4me2/pi-thread-phase-tools@main
 
 ## Current status
 
-Latest release: `v0.11.9`.
+Latest release: `v0.12.0`.
 
 Recent changes:
 
