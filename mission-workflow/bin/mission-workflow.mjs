@@ -429,7 +429,13 @@ function isNoCommandSentinel(value) {
     .toLowerCase()
     .replace(/^[`'"“”‘’\s]+|[`'"“”‘’.!\s]+$/g, "")
     .replace(/[\s_-]+/g, " ");
-  return !normalized || ["none", "none provided", "no command", "not provided", "not applicable", "n/a", "na", "null", "undefined"].includes(normalized);
+  const slashless = normalized.replace(/\s*\/\s*/g, "/");
+  const wordOnly = normalized.replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
+  const compact = wordOnly.replace(/\s+/g, "");
+  const placeholders = new Set([
+    "", "-", "—", "none", "none provided", "none supplied", "no command", "no commands", "no test command", "no user test command", "no user tests", "no user tests provided", "not provided", "not supplied", "not applicable", "n/a", "na", "nil", "null", "undefined",
+  ]);
+  return placeholders.has(normalized) || placeholders.has(slashless) || placeholders.has(wordOnly) || ["na", "n/a"].includes(compact);
 }
 
 function normalizeOptionalCommand(value) {

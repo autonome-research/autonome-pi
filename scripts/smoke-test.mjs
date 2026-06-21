@@ -173,6 +173,11 @@ try {
   log(Boolean(missionPlanDetails?.planPath), 'mission workflow plan emits planPath');
   const plannedMissionArtifact = missionPlanDetails?.planPath ? JSON.parse(readFileSync(missionPlanDetails.planPath, 'utf8')) : undefined;
   log(plannedMissionArtifact?.userTestCommand === undefined, 'mission workflow normalizes CLI user-test sentinel to absent optional command in plan');
+  const missionPlanEquivalentPlaceholder = expectExit('mission workflow mock plan normalizes equivalent user-test placeholder', ['node', missionCli, 'plan', '--planner', 'mock', '--goal', 'Equivalent no user tests placeholder mission', '--cwd', missionRepo, '--validation-command', 'true', '--user-test-command', 'No user tests provided.'], 0);
+  let missionPlanEquivalentDetails;
+  try { missionPlanEquivalentDetails = JSON.parse(missionPlanEquivalentPlaceholder.stdout); } catch { missionPlanEquivalentDetails = undefined; }
+  const missionPlanEquivalentArtifact = missionPlanEquivalentDetails?.planPath ? JSON.parse(readFileSync(missionPlanEquivalentDetails.planPath, 'utf8')) : undefined;
+  log(missionPlanEquivalentArtifact?.userTestCommand === undefined, 'mission workflow treats prose user-test placeholders as absent optional commands');
   if (missionPlanDetails?.planPath) writeFileSync(missionPlanDetails.planPath, JSON.stringify({ ...plannedMissionArtifact, userTestCommand: 'none provided' }, null, 2));
   const missionActivate = missionPlanDetails?.planPath
     ? expectExit('mission workflow mock activate succeeds with sentinel in existing plan artifact', ['node', missionCli, 'activate', '--approved', '--plan-path', missionPlanDetails.planPath, '--cwd', missionRepo], 0)
