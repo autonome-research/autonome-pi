@@ -181,9 +181,14 @@ try {
   const registryState = missionActivateDetails?.registryPath ? JSON.parse(readFileSync(missionActivateDetails.registryPath, 'utf8')) : undefined;
   log(registryState?.status === 'completed' && Array.isArray(registryState.completedFeatures), 'mission workflow registry records completed state');
   log(Boolean(missionActivateDetails?.finalCoveragePath) && existsSync(missionActivateDetails.finalCoveragePath), 'mission workflow writes final coverage report');
+  const missionPlanArtifact = missionPlanDetails?.planPath ? JSON.parse(readFileSync(missionPlanDetails.planPath, 'utf8')) : undefined;
+  log(missionPlanArtifact?.userTestCommand === undefined, 'mission workflow normalizes user-test sentinel to absent optional command in plan');
+  const missionFinalCoverage = missionActivateDetails?.finalCoveragePath && existsSync(missionActivateDetails.finalCoveragePath) ? JSON.parse(readFileSync(missionActivateDetails.finalCoveragePath, 'utf8')) : undefined;
+  log(missionFinalCoverage?.scope === 'final' && missionFinalCoverage?.gaps?.length === 0 && missionFinalCoverage?.assertions?.every((assertion) => assertion.status === 'pass'), 'mission workflow final coverage passes after skipped optional user test');
   const missionValidationReportPath = missionActivateDetails?.runId ? join(store, 'artifacts', missionActivateDetails.runId, 'validation', 'milestone-001-report.json') : undefined;
   const missionValidationReport = missionValidationReportPath && existsSync(missionValidationReportPath) ? JSON.parse(readFileSync(missionValidationReportPath, 'utf8')) : undefined;
   log(missionValidationReport?.reports?.some((report) => report.validator === 'user-testing-command' && report.skipped === true && report.notApplicable === true && report.passed === true && report.command === null), 'mission workflow records absent user-test command as skipped validation');
+  log(!missionValidationReport?.reports?.some((report) => report.validator === 'user-testing-command' && report.command === 'none provided'), 'mission workflow does not execute user-test sentinel as a shell command');
   const missionResume = missionPlanDetails?.planPath
     ? expectExit('mission workflow rejects resume after completed mission', ['node', missionCli, 'resume', '--approved', '--plan-path', missionPlanDetails.planPath, '--cwd', missionRepo], 1)
     : undefined;
