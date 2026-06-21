@@ -112,6 +112,15 @@ try {
 
   expectExit('Pi extension package loads', ['pi', '--no-extensions', '-e', '.', '--list-models'], 0, { env: { PI_OFFLINE: '1' }, timeout: 60_000 });
 
+  const bugSolverCli = join(root, 'bug-solver-workflow/bin/bug-solver-workflow.mjs');
+  expectExit('bug-solver workflow CLI help succeeds', ['node', bugSolverCli, '--help'], 0);
+  const bugPrecheck = expectExit('bug-solver workflow precheck writes durable artifact', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix smoke-test bug transaction', '--json'], 0);
+  let bugPrecheckDetails;
+  try { bugPrecheckDetails = JSON.parse(bugPrecheck.stdout); } catch { bugPrecheckDetails = undefined; }
+  log(Boolean(bugPrecheckDetails?.precheckPath) && existsSync(bugPrecheckDetails.precheckPath) && bugPrecheckDetails.precheckPath.includes('bug-solver-workflow') && !bugPrecheckDetails.precheckPath.startsWith(root), 'bug-solver precheck artifact is durable and outside target repo', bugPrecheckDetails?.precheckPath || '');
+  const bugRunSummary = bugPrecheckDetails?.runId ? storeApi.getRunSummary(bugPrecheckDetails.runId) : undefined;
+  log(bugRunSummary?.workflow === 'bug-solver-workflow' && bugRunSummary?.normalizedStatus === 'success', 'bug-solver workflow emits generic thread-phase events');
+
   const cli = join(root, 'dynamic-thread-phase-workflow/bin/dynamic-thread-phase-workflow.mjs');
 
   const badTools = join(tmp, 'bad-tools.json');

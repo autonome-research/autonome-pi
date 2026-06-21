@@ -9,6 +9,7 @@ Private Pi package for thread-phase workflow visualization and example workflows
 - `code-review-workflow` — git diff/commit code review workflow using Pi subagents.
 - `dynamic-workflows` — validated ad-hoc workflow runner for dynamic workflows planned in chat, with structured spec mode and advanced JavaScript harness mode.
 - `mission-workflow` — Droid/Missions-style long-running software mission extension with plan approval, validation contracts, strict handoffs, per-feature worktrees/commits, command + adversarial validators, durable registry/resume, coverage artifacts, and repair loops.
+- `bug-solver-workflow` — persistent one-bug-per-transaction solver extension scaffold with read-only precheck, approval-gated activation surface, durable external artifacts, and thread-phase observability.
 - `skills/dynamic-workflows` and `skills/mission-workflow` — on-demand Pi skills that teach other sessions/configurations how to use these workflow tools safely.
 
 ## Install
@@ -31,6 +32,7 @@ pi install git:git@github.com:Code4me2/pi-thread-phase-tools@main
 - `/code-review` runs code review workflows.
 - `dynamic_workflow` runs validated dynamic workflows from structured specs or JavaScript harnesses. `dynamic_thread_phase_workflow` remains as a deprecated compatibility alias.
 - `mission_workflow` plans and activates approved Droid/Missions-style software missions. Always run `action: "plan"` and get user approval before `action: "activate"`.
+- `bug_solver_workflow` prechecks and approval-gates a focused one-bug transaction. Always run `action: "precheck"` before `action: "solve"` with `approved: true`.
 - Tool/API inspection remains available through `thread_phase_runs`.
 - Workflow skills are included in the package and should load automatically when tasks ask for dynamic workflows, mission workflows, structured workflow specs, JS harness workflows, or multi-phase dynamic execution.
 

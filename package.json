@@ -19,7 +19,8 @@
       "codebase-exploration-workflow/index.ts",
       "code-review-workflow/index.ts",
       "dynamic-thread-phase-workflow/index.ts",
-      "mission-workflow/index.ts"
+      "mission-workflow/index.ts",
+      "bug-solver-workflow/index.ts"
     ],
     "skills": [
       "skills"
