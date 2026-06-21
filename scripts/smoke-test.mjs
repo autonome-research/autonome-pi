@@ -189,6 +189,9 @@ try {
   const missionValidationReport = missionValidationReportPath && existsSync(missionValidationReportPath) ? JSON.parse(readFileSync(missionValidationReportPath, 'utf8')) : undefined;
   log(missionValidationReport?.reports?.some((report) => report.validator === 'user-testing-command' && report.skipped === true && report.notApplicable === true && report.passed === true && report.command === null), 'mission workflow records absent user-test command as skipped validation');
   log(!missionValidationReport?.reports?.some((report) => report.validator === 'user-testing-command' && report.command === 'none provided'), 'mission workflow does not execute user-test sentinel as a shell command');
+  const missionMilestoneCoverage = missionValidationReport?.coveragePath && existsSync(missionValidationReport.coveragePath) ? JSON.parse(readFileSync(missionValidationReport.coveragePath, 'utf8')) : undefined;
+  const missionCoverageValidators = missionMilestoneCoverage?.assertions?.flatMap((assertion) => assertion.validators || []) || [];
+  log(missionCoverageValidators.some((validator) => validator.validator === 'user-testing-command' && validator.command === null && validator.passed === true && validator.skipped === true && validator.notApplicable === true), 'mission workflow milestone coverage records skipped optional user test validator');
   const missionResume = missionPlanDetails?.planPath
     ? expectExit('mission workflow rejects resume after completed mission', ['node', missionCli, 'resume', '--approved', '--plan-path', missionPlanDetails.planPath, '--cwd', missionRepo], 1)
     : undefined;

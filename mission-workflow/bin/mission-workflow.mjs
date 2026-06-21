@@ -440,6 +440,12 @@ function splitList(value) {
   return String(value).split(/[;,]/).map((s) => s.trim()).filter((s) => s && !isNoCommandSentinel(s));
 }
 
+function normalizeCommandList(value, { split = false } = {}) {
+  const raw = Array.isArray(value) ? value : (value === undefined || value === null ? [] : [value]);
+  const commands = split ? raw.flatMap(splitList) : raw.map((item) => String(item || "").trim()).filter(Boolean);
+  return commands.filter((command) => !isNoCommandSentinel(command));
+}
+
 function writeArtifact(run, fileName, content, kind = "markdown", title = fileName) {
   const dir = join(ARTIFACTS_DIR, run.runId);
   mkdirSync(dir, { recursive: true });
@@ -935,7 +941,7 @@ function defaultPlan({ goal, cwd, args, repoRoot }) {
     baseRef: "HEAD",
     worktreeBaseDir: join(homedir(), ".pi", "agent", "mission-workflow", "worktrees", missionId),
     maxRepairIterations: Number(args["max-repair-iterations"] || DEFAULT_MAX_REPAIR_ITERATIONS),
-    validationCommands: splitList(args["validation-command"]),
+    validationCommands: normalizeCommandList(args["validation-command"], { split: true }),
     userTestCommand: normalizeOptionalCommand(args["user-test-command"]),
     planner: String(args.planner || "pi"),
     modelPlan: args["model-plan"] ? String(args["model-plan"]) : undefined,
@@ -1012,7 +1018,7 @@ function normalizePlan(plan, { goal, cwd, args, repoRoot }) {
     baseRef: plan.baseRef || "HEAD",
     worktreeBaseDir: plan.worktreeBaseDir || join(homedir(), ".pi", "agent", "mission-workflow", "worktrees", missionId),
     maxRepairIterations: Number(plan.maxRepairIterations || args["max-repair-iterations"] || DEFAULT_MAX_REPAIR_ITERATIONS),
-    validationCommands: Array.isArray(plan.validationCommands) ? plan.validationCommands : fallback.validationCommands,
+    validationCommands: plan.validationCommands !== undefined ? normalizeCommandList(plan.validationCommands, { split: !Array.isArray(plan.validationCommands) }) : fallback.validationCommands,
     userTestCommand: normalizeOptionalCommand(plan.userTestCommand) || fallback.userTestCommand,
     planner: String(args.planner || plan.planner || fallback.planner || "pi"),
     modelPlan: args["model-plan"] ? String(args["model-plan"]) : plan.modelPlan,
@@ -1829,7 +1835,7 @@ function buildCoverageReport({ plan, milestone, iterationState, commandReports, 
     const features = featuresByAssertion.get(String(assertion.id)) || [];
     const validator = validatorAssertions.get(String(assertion.id));
     const validators = [
-      ...commandReports.map((report) => ({ validator: report.validator, command: report.command, passed: report.passed, artifact: report.artifact })),
+      ...commandReports.map((report) => ({ validator: report.validator, command: report.command ?? null, passed: report.passed, skipped: Boolean(report.skipped), notApplicable: Boolean(report.notApplicable), exitCode: report.exitCode, timedOut: Boolean(report.timedOut), artifact: report.artifact, note: report.note })),
       ...(validatorReport ? [{ validator: "adversarial-scrutiny", passed: validatorReport.passed && isPassedAssertionStatus(validator?.status), artifact: validatorReport.artifact, evidence: validator?.evidence }] : []),
     ];
     let status = "pass";
