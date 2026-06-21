@@ -423,10 +423,21 @@ function clearResolvedRegistryError(state, reason, at = new Date().toISOString()
   };
 }
 
+function isNoCommandSentinel(value) {
+  const normalized = String(value || "").trim().toLowerCase().replace(/[\s_-]+/g, " ");
+  return !normalized || ["none", "none provided", "no command", "not provided", "not applicable", "n/a", "na", "null", "undefined"].includes(normalized);
+}
+
+function normalizeOptionalCommand(value) {
+  if (value === undefined || value === null) return undefined;
+  const command = String(value).trim();
+  return isNoCommandSentinel(command) ? undefined : command;
+}
+
 function splitList(value) {
   if (!value) return [];
   if (Array.isArray(value)) return value.flatMap(splitList);
-  return String(value).split(/[;,]/).map((s) => s.trim()).filter(Boolean);
+  return String(value).split(/[;,]/).map((s) => s.trim()).filter((s) => s && !isNoCommandSentinel(s));
 }
 
 function writeArtifact(run, fileName, content, kind = "markdown", title = fileName) {
@@ -925,7 +936,7 @@ function defaultPlan({ goal, cwd, args, repoRoot }) {
     worktreeBaseDir: join(homedir(), ".pi", "agent", "mission-workflow", "worktrees", missionId),
     maxRepairIterations: Number(args["max-repair-iterations"] || DEFAULT_MAX_REPAIR_ITERATIONS),
     validationCommands: splitList(args["validation-command"]),
-    userTestCommand: args["user-test-command"] ? String(args["user-test-command"]) : undefined,
+    userTestCommand: normalizeOptionalCommand(args["user-test-command"]),
     planner: String(args.planner || "pi"),
     modelPlan: args["model-plan"] ? String(args["model-plan"]) : undefined,
     modelWorker: args["model-worker"] ? String(args["model-worker"]) : undefined,
@@ -1002,7 +1013,7 @@ function normalizePlan(plan, { goal, cwd, args, repoRoot }) {
     worktreeBaseDir: plan.worktreeBaseDir || join(homedir(), ".pi", "agent", "mission-workflow", "worktrees", missionId),
     maxRepairIterations: Number(plan.maxRepairIterations || args["max-repair-iterations"] || DEFAULT_MAX_REPAIR_ITERATIONS),
     validationCommands: Array.isArray(plan.validationCommands) ? plan.validationCommands : fallback.validationCommands,
-    userTestCommand: plan.userTestCommand || fallback.userTestCommand,
+    userTestCommand: normalizeOptionalCommand(plan.userTestCommand) || fallback.userTestCommand,
     planner: String(args.planner || plan.planner || fallback.planner || "pi"),
     modelPlan: args["model-plan"] ? String(args["model-plan"]) : plan.modelPlan,
     modelWorker: args["model-worker"] ? String(args["model-worker"]) : plan.modelWorker,
@@ -1917,6 +1928,8 @@ async function runValidation(env, plan, milestone, iterationState, ctx, run) {
     if ((result.aborted && !result.timedOut) || ctx.signal.aborted) throw abortError(ctx.signal.reason || result.error || "cancelled");
     const file = writeArtifact(run, `validation/${safeName(milestone.id)}-user-test.txt`, [`$ ${command}`, result.error ? `# ${result.error}` : "", result.stdout, result.stderr].join("\n"), "file", `User testing command: ${command}`);
     reports.push({ validator: "user-testing-command", command, passed: result.ok, exitCode: result.code, timedOut: Boolean(result.timedOut), artifact: file, stdoutExcerpt: compactText(result.stdout || "", 4000), stderrExcerpt: compactText(result.stderr || result.error || "", 4000) });
+  } else {
+    reports.push({ validator: "user-testing-command", command: null, passed: true, skipped: true, notApplicable: true, note: "No optional user test command configured." });
   }
   if (reports.length === 0) reports.push({ validator: "scrutiny-command", command: "none", passed: true, note: "No validation commands configured." });
   const coverageDraft = buildCoverageReport({ plan, milestone, iterationState, commandReports: reports, validatorReport: undefined, scope: "milestone" });

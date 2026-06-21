@@ -57,7 +57,7 @@ await mission_workflow({
 - Command validators run configured `validationCommands` after each milestone.
 - A fresh read-only adversarial Pi validator agent then reviews source/spec docs, the validation contract, worker handoffs, git diff, and command outputs. It uses `modelValidator` when provided and writes structured JSON reports.
 - Must-level validator objections or requirement coverage gaps fail milestone validation and enqueue targeted repair features up to `maxRepairIterations` (default `10`).
-- User-testing validator starts as a configured command (`userTestCommand`).
+- User-testing validator starts as a configured command (`userTestCommand`). If the optional command is absent, empty, or a planner/CLI placeholder such as `none provided`/`n/a`, it is recorded as a skipped/not-applicable validation item and is never executed as a shell command.
 - Heartbeat events record compact current milestone/feature/branch/worktree pointers and child process ids for stale-run detection.
 - Durable mission state is persisted under `~/.pi/agent/mission-workflow/registry/<missionId>/` with plan path, branch, worktree, completed features, validation/coverage reports, current work item, role models, trusted base/head checkpoints, trusted plan fingerprint, trusted runner-owned commits, and timestamps.
 - Per-milestone and final coverage artifacts map assertion -> features -> commits -> validators -> status.

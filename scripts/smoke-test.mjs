@@ -167,7 +167,7 @@ try {
   expectExit('mission smoke repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: missionRepo });
   writeFileSync(join(missionRepo, 'README.md'), 'hello\n');
   expectExit('mission smoke repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: missionRepo });
-  const missionPlan = expectExit('mission workflow mock plan succeeds', ['node', missionCli, 'plan', '--planner', 'mock', '--goal', 'No-op smoke mission', '--cwd', missionRepo], 0);
+  const missionPlan = expectExit('mission workflow mock plan succeeds', ['node', missionCli, 'plan', '--planner', 'mock', '--goal', 'No-op smoke mission', '--cwd', missionRepo, '--validation-command', 'true', '--user-test-command', 'none provided'], 0);
   let missionPlanDetails;
   try { missionPlanDetails = JSON.parse(missionPlan.stdout); } catch { missionPlanDetails = undefined; }
   log(Boolean(missionPlanDetails?.planPath), 'mission workflow plan emits planPath');
@@ -181,6 +181,9 @@ try {
   const registryState = missionActivateDetails?.registryPath ? JSON.parse(readFileSync(missionActivateDetails.registryPath, 'utf8')) : undefined;
   log(registryState?.status === 'completed' && Array.isArray(registryState.completedFeatures), 'mission workflow registry records completed state');
   log(Boolean(missionActivateDetails?.finalCoveragePath) && existsSync(missionActivateDetails.finalCoveragePath), 'mission workflow writes final coverage report');
+  const missionValidationReportPath = missionActivateDetails?.runId ? join(store, 'artifacts', missionActivateDetails.runId, 'validation', 'milestone-001-report.json') : undefined;
+  const missionValidationReport = missionValidationReportPath && existsSync(missionValidationReportPath) ? JSON.parse(readFileSync(missionValidationReportPath, 'utf8')) : undefined;
+  log(missionValidationReport?.reports?.some((report) => report.validator === 'user-testing-command' && report.skipped === true && report.notApplicable === true && report.passed === true && report.command === null), 'mission workflow records absent user-test command as skipped validation');
   const missionResume = missionPlanDetails?.planPath
     ? expectExit('mission workflow rejects resume after completed mission', ['node', missionCli, 'resume', '--approved', '--plan-path', missionPlanDetails.planPath, '--cwd', missionRepo], 1)
     : undefined;
