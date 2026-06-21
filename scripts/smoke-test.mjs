@@ -125,6 +125,12 @@ try {
   log(bugContract?.schema === 'pi-bug-solver-workflow/validation-contract/v1' && bugContract?.createdBeforeImplementation === true && bugContract?.assertions?.length >= 4 && Object.keys(bugContract?.workflowEvidenceMap || {}).includes('single-bug-scope'), 'bug-solver validation contract maps explicit assertions to durable evidence');
   const bugRunSummary = bugPrecheckDetails?.runId ? storeApi.getRunSummary(bugPrecheckDetails.runId) : undefined;
   log(bugRunSummary?.workflow === 'bug-solver-workflow' && bugRunSummary?.normalizedStatus === 'success', 'bug-solver workflow emits generic thread-phase events');
+  const bugRunEvents = bugPrecheckDetails?.runId ? storeApi.readRun(bugPrecheckDetails.runId) : [];
+  const genericThreadPhaseTypes = new Set(['workflow_start', 'phase_start', 'phase_event', 'artifact', 'phase_end', 'workflow_end']);
+  log(bugRunEvents.length >= 6 && bugRunEvents.every((event) => event.schema === 'thread-phase-ui/v1' && genericThreadPhaseTypes.has(event.type)) && bugRunEvents.some((event) => event.type === 'artifact' && event.artifact?.path === bugPrecheckDetails.precheckPath), 'bug-solver observability persists only generic thread-phase event types');
+  const visualizerStoreSource = readFileSync(join(root, 'thread-phase-visualizer/lib/store.mjs'), 'utf8');
+  const visualizerIndexSource = readFileSync(join(root, 'thread-phase-visualizer/index.ts'), 'utf8');
+  log(!/bug[-_]solver|pi-bug-solver/i.test(`${visualizerStoreSource}\n${visualizerIndexSource}`), 'generic thread-phase visualizer has no bug-solver-specific coupling');
   expectExit('bug-solver workflow accepts single-bug phrasing with non-independent conjunction', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix crash when loading and saving the same profile', '--json'], 0);
   expectExit('bug-solver workflow rejects multi-bug transaction before solve', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix login bug and also repair billing bug plus update exports', '--json'], 1);
   expectExit('bug-solver workflow rejects single-conjunction two-bug phrasing', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix login timeout and repair billing total bug', '--json'], 1);
