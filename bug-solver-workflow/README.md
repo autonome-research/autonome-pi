@@ -44,4 +44,4 @@ node bug-solver-workflow/bin/bug-solver-workflow.mjs solve \
 - `precheck` writes `precheck.json`, `transaction-plan.json`, `validation-contract.json`, `allowlist-decisions.jsonl`, and evidence path placeholders before implementation begins.
 - The transaction plan schema (`pi-bug-solver-workflow/transaction-plan/v1`) is intentionally stable: it contains exactly-one-bug status, repo/base metadata, validation/user-test commands, max repair iterations (default 8), baseline evidence metadata, allowlist policy, artifact paths, and final evidence paths.
 - The validation contract schema (`pi-bug-solver-workflow/validation-contract/v1`) records explicit must-level assertions and maps each assertion to durable workflow evidence paths before any edit-capable phase.
-- `solve` is intentionally confirmation-gated and refuses multi-bug prechecks/plans.
+- `solve` is intentionally confirmation-gated and refuses multi-bug prechecks/plans, including comma-separated independent clauses such as `Fix login bug, repair billing bug`.

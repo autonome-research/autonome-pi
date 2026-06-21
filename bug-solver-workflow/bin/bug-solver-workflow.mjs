@@ -75,16 +75,30 @@ function parseMaxRepairs(value) {
   return parsed;
 }
 
-function isIndependentBugClause(value) {
-  const clause = String(value || "").trim().replace(/^[-*]\s+/, "").replace(/^(?:\d+\.|\([a-z0-9]+\))\s+/i, "");
-  if (clause.length < 4) return false;
-  const actionPattern = /\b(fix|repair|resolve|correct|prevent|stop|address|debug|handle|ensure|make)\b/i;
-  const failurePattern = /\b(bug|defect|error|fail(?:s|ed|ing|ure)?|crash(?:es|ed|ing)?|exception|regression|timeout|incorrect|wrong|broken|hang(?:s|ing)?|leak(?:s|ing)?|corrupt(?:s|ed|ing)?|500|404)\b/i;
-  return actionPattern.test(clause) || failurePattern.test(clause);
+const BUG_ACTION_PATTERN = /\b(fix|repair|resolve|correct|prevent|stop|address|debug|handle|ensure|make)\b/i;
+const BUG_FAILURE_PATTERN = /\b(bug|defect|error|fail(?:s|ed|ing|ure)?|crash(?:es|ed|ing)?|exception|regression|timeout|incorrect|wrong|broken|hang(?:s|ing)?|leak(?:s|ing)?|corrupt(?:s|ed|ing)?|500|404)\b/i;
+
+function normalizeBugClause(value) {
+  return String(value || "").trim().replace(/^[-*]\s+/, "").replace(/^(?:\d+\.|\([a-z0-9]+\))\s+/i, "");
 }
 
-function countIndependentClauses(parts) {
-  return parts.map((part) => part.trim()).filter(isIndependentBugClause).length;
+function isIndependentBugClause(value) {
+  const clause = normalizeBugClause(value);
+  if (clause.length < 4) return false;
+  return BUG_ACTION_PATTERN.test(clause) || BUG_FAILURE_PATTERN.test(clause);
+}
+
+function isCommaSeparatedIndependentBugClause(value) {
+  const clause = normalizeBugClause(value);
+  if (clause.length < 4) return false;
+  // Commas are common inside one bug description ("Fix crash when loading, saving, and closing").
+  // Treat a comma segment as an independent transaction only when it looks like a standalone
+  // bug/action clause: it starts with another repair verb or contains an explicit bug/failure noun.
+  return BUG_ACTION_PATTERN.test(clause) || /\b(bug|defect|regression|crash(?:es|ed|ing)?|exception|timeout|error|failure|broken)\b/i.test(clause);
+}
+
+function countIndependentClauses(parts, predicate = isIndependentBugClause) {
+  return parts.map((part) => part.trim()).filter(predicate).length;
 }
 
 function numberedClauses(text) {
@@ -101,6 +115,7 @@ function classifyBugCount(bug) {
   const signals = {
     conjunctions: [],
     semicolonClauses: 0,
+    commaClauses: 0,
     bulletClauses: 0,
     numberedClauses: 0,
   };
@@ -116,10 +131,11 @@ function classifyBugCount(bug) {
   }
 
   signals.semicolonClauses = countIndependentClauses(text.split(/;+/));
+  signals.commaClauses = countIndependentClauses(text.split(/,+/), isCommaSeparatedIndependentBugClause);
   signals.bulletClauses = countIndependentClauses(text.split(/\n/).filter((line) => /^\s*[-*]\s+/.test(line)));
   signals.numberedClauses = countIndependentClauses(numberedClauses(text));
 
-  const likelyMultiple = signals.conjunctions.length > 0 || signals.semicolonClauses >= 2 || signals.bulletClauses >= 2 || signals.numberedClauses >= 2;
+  const likelyMultiple = signals.conjunctions.length > 0 || signals.semicolonClauses >= 2 || signals.commaClauses >= 2 || signals.bulletClauses >= 2 || signals.numberedClauses >= 2;
   const splitRecommendation = likelyMultiple
     ? "Reject this activation and create one transaction per independent bug before any edit-capable phase."
     : undefined;
@@ -356,8 +372,11 @@ async function solve(args, json) {
   if (!existsSync(planPath)) die(`precheck plan not found: ${planPath}`, 1, json);
   const plan = readJson(planPath);
   const transactionId = plan.transactionId;
-  const multiplicity = plan.transaction?.multiplicity || plan.multiplicity || {};
-  const exactlyOneBug = plan.transaction?.exactlyOneBug ?? !multiplicity.likelyMultiple;
+  const planBugDescription = plan.transaction?.bugDescription || plan.bugDescription || plan.bug || "";
+  const currentMultiplicity = classifyBugCount(planBugDescription);
+  const storedMultiplicity = plan.transaction?.multiplicity || plan.multiplicity || {};
+  const multiplicity = currentMultiplicity.likelyMultiple ? currentMultiplicity : storedMultiplicity;
+  const exactlyOneBug = currentMultiplicity.likelyMultiple ? false : (plan.transaction?.exactlyOneBug ?? !storedMultiplicity.likelyMultiple);
   const run = createRun({ workflow: WORKFLOW, cwd, input: { action: "solve", transactionId }, metadata: { transactionId, mode: "solve" } });
   try {
     phaseStart(run, "confirmation-gate", { planPath, approved: true });

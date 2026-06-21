@@ -135,6 +135,11 @@ try {
   expectExit('bug-solver workflow rejects multi-bug transaction before solve', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix login bug and also repair billing bug plus update exports', '--json'], 1);
   expectExit('bug-solver workflow rejects single-conjunction two-bug phrasing', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix login timeout and repair billing total bug', '--json'], 1);
   expectExit('bug-solver workflow rejects semicolon two-bug phrasing', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix login timeout; repair billing total bug', '--json'], 1);
+  expectExit('bug-solver workflow rejects comma-separated two-bug phrasing', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix login bug, repair billing bug', '--json'], 1);
+  expectExit('bug-solver workflow rejects comma-separated multi-action phrasing before solve activation', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix login bug, repair billing bug, update exports', '--json'], 1);
+  const legacyCommaPlan = join(tmp, 'legacy-comma-plan.json');
+  writeFileSync(legacyCommaPlan, JSON.stringify({ schema: 'pi-bug-solver-workflow/transaction-plan/v1', transactionId: 'legacy-comma-plan', status: 'awaiting_confirmation', editingAllowed: false, transaction: { exactlyOneBug: true, bugDescription: 'Fix login bug, repair billing bug', multiplicity: { likelyMultiple: false } }, validation: { contractPath: join(tmp, 'legacy-contract.json') } }, null, 2));
+  expectExit('bug-solver workflow solve gate reclassifies and rejects legacy comma-separated multi-bug plans', ['node', bugSolverCli, 'solve', '--cwd', root, '--plan-path', legacyCommaPlan, '--approved', '--json'], 1);
   expectExit('bug-solver workflow rejects bullet-list two-bug phrasing', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', '- Fix login timeout\n- Repair billing total bug', '--json'], 1);
   expectExit('bug-solver workflow rejects numbered two-bug phrasing', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', '1. Fix login timeout 2. Repair billing total bug', '--json'], 1);
 
