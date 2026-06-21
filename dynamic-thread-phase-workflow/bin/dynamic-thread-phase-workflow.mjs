@@ -42,12 +42,23 @@ const MAX_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_WORKFLOW_MAX
 async function loadThreadPhaseCore() {
   try {
     return await import("@autonome-research/thread-phase");
-  } catch {
-    const globalPath = process.env.THREAD_PHASE_CORE_PATH || join(
-      homedir(), ".npm-global", "lib", "node_modules", "@autonome-research", "thread-phase-cli",
-      "node_modules", "@autonome-research", "thread-phase", "dist", "index.js",
-    );
-    return await import(globalPath);
+  } catch (packageError) {
+    const nodePrefix = resolve(process.execPath, "..", "..");
+    const candidates = [
+      process.env.THREAD_PHASE_CORE_PATH,
+      join(homedir(), ".npm-global", "lib", "node_modules", "@autonome-research", "thread-phase-cli", "node_modules", "@autonome-research", "thread-phase", "dist", "index.js"),
+      join(nodePrefix, "lib", "node_modules", "@autonome-research", "thread-phase-cli", "node_modules", "@autonome-research", "thread-phase", "dist", "index.js"),
+    ].filter(Boolean);
+    const errors = [packageError];
+    for (const candidate of candidates) {
+      if (!existsSync(candidate)) continue;
+      try {
+        return await import(pathToFileURL(candidate).href);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    throw new AggregateError(errors, `Unable to load @autonome-research/thread-phase from package or fallback paths: ${candidates.join(", ")}`);
   }
 }
 
