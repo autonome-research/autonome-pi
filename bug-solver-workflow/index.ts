@@ -96,6 +96,9 @@ function buildArgs(params: Record<string, any>, ctx: any): string[] {
 	if (params.planPath) args.push("--plan-path", params.planPath);
 	if (params.approved) args.push("--approved");
 	if (params.background) args.push("--background");
+	if (params.userTestCommand) args.push("--user-test-command", params.userTestCommand);
+	if (params.maxRepairIterations !== undefined) args.push("--max-repairs", String(params.maxRepairIterations));
+	for (const entry of splitList(params.allowlist)) args.push("--allowlist", entry);
 	for (const command of splitList(params.validationCommands)) args.push("--validation-command", command);
 	return addSessionArgs(args, ctx);
 }
@@ -138,7 +141,10 @@ export default function bugSolverWorkflow(pi: ExtensionAPI) {
 			planPath: Type.Optional(Type.String({ description: "Precheck artifact/plan path produced by action=precheck." })),
 			approved: Type.Optional(Type.Boolean({ description: "Required true for action=solve after explicit precheck confirmation." })),
 			background: Type.Optional(Type.Boolean({ description: "Start action in the background and return immediately when supported." })),
-			validationCommands: Type.Optional(Type.Array(Type.String(), { description: "Candidate validation commands to record for baseline-aware solve planning." })),
+			validationCommands: Type.Optional(Type.Array(Type.String(), { description: "Candidate broad validation commands to record for baseline-aware solve planning." })),
+			userTestCommand: Type.Optional(Type.String({ description: "Optional targeted bug-reproduction/user test command to run before broad validation." })),
+			maxRepairIterations: Type.Optional(Type.Number({ description: "Maximum bounded repair attempts for the transaction. Defaults to 8." })),
+			allowlist: Type.Optional(Type.Array(Type.String(), { description: "Initial file/path allowlist for implementation scope control." })),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const action = (params.action || "precheck") as BugSolverAction;

@@ -21,22 +21,27 @@ const ARTIFACT_ROOT = process.env.PI_BUG_SOLVER_ARTIFACT_DIR || join(AGENT_DIR, 
 
 function parseArgs(argv) {
   const out = { _: [] };
+  const setArg = (key, value) => {
+    if (out[key] === undefined) out[key] = value;
+    else if (Array.isArray(out[key])) out[key].push(value);
+    else out[key] = [out[key], value];
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--") { out._.push(...argv.slice(i + 1)); break; }
     if (arg.startsWith("--")) {
       const eq = arg.indexOf("=");
       const key = arg.slice(2, eq === -1 ? undefined : eq);
-      if (eq !== -1) out[key] = arg.slice(eq + 1);
-      else if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) out[key] = argv[++i];
-      else out[key] = true;
+      if (eq !== -1) setArg(key, arg.slice(eq + 1));
+      else if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) setArg(key, argv[++i]);
+      else setArg(key, true);
     } else out._.push(arg);
   }
   return out;
 }
 
 function usage() {
-  return `Usage:\n  bug-solver-workflow precheck --bug <single bug> [--cwd <repo>] [--validation-command <cmd>] [--json]\n  bug-solver-workflow solve --plan-path <precheck.json> --approved [--cwd <repo>] [--json]\n  bug-solver-workflow status [--transaction-id <id>] [--json]\n\nThe solve action is intentionally approval-gated. Runtime artifacts are written outside the target repo under ${ARTIFACT_ROOT}.`;
+  return `Usage:\n  bug-solver-workflow precheck --bug <single bug> [--cwd <repo>] [--validation-command <cmd>] [--user-test-command <cmd>] [--max-repairs <n>] [--allowlist <path>] [--json]\n  bug-solver-workflow solve --plan-path <transaction-plan.json|precheck.json> --approved [--cwd <repo>] [--json]\n  bug-solver-workflow status [--transaction-id <id>] [--json]\n\nThe solve action is intentionally approval-gated. Runtime artifacts are written outside the target repo under ${ARTIFACT_ROOT}.`;
 }
 
 function die(message, code = 1, json = false) {
@@ -53,11 +58,21 @@ function hashText(text, len = 10) {
   return createHash("sha256").update(String(text)).digest("hex").slice(0, len);
 }
 
-function splitValidationCommands(args) {
-  const value = args["validation-command"] || args.validationCommands;
+function splitValues(value) {
   if (!value) return [];
   const values = Array.isArray(value) ? value : [value];
   return values.flatMap((item) => String(item).split(/[;,]/)).map((s) => s.trim()).filter(Boolean);
+}
+
+function splitValidationCommands(args) {
+  return splitValues(args["validation-command"] || args.validationCommands);
+}
+
+function parseMaxRepairs(value) {
+  if (value === undefined || value === true || value === "") return 8;
+  const parsed = Number.parseInt(String(Array.isArray(value) ? value.at(-1) : value), 10);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 50) throw new Error("--max-repairs must be an integer from 0 to 50");
+  return parsed;
 }
 
 function classifyBugCount(bug) {
@@ -65,7 +80,121 @@ function classifyBugCount(bug) {
   const separators = (text.match(/\b(and|also|plus)\b|;|\n\s*[-*]\s+/gi) || []).length;
   const enumerated = (text.match(/(?:^|\s)(?:\d+\.|\([a-z0-9]+\))/gi) || []).length;
   const likelyMultiple = separators >= 2 || enumerated >= 2;
-  return { likelyMultiple, signals: { separators, enumerated } };
+  const splitRecommendation = likelyMultiple
+    ? "Reject this activation and create one transaction per independent bug before any edit-capable phase."
+    : undefined;
+  return { likelyMultiple, signals: { separators, enumerated }, splitRecommendation };
+}
+
+function buildArtifactPaths(dir) {
+  return {
+    root: dir,
+    precheck: join(dir, "precheck.json"),
+    transactionPlan: join(dir, "transaction-plan.json"),
+    validationContract: join(dir, "validation-contract.json"),
+    baseline: join(dir, "evidence", "baseline-validation.json"),
+    allowlistDecisions: join(dir, "allowlist-decisions.jsonl"),
+    implementationEvidence: join(dir, "evidence", "implementation-evidence.jsonl"),
+    finalReport: join(dir, "evidence", "final-report.json"),
+    state: join(dir, "state.json"),
+  };
+}
+
+function buildValidationContract({ transactionId, bug, cwd, validationCommands, userTestCommand, artifactPaths }) {
+  const assertions = [
+    {
+      id: "single-bug-scope",
+      description: "The transaction addresses exactly one bug and rejects or splits multi-bug requests before any edit-capable phase.",
+      priority: "must",
+      evidenceRequired: ["precheck.multiplicity", "transactionPlan.transaction.exactlyOneBug"],
+      evidencePaths: [artifactPaths.precheck, artifactPaths.transactionPlan],
+    },
+    {
+      id: "bug-reproduction-before-broad-validation",
+      description: "Targeted bug reproduction or user-provided test evidence is identified and run before broad validation commands.",
+      priority: "must",
+      evidenceRequired: ["validation.userTestCommand", "validation.commands", "evidence.baseline", "evidence.implementation"],
+      evidencePaths: [artifactPaths.baseline, artifactPaths.implementationEvidence],
+    },
+    {
+      id: "baseline-aware-validation",
+      description: "Baseline command results are recorded before implementation and later compared so pre-existing failures are not reported as new regressions.",
+      priority: "must",
+      evidenceRequired: ["baseline.status", "baseline.commandResults"],
+      evidencePaths: [artifactPaths.baseline, artifactPaths.finalReport],
+    },
+    {
+      id: "allowlisted-scope-control",
+      description: "Implementation edits are restricted to the current allowlist unless an expansion is justified and durably recorded first.",
+      priority: "must",
+      evidenceRequired: ["allowlist.current", "allowlist.decisions"],
+      evidencePaths: [artifactPaths.allowlistDecisions, artifactPaths.finalReport],
+    },
+  ];
+  return {
+    schema: "pi-bug-solver-workflow/validation-contract/v1",
+    transactionId,
+    createdAt: new Date().toISOString(),
+    createdBeforeImplementation: true,
+    repoPath: cwd,
+    bugDescription: bug,
+    validationCommands,
+    userTestCommand: userTestCommand || null,
+    assertions,
+    workflowEvidenceMap: Object.fromEntries(assertions.map((assertion) => [assertion.id, assertion.evidencePaths])),
+  };
+}
+
+function buildTransactionPlan({ transactionId, cwd, bug, git, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, contractPath }) {
+  return {
+    schema: "pi-bug-solver-workflow/transaction-plan/v1",
+    transactionId,
+    createdAt: new Date().toISOString(),
+    status: multiplicity.likelyMultiple ? "rejected_multi_bug" : "awaiting_confirmation",
+    editingAllowed: false,
+    confirmationRequired: true,
+    transaction: {
+      exactlyOneBug: !multiplicity.likelyMultiple,
+      bugDescription: bug,
+      multiplicity,
+      splitRequired: Boolean(multiplicity.likelyMultiple),
+    },
+    repo: {
+      cwd,
+      root: git.root || cwd,
+      baseCommit: git.head || null,
+      baseRef: git.branch || "HEAD",
+      statusAtPrecheck: git.statusShort || "",
+      isGitRepo: git.isGitRepo,
+    },
+    validation: {
+      commands: validationCommands,
+      userTestCommand: userTestCommand || null,
+      executionOrder: ["targeted_bug_reproduction", "broad_validation_commands"],
+      baseline: { required: true, status: "pending", evidencePath: artifactPaths.baseline },
+      contractPath,
+    },
+    repairPolicy: { maxRepairIterations, defaultMaxRepairIterations: 8, failureClassificationRequired: true },
+    allowlist: {
+      current: allowlist,
+      expansionPolicy: "Edits outside current allowlist are blocked until a justification is appended to allowlist-decisions.jsonl.",
+      decisionsPath: artifactPaths.allowlistDecisions,
+    },
+    artifacts: artifactPaths,
+    evidencePaths: {
+      precheck: artifactPaths.precheck,
+      validationContract: artifactPaths.validationContract,
+      baseline: artifactPaths.baseline,
+      allowlistDecisions: artifactPaths.allowlistDecisions,
+      implementation: artifactPaths.implementationEvidence,
+      finalReport: artifactPaths.finalReport,
+    },
+  };
+}
+
+function writeInitialJsonl(file, record) {
+  mkdirSync(resolve(file, ".."), { recursive: true });
+  writeFileSync(file, `${JSON.stringify(record)}\n`, "utf8");
 }
 
 function runGit(cwd, args) {
@@ -122,6 +251,13 @@ async function precheck(args, json) {
     phaseStart(run, "precheck", { transactionId, cwd });
     const multiplicity = classifyBugCount(bug);
     const git = await gitInfo(cwd);
+    const validationCommands = splitValidationCommands(args);
+    const userTestCommand = args["user-test-command"] ? String(Array.isArray(args["user-test-command"]) ? args["user-test-command"].at(-1) : args["user-test-command"]).trim() : null;
+    const maxRepairIterations = parseMaxRepairs(args["max-repairs"] ?? args.maxRepairIterations);
+    const artifactPaths = buildArtifactPaths(dir);
+    const allowlist = splitValues(args.allowlist || args["allow-list"]);
+    const contract = buildValidationContract({ transactionId, bug, cwd, validationCommands, userTestCommand, artifactPaths });
+    const plan = buildTransactionPlan({ transactionId, cwd, bug, git, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, contractPath: artifactPaths.validationContract });
     const record = {
       schema: "pi-bug-solver-workflow/precheck/v1",
       transactionId,
@@ -130,25 +266,39 @@ async function precheck(args, json) {
       bug,
       status: multiplicity.likelyMultiple ? "rejected_multi_bug" : "awaiting_confirmation",
       readOnly: true,
+      editingAllowed: false,
       confirmationRequired: true,
-      approvalInstruction: "Review this precheck artifact. Then call solve with --approved and --plan-path only if it represents exactly one bug transaction.",
+      approvalInstruction: "Review precheck.json, transaction-plan.json, and validation-contract.json. Then call solve with --approved and --plan-path only if this is exactly one bug transaction.",
       git,
-      validationCommands: splitValidationCommands(args),
+      validationCommands,
+      userTestCommand,
+      maxRepairIterations,
+      allowlist,
       multiplicity,
+      transactionPlanPath: artifactPaths.transactionPlan,
+      validationContractPath: artifactPaths.validationContract,
+      evidencePaths: plan.evidencePaths,
       plannedSafety: {
         worktreeIsolation: true,
         immutableBaseCommit: git.head,
         externalArtifactsDir: dir,
         threadPhaseWorkflow: WORKFLOW,
+        validationAssertionsMappedBeforeImplementation: true,
       },
     };
-    const file = join(dir, "precheck.json");
+    const file = artifactPaths.precheck;
     writeJson(file, record);
+    writeJson(artifactPaths.transactionPlan, plan);
+    writeJson(artifactPaths.validationContract, contract);
+    writeInitialJsonl(artifactPaths.allowlistDecisions, { type: "initial_allowlist", createdAt: record.createdAt, allowlist, justification: "Seeded during read-only precheck before implementation." });
+    writeJson(artifactPaths.state, { schema: "pi-bug-solver-workflow/state/v1", transactionId, status: record.status, phase: "precheck", planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract });
     phaseEvent(run, "precheck", { message: "Recorded read-only bug transaction precheck", transactionId, status: record.status, artifactPath: file });
     emitArtifact(run, { kind: "file", title: "bug-solver precheck", path: file });
-    phaseEnd(run, "precheck", multiplicity.likelyMultiple ? STATUSES.FAILED : STATUSES.SUCCESS, { status: record.status });
-    completeRun(run, multiplicity.likelyMultiple ? STATUSES.FAILED : STATUSES.SUCCESS, { transactionId, precheckPath: file });
-    const result = { ok: !multiplicity.likelyMultiple, action: "precheck", runId: run.runId, transactionId, precheckPath: file, artifactDir: dir, status: record.status, confirmationRequired: true };
+    emitArtifact(run, { kind: "file", title: "bug-solver transaction plan", path: artifactPaths.transactionPlan });
+    emitArtifact(run, { kind: "file", title: "bug-solver validation contract", path: artifactPaths.validationContract });
+    phaseEnd(run, "precheck", multiplicity.likelyMultiple ? STATUSES.FAILED : STATUSES.SUCCESS, { status: record.status, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract });
+    completeRun(run, multiplicity.likelyMultiple ? STATUSES.FAILED : STATUSES.SUCCESS, { transactionId, precheckPath: file, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract });
+    const result = { ok: !multiplicity.likelyMultiple, action: "precheck", runId: run.runId, transactionId, precheckPath: file, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract, artifactDir: dir, status: record.status, confirmationRequired: true };
     if (json) console.log(JSON.stringify(result, null, 2));
     else console.log(`${record.status}: ${file}`);
     process.exit(multiplicity.likelyMultiple ? 1 : 0);
@@ -165,25 +315,33 @@ async function solve(args, json) {
   const planPath = resolve(String(args["plan-path"]));
   if (!existsSync(planPath)) die(`precheck plan not found: ${planPath}`, 1, json);
   const plan = readJson(planPath);
-  const run = createRun({ workflow: WORKFLOW, cwd, input: { action: "solve", transactionId: plan.transactionId }, metadata: { transactionId: plan.transactionId, mode: "solve" } });
+  const transactionId = plan.transactionId;
+  const multiplicity = plan.transaction?.multiplicity || plan.multiplicity || {};
+  const exactlyOneBug = plan.transaction?.exactlyOneBug ?? !multiplicity.likelyMultiple;
+  const run = createRun({ workflow: WORKFLOW, cwd, input: { action: "solve", transactionId }, metadata: { transactionId, mode: "solve" } });
   try {
     phaseStart(run, "confirmation-gate", { planPath, approved: true });
-    if (plan.status === "rejected_multi_bug" || plan.multiplicity?.likelyMultiple) throw new Error("Precheck classified this request as multiple bugs; split it before solving.");
+    if (plan.status === "rejected_multi_bug" || multiplicity?.likelyMultiple || exactlyOneBug === false) throw new Error("Precheck classified this request as multiple bugs; split it before solving.");
+    if (plan.editingAllowed === true) throw new Error("Refusing a plan that was not preserved as pre-implementation/editingAllowed=false.");
+    if (!plan.validationContractPath && !plan.validation?.contractPath) throw new Error("Transaction plan is missing a durable validation contract path.");
     phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS);
-    phaseStart(run, "activation-scaffold", { transactionId: plan.transactionId });
+    phaseStart(run, "activation-scaffold", { transactionId });
     const activation = {
       schema: "pi-bug-solver-workflow/activation-scaffold/v1",
-      transactionId: plan.transactionId,
+      transactionId,
       createdAt: new Date().toISOString(),
       status: "not_implemented_in_scaffold",
+      planPath,
+      validationContractPath: plan.validationContractPath || plan.validation?.contractPath,
+      evidencePaths: plan.evidencePaths || {},
       message: "Persistent extension entrypoint is registered. Later milestones implement isolated worktree solving and bounded repairs.",
     };
-    const file = join(transactionDir(plan.transactionId), "activation-scaffold.json");
+    const file = join(transactionDir(transactionId), "activation-scaffold.json");
     writeJson(file, activation);
     emitArtifact(run, { kind: "file", title: "bug-solver activation scaffold", path: file });
     phaseEnd(run, "activation-scaffold", STATUSES.SUCCESS, { artifactPath: file });
-    completeRun(run, STATUSES.SUCCESS, { transactionId: plan.transactionId, activationPath: file });
-    const result = { ok: true, action: "solve", runId: run.runId, transactionId: plan.transactionId, activationPath: file };
+    completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file });
+    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file };
     if (json) console.log(JSON.stringify(result, null, 2));
     else console.log(`activation scaffold recorded: ${file}`);
   } catch (error) {

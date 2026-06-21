@@ -118,8 +118,14 @@ try {
   let bugPrecheckDetails;
   try { bugPrecheckDetails = JSON.parse(bugPrecheck.stdout); } catch { bugPrecheckDetails = undefined; }
   log(Boolean(bugPrecheckDetails?.precheckPath) && existsSync(bugPrecheckDetails.precheckPath) && bugPrecheckDetails.precheckPath.includes('bug-solver-workflow') && !bugPrecheckDetails.precheckPath.startsWith(root), 'bug-solver precheck artifact is durable and outside target repo', bugPrecheckDetails?.precheckPath || '');
+  log(Boolean(bugPrecheckDetails?.planPath) && existsSync(bugPrecheckDetails.planPath) && Boolean(bugPrecheckDetails?.validationContractPath) && existsSync(bugPrecheckDetails.validationContractPath), 'bug-solver precheck writes transaction plan and validation contract artifacts');
+  const bugPlan = bugPrecheckDetails?.planPath ? JSON.parse(readFileSync(bugPrecheckDetails.planPath, 'utf8')) : undefined;
+  const bugContract = bugPrecheckDetails?.validationContractPath ? JSON.parse(readFileSync(bugPrecheckDetails.validationContractPath, 'utf8')) : undefined;
+  log(bugPlan?.schema === 'pi-bug-solver-workflow/transaction-plan/v1' && bugPlan?.transaction?.exactlyOneBug === true && bugPlan?.repairPolicy?.maxRepairIterations === 8 && Boolean(bugPlan?.validation?.baseline?.evidencePath) && Boolean(bugPlan?.allowlist?.decisionsPath), 'bug-solver transaction plan captures one-bug schema, baseline, allowlist, and repair policy');
+  log(bugContract?.schema === 'pi-bug-solver-workflow/validation-contract/v1' && bugContract?.createdBeforeImplementation === true && bugContract?.assertions?.length >= 4 && Object.keys(bugContract?.workflowEvidenceMap || {}).includes('single-bug-scope'), 'bug-solver validation contract maps explicit assertions to durable evidence');
   const bugRunSummary = bugPrecheckDetails?.runId ? storeApi.getRunSummary(bugPrecheckDetails.runId) : undefined;
   log(bugRunSummary?.workflow === 'bug-solver-workflow' && bugRunSummary?.normalizedStatus === 'success', 'bug-solver workflow emits generic thread-phase events');
+  expectExit('bug-solver workflow rejects multi-bug transaction before solve', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix login bug and also repair billing bug plus update exports', '--json'], 1);
 
   const cli = join(root, 'dynamic-thread-phase-workflow/bin/dynamic-thread-phase-workflow.mjs');
 
