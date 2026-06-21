@@ -75,15 +75,55 @@ function parseMaxRepairs(value) {
   return parsed;
 }
 
+function isIndependentBugClause(value) {
+  const clause = String(value || "").trim().replace(/^[-*]\s+/, "").replace(/^(?:\d+\.|\([a-z0-9]+\))\s+/i, "");
+  if (clause.length < 4) return false;
+  const actionPattern = /\b(fix|repair|resolve|correct|prevent|stop|address|debug|handle|ensure|make)\b/i;
+  const failurePattern = /\b(bug|defect|error|fail(?:s|ed|ing|ure)?|crash(?:es|ed|ing)?|exception|regression|timeout|incorrect|wrong|broken|hang(?:s|ing)?|leak(?:s|ing)?|corrupt(?:s|ed|ing)?|500|404)\b/i;
+  return actionPattern.test(clause) || failurePattern.test(clause);
+}
+
+function countIndependentClauses(parts) {
+  return parts.map((part) => part.trim()).filter(isIndependentBugClause).length;
+}
+
+function numberedClauses(text) {
+  const matches = [...String(text || "").matchAll(/(?:^|\s)(?:\d+\.|\([a-z0-9]+\))\s+/gi)];
+  return matches.map((match, index) => {
+    const start = (match.index || 0) + match[0].length;
+    const end = index + 1 < matches.length ? matches[index + 1].index : text.length;
+    return text.slice(start, end);
+  });
+}
+
 function classifyBugCount(bug) {
   const text = String(bug || "");
-  const separators = (text.match(/\b(and|also|plus)\b|;|\n\s*[-*]\s+/gi) || []).length;
-  const enumerated = (text.match(/(?:^|\s)(?:\d+\.|\([a-z0-9]+\))/gi) || []).length;
-  const likelyMultiple = separators >= 2 || enumerated >= 2;
+  const signals = {
+    conjunctions: [],
+    semicolonClauses: 0,
+    bulletClauses: 0,
+    numberedClauses: 0,
+  };
+
+  for (const match of text.matchAll(/\b(?:and(?:\s+also)?|also|plus)\b/gi)) {
+    const before = text.slice(0, match.index);
+    const after = text.slice((match.index || 0) + match[0].length);
+    const left = before.split(/[;\n]/).at(-1) || before;
+    const right = after.split(/[;\n]/)[0] || after;
+    if (isIndependentBugClause(left) && isIndependentBugClause(right)) {
+      signals.conjunctions.push({ token: match[0].toLowerCase(), left: left.trim().slice(0, 120), right: right.trim().slice(0, 120) });
+    }
+  }
+
+  signals.semicolonClauses = countIndependentClauses(text.split(/;+/));
+  signals.bulletClauses = countIndependentClauses(text.split(/\n/).filter((line) => /^\s*[-*]\s+/.test(line)));
+  signals.numberedClauses = countIndependentClauses(numberedClauses(text));
+
+  const likelyMultiple = signals.conjunctions.length > 0 || signals.semicolonClauses >= 2 || signals.bulletClauses >= 2 || signals.numberedClauses >= 2;
   const splitRecommendation = likelyMultiple
     ? "Reject this activation and create one transaction per independent bug before any edit-capable phase."
     : undefined;
-  return { likelyMultiple, signals: { separators, enumerated }, splitRecommendation };
+  return { likelyMultiple, signals, splitRecommendation };
 }
 
 function buildArtifactPaths(dir) {
