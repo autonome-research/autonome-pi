@@ -171,8 +171,11 @@ try {
   let missionPlanDetails;
   try { missionPlanDetails = JSON.parse(missionPlan.stdout); } catch { missionPlanDetails = undefined; }
   log(Boolean(missionPlanDetails?.planPath), 'mission workflow plan emits planPath');
+  const plannedMissionArtifact = missionPlanDetails?.planPath ? JSON.parse(readFileSync(missionPlanDetails.planPath, 'utf8')) : undefined;
+  log(plannedMissionArtifact?.userTestCommand === undefined, 'mission workflow normalizes CLI user-test sentinel to absent optional command in plan');
+  if (missionPlanDetails?.planPath) writeFileSync(missionPlanDetails.planPath, JSON.stringify({ ...plannedMissionArtifact, userTestCommand: 'none provided' }, null, 2));
   const missionActivate = missionPlanDetails?.planPath
-    ? expectExit('mission workflow mock activate succeeds', ['node', missionCli, 'activate', '--approved', '--plan-path', missionPlanDetails.planPath, '--cwd', missionRepo], 0)
+    ? expectExit('mission workflow mock activate succeeds with sentinel in existing plan artifact', ['node', missionCli, 'activate', '--approved', '--plan-path', missionPlanDetails.planPath, '--cwd', missionRepo], 0)
     : undefined;
   let missionActivateDetails;
   try { missionActivateDetails = missionActivate?.stdout ? JSON.parse(missionActivate.stdout) : undefined; } catch { missionActivateDetails = undefined; }
@@ -182,7 +185,7 @@ try {
   log(registryState?.status === 'completed' && Array.isArray(registryState.completedFeatures), 'mission workflow registry records completed state');
   log(Boolean(missionActivateDetails?.finalCoveragePath) && existsSync(missionActivateDetails.finalCoveragePath), 'mission workflow writes final coverage report');
   const missionPlanArtifact = missionPlanDetails?.planPath ? JSON.parse(readFileSync(missionPlanDetails.planPath, 'utf8')) : undefined;
-  log(missionPlanArtifact?.userTestCommand === undefined, 'mission workflow normalizes user-test sentinel to absent optional command in plan');
+  log(missionPlanArtifact?.userTestCommand === undefined, 'mission workflow normalizes existing plan-artifact user-test sentinel before validation');
   const missionFinalCoverage = missionActivateDetails?.finalCoveragePath && existsSync(missionActivateDetails.finalCoveragePath) ? JSON.parse(readFileSync(missionActivateDetails.finalCoveragePath, 'utf8')) : undefined;
   log(missionFinalCoverage?.scope === 'final' && missionFinalCoverage?.gaps?.length === 0 && missionFinalCoverage?.assertions?.every((assertion) => assertion.status === 'pass'), 'mission workflow final coverage passes after skipped optional user test');
   const missionValidationReportPath = missionActivateDetails?.runId ? join(store, 'artifacts', missionActivateDetails.runId, 'validation', 'milestone-001-report.json') : undefined;

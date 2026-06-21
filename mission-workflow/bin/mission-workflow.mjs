@@ -424,7 +424,11 @@ function clearResolvedRegistryError(state, reason, at = new Date().toISOString()
 }
 
 function isNoCommandSentinel(value) {
-  const normalized = String(value || "").trim().toLowerCase().replace(/[\s_-]+/g, " ");
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^[`'"“”‘’\s]+|[`'"“”‘’.!\s]+$/g, "")
+    .replace(/[\s_-]+/g, " ");
   return !normalized || ["none", "none provided", "no command", "not provided", "not applicable", "n/a", "na", "null", "undefined"].includes(normalized);
 }
 
@@ -2109,7 +2113,13 @@ async function activateMission(args, cwd, run, ctx) {
   if (!isTruthyFlag(args.approved)) throw new Error("Activation requires --approved after the user reviews the mission plan.");
   if (!args["plan-path"]) throw new Error("--plan-path is required for activation");
   const planPathAbs = resolve(cwd, String(args["plan-path"]));
-  const plan = validatePlanForActivation(JSON.parse(readFileSync(planPathAbs, "utf8")));
+  const rawPlan = JSON.parse(readFileSync(planPathAbs, "utf8"));
+  const plan = validatePlanForActivation(rawPlan);
+  const normalizedPlanText = `${JSON.stringify(plan, null, 2)}\n`;
+  if (JSON.stringify(rawPlan) !== JSON.stringify(plan)) {
+    writeFileSync(planPathAbs, normalizedPlanText, "utf8");
+    phaseEvent(run, "prepare-mission", { kind: "data", key: "planPath", value: planPathAbs, message: "Normalized approved mission plan before validation" });
+  }
   ctx.modelWorker = args["model-worker"] || plan.modelWorker || ctx.modelWorker;
   ctx.modelValidator = args["model-validator"] || plan.modelValidator || ctx.modelValidator;
   const priorRegistry = readJsonFile(registryStatePath(plan.missionId), {});
