@@ -4,7 +4,7 @@
   "private": true,
   "description": "Thread-phase workflow visualizer and workflow examples for Pi.",
   "scripts": {
-    "build": "node --check bug-solver-workflow/bin/bug-solver-workflow.mjs && node --check dynamic-thread-phase-workflow/bin/dynamic-thread-phase-workflow.mjs && node --check mission-workflow/bin/mission-workflow.mjs",
+    "build": "node --check bugKill/bin/bugKill.mjs && node --check dynamic-thread-phase-workflow/bin/dynamic-thread-phase-workflow.mjs && node --check mission-workflow/bin/mission-workflow.mjs",
     "smoke": "node scripts/smoke-test.mjs",
     "test": "node scripts/smoke-test.mjs"
   },
@@ -21,7 +21,7 @@
       "code-review-workflow/index.ts",
       "dynamic-thread-phase-workflow/index.ts",
       "mission-workflow/index.ts",
-      "bug-solver-workflow/index.ts"
+      "bugKill/index.ts"
     ],
     "skills": [
       "skills"

@@ -1,17 +1,17 @@
-// Compatibility helpers for the committed M0 bug-solver scaffold.
+// Compatibility helpers for the committed M0 bugKill scaffold.
 //
 // These helpers are intentionally pure/read-only so later milestones can reuse
 // the same pre-implementation safety checks without changing the public
 // precheck/solve/status surface or mutating target repositories.
 
-export const BUG_SOLVER_WORKFLOW_NAME = "bug-solver-workflow";
+export const BUGKILL_WORKFLOW_NAME = "bugKill";
 
-export const BUG_SOLVER_SCHEMAS = Object.freeze({
-  precheck: "pi-bug-solver-workflow/precheck/v1",
-  transactionPlan: "pi-bug-solver-workflow/transaction-plan/v1",
-  validationContract: "pi-bug-solver-workflow/validation-contract/v1",
-  state: "pi-bug-solver-workflow/state/v1",
-  gatedActivation: "pi-bug-solver-workflow/gated-activation/v1",
+export const BUGKILL_SCHEMAS = Object.freeze({
+  precheck: "pi-bugKill/precheck/v1",
+  transactionPlan: "pi-bugKill/transaction-plan/v1",
+  validationContract: "pi-bugKill/validation-contract/v1",
+  state: "pi-bugKill/state/v1",
+  gatedActivation: "pi-bugKill/gated-activation/v1",
 });
 
 function asObject(value) {
@@ -51,12 +51,12 @@ function dirtyStatus(repo) {
   };
 }
 
-export function isBugSolverPrecheckArtifact(value) {
-  return asObject(value).schema === BUG_SOLVER_SCHEMAS.precheck;
+export function isBugKillPrecheckArtifact(value) {
+  return asObject(value).schema === BUGKILL_SCHEMAS.precheck;
 }
 
-export function isBugSolverTransactionPlan(value) {
-  return asObject(value).schema === BUG_SOLVER_SCHEMAS.transactionPlan;
+export function isBugKillTransactionPlan(value) {
+  return asObject(value).schema === BUGKILL_SCHEMAS.transactionPlan;
 }
 
 export function normalizeSolvePlanArtifact(artifact) {
@@ -88,7 +88,7 @@ export function normalizeSolvePlanArtifact(artifact) {
     evidencePaths,
     artifacts: asObject(input.artifacts),
     repo: asObject(input.repo || input.immutableTransactionIdentity?.repo || input.git),
-    sourceKind: isBugSolverPrecheckArtifact(input) ? "precheck" : isBugSolverTransactionPlan(input) ? "transaction-plan" : "unrecognized-schema",
+    sourceKind: isBugKillPrecheckArtifact(input) ? "precheck" : isBugKillTransactionPlan(input) ? "transaction-plan" : "unrecognized-schema",
   };
 }
 
@@ -107,7 +107,7 @@ export function assessPreImplementationGate(artifact, multiplicityOverride) {
   const splitRequired = plan.transaction.splitRequired === true || effectiveMultiplicity.likelyMultiple === true;
   const reasons = [];
 
-  if (!recognizedSchema) reasons.push("unrecognized bug-solver plan schema");
+  if (!recognizedSchema) reasons.push("unrecognized bugKill plan schema");
   if (!hasExplicitOneBugSafetyEvidence) reasons.push("missing explicit one-bug safety evidence");
   if (!plan.transactionId) reasons.push("missing transactionId");
   if (plan.status === "rejected_multi_bug" || splitRequired || exactlyOneBug === false) reasons.push("multi-bug or split-required transaction");

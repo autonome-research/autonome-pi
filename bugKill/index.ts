@@ -8,7 +8,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const SCRIPT = path.join(EXT_DIR, "bin", "bug-solver-workflow.mjs");
+const SCRIPT = path.join(EXT_DIR, "bin", "bugKill.mjs");
 const MAX_TOOL_TEXT = 30_000;
 
 type BugSolverAction = "precheck" | "solve" | "status";
@@ -179,12 +179,12 @@ export default function bugSolverWorkflow(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "bug_solver_workflow",
-		label: "Bug Solver Workflow",
-		description: "Run the dedicated one-bug-per-transaction bug-solver workflow scaffold with precheck/approval gates, durable external artifacts, and thread-phase observability.",
-		promptSnippet: "Precheck or activate an isolated one-bug solver transaction",
+		name: "bugKill",
+		label: "bugKill",
+		description: "Run the dedicated one-bug-per-transaction bugKill workflow scaffold with precheck/approval gates, durable external artifacts, and thread-phase observability.",
+		promptSnippet: "Precheck or activate an isolated one-bugKill transaction",
 		promptGuidelines: [
-			"Use bug_solver_workflow for a focused single-bug transaction, not broad multi-feature missions.",
+			"Use bugKill for a focused single-bug transaction, not broad multi-feature missions.",
 			"Run action='precheck' first. The precheck is read-only and records durable findings outside the target repository.",
 			"Only run action='solve' with approved=true after the user explicitly confirms the precheck result.",
 			"If a request names multiple independent bugs, reject or split it before solving.",
@@ -210,31 +210,31 @@ export default function bugSolverWorkflow(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const action = (params.action || "precheck") as BugSolverAction;
 			const cwd = resolveAgainstActive(activeCwd || ctx.cwd, params.cwd);
-			onUpdate?.({ content: [{ type: "text", text: `${action === "solve" ? "Activating" : action === "status" ? "Checking" : "Prechecking"} bug_solver_workflow in ${cwd}...` }] });
+			onUpdate?.({ content: [{ type: "text", text: `${action === "solve" ? "Activating" : action === "status" ? "Checking" : "Prechecking"} bugKill in ${cwd}...` }] });
 			const result = await runScript(buildArgs({ ...params, action, cwd }, ctx), cwd, signal);
 			let details: any;
 			try { details = parseJsonObject(result.stdout); } catch { details = { stdout: truncate(result.stdout), stderr: truncate(result.stderr) }; }
-			if (result.code !== 0 && !(params.background && details?.background)) throw new Error(result.stderr || result.stdout || `bug_solver_workflow exited ${result.code}`);
+			if (result.code !== 0 && !(params.background && details?.background)) throw new Error(result.stderr || result.stdout || `bugKill exited ${result.code}`);
 			const text = details?.background
-				? `Started bug-solver workflow in background (pid ${details.pid}). Open ctrl+shift+t to monitor it.`
-				: result.stdout || "Bug-solver workflow complete.";
+				? `Started bugKill workflow in background (pid ${details.pid}). Open ctrl+shift+t to monitor it.`
+				: result.stdout || "bugKill workflow complete.";
 			return { content: [{ type: "text", text: truncate(text) }], details };
 		},
 	});
 
-	pi.registerCommand("bug-solver", {
-		description: "Precheck/status/solve a single bug transaction with the bug-solver workflow. Supports the same safe flags as the tool, for example: /bug-solver precheck --bug 'Fix X' --validation-command 'npm test', /bug-solver solve --plan-path <path> --approved --background, or /bug-solver status --transaction-id <id>.",
+	pi.registerCommand("bugKill", {
+		description: "Precheck/status/solve a single bug transaction with the bugKill workflow. Supports the same safe flags as the tool, for example: /bugKill precheck --bug 'Fix X' --validation-command 'npm test', /bugKill solve --plan-path <path> --approved --background, or /bugKill status --transaction-id <id>.",
 		handler: async (args, ctx) => {
 			const params = cliParamsFromArgs(args);
 			const action = (params.action || "precheck") as BugSolverAction;
 			const cwd = resolveAgainstActive(activeCwd || ctx.cwd, params.cwd);
-			ctx.ui.setStatus("bug-solver", `${action} running...`);
+			ctx.ui.setStatus("bugKill", `${action} running...`);
 			try {
 				const result = await runScript(buildArgs({ ...params, action, cwd }, ctx), cwd, ctx.signal);
-				if (result.code !== 0) ctx.ui.notify(result.stderr || result.stdout || `bug-solver exited ${result.code}`, "error");
+				if (result.code !== 0) ctx.ui.notify(result.stderr || result.stdout || `bugKill exited ${result.code}`, "error");
 				else ctx.ui.notify(truncate(result.stdout.trim(), 4000), "info");
 			} finally {
-				ctx.ui.setStatus("bug-solver", undefined);
+				ctx.ui.setStatus("bugKill", undefined);
 			}
 		},
 	});

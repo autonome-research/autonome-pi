@@ -17,9 +17,9 @@ import {
 } from "../../thread-phase-visualizer/lib/store.mjs";
 import { assessPreImplementationGate, normalizeSolvePlanArtifact } from "../lib/m0-compat.mjs";
 
-const WORKFLOW = "bug-solver-workflow";
+const WORKFLOW = "bugKill";
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
-const DEFAULT_ARTIFACT_ROOT = join(AGENT_DIR, "bug-solver-workflow");
+const DEFAULT_ARTIFACT_ROOT = join(AGENT_DIR, "bugKill");
 const MAX_COMMAND_OUTPUT_BYTES = 24_000;
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 const RUNNER_EVIDENCE_SECRET = randomUUID();
@@ -49,7 +49,7 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  return `Usage:\n  bug-solver-workflow precheck --bug <single bug> [--cwd <repo>] [--validation-command <cmd>]... [--user-test-command <cmd>] [--max-repairs <n>] [--allowlist <path>] [--command-timeout-ms <ms>] [--background] [--json]\n  bug-solver-workflow solve --plan-path <transaction-plan.json|precheck.json> --approved [--cwd <repo>] [--implementation-command <cmd>] [--cleanup preserve|auto] [--delete-branch-on-cleanup] [--command-timeout-ms <ms>] [--background] [--json]\n  bug-solver-workflow status [--transaction-id <id>|--transaction-dir <dir>] [--json]\n\nRepeat --validation-command for multiple broad commands; each value is stored and executed unchanged, including shell semicolons and commas inside the command. The solve action is intentionally approval-gated. Runtime artifacts are written outside the target repo under ${ARTIFACT_ROOT}. Use --background from the Pi extension or CLI to start a durable transaction and return a pid immediately; use status to inspect transaction state. Command timeouts default to ${DEFAULT_COMMAND_TIMEOUT_MS}ms and can be overridden safely with --command-timeout-ms or PI_BUG_SOLVER_COMMAND_TIMEOUT_MS.`;
+  return `Usage:\n  bugKill precheck --bug <single bug> [--cwd <repo>] [--validation-command <cmd>]... [--user-test-command <cmd>] [--max-repairs <n>] [--allowlist <path>] [--command-timeout-ms <ms>] [--background] [--json]\n  bugKill solve --plan-path <transaction-plan.json|precheck.json> --approved [--cwd <repo>] [--implementation-command <cmd>] [--cleanup preserve|auto] [--delete-branch-on-cleanup] [--command-timeout-ms <ms>] [--background] [--json]\n  bugKill status [--transaction-id <id>|--transaction-dir <dir>] [--json]\n\nRepeat --validation-command for multiple broad commands; each value is stored and executed unchanged, including shell semicolons and commas inside the command. The solve action is intentionally approval-gated. Runtime artifacts are written outside the target repo under ${ARTIFACT_ROOT}. Use --background from the Pi extension or CLI to start a durable transaction and return a pid immediately; use status to inspect transaction state. Command timeouts default to ${DEFAULT_COMMAND_TIMEOUT_MS}ms and can be overridden safely with --command-timeout-ms or PI_BUGKILL_COMMAND_TIMEOUT_MS.`;
 }
 
 function die(message, code = 1, json = false) {
@@ -74,7 +74,7 @@ function maybeStartBackground(args, argv, json) {
   const childArgs = argvWithoutBackground(argv);
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...childArgs], {
     cwd: process.cwd(),
-    env: { ...process.env, PI_BUG_SOLVER_BACKGROUND_PARENT: String(process.pid) },
+    env: { ...process.env, PI_BUGKILL_BACKGROUND_PARENT: String(process.pid) },
     detached: true,
     stdio: "ignore",
   });
@@ -84,10 +84,10 @@ function maybeStartBackground(args, argv, json) {
     background: true,
     pid: child.pid,
     action: String(args._?.[0] || args.action || "help"),
-    message: "bug-solver-workflow started in the background; inspect durable state with action=status, transactionId, or transactionDir.",
+    message: "bugKill started in the background; inspect durable state with action=status, transactionId, or transactionDir.",
   };
   if (json) console.log(JSON.stringify(result, null, 2));
-  else console.log(`bug-solver-workflow background pid ${child.pid}; use status to inspect durable state.`);
+  else console.log(`bugKill background pid ${child.pid}; use status to inspect durable state.`);
   return true;
 }
 
@@ -113,15 +113,15 @@ function runnerEvidencePayload(record) {
 function sealRunnerOwnedEvidence(record) {
   const sealed = {
     ...record,
-    runnerEvidenceSealVersion: "pi-bug-solver-runner-owned-evidence-seal/v1",
-    runnerEvidenceTrustBoundary: "Created by the bug-solver runner after the edit-capable command completed; validation/user-test commands do not receive the in-memory seal secret and cannot mint trusted runner-owned implementation metadata.",
+    runnerEvidenceSealVersion: "pi-bugKill-runner-owned-evidence-seal/v1",
+    runnerEvidenceTrustBoundary: "Created by the bugKill runner after the edit-capable command completed; validation/user-test commands do not receive the in-memory seal secret and cannot mint trusted runner-owned implementation metadata.",
   };
   sealed.runnerEvidenceSeal = createHmac("sha256", RUNNER_EVIDENCE_SECRET).update(stableJson(runnerEvidencePayload(sealed))).digest("hex");
   return sealed;
 }
 
 function hasValidRunnerOwnedEvidenceSeal(record) {
-  if (!record || record.runnerEvidenceSealVersion !== "pi-bug-solver-runner-owned-evidence-seal/v1" || typeof record.runnerEvidenceSeal !== "string") return false;
+  if (!record || record.runnerEvidenceSealVersion !== "pi-bugKill-runner-owned-evidence-seal/v1" || typeof record.runnerEvidenceSeal !== "string") return false;
   const expected = createHmac("sha256", RUNNER_EVIDENCE_SECRET).update(stableJson(runnerEvidencePayload(record))).digest("hex");
   return record.runnerEvidenceSeal === expected;
 }
@@ -167,7 +167,7 @@ function expandHomePath(input) {
 }
 
 function resolveArtifactRoot() {
-  return resolve(expandHomePath(process.env.PI_BUG_SOLVER_ARTIFACT_DIR || DEFAULT_ARTIFACT_ROOT));
+  return resolve(expandHomePath(process.env.PI_BUGKILL_ARTIFACT_DIR || DEFAULT_ARTIFACT_ROOT));
 }
 
 function sameOrInsidePath(candidate, parent) {
@@ -216,7 +216,7 @@ function parseCommandTimeoutMs(value) {
 
 function applyRuntimeArgs(args) {
   const timeoutMs = parseCommandTimeoutMs(args["command-timeout-ms"] ?? args.commandTimeoutMs);
-  if (timeoutMs !== undefined) process.env.PI_BUG_SOLVER_COMMAND_TIMEOUT_MS = String(timeoutMs);
+  if (timeoutMs !== undefined) process.env.PI_BUGKILL_COMMAND_TIMEOUT_MS = String(timeoutMs);
 }
 
 function cleanupPolicyFromArgs(args) {
@@ -241,7 +241,7 @@ function recordRequestedCleanupPolicy({ artifactPaths, transactionId, args }) {
   const cleanup = cleanupPolicyFromArgs(args);
   if (!cleanup) return undefined;
   const now = new Date().toISOString();
-  const metadata = tryReadJson(artifactPaths.worktreeMetadata) || { schema: "pi-bug-solver-workflow/worktree-metadata/v1", transactionId };
+  const metadata = tryReadJson(artifactPaths.worktreeMetadata) || { schema: "pi-bugKill/worktree-metadata/v1", transactionId };
   writeJson(artifactPaths.worktreeMetadata, { ...metadata, transactionId, updatedAt: now, cleanup: { ...(metadata.cleanup || {}), ...cleanup } });
   return cleanup;
 }
@@ -453,7 +453,7 @@ function buildValidationContract({ transactionId, bug, cwd, validationCommands, 
     },
     {
       id: "automated-safety-tests",
-      description: "Automated tests cover the core bug-solver workflow safety and validation guarantees.",
+      description: "Automated tests cover the core bugKill workflow safety and validation guarantees.",
       priority: "must",
       validationMethod: "both",
       evidenceRequired: ["testCommands", "smokeEvidence", "finalReport.commands"],
@@ -469,7 +469,7 @@ function buildValidationContract({ transactionId, bug, cwd, validationCommands, 
     },
   ];
   return {
-    schema: "pi-bug-solver-workflow/validation-contract/v1",
+    schema: "pi-bugKill/validation-contract/v1",
     transactionId,
     createdAt: new Date().toISOString(),
     createdBeforeImplementation: true,
@@ -486,7 +486,7 @@ function buildValidationContract({ transactionId, bug, cwd, validationCommands, 
 
 function buildTransactionPlan({ transactionId, cwd, bug, git, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, contractPath }) {
   return {
-    schema: "pi-bug-solver-workflow/transaction-plan/v1",
+    schema: "pi-bugKill/transaction-plan/v1",
     transactionId,
     createdAt: new Date().toISOString(),
     status: multiplicity.likelyMultiple ? "rejected_multi_bug" : "awaiting_confirmation",
@@ -578,7 +578,7 @@ function outputTruncationMetadata(text, totalBytes, maxBytes = MAX_COMMAND_OUTPU
 }
 
 function commandTimeoutMs() {
-  const parsed = Number.parseInt(String(process.env.PI_BUG_SOLVER_COMMAND_TIMEOUT_MS || DEFAULT_COMMAND_TIMEOUT_MS), 10);
+  const parsed = Number.parseInt(String(process.env.PI_BUGKILL_COMMAND_TIMEOUT_MS || DEFAULT_COMMAND_TIMEOUT_MS), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_COMMAND_TIMEOUT_MS;
 }
 
@@ -747,7 +747,7 @@ function recordBaselineWorktreeIntegrityRefusal({ transactionId, artifactPaths, 
     assessment,
   }, FAILURE_CATEGORIES.GIT_WORKTREE, { worktreeMetadata: artifactPaths.worktreeMetadata, failureClassifications: artifactPaths.failureClassifications, baseline: artifactPaths.baseline });
   appendJsonl(artifactPaths.failureClassifications, failure);
-  const existing = tryReadJson(artifactPaths.worktreeMetadata) || { schema: "pi-bug-solver-workflow/worktree-metadata/v1", transactionId };
+  const existing = tryReadJson(artifactPaths.worktreeMetadata) || { schema: "pi-bugKill/worktree-metadata/v1", transactionId };
   writeJson(artifactPaths.worktreeMetadata, {
     ...existing,
     updatedAt: createdAt,
@@ -849,7 +849,7 @@ function classifyCallerWorktreeMutation({ transactionId, phase, callerCwd, befor
   const statusChanged = (before?.statusShort || "") !== (after?.statusShort || "");
   const detected = Boolean(before && after && (headChanged || statusChanged));
   const base = {
-    schema: "pi-bug-solver-workflow/caller-worktree-integrity/v1",
+    schema: "pi-bugKill/caller-worktree-integrity/v1",
     transactionId,
     phase,
     callerWorktreePath: callerCwd || null,
@@ -1261,7 +1261,7 @@ function buildImplementationContext({ transactionId, planArtifact, artifactPaths
     worktreeMetadata: artifactPaths.worktreeMetadata,
   };
   return {
-    schema: "pi-bug-solver-workflow/implementation-context/v1",
+    schema: "pi-bugKill/implementation-context/v1",
     transactionId,
     createdAt: new Date().toISOString(),
     status: "ready_for_implementation",
@@ -1304,16 +1304,16 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
   writeJson(artifactPaths.implementationContext, implementationContext);
   const allowlistDecisionPrefixBytes = fileSizeBytes(artifactPaths.allowlistDecisions);
   const commandResult = command ? await runShellCommand(command, worktreePath, {
-    PI_BUG_SOLVER_TRANSACTION_ID: transactionId,
-    PI_BUG_SOLVER_WORKTREE: worktreePath,
-    PI_BUG_SOLVER_BUG_DESCRIPTION: implementationContext.bugDescription,
-    PI_BUG_SOLVER_VALIDATION_CONTRACT: implementationContext.validationContractPath,
-    PI_BUG_SOLVER_BASELINE_EVIDENCE: artifactPaths.baseline,
-    PI_BUG_SOLVER_IMPLEMENTATION_CONTEXT: artifactPaths.implementationContext,
-    PI_BUG_SOLVER_IMPLEMENTATION_EVIDENCE: artifactPaths.implementationEvidence,
-    PI_BUG_SOLVER_POST_VALIDATION_EVIDENCE: artifactPaths.postValidation,
-    PI_BUG_SOLVER_ALLOWLIST_DECISIONS: artifactPaths.allowlistDecisions,
-    PI_BUG_SOLVER_REQUIRED_EVIDENCE_PATHS: JSON.stringify(implementationContext.requiredEvidencePaths),
+    PI_BUGKILL_TRANSACTION_ID: transactionId,
+    PI_BUGKILL_WORKTREE: worktreePath,
+    PI_BUGKILL_BUG_DESCRIPTION: implementationContext.bugDescription,
+    PI_BUGKILL_VALIDATION_CONTRACT: implementationContext.validationContractPath,
+    PI_BUGKILL_BASELINE_EVIDENCE: artifactPaths.baseline,
+    PI_BUGKILL_IMPLEMENTATION_CONTEXT: artifactPaths.implementationContext,
+    PI_BUGKILL_IMPLEMENTATION_EVIDENCE: artifactPaths.implementationEvidence,
+    PI_BUGKILL_POST_VALIDATION_EVIDENCE: artifactPaths.postValidation,
+    PI_BUGKILL_ALLOWLIST_DECISIONS: artifactPaths.allowlistDecisions,
+    PI_BUGKILL_REQUIRED_EVIDENCE_PATHS: JSON.stringify(implementationContext.requiredEvidencePaths),
   }) : null;
   const after = await gitInfo(worktreePath);
   const callerAfter = callerCwd ? await gitInfo(callerCwd) : null;
@@ -1353,7 +1353,7 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
   }
   const finalAllowlist = evaluateAllowlist({ changedFiles, planArtifact, artifactPaths, decisionPrefixBytes: allowlistDecisionPrefixBytes, acceptanceWindowStartedAt: startedAt });
   const record = sealRunnerOwnedEvidence({
-    schema: "pi-bug-solver-workflow/implementation-evidence/v1",
+    schema: "pi-bugKill/implementation-evidence/v1",
     type: "implementation_change",
     transactionId,
     createdAt: completedAt,
@@ -1399,7 +1399,7 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
       requiredEvidencePaths: implementationContext.requiredEvidencePaths,
     },
     allowlistAcceptanceWindow: { startedAt, decisionPrefixBytes: allowlistDecisionPrefixBytes, rule: "Only allowlist expansions durably present in allowlist-decisions.jsonl before this implementation acceptance window are accepted for this attempt; later expansions become eligible for a subsequent repair attempt." },
-    note: command ? "Implementation command ran in the isolated transaction worktree after baseline validation and before post-change validation with durable bug/contract/baseline/allowlist/evidence context supplied via PI_BUG_SOLVER_IMPLEMENTATION_CONTEXT." : "No implementation command was supplied; the edit-capable implementation phase still recorded isolated-worktree git state between baseline and post-change validation.",
+    note: command ? "Implementation command ran in the isolated transaction worktree after baseline validation and before post-change validation with durable bug/contract/baseline/allowlist/evidence context supplied via PI_BUGKILL_IMPLEMENTATION_CONTEXT." : "No implementation command was supplied; the edit-capable implementation phase still recorded isolated-worktree git state between baseline and post-change validation.",
   });
   appendJsonl(artifactPaths.implementationEvidence, record);
   if (callerMutation.detected && failOnCallerMutation) {
@@ -1468,7 +1468,7 @@ async function runRepairAttempt({ transactionId, planArtifact, artifactPaths, wo
   const before = await gitInfo(worktreePath);
   const callerBefore = callerCwd ? await gitInfo(callerCwd) : null;
   const startRecord = {
-    schema: "pi-bug-solver-workflow/repair-attempt/v1",
+    schema: "pi-bugKill/repair-attempt/v1",
     type: "repair_attempt_started",
     transactionId,
     attempt,
@@ -1724,7 +1724,7 @@ async function runPostChangeValidation({ transactionId, planArtifact, artifactPa
       ? "skipped_no_commands"
       : (comparison.newlyRegressed.length ? "completed_with_regressions" : (finalVerification.status === "failed" ? "completed_with_unfixed_targeted_failures" : (finalVerification.status === "inconclusive" ? (finalVerification.notImplemented ? "inconclusive_not_implemented" : "inconclusive_not_reproduced") : "passed_without_new_regressions"))));
   const record = {
-    schema: "pi-bug-solver-workflow/post-change-validation/v1",
+    schema: "pi-bugKill/post-change-validation/v1",
     transactionId,
     createdAt: startedAt,
     completedAt: new Date().toISOString(),
@@ -1773,7 +1773,7 @@ async function runBaselineValidation({ transactionId, planArtifact, artifactPath
     ? "failed_baseline_integrity"
     : (baselineIntegrityClassifications.length ? "completed_with_baseline_mutations_neutralized" : (commands.length === 0 ? "skipped_no_commands" : (results.some((result) => result.status !== 0) ? "completed_with_pre_existing_failures" : "passed")));
   const record = {
-    schema: "pi-bug-solver-workflow/baseline-validation/v1",
+    schema: "pi-bugKill/baseline-validation/v1",
     transactionId,
     createdAt: startedAt,
     completedAt: new Date().toISOString(),
@@ -1857,7 +1857,7 @@ function validateArtifactRootExternal({ cwd, git }) {
   const inTargetRoot = sameOrInsidePath(artifactRoot, targetRoot) || sameOrInsidePath(physicalArtifactRoot, physicalTargetRoot);
   const inTargetCwd = sameOrInsidePath(artifactRoot, targetCwd) || sameOrInsidePath(physicalArtifactRoot, physicalTargetCwd);
   if (inTargetRoot || inTargetCwd) {
-    throw new Error(`Refusing PI_BUG_SOLVER_ARTIFACT_DIR inside the target repository/cwd. artifactRoot=${artifactRoot}; physicalArtifactRoot=${physicalArtifactRoot}; targetRoot=${targetRoot}; physicalTargetRoot=${physicalTargetRoot}; cwd=${targetCwd}; physicalCwd=${physicalTargetCwd}. Choose an external durable directory outside the repository.`);
+    throw new Error(`Refusing PI_BUGKILL_ARTIFACT_DIR inside the target repository/cwd. artifactRoot=${artifactRoot}; physicalArtifactRoot=${physicalArtifactRoot}; targetRoot=${targetRoot}; physicalTargetRoot=${physicalTargetRoot}; cwd=${targetCwd}; physicalCwd=${physicalTargetCwd}. Choose an external durable directory outside the repository.`);
   }
   ARTIFACT_ROOT = artifactRoot;
   return { artifactRoot, physicalArtifactRoot, targetRoot, physicalTargetRoot, targetCwd, physicalTargetCwd, externalToTargetRepo: true };
@@ -1900,7 +1900,7 @@ function inspectPrecheckLock(lock) {
   if (!raw.trim()) return { ...base, recoverable: true, status: "empty_stale", reason: "Lock file is empty; this can only be left by an interrupted non-atomic legacy lock writer." };
   let parsed;
   try { parsed = JSON.parse(raw); } catch (error) { return { ...base, recoverable: true, status: "malformed_stale", reason: error.message || String(error) }; }
-  if (parsed?.schema !== "pi-bug-solver-workflow/precheck-lock/v1" || !Number.isInteger(parsed?.pid)) {
+  if (parsed?.schema !== "pi-bugKill/precheck-lock/v1" || !Number.isInteger(parsed?.pid)) {
     return { ...base, recoverable: true, status: "malformed_stale", lock: parsed, reason: "Lock JSON is missing the expected schema or integer pid." };
   }
   const alive = isProcessAlive(parsed.pid);
@@ -1936,7 +1936,7 @@ function withPrecheckLock(paths, transactionId, fn) {
   mkdirSync(paths.root, { recursive: true });
   const lock = paths.precheckLock;
   const now = new Date().toISOString();
-  const recoveredLock = acquirePrecheckLock(lock, { schema: "pi-bug-solver-workflow/precheck-lock/v1", transactionId, pid: process.pid, createdAt: now });
+  const recoveredLock = acquirePrecheckLock(lock, { schema: "pi-bugKill/precheck-lock/v1", transactionId, pid: process.pid, createdAt: now });
   return Promise.resolve().then(() => fn(recoveredLock)).finally(() => rmSync(lock, { force: true }));
 }
 
@@ -1949,7 +1949,7 @@ function registryIndexPath() {
 }
 
 function transactionBranchName(transactionId) {
-  return `bug-solver/${safeId(transactionId).slice(0, 60)}`;
+  return `bugKill/${safeId(transactionId).slice(0, 60)}`;
 }
 
 function transactionWorktreePath(transactionId) {
@@ -1983,7 +1983,7 @@ function artifactRegistry({ transactionId, artifactPaths }) {
     durableAtPrecheck: true,
   }));
   return {
-    schema: "pi-bug-solver-workflow/artifact-registry/v1",
+    schema: "pi-bugKill/artifact-registry/v1",
     transactionId,
     artifactRoot: ARTIFACT_ROOT,
     transactionDir: artifactPaths.root,
@@ -2007,7 +2007,7 @@ function verifyRegisteredArtifactsExist(registry, { includeRegistry = true } = {
 
 function writePrecheckIncompleteMarker({ artifactPaths, transactionId, state, stage, error }) {
   const marker = {
-    schema: "pi-bug-solver-workflow/precheck-materialization/v1",
+    schema: "pi-bugKill/precheck-materialization/v1",
     transactionId,
     status: "incomplete",
     stage,
@@ -2072,7 +2072,7 @@ function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, 
   };
   return {
     baseline: {
-      schema: "pi-bug-solver-workflow/baseline-validation/v1",
+      schema: "pi-bugKill/baseline-validation/v1",
       transactionId,
       createdAt,
       status: "pending",
@@ -2081,7 +2081,7 @@ function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, 
       evidencePaths: commonSummary.evidencePaths,
     },
     postValidation: {
-      schema: "pi-bug-solver-workflow/post-change-validation/v1",
+      schema: "pi-bugKill/post-change-validation/v1",
       transactionId,
       createdAt,
       status: "pending",
@@ -2092,7 +2092,7 @@ function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, 
       evidencePaths: commonSummary.evidencePaths,
     },
     implementationContext: {
-      schema: "pi-bug-solver-workflow/implementation-context/v1",
+      schema: "pi-bugKill/implementation-context/v1",
       transactionId,
       createdAt,
       status: "pending_baseline",
@@ -2108,7 +2108,7 @@ function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, 
     },
     implementationEvidence: { type: "implementation_evidence_initialized", createdAt, transactionId, status: "pending", decisions: [], commands: [], evidencePaths: commonSummary.evidencePaths },
     precheckReport: {
-      schema: "pi-bug-solver-workflow/intermediate-report/v1",
+      schema: "pi-bugKill/intermediate-report/v1",
       reportKind: "precheck",
       summary: commonSummary,
       decisions: [
@@ -2118,7 +2118,7 @@ function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, 
       evidencePaths: commonSummary.evidencePaths,
     },
     finalReport: {
-      schema: "pi-bug-solver-workflow/final-report/v1",
+      schema: "pi-bugKill/final-report/v1",
       transactionId,
       createdAt,
       status: "pending",
@@ -2310,7 +2310,7 @@ function buildTransactionState({ transactionId, cwd, bug, git, validationCommand
     rootedAtBaseCommit: repoIdentity.baseCommit,
   };
   return {
-    schema: "pi-bug-solver-workflow/state/v1",
+    schema: "pi-bugKill/state/v1",
     transactionId,
     createdAt,
     updatedAt: now,
@@ -2380,11 +2380,11 @@ function buildTransactionState({ transactionId, cwd, bug, git, validationCommand
 
 function updateGlobalRegistry(state) {
   const file = registryIndexPath();
-  const existing = existsSync(file) ? readJson(file) : { schema: "pi-bug-solver-workflow/transaction-index/v1", artifactRoot: ARTIFACT_ROOT, transactions: {} };
+  const existing = existsSync(file) ? readJson(file) : { schema: "pi-bugKill/transaction-index/v1", artifactRoot: ARTIFACT_ROOT, transactions: {} };
   const previous = existing.transactions?.[state.transactionId] || {};
   const next = {
     ...existing,
-    schema: "pi-bug-solver-workflow/transaction-index/v1",
+    schema: "pi-bugKill/transaction-index/v1",
     artifactRoot: ARTIFACT_ROOT,
     updatedAt: new Date().toISOString(),
     transactions: {
@@ -2429,7 +2429,7 @@ async function precheck(args, json) {
     const contract = buildValidationContract({ transactionId, bug, cwd, validationCommands, userTestCommand, artifactPaths });
     const plan = buildTransactionPlan({ transactionId, cwd, bug, git, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, contractPath: artifactPaths.validationContract });
     const record = {
-      schema: "pi-bug-solver-workflow/precheck/v1",
+      schema: "pi-bugKill/precheck/v1",
       transactionId,
       createdAt: new Date().toISOString(),
       cwd,
@@ -2523,7 +2523,7 @@ async function precheck(args, json) {
         writeJson(artifactPaths.precheckReport, pendingArtifacts.precheckReport);
         writeInitialJson(artifactPaths.finalReport, pendingArtifacts.finalReport);
         writeInitialJson(artifactPaths.worktreeMetadata, {
-          schema: "pi-bug-solver-workflow/worktree-metadata/v1",
+          schema: "pi-bugKill/worktree-metadata/v1",
           transactionId,
           createdAt: record.createdAt,
           status: "pending_activation",
@@ -2540,7 +2540,7 @@ async function precheck(args, json) {
         state.lifecycle.materializationStatus = "awaiting_artifact_registry";
         writeJson(artifactPaths.state, state);
         verifyRegisteredArtifactsExist(registry, { includeRegistry: false });
-        if (process.env.PI_BUG_SOLVER_INTERRUPT_PRECHECK_AFTER === "files") throw new Error("Injected interruption after precheck files materialized before artifact registry write");
+        if (process.env.PI_BUGKILL_INTERRUPT_PRECHECK_AFTER === "files") throw new Error("Injected interruption after precheck files materialized before artifact registry write");
         writeJson(artifactPaths.artifactRegistry, registry);
         verifyRegisteredArtifactsExist(registry, { includeRegistry: true });
         state.lifecycle.materializationComplete = true;
@@ -2555,17 +2555,17 @@ async function precheck(args, json) {
       }
     });
     phaseEvent(run, "precheck", { message: "Recorded read-only bug transaction precheck and durable state schema", transactionId, status: record.status, artifactPath: file, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry });
-    emitArtifact(run, { kind: "file", title: "bug-solver precheck", path: file });
-    emitArtifact(run, { kind: "file", title: "bug-solver transaction plan", path: artifactPaths.transactionPlan });
-    emitArtifact(run, { kind: "file", title: "bug-solver validation contract", path: artifactPaths.validationContract });
-    emitArtifact(run, { kind: "file", title: "bug-solver transaction state", path: artifactPaths.state });
-    emitArtifact(run, { kind: "file", title: "bug-solver artifact registry", path: artifactPaths.artifactRegistry });
-    emitArtifact(run, { kind: "file", title: "bug-solver pending baseline evidence", path: artifactPaths.baseline });
-    emitArtifact(run, { kind: "file", title: "bug-solver pending post-change validation evidence", path: artifactPaths.postValidation });
-    emitArtifact(run, { kind: "file", title: "bug-solver pending implementation context", path: artifactPaths.implementationContext });
-    emitArtifact(run, { kind: "file", title: "bug-solver precheck intermediate report", path: artifactPaths.precheckReport });
-    emitArtifact(run, { kind: "file", title: "bug-solver pending final report", path: artifactPaths.finalReport });
-    emitArtifact(run, { kind: "file", title: "bug-solver worktree metadata", path: artifactPaths.worktreeMetadata });
+    emitArtifact(run, { kind: "file", title: "bugKill precheck", path: file });
+    emitArtifact(run, { kind: "file", title: "bugKill transaction plan", path: artifactPaths.transactionPlan });
+    emitArtifact(run, { kind: "file", title: "bugKill validation contract", path: artifactPaths.validationContract });
+    emitArtifact(run, { kind: "file", title: "bugKill transaction state", path: artifactPaths.state });
+    emitArtifact(run, { kind: "file", title: "bugKill artifact registry", path: artifactPaths.artifactRegistry });
+    emitArtifact(run, { kind: "file", title: "bugKill pending baseline evidence", path: artifactPaths.baseline });
+    emitArtifact(run, { kind: "file", title: "bugKill pending post-change validation evidence", path: artifactPaths.postValidation });
+    emitArtifact(run, { kind: "file", title: "bugKill pending implementation context", path: artifactPaths.implementationContext });
+    emitArtifact(run, { kind: "file", title: "bugKill precheck intermediate report", path: artifactPaths.precheckReport });
+    emitArtifact(run, { kind: "file", title: "bugKill pending final report", path: artifactPaths.finalReport });
+    emitArtifact(run, { kind: "file", title: "bugKill worktree metadata", path: artifactPaths.worktreeMetadata });
     phaseEnd(run, "precheck", multiplicity.likelyMultiple ? STATUSES.FAILED : STATUSES.SUCCESS, { status: record.status, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry });
     completeRun(run, multiplicity.likelyMultiple ? STATUSES.FAILED : STATUSES.SUCCESS, { transactionId, precheckPath: file, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry });
     const result = { ok: !multiplicity.likelyMultiple, action: "precheck", runId: run.runId, transactionId, precheckPath: file, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry, registryIndexPath: registryIndex, artifactDir: dir, status: record.status, confirmationRequired: true };
@@ -2624,7 +2624,7 @@ async function createOrReuseTransactionWorktree({ cwd, transactionId, baseCommit
   const after = await gitInfo(cwd);
   const callerWorktreeUnchanged = (before.head || null) === (after.head || null) && (before.statusShort || "") === (after.statusShort || "");
   const record = {
-    schema: "pi-bug-solver-workflow/worktree-metadata/v1",
+    schema: "pi-bugKill/worktree-metadata/v1",
     transactionId,
     updatedAt: now,
     status: "ready",
@@ -2677,7 +2677,7 @@ async function createOrReuseTransactionWorktree({ cwd, transactionId, baseCommit
 
 async function applyRecordedWorktreeCleanupPolicy({ transactionId, artifactPaths, repoRoot, branchName, worktreePath }) {
   const now = new Date().toISOString();
-  const metadata = tryReadJson(artifactPaths.worktreeMetadata) || { schema: "pi-bug-solver-workflow/worktree-metadata/v1", transactionId };
+  const metadata = tryReadJson(artifactPaths.worktreeMetadata) || { schema: "pi-bugKill/worktree-metadata/v1", transactionId };
   const policy = metadata.cleanup || {};
   const evidence = {
     appliedAt: now,
@@ -2732,7 +2732,7 @@ function completionEvidenceIntegrity({ transactionId, state, finalReport, artifa
   const problems = [];
   if (!finalReport || finalReport.unreadable) problems.push(`final report is ${finalReport?.unreadable ? "unreadable" : "missing"}`);
   if (finalReport) {
-    if (finalReport.schema !== "pi-bug-solver-workflow/final-report/v1") problems.push("final report schema is missing or unrecognized");
+    if (finalReport.schema !== "pi-bugKill/final-report/v1") problems.push("final report schema is missing or unrecognized");
     if (transactionId && finalReport.transactionId !== transactionId) problems.push("final report transaction id does not match state/plan");
     if (finalReport.status !== "completed" || finalReport.terminal !== true) problems.push("final report is not terminal completed");
     const outcome = finalReport.outcome || finalReport.finalOutcome;
@@ -2817,7 +2817,7 @@ async function createTransactionCommit({ transactionId, planArtifact, artifactPa
   if (before.head && before.head !== baseCommit) {
     const committedAhead = await runGit(worktreePath, ["diff", "--name-only", `${baseCommit}..HEAD`]);
     const committedFiles = committedAhead.status === 0 ? committedAhead.stdout.split(/\n/).map((s) => normalizeChangedFilePath(s.trim())).filter(Boolean) : [];
-    throw new Error(`Refusing to create final report from a transaction worktree whose HEAD is already ahead of the recorded base before runner-owned commit creation; head=${before.head}; base=${baseCommit}; committedFiles=${committedFiles.join(",") || "<unknown>"}. Implementation commands must leave commit creation to bug-solver-workflow, or recover from a verified final report.`);
+    throw new Error(`Refusing to create final report from a transaction worktree whose HEAD is already ahead of the recorded base before runner-owned commit creation; head=${before.head}; base=${baseCommit}; committedFiles=${committedFiles.join(",") || "<unknown>"}. Implementation commands must leave commit creation to bugKill, or recover from a verified final report.`);
   }
   const changedFilesBeforeCommit = await gitChangedFilesSince(worktreePath, baseCommit);
   const rawAcceptedChangedFiles = acceptedChangedFilesForCommit({ implementation, repairRecords });
@@ -2826,7 +2826,7 @@ async function createTransactionCommit({ transactionId, planArtifact, artifactPa
   const staleAcceptedChangedFiles = rawAcceptedChangedFiles.filter((file) => !changedFilesBeforeCommitSet.has(normalizeChangedFilePath(file)));
   const unacceptedChangedFiles = changedFilesBeforeCommit.filter((file) => !acceptedChangedFiles.includes(normalizeChangedFilePath(file)));
   const record = {
-    schema: "pi-bug-solver-workflow/transaction-commit/v1",
+    schema: "pi-bugKill/transaction-commit/v1",
     transactionId,
     startedAt,
     completedAt: null,
@@ -2885,9 +2885,9 @@ async function createTransactionCommit({ transactionId, planArtifact, artifactPa
     return record;
   }
 
-  const bug = String(planArtifact?.transaction?.bugDescription || planArtifact?.bugDescription || "bug solver transaction").trim();
+  const bug = String(planArtifact?.transaction?.bugDescription || planArtifact?.bugDescription || "bugKill transaction").trim();
   const message = [
-    `bug-solver: ${bug.slice(0, 72) || transactionId}`,
+    `bugKill: ${bug.slice(0, 72) || transactionId}`,
     "",
     `Transaction-Id: ${transactionId}`,
     `Base-Commit: ${baseCommit}`,
@@ -2896,10 +2896,10 @@ async function createTransactionCommit({ transactionId, planArtifact, artifactPa
     `Repair-Attempts: ${repairRecords?.length || 0}`,
     `Final-Verification: ${postValidation?.finalVerification?.status || "unknown"}`,
     "",
-    "Created by pi bug-solver-workflow in an isolated transaction worktree.",
+    "Created by pi bugKill in an isolated transaction worktree.",
   ].join("\n");
-  const commit = await runGit(worktreePath, ["-c", "user.name=Pi Bug Solver", "-c", "user.email=pi-bug-solver@localhost", "commit", "-m", message]);
-  record.commands.push({ command: "git -c user.name=Pi Bug Solver -c user.email=pi-bug-solver@localhost commit -m <transaction metadata>", status: commit.status, stderr: commit.stderr.trim(), stdout: commit.stdout.trim() });
+  const commit = await runGit(worktreePath, ["-c", "user.name=Pi bugKill", "-c", "user.email=pi-bugKill@localhost", "commit", "-m", message]);
+  record.commands.push({ command: "git -c user.name=Pi bugKill -c user.email=pi-bugKill@localhost commit -m <transaction metadata>", status: commit.status, stderr: commit.stderr.trim(), stdout: commit.stdout.trim() });
   if (commit.status !== 0) throw new Error(`Unable to create transaction commit on ${branchName}: ${(commit.stderr || commit.stdout).trim()}`);
   const head = await runGit(worktreePath, ["rev-parse", "HEAD"]);
   if (head.status !== 0) throw new Error(`Unable to read transaction commit hash: ${(head.stderr || head.stdout).trim()}`);
@@ -2950,7 +2950,7 @@ function recordSolveFailureClassification({ transactionId, planArtifact, plan, p
     status: "failed",
     planPath,
     error: error?.message || String(error),
-    stack: process.env.PI_BUG_SOLVER_DEBUG_FAILURE_STACK === "1" ? error?.stack : undefined,
+    stack: process.env.PI_BUGKILL_DEBUG_FAILURE_STACK === "1" ? error?.stack : undefined,
     rationale: "Solve failed before normal completion; the workflow persisted an actionable failure category for recovery and reporting.",
   }, category, { failureClassifications: artifactPaths.failureClassifications, state: statePath, finalReport: finalReportPath });
   try { appendJsonl(artifactPaths.failureClassifications, record); } catch { /* best-effort failure persistence */ }
@@ -3083,7 +3083,7 @@ async function solve(args, json) {
     phaseStart(run, "gated-activation", { transactionId });
     const worktreeRecord = await createOrReuseTransactionWorktree({ cwd, transactionId, baseCommit: integrity.baseCommit, state: integrity.state, artifactPaths });
     const activation = {
-      schema: "pi-bug-solver-workflow/gated-activation/v1",
+      schema: "pi-bugKill/gated-activation/v1",
       transactionId,
       createdAt: new Date().toISOString(),
       status: "isolated_worktree_ready",
@@ -3137,10 +3137,10 @@ async function solve(args, json) {
       };
       writeJson(statePath, updatedState);
       updatedStateForRegistry = updatedState;
-      emitArtifact(run, { kind: "file", title: "bug-solver transaction state", path: statePath });
+      emitArtifact(run, { kind: "file", title: "bugKill transaction state", path: statePath });
     }
-    emitArtifact(run, { kind: "file", title: "bug-solver gated activation", path: file });
-    emitArtifact(run, { kind: "file", title: "bug-solver worktree metadata", path: artifactPaths.worktreeMetadata });
+    emitArtifact(run, { kind: "file", title: "bugKill gated activation", path: file });
+    emitArtifact(run, { kind: "file", title: "bugKill worktree metadata", path: artifactPaths.worktreeMetadata });
     phaseEnd(run, "gated-activation", STATUSES.SUCCESS, { artifactPath: file, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name });
 
     currentPhase = "baseline-validation";
@@ -3171,8 +3171,8 @@ async function solve(args, json) {
       });
     }
     if (updatedStateForRegistry) updateGlobalRegistry(updatedStateForRegistry);
-    emitArtifact(run, { kind: "file", title: "bug-solver baseline validation", path: artifactPaths.baseline });
-    emitArtifact(run, { kind: "file", title: "bug-solver failure classifications", path: artifactPaths.failureClassifications });
+    emitArtifact(run, { kind: "file", title: "bugKill baseline validation", path: artifactPaths.baseline });
+    emitArtifact(run, { kind: "file", title: "bugKill failure classifications", path: artifactPaths.failureClassifications });
     phaseEnd(run, "baseline-validation", baseline.status === "passed" || baseline.status === "skipped_no_commands" || baseline.status === "completed_with_pre_existing_failures" || baseline.status === "completed_with_baseline_mutations_neutralized" ? STATUSES.SUCCESS : STATUSES.FAILED, { status: baseline.status, commands: baseline.commandResults.length, preExistingFailures: baseline.failures.preExisting.length, targetedBeforeBroad: baseline.targetedBeforeBroad, baselineIntegrity: baseline.baselineIntegrity?.status });
 
     currentPhase = "implementation";
@@ -3207,8 +3207,8 @@ async function solve(args, json) {
       });
     }
     if (updatedStateForRegistry) updateGlobalRegistry(updatedStateForRegistry);
-    emitArtifact(run, { kind: "file", title: "bug-solver implementation context", path: artifactPaths.implementationContext });
-    emitArtifact(run, { kind: "file", title: "bug-solver implementation evidence", path: artifactPaths.implementationEvidence });
+    emitArtifact(run, { kind: "file", title: "bugKill implementation context", path: artifactPaths.implementationContext });
+    emitArtifact(run, { kind: "file", title: "bugKill implementation evidence", path: artifactPaths.implementationEvidence });
     phaseEnd(run, "implementation", !implementation.allowlist.accepted || (implementation.commandResult?.status && implementation.commandResult.status !== 0) ? STATUSES.FAILED : STATUSES.SUCCESS, { status: implementation.status, commandProvided: implementation.commandProvided, changedFiles: implementation.changedFiles.length, worktreeChangedAfterBaseline: implementation.worktreeChangedAfterBaseline, allowlistAccepted: implementation.allowlist.accepted, outOfScopeFiles: implementation.allowlist.outOfScopeFiles });
 
     currentPhase = "post-change-validation";
@@ -3271,8 +3271,8 @@ async function solve(args, json) {
       });
     }
     if (updatedStateForRegistry) updateGlobalRegistry(updatedStateForRegistry);
-    emitArtifact(run, { kind: "file", title: "bug-solver post-change validation", path: artifactPaths.postValidation });
-    emitArtifact(run, { kind: "file", title: "bug-solver implementation evidence", path: artifactPaths.implementationEvidence });
+    emitArtifact(run, { kind: "file", title: "bugKill post-change validation", path: artifactPaths.postValidation });
+    emitArtifact(run, { kind: "file", title: "bugKill implementation evidence", path: artifactPaths.implementationEvidence });
     const finalVerificationPassed = finalVerificationProvesBugFixed(postValidation.finalVerification);
     phaseEnd(run, "post-change-validation", repairCapReached ? STATUSES.FAILED : (postValidation.failures.regressions.length === 0 && finalVerificationPassed ? STATUSES.SUCCESS : STATUSES.FAILED), { status: postValidation.status, commands: postValidation.commandResults.length, fixed: postValidation.comparison.fixed.length, unchangedPreExisting: postValidation.comparison.unchangedPreExisting.length, newlyRegressed: postValidation.comparison.newlyRegressed.length, targetedBeforeBroad: postValidation.targetedBeforeBroad, finalVerification: postValidation.finalVerification.status, bugFixed: postValidation.finalVerification.bugFixed === true, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, repairCapReached });
     if (repairCapReached) throw new Error(`Repair cap reached after ${repairRecords.length}/${repairMax} attempts; terminal failure recorded in ${artifactPaths.repairAttempts}`);
@@ -3298,7 +3298,7 @@ async function solve(args, json) {
       finalVerification: postValidation.finalVerification,
       guidance: transactionCommit.manualNextSteps,
     };
-    if (process.env.PI_BUG_SOLVER_INTERRUPT_SOLVE_BEFORE === "cleanup_final_report_update") throw new Error("Injected interruption before cleanup and final report update");
+    if (process.env.PI_BUGKILL_INTERRUPT_SOLVE_BEFORE === "cleanup_final_report_update") throw new Error("Injected interruption before cleanup and final report update");
     const cleanupResult = await applyRecordedWorktreeCleanupPolicy({ transactionId, artifactPaths, repoRoot: integrity.state?.repo?.root || cwd, branchName: worktreeRecord.branch.name, worktreePath: worktreeRecord.worktree.path });
     if (existsSync(artifactPaths.finalReport)) {
       const finalReport = readJson(artifactPaths.finalReport);
@@ -3308,7 +3308,7 @@ async function solve(args, json) {
         status: "completed",
         terminal: true,
         completionProtocol: {
-          schema: "pi-bug-solver-workflow/completion-protocol/v1",
+          schema: "pi-bugKill/completion-protocol/v1",
           status: "final_report_written_before_state_completed",
           stateAdvertisesCompletedAfterVerifiedFinalReport: true,
           verifiedBeforeStateCompletion: false,
@@ -3333,7 +3333,7 @@ async function solve(args, json) {
       const reportIntegrity = completionEvidenceIntegrity({ transactionId, state: null, finalReport: reportBeforeCompletedState, artifactPaths });
       if (!reportIntegrity.ok) throw new Error(`Completion protocol refused to mark state completed because final-report evidence was not verified: ${reportIntegrity.problems.join("; ")}`);
       writeJson(artifactPaths.finalReport, { ...reportBeforeCompletedState, completionProtocol: { ...(reportBeforeCompletedState.completionProtocol || {}), verifiedBeforeStateCompletion: true, evidenceVerifiedAt: new Date().toISOString(), integrity: reportIntegrity } });
-      if (process.env.PI_BUG_SOLVER_INTERRUPT_SOLVE_AFTER === "transaction_commit") throw new Error("Injected interruption after transaction commit creation and verified final-report write before cleanup/state completion");
+      if (process.env.PI_BUGKILL_INTERRUPT_SOLVE_AFTER === "transaction_commit") throw new Error("Injected interruption after transaction commit creation and verified final-report write before cleanup/state completion");
     } else {
       throw new Error(`Completion protocol refused to mark state completed because final report is missing: ${artifactPaths.finalReport}`);
     }
@@ -3354,10 +3354,10 @@ async function solve(args, json) {
       writeJson(statePath, updatedState);
       updatedStateForRegistry = updatedState;
       updateGlobalRegistry(updatedStateForRegistry);
-      if (process.env.PI_BUG_SOLVER_INTERRUPT_SOLVE_AFTER === "completed_state") throw new Error("Injected interruption after completed state write before final workflow event/report handoff");
+      if (process.env.PI_BUGKILL_INTERRUPT_SOLVE_AFTER === "completed_state") throw new Error("Injected interruption after completed state write before final workflow event/report handoff");
     }
-    emitArtifact(run, { kind: "file", title: "bug-solver final report", path: artifactPaths.finalReport });
-    emitArtifact(run, { kind: "file", title: "bug-solver cleanup/worktree metadata", path: artifactPaths.worktreeMetadata });
+    emitArtifact(run, { kind: "file", title: "bugKill final report", path: artifactPaths.finalReport });
+    emitArtifact(run, { kind: "file", title: "bugKill cleanup/worktree metadata", path: artifactPaths.worktreeMetadata });
     phaseEnd(run, "transaction-commit-and-report", transactionCommit.status === "committed_for_review" ? STATUSES.SUCCESS : STATUSES.FAILED, { status: transactionCommit.status, commit: transactionCommit.commit, changedFiles: transactionCommit.changedFiles.length, branch: worktreeRecord.branch.name, finalReportPath: artifactPaths.finalReport, manualReviewRequired: true, cleanupStatus: cleanupResult.status });
 
     completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence, repairAttemptsPath: artifactPaths.repairAttempts, postValidationPath: artifactPaths.postValidation, finalReportPath: artifactPaths.finalReport, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name, transactionCommit: transactionCommit.commit, finalStatus: outcome.status, cleanupStatus: cleanupResult.status });
@@ -3475,7 +3475,7 @@ function assertImmutableBaseMetadata({ planArtifact, state, git }) {
 function assertValidationContractIntegrity(contractPath, context) {
   const file = assertExistingExternalFile(contractPath, "validationContract", context);
   const contract = readJson(file);
-  if (contract?.schema !== "pi-bug-solver-workflow/validation-contract/v1") throw new Error(`Validation contract has unsafe or unrecognized schema: ${contract?.schema || "missing"}`);
+  if (contract?.schema !== "pi-bugKill/validation-contract/v1") throw new Error(`Validation contract has unsafe or unrecognized schema: ${contract?.schema || "missing"}`);
   if (contract.createdBeforeImplementation !== true || contract.evidenceMappingCreatedBeforeImplementation !== true) throw new Error("Validation contract must be created with evidence mappings before implementation.");
   if (!Array.isArray(contract.assertions) || contract.assertions.length === 0) throw new Error("Validation contract must contain explicit assertions before solve activation.");
   const evidenceMap = contract.workflowEvidenceMap || {};
@@ -3497,12 +3497,12 @@ function assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd }) {
   const artifactRegistryPath = planArtifact.artifactRegistryPath || plan.artifacts?.artifactRegistry || plan.evidencePaths?.artifactRegistry;
   const stateFile = assertExistingExternalFile(statePath, "state", context);
   const state = readJson(stateFile);
-  if (state?.schema !== "pi-bug-solver-workflow/state/v1") throw new Error(`Transaction state has unsafe or unrecognized schema: ${state?.schema || "missing"}`);
+  if (state?.schema !== "pi-bugKill/state/v1") throw new Error(`Transaction state has unsafe or unrecognized schema: ${state?.schema || "missing"}`);
   if (state.transactionId !== plan.transactionId) throw new Error("Transaction state id does not match solve plan id.");
   const baseCommit = assertImmutableBaseMetadata({ planArtifact, state, git });
   const registryFile = assertExistingExternalFile(artifactRegistryPath, "artifactRegistry", context);
   const registry = readJson(registryFile);
-  if (registry?.schema !== "pi-bug-solver-workflow/artifact-registry/v1" || registry.materializationComplete !== true || !Array.isArray(registry.entries) || registry.entries.length === 0) throw new Error("Artifact registry must be materialized before solve activation.");
+  if (registry?.schema !== "pi-bugKill/artifact-registry/v1" || registry.materializationComplete !== true || !Array.isArray(registry.entries) || registry.entries.length === 0) throw new Error("Artifact registry must be materialized before solve activation.");
   if (registry.transactionId !== plan.transactionId) throw new Error("Artifact registry transaction id does not match solve plan id.");
   if (registry.recoverableByTransactionId !== true) throw new Error("Artifact registry must be recoverable by transaction id before solve activation.");
   const entriesByKind = registryEntryByKind(registry);
@@ -3540,7 +3540,7 @@ function assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd }) {
 
   const globalRegistry = existsSync(registryIndexPath()) ? readJson(registryIndexPath()) : undefined;
   const indexed = globalRegistry?.transactions?.[plan.transactionId];
-  if (globalRegistry?.schema !== "pi-bug-solver-workflow/transaction-index/v1" || !indexed) throw new Error("Global transaction registry is missing this transaction id before solve activation.");
+  if (globalRegistry?.schema !== "pi-bugKill/transaction-index/v1" || !indexed) throw new Error("Global transaction registry is missing this transaction id before solve activation.");
   assertSameArtifactPath(indexed.statePath, stateFile, "global registry state path");
   assertSameArtifactPath(indexed.artifactDir, expectedDir, "global registry artifact directory");
   assertSameArtifactPath(indexed.planPath, entriesByKind.get("transactionPlan")?.path, "global registry transaction plan path");
@@ -3550,7 +3550,7 @@ function assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd }) {
   if (contract.transactionId !== plan.transactionId) throw new Error("Validation contract transaction id does not match solve plan id.");
   if (contract.repoPath && canonicalArtifactPath(contract.repoPath) !== targetCwd && canonicalArtifactPath(contract.repoPath) !== targetRoot) throw new Error("Validation contract repository path does not match solve target repository.");
   const transactionPlan = readJson(authoritativeTransactionPlanPath);
-  if (transactionPlan?.schema !== "pi-bug-solver-workflow/transaction-plan/v1" || transactionPlan.transactionId !== plan.transactionId) throw new Error("Durable registered transaction plan does not match solve transaction id.");
+  if (transactionPlan?.schema !== "pi-bugKill/transaction-plan/v1" || transactionPlan.transactionId !== plan.transactionId) throw new Error("Durable registered transaction plan does not match solve transaction id.");
   if (transactionPlan.status !== plan.status || transactionPlan.transaction?.bugDescription !== plan.transaction?.bugDescription) throw new Error("Submitted solve artifact does not match the durable registered transaction plan.");
   if (transactionPlan.validation?.contractPath) assertSameArtifactPath(transactionPlan.validation.contractPath, entriesByKind.get("validationContract")?.path, "registered transaction plan contract path");
   if (transactionPlan.statePath) assertSameArtifactPath(transactionPlan.statePath, stateFile, "registered transaction plan state path");
