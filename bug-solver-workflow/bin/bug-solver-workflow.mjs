@@ -1653,7 +1653,92 @@ function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, 
   };
 }
 
-function assertExistingTransactionCompatible({ transactionId, cwd, bug, git, artifactPaths }) {
+function normalizedPrecheckConfig({ validationCommands = [], userTestCommand = null, maxRepairIterations = 8, allowlist = [] }) {
+  return {
+    validationCommands: validationCommands.map((command) => String(command).trim()).filter(Boolean),
+    userTestCommand: userTestCommand ? String(userTestCommand).trim() : null,
+    maxRepairIterations: Number(maxRepairIterations),
+    allowlist: [...new Set((allowlist || []).map((entry) => String(entry).trim()).filter(Boolean))].sort(),
+  };
+}
+
+function existingPrecheckConfig(existing, artifactPaths) {
+  const plan = existsSync(artifactPaths.transactionPlan) ? tryReadJson(artifactPaths.transactionPlan) : undefined;
+  const precheckArtifact = existsSync(artifactPaths.precheck) ? tryReadJson(artifactPaths.precheck) : undefined;
+  return normalizedPrecheckConfig({
+    validationCommands: existing?.validation?.commands || plan?.validation?.commands || precheckArtifact?.validationCommands || [],
+    userTestCommand: existing?.validation?.userTestCommand ?? plan?.validation?.userTestCommand ?? precheckArtifact?.userTestCommand ?? null,
+    maxRepairIterations: existing?.repair?.maxRepairIterations ?? plan?.repairPolicy?.maxRepairIterations ?? precheckArtifact?.maxRepairIterations ?? 8,
+    allowlist: existing?.allowlist?.current || plan?.allowlist?.current || precheckArtifact?.allowlist || [],
+  });
+}
+
+function precheckConfigMismatches(existingConfig, requestedConfig) {
+  const mismatches = [];
+  const sameArray = (a, b) => a.length === b.length && a.every((value, index) => value === b[index]);
+  if (!sameArray(existingConfig.validationCommands, requestedConfig.validationCommands)) mismatches.push("validation commands differ from existing transaction configuration");
+  if ((existingConfig.userTestCommand || null) !== (requestedConfig.userTestCommand || null)) mismatches.push("user-test command differs from existing transaction configuration");
+  if (existingConfig.maxRepairIterations !== requestedConfig.maxRepairIterations) mismatches.push("max repairs differs from existing transaction configuration");
+  if (!sameArray(existingConfig.allowlist, requestedConfig.allowlist)) mismatches.push("allowlist differs from existing transaction configuration");
+  return mismatches;
+}
+
+function recordRejectedRepeatedPrecheck({ transactionId, artifactPaths, requestedConfig, existingConfig, mismatches }) {
+  const now = new Date().toISOString();
+  const rejection = {
+    type: "repeated_precheck_configuration_rejected",
+    createdAt: now,
+    transactionId,
+    category: FAILURE_CATEGORIES.LIFECYCLE.id,
+    categoryLabel: FAILURE_CATEGORIES.LIFECYCLE.label,
+    reason: "Repeated precheck invocation used a transaction id whose materialized configuration differs from the request.",
+    mismatches,
+    existingConfig,
+    requestedConfig,
+    evidencePaths: {
+      state: artifactPaths.state,
+      precheckReport: artifactPaths.precheckReport,
+      failureClassifications: artifactPaths.failureClassifications,
+      transactionPlan: artifactPaths.transactionPlan,
+    },
+  };
+  if (existsSync(artifactPaths.failureClassifications)) appendJsonl(artifactPaths.failureClassifications, rejection);
+  if (existsSync(artifactPaths.state)) {
+    const state = readJson(artifactPaths.state);
+    const rejected = Array.isArray(state.observations?.rejectedPrechecks) ? state.observations.rejectedPrechecks : [];
+    state.updatedAt = now;
+    state.observations = {
+      ...(state.observations || {}),
+      rejectedPrechecks: [...rejected, rejection].slice(-25),
+      latestRejectedPrecheck: rejection,
+    };
+    state.lifecycle = {
+      ...(state.lifecycle || {}),
+      lastRejectedRepeatedPrecheckAt: now,
+      lastRejectedRepeatedPrecheckReason: rejection.reason,
+    };
+    writeJson(artifactPaths.state, state);
+  }
+  if (existsSync(artifactPaths.precheckReport)) {
+    const report = readJson(artifactPaths.precheckReport);
+    report.updatedAt = now;
+    report.decisions = [
+      ...(Array.isArray(report.decisions) ? report.decisions : []),
+      { decision: "reject_repeated_precheck_configuration_mismatch", createdAt: now, justification: rejection.reason, mismatches, evidencePath: artifactPaths.failureClassifications },
+    ];
+    report.failures = {
+      ...(report.failures || {}),
+      repeatedPrecheckConfigurationMismatches: [
+        ...((report.failures?.repeatedPrecheckConfigurationMismatches) || []),
+        rejection,
+      ].slice(-25),
+    };
+    writeJson(artifactPaths.precheckReport, report);
+  }
+  return rejection;
+}
+
+function assertExistingTransactionCompatible({ transactionId, cwd, bug, git, artifactPaths, validationCommands, userTestCommand, maxRepairIterations, allowlist }) {
   const marker = existsSync(artifactPaths.precheckIncomplete) ? tryReadJson(artifactPaths.precheckIncomplete) : undefined;
   const existing = existsSync(artifactPaths.state) ? readJson(artifactPaths.state) : (marker ? { ...(marker.immutableIdentity || {}), transactionId: marker.transactionId, repo: marker.immutableIdentity?.repo, transaction: marker.immutableIdentity?.transaction } : undefined);
   if (!existing) return;
@@ -1674,6 +1759,15 @@ function assertExistingTransactionCompatible({ transactionId, cwd, bug, git, art
   if (existingBranchName && existingBranchName !== expectedBranchName) incompatible.push("planned branch name differs from transaction identity");
   if (incompatible.length) {
     throw new Error(`transaction id ${transactionId} already exists for an incompatible transaction (${incompatible.join("; ")}); choose a new --transaction-id`);
+  }
+  if (existsSync(artifactPaths.state)) {
+    const existingConfig = existingPrecheckConfig(existing, artifactPaths);
+    const requestedConfig = normalizedPrecheckConfig({ validationCommands, userTestCommand, maxRepairIterations, allowlist });
+    const configMismatches = precheckConfigMismatches(existingConfig, requestedConfig);
+    if (configMismatches.length) {
+      recordRejectedRepeatedPrecheck({ transactionId, artifactPaths, requestedConfig, existingConfig, mismatches: configMismatches });
+      throw new Error(`transaction id ${transactionId} already exists with different precheck configuration (${configMismatches.join("; ")}); choose a new --transaction-id or repeat precheck with the materialized configuration`);
+    }
   }
 }
 
@@ -1841,9 +1935,9 @@ async function precheck(args, json) {
     const validationCommands = splitValidationCommands(args);
     const userTestCommand = args["user-test-command"] ? String(Array.isArray(args["user-test-command"]) ? args["user-test-command"].at(-1) : args["user-test-command"]).trim() : null;
     const maxRepairIterations = parseMaxRepairs(args["max-repairs"] ?? args.maxRepairIterations);
-    const artifactPaths = buildArtifactPaths(dir);
-    assertExistingTransactionCompatible({ transactionId, cwd, bug, git, artifactPaths });
     const allowlist = splitValues(args.allowlist || args["allow-list"]);
+    const artifactPaths = buildArtifactPaths(dir);
+    assertExistingTransactionCompatible({ transactionId, cwd, bug, git, artifactPaths, validationCommands, userTestCommand, maxRepairIterations, allowlist });
     const contract = buildValidationContract({ transactionId, bug, cwd, validationCommands, userTestCommand, artifactPaths });
     const plan = buildTransactionPlan({ transactionId, cwd, bug, git, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, contractPath: artifactPaths.validationContract });
     const record = {
