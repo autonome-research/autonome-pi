@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -159,6 +159,8 @@ function buildArtifactPaths(dir) {
     intermediateReportsDir: join(dir, "reports"),
     precheckReport: join(dir, "reports", "precheck-report.json"),
     state: join(dir, "state.json"),
+    precheckIncomplete: join(dir, ".precheck-incomplete.json"),
+    precheckLock: join(dir, ".precheck.lock"),
   };
 }
 
@@ -321,6 +323,31 @@ function readJson(file) {
   return JSON.parse(readFileSync(file, "utf8"));
 }
 
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch { return false; }
+}
+
+function withPrecheckLock(paths, transactionId, fn) {
+  mkdirSync(paths.root, { recursive: true });
+  const lock = paths.precheckLock;
+  const now = new Date().toISOString();
+  try {
+    const fd = openSync(lock, "wx");
+    closeSync(fd);
+    writeFileSync(lock, `${JSON.stringify({ schema: "pi-bug-solver-workflow/precheck-lock/v1", transactionId, pid: process.pid, createdAt: now })}\n`, "utf8");
+  } catch (error) {
+    const existing = tryReadJson(lock);
+    if (existing?.pid && !isProcessAlive(existing.pid)) rmSync(lock, { force: true });
+    else throw new Error(`precheck materialization is already in progress for ${transactionId}; lock=${lock}`);
+    const fd = openSync(lock, "wx");
+    closeSync(fd);
+    writeFileSync(lock, `${JSON.stringify({ schema: "pi-bug-solver-workflow/precheck-lock/v1", transactionId, pid: process.pid, createdAt: now, recoveredStaleLock: existing || null })}\n`, "utf8");
+  }
+  return Promise.resolve().then(fn).finally(() => rmSync(lock, { force: true }));
+}
+
 function transactionDir(transactionId) {
   return join(ARTIFACT_ROOT, "transactions", safeId(transactionId));
 }
@@ -368,8 +395,40 @@ function artifactRegistry({ transactionId, artifactPaths }) {
     createdAt: existing.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     recoverableByTransactionId: true,
+    materializationComplete: true,
     entries,
   };
+}
+
+function expectedRegistryEntries({ artifactPaths }) {
+  return artifactRegistry({ transactionId: "pending", artifactPaths }).entries;
+}
+
+function verifyRegisteredArtifactsExist(registry, { includeRegistry = true } = {}) {
+  const missing = (registry.entries || []).filter((entry) => (includeRegistry || entry.kind !== "artifactRegistry") && !existsSync(entry.path));
+  if (missing.length) throw new Error(`precheck artifact materialization incomplete; missing registered file(s): ${missing.map((entry) => `${entry.kind}:${entry.path}`).join(", ")}`);
+  return true;
+}
+
+function writePrecheckIncompleteMarker({ artifactPaths, transactionId, state, stage, error }) {
+  const marker = {
+    schema: "pi-bug-solver-workflow/precheck-materialization/v1",
+    transactionId,
+    status: "incomplete",
+    stage,
+    updatedAt: new Date().toISOString(),
+    transactionDir: artifactPaths.root,
+    immutableIdentity: state ? { repo: state.repo, branch: state.branch, worktree: state.worktree, transaction: state.transaction, createdAt: state.createdAt } : undefined,
+    artifactRegistryPath: artifactPaths.artifactRegistry,
+    expectedArtifacts: expectedRegistryEntries({ artifactPaths }).map((entry) => ({ kind: entry.kind, path: entry.path, exists: existsSync(entry.path) })),
+    error: error ? (error.message || String(error)) : undefined,
+  };
+  writeJson(artifactPaths.precheckIncomplete, marker);
+  return marker;
+}
+
+function clearPrecheckIncompleteMarker(artifactPaths) {
+  rmSync(artifactPaths.precheckIncomplete, { force: true });
 }
 
 function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, createdAt }) {
@@ -442,8 +501,9 @@ function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, 
 }
 
 function assertExistingTransactionCompatible({ transactionId, cwd, bug, git, artifactPaths }) {
-  if (!existsSync(artifactPaths.state)) return;
-  const existing = readJson(artifactPaths.state);
+  const marker = existsSync(artifactPaths.precheckIncomplete) ? tryReadJson(artifactPaths.precheckIncomplete) : undefined;
+  const existing = existsSync(artifactPaths.state) ? readJson(artifactPaths.state) : (marker ? { ...(marker.immutableIdentity || {}), transactionId: marker.transactionId, repo: marker.immutableIdentity?.repo, transaction: marker.immutableIdentity?.transaction } : undefined);
+  if (!existing) return;
   const existingBug = existing.transaction?.bugDescription;
   const existingCwd = existing.repo?.cwd;
   const existingRoot = existing.repo?.root;
@@ -466,7 +526,8 @@ function assertExistingTransactionCompatible({ transactionId, cwd, bug, git, art
 
 function buildTransactionState({ transactionId, cwd, bug, git, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, status }) {
   const now = new Date().toISOString();
-  const existing = existsSync(artifactPaths.state) ? readJson(artifactPaths.state) : {};
+  const incomplete = !existsSync(artifactPaths.state) && existsSync(artifactPaths.precheckIncomplete) ? (tryReadJson(artifactPaths.precheckIncomplete)?.immutableIdentity || {}) : {};
+  const existing = existsSync(artifactPaths.state) ? readJson(artifactPaths.state) : { createdAt: incomplete.createdAt, repo: incomplete.repo, branch: incomplete.branch, worktree: incomplete.worktree };
   const createdAt = existing.createdAt || now;
   const revision = Number.isInteger(existing.revision) ? existing.revision + 1 : 1;
   const lifecycleStatus = status || (multiplicity.likelyMultiple ? "rejected_multi_bug" : "awaiting_confirmation");
@@ -521,6 +582,7 @@ function buildTransactionState({ transactionId, cwd, bug, git, validationCommand
       editingAllowed: false,
       confirmationRequired: true,
       readOnlyPrecheckComplete: true,
+      materializationComplete: false,
     },
     transaction: {
       exactlyOneBug: !multiplicity.likelyMultiple,
@@ -680,19 +742,34 @@ async function precheck(args, json) {
       statePath: artifactPaths.state,
       artifactRegistryPath: artifactPaths.artifactRegistry,
     };
-    writeJson(file, recordForWrite);
-    writeJson(artifactPaths.transactionPlan, planForWrite);
-    writeJson(artifactPaths.validationContract, contract);
-    writeJson(artifactPaths.artifactRegistry, registry);
-    writeInitialJson(artifactPaths.baseline, pendingArtifacts.baseline);
-    writeInitialJsonl(artifactPaths.allowlistDecisions, { type: "initial_allowlist", createdAt: record.createdAt, allowlist, justification: "Seeded during read-only precheck before implementation." });
-    writeInitialJsonl(artifactPaths.implementationEvidence, pendingArtifacts.implementationEvidence);
-    writeInitialJsonl(artifactPaths.repairAttempts, { type: "repair_counter_initialized", createdAt: record.createdAt, attempts: 0, maxRepairIterations, remaining: maxRepairIterations });
-    writeInitialJsonl(artifactPaths.failureClassifications, { type: "failure_classification_initialized", createdAt: record.createdAt, status: "none", classification: null });
-    writeJson(artifactPaths.precheckReport, pendingArtifacts.precheckReport);
-    writeInitialJson(artifactPaths.finalReport, pendingArtifacts.finalReport);
-    writeJson(artifactPaths.state, state);
-    const registryIndex = updateGlobalRegistry(state);
+    let registryIndex;
+    await withPrecheckLock(artifactPaths, transactionId, async () => {
+      try {
+        writePrecheckIncompleteMarker({ artifactPaths, transactionId, state, stage: "starting_materialization" });
+        writeJson(file, recordForWrite);
+        writeJson(artifactPaths.transactionPlan, planForWrite);
+        writeJson(artifactPaths.validationContract, contract);
+        writeInitialJson(artifactPaths.baseline, pendingArtifacts.baseline);
+        writeInitialJsonl(artifactPaths.allowlistDecisions, { type: "initial_allowlist", createdAt: record.createdAt, allowlist, justification: "Seeded during read-only precheck before implementation." });
+        writeInitialJsonl(artifactPaths.implementationEvidence, pendingArtifacts.implementationEvidence);
+        writeInitialJsonl(artifactPaths.repairAttempts, { type: "repair_counter_initialized", createdAt: record.createdAt, attempts: 0, maxRepairIterations, remaining: maxRepairIterations });
+        writeInitialJsonl(artifactPaths.failureClassifications, { type: "failure_classification_initialized", createdAt: record.createdAt, status: "none", classification: null });
+        writeJson(artifactPaths.precheckReport, pendingArtifacts.precheckReport);
+        writeInitialJson(artifactPaths.finalReport, pendingArtifacts.finalReport);
+        state.lifecycle.materializationComplete = true;
+        state.lifecycle.materializationStatus = "complete";
+        writeJson(artifactPaths.state, state);
+        verifyRegisteredArtifactsExist(registry, { includeRegistry: false });
+        if (process.env.PI_BUG_SOLVER_INTERRUPT_PRECHECK_AFTER === "files") throw new Error("Injected interruption after precheck files materialized before artifact registry write");
+        writeJson(artifactPaths.artifactRegistry, registry);
+        verifyRegisteredArtifactsExist(registry, { includeRegistry: true });
+        clearPrecheckIncompleteMarker(artifactPaths);
+        registryIndex = updateGlobalRegistry(state);
+      } catch (error) {
+        writePrecheckIncompleteMarker({ artifactPaths, transactionId, state, stage: "materialization_interrupted", error });
+        throw error;
+      }
+    });
     phaseEvent(run, "precheck", { message: "Recorded read-only bug transaction precheck and durable state schema", transactionId, status: record.status, artifactPath: file, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry });
     emitArtifact(run, { kind: "file", title: "bug-solver precheck", path: file });
     emitArtifact(run, { kind: "file", title: "bug-solver transaction plan", path: artifactPaths.transactionPlan });
@@ -835,11 +912,20 @@ function loadTransactionInspection(dir, transactionIdHint) {
   const plan = tryReadJson(paths.transactionPlan);
   const precheck = tryReadJson(paths.precheck);
   const artifactRegistryDoc = tryReadJson(paths.artifactRegistry);
+  const incompleteMarker = tryReadJson(paths.precheckIncomplete);
+  const lock = tryReadJson(paths.precheckLock);
   const finalReport = tryReadJson(paths.finalReport);
   const activation = tryReadJson(join(dir, "activation-scaffold.json"));
   const transactionId = state?.transactionId || plan?.transactionId || precheck?.transactionId || transactionIdHint;
   const reportsDir = state?.reports?.intermediateReportsDir || paths.intermediateReportsDir;
-  const artifactEntries = (artifactRegistryDoc?.entries || []).map((entry) => ({ ...entry, exists: existsSync(entry.path) }));
+  const registryEntries = artifactRegistryDoc?.entries || expectedRegistryEntries({ artifactPaths: paths }).map((entry) => ({ ...entry, lifecycleStatus: "expected_not_registered_until_materialized", durableAtPrecheck: false }));
+  const artifactEntries = registryEntries.map((entry) => ({ ...entry, exists: existsSync(entry.path) }));
+  const missingRegisteredArtifacts = artifactEntries.filter((entry) => !entry.exists).map((entry) => ({ kind: entry.kind, path: entry.path }));
+  const materializationStatus = artifactRegistryDoc?.materializationComplete === true && missingRegisteredArtifacts.length === 0
+    ? "complete"
+    : incompleteMarker?.status === "incomplete" || lock?.schema
+      ? "incomplete"
+      : artifactRegistryDoc ? "corrupt_missing_registered_artifacts" : "not_materialized";
   const worktreePath = state?.worktree?.path || plan?.worktree?.path || transactionWorktreePath(transactionId || transactionIdHint || "unknown");
   const latestFailureClassification = lastJsonlRecord(state?.failureClassification?.classificationsPath || paths.failureClassifications);
   const latestRepairAttempt = lastJsonlRecord(state?.repair?.attemptsPath || paths.repairAttempts);
@@ -847,14 +933,24 @@ function loadTransactionInspection(dir, transactionIdHint) {
     transactionId,
     transactionDir: dir,
     exists: existsSync(dir),
-    recoverable: Boolean(state && existsSync(paths.artifactRegistry)),
+    recoverable: Boolean((state || incompleteMarker || artifactRegistryDoc) && existsSync(dir)),
     statePath: paths.state,
     planPath: paths.transactionPlan,
     precheckPath: paths.precheck,
     artifactRegistryPath: paths.artifactRegistry,
-    latestPhase: state?.lifecycle?.phase || null,
-    status: state?.lifecycle?.status || state?.status || plan?.status || precheck?.status || null,
+    latestPhase: state?.lifecycle?.phase || (incompleteMarker ? "precheck-materialization" : null),
+    status: state?.lifecycle?.status || state?.status || plan?.status || precheck?.status || (incompleteMarker ? "precheck_incomplete" : null),
     terminalOutcome: deriveTerminalOutcome({ state, finalReport, activation }),
+    precheckMaterialization: {
+      status: materializationStatus,
+      complete: materializationStatus === "complete",
+      incompleteMarkerPath: paths.precheckIncomplete,
+      incompleteMarker: incompleteMarker || null,
+      lockPath: paths.precheckLock,
+      lock: lock || null,
+      missingRegisteredArtifacts,
+      registryWrittenLast: Boolean(artifactRegistryDoc && materializationStatus === "complete"),
+    },
     repo: state?.repo || plan?.repo || (precheck ? { cwd: precheck.cwd, ...(precheck.git || {}) } : undefined),
     branch: state?.branch || { plannedName: transactionId ? transactionBranchName(transactionId) : undefined, status: "unknown" },
     worktree: { ...(state?.worktree || {}), path: worktreePath, exists: existsSync(worktreePath) },

@@ -162,6 +162,25 @@ try {
   const repeatedPlan = repeatedFirstDetails?.planPath ? JSON.parse(readFileSync(repeatedFirstDetails.planPath, 'utf8')) : undefined;
   log(repeatedState?.repo?.baseCommit === repeatedFirstHead && repeatedState?.branch?.baseCommit === repeatedFirstHead && repeatedState?.worktree?.rootedAtBaseCommit === repeatedFirstHead && repeatedPlan?.repo?.baseCommit === repeatedFirstHead && repeatedSecondHead !== repeatedFirstHead, 'bug-solver repeated precheck preserves immutable base commit/ref, branch, and worktree identity');
   log(repeatedState?.observations?.prechecks?.length >= 2 && repeatedState?.observations?.latestPrecheck?.repo?.head === repeatedSecondHead, 'bug-solver repeated precheck records later repo observations separately from immutable identity');
+  const interruptedArtifacts = join(tmp, 'interrupted-bug-solver-artifacts');
+  const interruptedRepo = join(tmp, 'interrupted-precheck-repo');
+  mkdirSync(interruptedRepo, { recursive: true });
+  expectExit('bug-solver interrupted-precheck repo git init', ['git', 'init', '-q'], 0, { cwd: interruptedRepo });
+  expectExit('bug-solver interrupted-precheck repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: interruptedRepo });
+  expectExit('bug-solver interrupted-precheck repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: interruptedRepo });
+  writeFileSync(join(interruptedRepo, 'README.md'), 'interrupted\n');
+  expectExit('bug-solver interrupted-precheck repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: interruptedRepo });
+  const interruptedId = 'smoke-interrupted-precheck';
+  expectExit('bug-solver injected interruption fails after files before registry', ['node', bugSolverCli, 'precheck', '--cwd', interruptedRepo, '--bug', 'Fix interrupted precheck artifact bug', '--transaction-id', interruptedId, '--json'], 1, { env: { PI_BUG_SOLVER_ARTIFACT_DIR: interruptedArtifacts, PI_BUG_SOLVER_INTERRUPT_PRECHECK_AFTER: 'files' } });
+  const interruptedStatus = expectExit('bug-solver status recovers interrupted precheck by immutable id', ['node', bugSolverCli, 'status', '--transaction-id', interruptedId, '--json'], 0, { env: { PI_BUG_SOLVER_ARTIFACT_DIR: interruptedArtifacts } });
+  let interruptedStatusDetails;
+  try { interruptedStatusDetails = JSON.parse(interruptedStatus.stdout); } catch { interruptedStatusDetails = undefined; }
+  log(interruptedStatusDetails?.recoverable === true && interruptedStatusDetails?.precheckMaterialization?.status === 'incomplete' && interruptedStatusDetails?.artifacts?.files?.artifactRegistry?.exists === false, 'bug-solver interrupted precheck is marked incomplete without a premature artifact registry');
+  const interruptedRetry = expectExit('bug-solver retry completes interrupted precheck with same immutable id', ['node', bugSolverCli, 'precheck', '--cwd', interruptedRepo, '--bug', 'Fix interrupted precheck artifact bug', '--transaction-id', interruptedId, '--json'], 0, { env: { PI_BUG_SOLVER_ARTIFACT_DIR: interruptedArtifacts } });
+  let interruptedRetryDetails;
+  try { interruptedRetryDetails = JSON.parse(interruptedRetry.stdout); } catch { interruptedRetryDetails = undefined; }
+  const interruptedRegistry = interruptedRetryDetails?.artifactRegistryPath ? JSON.parse(readFileSync(interruptedRetryDetails.artifactRegistryPath, 'utf8')) : undefined;
+  log(interruptedRegistry?.materializationComplete === true && interruptedRegistry.entries.every((entry) => existsSync(entry.path)), 'bug-solver writes artifact registry only after all registered artifacts exist on retry');
   const visualizerStoreSource = readFileSync(join(root, 'thread-phase-visualizer/lib/store.mjs'), 'utf8');
   const visualizerIndexSource = readFileSync(join(root, 'thread-phase-visualizer/index.ts'), 'utf8');
   log(!/bug[-_]solver|pi-bug-solver/i.test(`${visualizerStoreSource}\n${visualizerIndexSource}`), 'generic thread-phase visualizer has no bug-solver-specific coupling');
