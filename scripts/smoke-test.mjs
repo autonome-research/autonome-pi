@@ -187,6 +187,25 @@ try {
   log(repeatedState?.repo?.baseCommit === repeatedFirstHead && repeatedState?.branch?.baseCommit === repeatedFirstHead && repeatedState?.worktree?.rootedAtBaseCommit === repeatedFirstHead && repeatedPlan?.repo?.baseCommit === repeatedFirstHead && repeatedPlan?.repo?.dirtyAtPrecheck?.hasDirtyWorktree === false && repeatedSecondHead !== repeatedFirstHead, 'bug-solver repeated precheck preserves immutable base commit/ref, clean dirty-signal snapshot, branch, and worktree identity');
   log(repeatedState?.observations?.prechecks?.length >= 2 && repeatedState?.observations?.latestPrecheck?.repo?.head === repeatedSecondHead, 'bug-solver repeated precheck records later repo observations separately from immutable identity');
   expectExit('bug-solver workflow solve requires explicit approval before activation', ['node', bugSolverCli, 'solve', '--cwd', repeatedPrecheckRepo, '--plan-path', repeatedFirstDetails?.planPath || join(tmp, 'missing-unapproved-plan.json'), '--json'], 1);
+  const gatedSolveRepo = join(tmp, 'gated-solve-repo');
+  mkdirSync(gatedSolveRepo, { recursive: true });
+  expectExit('bug-solver gated-solve repo git init', ['git', 'init', '-q'], 0, { cwd: gatedSolveRepo });
+  expectExit('bug-solver gated-solve repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: gatedSolveRepo });
+  expectExit('bug-solver gated-solve repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: gatedSolveRepo });
+  writeFileSync(join(gatedSolveRepo, 'README.md'), 'clean gated solve\n');
+  expectExit('bug-solver gated-solve repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: gatedSolveRepo });
+  const gatedPrecheck = expectExit('bug-solver workflow precheck for approved gated solve succeeds', ['node', bugSolverCli, 'precheck', '--cwd', gatedSolveRepo, '--bug', 'Fix gated activation integrity bug', '--validation-command', 'npm test', '--json'], 0);
+  let gatedPrecheckDetails;
+  try { gatedPrecheckDetails = JSON.parse(gatedPrecheck.stdout); } catch { gatedPrecheckDetails = undefined; }
+  const gatedSolve = expectExit('bug-solver workflow approved solve records gated activation after integrity checks', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', gatedPrecheckDetails?.planPath || join(tmp, 'missing-gated-plan.json'), '--approved', '--json'], 0);
+  let gatedSolveDetails;
+  try { gatedSolveDetails = JSON.parse(gatedSolve.stdout); } catch { gatedSolveDetails = undefined; }
+  const gatedActivation = gatedSolveDetails?.activationPath ? JSON.parse(readFileSync(gatedSolveDetails.activationPath, 'utf8')) : undefined;
+  log(gatedActivation?.schema === 'pi-bug-solver-workflow/gated-activation/v1' && gatedActivation?.integrityChecks?.validationContract === 'materialized_with_evidence_map' && gatedActivation?.editCapableResourcesCreated === false, 'bug-solver approved solve writes real gated activation without edit-capable resources');
+  const gatedPlan = gatedPrecheckDetails?.planPath ? JSON.parse(readFileSync(gatedPrecheckDetails.planPath, 'utf8')) : undefined;
+  const forgedInRepoContractPlan = join(tmp, 'forged-in-repo-contract-plan.json');
+  writeFileSync(forgedInRepoContractPlan, JSON.stringify({ ...gatedPlan, validation: { ...(gatedPlan?.validation || {}), contractPath: join(gatedSolveRepo, 'contract.json') }, validationContractPath: join(gatedSolveRepo, 'contract.json') }, null, 2));
+  expectExit('bug-solver workflow solve gate rejects validation contract paths inside target repo before edits', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', forgedInRepoContractPlan, '--approved', '--json'], 1);
   const dirtyPrecheckRepo = join(tmp, 'dirty-precheck-repo');
   mkdirSync(dirtyPrecheckRepo, { recursive: true });
   expectExit('bug-solver dirty-precheck repo git init', ['git', 'init', '-q'], 0, { cwd: dirtyPrecheckRepo });

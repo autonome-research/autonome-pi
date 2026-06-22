@@ -1042,7 +1042,7 @@ async function solve(args, json) {
   validateArtifactRootExternal({ cwd, git });
   if (!args.approved) die("solve requires --approved after explicit precheck confirmation", 1, json);
   if (!args["plan-path"]) die("solve requires --plan-path from precheck", 1, json);
-  const planPath = resolve(String(args["plan-path"]));
+  const planPath = resolve(expandHomePath(String(args["plan-path"])));
   if (!existsSync(planPath)) die(`precheck plan not found: ${planPath}`, 1, json);
   const planArtifact = readJson(planPath);
   const plan = normalizeSolvePlanArtifact(planArtifact);
@@ -1062,21 +1062,33 @@ async function solve(args, json) {
     const currentDirty = git.dirty || parseGitStatusSignals(git.statusShort);
     if (precheckDirty.hasDirtyWorktree) throw new Error(`Refusing unsafe plan recorded against a dirty worktree before edit-capable phases: ${precheckDirty.statusShort}`);
     if (currentDirty.hasDirtyWorktree) throw new Error(`Refusing solve activation from a dirty caller worktree before edit-capable phases: ${currentDirty.statusShort}`);
-    if (planArtifact?.repo?.baseCommit && git.head && planArtifact.repo.baseCommit !== git.head) throw new Error(`Refusing solve activation because caller HEAD ${git.head} differs from recorded base ${planArtifact.repo.baseCommit}; rerun precheck at the intended base.`);
     if (!gate.safeBeforeEditCapablePhase) throw new Error(`Transaction plan is unsafe before edit-capable phases: ${gate.reasons.join("; ")}`);
-    phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS);
-    phaseStart(run, "activation-scaffold", { transactionId });
+    const integrity = assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd });
+    phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS, { integrity: "passed", validationAssertions: integrity.contract.assertions.length, artifactCount: integrity.registry.entries.length });
+    phaseStart(run, "gated-activation", { transactionId });
     const activation = {
-      schema: "pi-bug-solver-workflow/activation-scaffold/v1",
+      schema: "pi-bug-solver-workflow/gated-activation/v1",
       transactionId,
       createdAt: new Date().toISOString(),
-      status: "not_implemented_in_scaffold",
+      status: "approved_gate_passed",
+      editingAllowed: false,
+      editCapableResourcesCreated: false,
       planPath,
       validationContractPath: plan.validationContractPath,
+      statePath: plan.artifacts?.state || plan.evidencePaths?.state,
+      artifactRegistryPath: plan.artifactRegistryPath || plan.artifacts?.artifactRegistry || plan.evidencePaths?.artifactRegistry,
       evidencePaths: plan.evidencePaths || {},
-      message: "Persistent extension entrypoint is registered. Later milestones implement isolated worktree solving and bounded repairs.",
+      integrityChecks: {
+        approved: true,
+        exactlyOneBug: true,
+        immutableBaseMetadata: "verified",
+        validationContract: "materialized_with_evidence_map",
+        externalArtifacts: "verified",
+        safePlanSchema: plan.sourceKind,
+      },
+      message: "Solve confirmation gate passed. Later edit-capable phases may create isolated resources only after these durable safety checks.",
     };
-    const file = join(transactionDir(transactionId), "activation-scaffold.json");
+    const file = join(transactionDir(transactionId), "activation-gate.json");
     writeJson(file, activation);
     const statePath = plan.artifacts?.state || join(transactionDir(transactionId), "state.json");
     if (existsSync(statePath)) {
@@ -1085,19 +1097,19 @@ async function solve(args, json) {
         ...state,
         updatedAt: new Date().toISOString(),
         revision: Number.isInteger(state.revision) ? state.revision + 1 : 1,
-        lifecycle: { ...(state.lifecycle || {}), status: "activation_scaffold_recorded", phase: "activation-scaffold", editingAllowed: false, terminal: false },
-        reports: { ...(state.reports || {}), activationScaffoldPath: file },
+        lifecycle: { ...(state.lifecycle || {}), status: "activation_gate_passed", phase: "gated-activation", editingAllowed: false, terminal: false },
+        reports: { ...(state.reports || {}), activationGatePath: file },
       };
       writeJson(statePath, updatedState);
       updateGlobalRegistry(updatedState);
       emitArtifact(run, { kind: "file", title: "bug-solver transaction state", path: statePath });
     }
-    emitArtifact(run, { kind: "file", title: "bug-solver activation scaffold", path: file });
-    phaseEnd(run, "activation-scaffold", STATUSES.SUCCESS, { artifactPath: file });
+    emitArtifact(run, { kind: "file", title: "bug-solver gated activation", path: file });
+    phaseEnd(run, "gated-activation", STATUSES.SUCCESS, { artifactPath: file });
     completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file });
-    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file };
+    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file, status: activation.status, editCapableResourcesCreated: false };
     if (json) console.log(JSON.stringify(result, null, 2));
-    else console.log(`activation scaffold recorded: ${file}`);
+    else console.log(`gated activation recorded: ${file}`);
   } catch (error) {
     failRun(run, error, { transactionId: plan.transactionId });
     die(error.message || String(error), 1, json);
@@ -1146,9 +1158,100 @@ function lastJsonlRecord(file) {
 }
 
 function planDirtySignals(plan) {
-  const repo = plan?.repo || {};
+  const repo = plan?.repo || plan?.immutableTransactionIdentity?.repo || plan?.git || {};
   const dirty = repo.dirtyAtPrecheck || repo.dirty || parseGitStatusSignals(repo.statusAtPrecheck || repo.statusShort || "");
   return dirty;
+}
+
+function collectStringPaths(value, paths = new Set()) {
+  if (!value || typeof value !== "object") return paths;
+  for (const entry of Object.values(value)) {
+    if (typeof entry === "string" && (entry.startsWith("/") || entry.startsWith("~"))) paths.add(resolve(expandHomePath(entry)));
+    else if (entry && typeof entry === "object") collectStringPaths(entry, paths);
+  }
+  return paths;
+}
+
+function assertPathExternalToTarget(file, label, { targetRoot, targetCwd }) {
+  if (!file || typeof file !== "string") throw new Error(`Transaction plan is missing required artifact path: ${label}`);
+  if (!isAbsolute(expandHomePath(file))) throw new Error(`Transaction artifact path for ${label} must be absolute and external: ${file}`);
+  const absolute = resolve(expandHomePath(file));
+  const physical = physicalPathForContainment(absolute);
+  if (sameOrInsidePath(absolute, targetRoot) || sameOrInsidePath(absolute, targetCwd) || sameOrInsidePath(physical, physicalPathForContainment(targetRoot)) || sameOrInsidePath(physical, physicalPathForContainment(targetCwd))) {
+    throw new Error(`Unsafe transaction artifact path for ${label}; must be external to target repository: ${absolute}`);
+  }
+  return absolute;
+}
+
+function assertExistingExternalFile(file, label, context) {
+  const absolute = assertPathExternalToTarget(file, label, context);
+  if (!existsSync(absolute)) throw new Error(`Required durable artifact for ${label} does not exist before solve activation: ${absolute}`);
+  return absolute;
+}
+
+function assertImmutableBaseMetadata({ planArtifact, state, git }) {
+  const repo = planArtifact?.repo || planArtifact?.immutableTransactionIdentity?.repo || planArtifact?.git || {};
+  const baseCommit = repo.baseCommit || repo.head;
+  if (!baseCommit || typeof baseCommit !== "string") throw new Error("Transaction plan is missing immutable base commit metadata.");
+  if (git.head && baseCommit !== git.head) throw new Error(`Refusing solve activation because caller HEAD ${git.head} differs from recorded base ${baseCommit}; rerun precheck at the intended base.`);
+  const mismatches = [];
+  if (state?.repo?.baseCommit && state.repo.baseCommit !== baseCommit) mismatches.push(`state.repo.baseCommit=${state.repo.baseCommit}`);
+  if (state?.branch?.baseCommit && state.branch.baseCommit !== baseCommit) mismatches.push(`state.branch.baseCommit=${state.branch.baseCommit}`);
+  if (state?.worktree?.rootedAtBaseCommit && state.worktree.rootedAtBaseCommit !== baseCommit) mismatches.push(`state.worktree.rootedAtBaseCommit=${state.worktree.rootedAtBaseCommit}`);
+  if (mismatches.length) throw new Error(`Transaction immutable base metadata is inconsistent with plan base ${baseCommit}: ${mismatches.join(", ")}`);
+  return baseCommit;
+}
+
+function assertValidationContractIntegrity(contractPath, context) {
+  const file = assertExistingExternalFile(contractPath, "validationContract", context);
+  const contract = readJson(file);
+  if (contract?.schema !== "pi-bug-solver-workflow/validation-contract/v1") throw new Error(`Validation contract has unsafe or unrecognized schema: ${contract?.schema || "missing"}`);
+  if (contract.createdBeforeImplementation !== true || contract.evidenceMappingCreatedBeforeImplementation !== true) throw new Error("Validation contract must be created with evidence mappings before implementation.");
+  if (!Array.isArray(contract.assertions) || contract.assertions.length === 0) throw new Error("Validation contract must contain explicit assertions before solve activation.");
+  const evidenceMap = contract.workflowEvidenceMap || {};
+  for (const assertion of contract.assertions) {
+    const mapped = evidenceMap[assertion.id];
+    if (!Array.isArray(mapped) || mapped.length === 0) throw new Error(`Validation assertion ${assertion.id || "<missing>"} is not mapped to durable evidence paths.`);
+    for (const evidencePath of mapped) assertExistingExternalFile(evidencePath, `validationContract.workflowEvidenceMap.${assertion.id}`, context);
+  }
+  return contract;
+}
+
+function assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd }) {
+  const targetRoot = resolve(git?.root || cwd);
+  const targetCwd = resolve(cwd);
+  const context = { targetRoot, targetCwd };
+  if (plan.sourceKind !== "transaction-plan" && plan.sourceKind !== "precheck") throw new Error(`Refusing unsafe plan schema before edit-capable phases: ${planArtifact?.schema || "missing"}`);
+  assertExistingExternalFile(planPath, "planPath", context);
+  const statePath = planArtifact.statePath || plan.artifacts?.state || plan.evidencePaths?.state;
+  const artifactRegistryPath = planArtifact.artifactRegistryPath || plan.artifacts?.artifactRegistry || plan.evidencePaths?.artifactRegistry;
+  const stateFile = assertExistingExternalFile(statePath, "state", context);
+  const state = readJson(stateFile);
+  if (state?.schema !== "pi-bug-solver-workflow/state/v1") throw new Error(`Transaction state has unsafe or unrecognized schema: ${state?.schema || "missing"}`);
+  if (state.transactionId !== plan.transactionId) throw new Error("Transaction state id does not match solve plan id.");
+  assertImmutableBaseMetadata({ planArtifact, state, git });
+  const registryFile = assertExistingExternalFile(artifactRegistryPath, "artifactRegistry", context);
+  const registry = readJson(registryFile);
+  if (registry?.schema !== "pi-bug-solver-workflow/artifact-registry/v1" || registry.materializationComplete !== true || !Array.isArray(registry.entries) || registry.entries.length === 0) throw new Error("Artifact registry must be materialized before solve activation.");
+  for (const entry of registry.entries) {
+    assertExistingExternalFile(entry.path, `artifactRegistry.entries.${entry.kind || "artifact"}`, context);
+    if (entry.externalToTargetRepo !== true || entry.durableAtPrecheck !== true || entry.lifecycleStatus !== "materialized_at_precheck") throw new Error(`Artifact registry entry is not a durable external precheck artifact: ${entry.kind || entry.path}`);
+  }
+  const contract = assertValidationContractIntegrity(plan.validationContractPath, context);
+  const expectedTransactionPlan = planArtifact.transactionPlanPath || plan.artifacts?.transactionPlan;
+  if (plan.sourceKind === "precheck" && expectedTransactionPlan) {
+    const transactionPlanFile = assertExistingExternalFile(expectedTransactionPlan, "transactionPlan", context);
+    const transactionPlan = readJson(transactionPlanFile);
+    if (transactionPlan?.schema !== "pi-bug-solver-workflow/transaction-plan/v1" || transactionPlan.transactionId !== plan.transactionId) throw new Error("Precheck artifact does not point to a matching durable transaction plan.");
+  }
+  for (const [index, artifactPath] of [...collectStringPaths(planArtifact.artifacts), ...collectStringPaths(planArtifact.evidencePaths)].entries()) {
+    if ([".precheck-incomplete.json", ".precheck.lock"].some((suffix) => artifactPath.endsWith(suffix))) {
+      assertPathExternalToTarget(artifactPath, `plan.artifactPath.${index}`, context);
+      continue;
+    }
+    assertExistingExternalFile(artifactPath, `plan.artifactPath.${index}`, context);
+  }
+  return { state, registry, contract };
 }
 
 function deriveTerminalOutcome({ state, finalReport, activation }) {
@@ -1174,7 +1277,7 @@ function loadTransactionInspection(dir, transactionIdHint) {
   const lock = tryReadJson(paths.precheckLock);
   const lockInspection = inspectPrecheckLock(paths.precheckLock);
   const finalReport = tryReadJson(paths.finalReport);
-  const activation = tryReadJson(join(dir, "activation-scaffold.json"));
+  const activation = tryReadJson(join(dir, "activation-gate.json")) || tryReadJson(join(dir, "activation-scaffold.json"));
   const transactionId = state?.transactionId || plan?.transactionId || precheck?.transactionId || transactionIdHint;
   const reportsDir = state?.reports?.intermediateReportsDir || paths.intermediateReportsDir;
   const registryEntries = artifactRegistryDoc?.entries || expectedRegistryEntries({ artifactPaths: paths }).map((entry) => ({ ...entry, lifecycleStatus: "expected_not_registered_until_materialized", durableAtPrecheck: false }));
@@ -1223,6 +1326,7 @@ function loadTransactionInspection(dir, transactionIdHint) {
     reports: {
       finalReport: fileSummary(state?.reports?.finalReportPath || paths.finalReport),
       precheckReport: fileSummary(state?.reports?.precheckReportPath || paths.precheckReport),
+      activationGate: fileSummary(join(dir, "activation-gate.json")),
       activationScaffold: fileSummary(join(dir, "activation-scaffold.json")),
       intermediateReportsDir: reportsDir,
       intermediateReports: listJsonReports(reportsDir),

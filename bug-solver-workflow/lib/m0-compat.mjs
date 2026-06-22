@@ -11,7 +11,7 @@ export const BUG_SOLVER_SCHEMAS = Object.freeze({
   transactionPlan: "pi-bug-solver-workflow/transaction-plan/v1",
   validationContract: "pi-bug-solver-workflow/validation-contract/v1",
   state: "pi-bug-solver-workflow/state/v1",
-  activationScaffold: "pi-bug-solver-workflow/activation-scaffold/v1",
+  gatedActivation: "pi-bug-solver-workflow/gated-activation/v1",
 });
 
 function asObject(value) {
@@ -87,7 +87,7 @@ export function normalizeSolvePlanArtifact(artifact) {
     validationContractPath: firstString(input.validationContractPath, validation.contractPath),
     evidencePaths,
     artifacts: asObject(input.artifacts),
-    repo: asObject(input.repo),
+    repo: asObject(input.repo || input.immutableTransactionIdentity?.repo || input.git),
     sourceKind: isBugSolverPrecheckArtifact(input) ? "precheck" : isBugSolverTransactionPlan(input) ? "transaction-plan" : "unrecognized-schema",
   };
 }
