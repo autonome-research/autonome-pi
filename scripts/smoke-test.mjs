@@ -166,6 +166,24 @@ try {
   let bugDirStatusDetails;
   try { bugDirStatusDetails = bugDirStatus?.stdout ? JSON.parse(bugDirStatus.stdout) : undefined; } catch { bugDirStatusDetails = undefined; }
   log(bugDirStatusDetails?.transactionId === bugPrecheckDetails?.transactionId && bugDirStatusDetails?.artifactRegistryPath === bugPrecheckDetails?.artifactRegistryPath, 'bug-solver status can recover transaction details from a directory without a target repo edit');
+  const atomicValidationRepo = join(tmp, 'atomic-validation-command-repo');
+  mkdirSync(atomicValidationRepo, { recursive: true });
+  expectExit('bug-solver atomic-validation repo git init', ['git', 'init', '-q'], 0, { cwd: atomicValidationRepo });
+  expectExit('bug-solver atomic-validation repo config user email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: atomicValidationRepo });
+  expectExit('bug-solver atomic-validation repo config user name', ['git', 'config', 'user.name', 'Test User'], 0, { cwd: atomicValidationRepo });
+  writeFileSync(join(atomicValidationRepo, 'README.md'), 'atomic validation command\n');
+  expectExit('bug-solver atomic-validation repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: atomicValidationRepo });
+  const atomicValidationCommand = 'printf "alpha,beta"; exit 1';
+  const atomicValidationPrecheck = expectExit('bug-solver precheck preserves semicolon/comma validation command atomically', ['node', bugSolverCli, 'precheck', '--cwd', atomicValidationRepo, '--bug', 'Fix atomic validation command bug', '--user-test-command', 'printf targeted', '--validation-command', atomicValidationCommand, '--json'], 0);
+  let atomicValidationPrecheckDetails;
+  try { atomicValidationPrecheckDetails = JSON.parse(atomicValidationPrecheck.stdout); } catch { atomicValidationPrecheckDetails = undefined; }
+  const atomicValidationPlan = atomicValidationPrecheckDetails?.planPath ? JSON.parse(readFileSync(atomicValidationPrecheckDetails.planPath, 'utf8')) : undefined;
+  const atomicValidationSolve = expectExit('bug-solver solve executes preserved validation command in baseline and post-change validation', ['node', bugSolverCli, 'solve', '--cwd', atomicValidationRepo, '--plan-path', atomicValidationPrecheckDetails?.planPath || join(tmp, 'missing-atomic-validation-plan.json'), '--approved', '--json'], 0);
+  let atomicValidationSolveDetails;
+  try { atomicValidationSolveDetails = JSON.parse(atomicValidationSolve.stdout); } catch { atomicValidationSolveDetails = undefined; }
+  const atomicValidationBaseline = atomicValidationSolveDetails?.baselinePath ? JSON.parse(readFileSync(atomicValidationSolveDetails.baselinePath, 'utf8')) : undefined;
+  const atomicValidationPost = atomicValidationSolveDetails?.postValidationPath ? JSON.parse(readFileSync(atomicValidationSolveDetails.postValidationPath, 'utf8')) : undefined;
+  log(atomicValidationPlan?.validation?.commands?.length === 1 && atomicValidationPlan.validation.commands[0] === atomicValidationCommand && atomicValidationBaseline?.commandResults?.length === 2 && atomicValidationBaseline.commandResults[1]?.command === atomicValidationCommand && atomicValidationBaseline.commandResults[1]?.status === 1 && atomicValidationPost?.commandResults?.length === 2 && atomicValidationPost.commandResults[1]?.command === atomicValidationCommand && atomicValidationPost.commandResults[1]?.status === 1, 'bug-solver stores and executes each repeated validation-command flag atomically through baseline and post-change validation');
   const interruptedArtifactRoot = join(tmp, 'interrupted-precheck-artifacts');
   const interruptedTransactionId = 'smoke-interrupted-precheck-registry-last';
   const interruptedTransactionDir = join(interruptedArtifactRoot, 'transactions', interruptedTransactionId);

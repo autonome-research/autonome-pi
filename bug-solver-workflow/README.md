@@ -19,6 +19,7 @@ node bug-solver-workflow/bin/bug-solver-workflow.mjs precheck \
   --cwd /path/to/repo \
   --bug "Fix login returning 500 for expired reset tokens" \
   --validation-command "npm test" \
+  --validation-command "npm run lint; npm run typecheck" \
   --user-test-command "npm test -- login-reset.repro.test" \
   --max-repairs 8 \
   --allowlist "src/auth" \
@@ -36,6 +37,8 @@ node bug-solver-workflow/bin/bug-solver-workflow.mjs solve \
   --implementation-command 'npm run fix:targeted-bug' \
   --json
 ```
+
+Pass each broad validation command as its own repeated `--validation-command` flag. The workflow stores and executes each flag value atomically, so shell punctuation inside a command (for example `;`, `&&`, pipes, or commas in arguments) is preserved for both baseline and post-change validation instead of being treated as a command separator.
 
 Inspect resumable transaction state at any time without touching the target repository:
 

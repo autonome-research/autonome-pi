@@ -89,6 +89,13 @@ function splitList(value: unknown): string[] {
 	return String(value).split(/[;,]/).map((s) => s.trim()).filter(Boolean);
 }
 
+function commandList(value: unknown): string[] {
+	if (!value) return [];
+	if (Array.isArray(value)) return value.flatMap(commandList);
+	const command = String(value).trim();
+	return command ? [command] : [];
+}
+
 function buildArgs(params: Record<string, any>, ctx: any): string[] {
 	const args = [String(params.action || "precheck"), "--cwd", params.cwd, "--json"];
 	if (params.bug) args.push("--bug", params.bug);
@@ -101,7 +108,7 @@ function buildArgs(params: Record<string, any>, ctx: any): string[] {
 	if (params.implementationCommand) args.push("--implementation-command", params.implementationCommand);
 	if (params.maxRepairIterations !== undefined) args.push("--max-repairs", String(params.maxRepairIterations));
 	for (const entry of splitList(params.allowlist)) args.push("--allowlist", entry);
-	for (const command of splitList(params.validationCommands)) args.push("--validation-command", command);
+	for (const command of commandList(params.validationCommands)) args.push("--validation-command", command);
 	return addSessionArgs(args, ctx);
 }
 

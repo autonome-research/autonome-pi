@@ -45,7 +45,7 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  return `Usage:\n  bug-solver-workflow precheck --bug <single bug> [--cwd <repo>] [--validation-command <cmd>] [--user-test-command <cmd>] [--max-repairs <n>] [--allowlist <path>] [--json]\n  bug-solver-workflow solve --plan-path <transaction-plan.json|precheck.json> --approved [--cwd <repo>] [--implementation-command <cmd>] [--json]\n  bug-solver-workflow status [--transaction-id <id>|--transaction-dir <dir>] [--json]\n\nThe solve action is intentionally approval-gated. Runtime artifacts are written outside the target repo under ${ARTIFACT_ROOT}.`;
+  return `Usage:\n  bug-solver-workflow precheck --bug <single bug> [--cwd <repo>] [--validation-command <cmd>]... [--user-test-command <cmd>] [--max-repairs <n>] [--allowlist <path>] [--json]\n  bug-solver-workflow solve --plan-path <transaction-plan.json|precheck.json> --approved [--cwd <repo>] [--implementation-command <cmd>] [--json]\n  bug-solver-workflow status [--transaction-id <id>|--transaction-dir <dir>] [--json]\n\nRepeat --validation-command for multiple broad commands; each value is stored and executed unchanged, including shell semicolons and commas inside the command. The solve action is intentionally approval-gated. Runtime artifacts are written outside the target repo under ${ARTIFACT_ROOT}.`;
 }
 
 function die(message, code = 1, json = false) {
@@ -66,6 +66,19 @@ function splitValues(value) {
   if (!value) return [];
   const values = Array.isArray(value) ? value : [value];
   return values.flatMap((item) => String(item).split(/[;,]/)).map((s) => s.trim()).filter(Boolean);
+}
+
+function commandValues(value) {
+  if (!value) return [];
+  const values = Array.isArray(value) ? value : [value];
+  return values.flatMap((item) => {
+    if (Array.isArray(item)) return commandValues(item);
+    return [String(item).trim()];
+  }).filter(Boolean);
+}
+
+function splitValidationCommands(args) {
+  return commandValues(args["validation-command"] || args.validationCommands);
 }
 
 function expandHomePath(input) {
@@ -108,9 +121,6 @@ function pathRelative(from, to) {
   return importPathRelative(from, to).replace(/\\/g, "/");
 }
 
-function splitValidationCommands(args) {
-  return splitValues(args["validation-command"] || args.validationCommands);
-}
 
 function parseMaxRepairs(value) {
   if (value === undefined || value === true || value === "") return 8;
