@@ -370,6 +370,13 @@ try {
   const implementationPhaseContext = implementationPhaseSolveDetails?.implementationContextPath ? JSON.parse(readFileSync(implementationPhaseSolveDetails.implementationContextPath, 'utf8')) : undefined;
   const implementationPhasePostValidation = implementationPhaseSolveDetails?.postValidationPath ? JSON.parse(readFileSync(implementationPhaseSolveDetails.postValidationPath, 'utf8')) : undefined;
   log(implementationPhaseRecord?.editCapable === true && implementationPhaseRecord?.commandProvided === true && implementationPhaseRecord?.worktreeChangedAfterBaseline === true && implementationPhaseRecord?.changedFiles?.includes('README.md') && implementationPhaseContext?.status === 'ready_for_implementation' && implementationPhaseContext?.isolatedWorktreePath === implementationPhaseSolveDetails?.worktreePath && implementationPhaseContext?.baselineSummary?.status === 'completed_with_pre_existing_failures' && implementationPhaseContext?.allowlistPolicy?.justificationRequiredForExpansion === true && implementationPhaseRecord?.workerContext?.requiredEvidencePaths?.implementationContext === implementationPhaseSolveDetails?.implementationContextPath && implementationPhasePostValidation?.finalVerification?.targetedTransitions?.[0]?.baselineStatus === 1 && implementationPhasePostValidation?.finalVerification?.targetedTransitions?.[0]?.postStatus === 0 && implementationPhasePostValidation?.finalVerification?.targetedTransitions?.[0]?.fixedByOutcomeTransition === true && implementationPhasePostValidation?.finalVerification?.bugFixed === true && implementationPhasePostValidation?.finalVerification?.implementationBacked === true, 'bug-solver solve supplies durable implementation context to the isolated worker, captures changed files/evidence, and proves outcome-based bug fix');
+  const implementationStateBeforeRepeat = implementationPhasePrecheckDetails?.statePath ? JSON.parse(readFileSync(implementationPhasePrecheckDetails.statePath, 'utf8')) : undefined;
+  const implementationRepeatSolve = expectExit('bug-solver workflow repeated completed solve returns durable outcome without rerunning', ['node', bugSolverCli, 'solve', '--cwd', implementationPhaseRepo, '--plan-path', implementationPhasePrecheckDetails?.planPath || join(tmp, 'missing-implementation-phase-plan.json'), '--approved', '--json'], 0);
+  let implementationRepeatDetails;
+  try { implementationRepeatDetails = JSON.parse(implementationRepeatSolve.stdout); } catch { implementationRepeatDetails = undefined; }
+  const implementationStateAfterRepeat = implementationPhasePrecheckDetails?.statePath ? JSON.parse(readFileSync(implementationPhasePrecheckDetails.statePath, 'utf8')) : undefined;
+  const implementationWorktreeMetadataAfterRepeat = implementationPhaseSolveDetails?.worktreeMetadataPath ? JSON.parse(readFileSync(implementationPhaseSolveDetails.worktreeMetadataPath, 'utf8')) : undefined;
+  log(implementationRepeatDetails?.status === 'already_completed' && implementationRepeatDetails?.idempotent === true && implementationStateAfterRepeat?.lifecycle?.status === 'completed' && implementationStateAfterRepeat?.revision === implementationStateBeforeRepeat?.revision && implementationWorktreeMetadataAfterRepeat?.cleanup?.lastApplication?.status === 'preserved_by_policy', 'bug-solver repeated completed solve is idempotent and preserves recorded worktree cleanup policy');
 
   const unrelatedEditRepo = join(tmp, 'external-stateful-targeted-unrelated-edit-repo');
   mkdirSync(unrelatedEditRepo, { recursive: true });
@@ -451,30 +458,37 @@ try {
   const lateRepairAttempts = lateExpansionSolveDetails?.repairAttemptsPath ? readFileSync(lateExpansionSolveDetails.repairAttemptsPath, 'utf8').trim().split(/\n+/).filter(Boolean).map((line) => JSON.parse(line)) : [];
   log(lateInitialRecord?.allowlist?.accepted === false && lateInitialRecord?.allowlist?.ignoredLateExpansionRecords?.some((record) => record.paths?.includes('src') && /not durable before/.test(record.reason || '')) && lateRepairRecord?.allowlist?.accepted === true && lateRepairRecord?.allowlist?.acceptedExpansions?.some((record) => record.paths?.includes('src') && record.durableBeforeAcceptanceWindow === true) && lateRepairAttempts.some((record) => record.type === 'repair_attempt_completed' && record.allowlistAccepted === true), 'bug-solver rejects allowlist expansions appended during out-of-scope edits until a subsequent repair attempt snapshots them as already durable');
 
-  const gatedRepeatSolve = expectExit('bug-solver workflow repeated approved solve reuses isolated worktree safely', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', gatedPrecheckDetails?.planPath || join(tmp, 'missing-gated-plan.json'), '--approved', '--json'], 0);
+  const gatedStateBeforeRepeat = gatedPrecheckDetails?.statePath ? JSON.parse(readFileSync(gatedPrecheckDetails.statePath, 'utf8')) : undefined;
+  const gatedRepeatSolve = expectExit('bug-solver workflow repeated approved solve returns completed transaction safely', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', gatedPrecheckDetails?.planPath || join(tmp, 'missing-gated-plan.json'), '--approved', '--json'], 0);
   let gatedRepeatSolveDetails;
   try { gatedRepeatSolveDetails = JSON.parse(gatedRepeatSolve.stdout); } catch { gatedRepeatSolveDetails = undefined; }
   const gatedRepeatMetadata = gatedRepeatSolveDetails?.worktreeMetadataPath ? JSON.parse(readFileSync(gatedRepeatSolveDetails.worktreeMetadataPath, 'utf8')) : undefined;
-  log(gatedRepeatMetadata?.worktree?.action === 'reused' && gatedRepeatMetadata?.branch?.action === 'reused' && gatedRepeatMetadata?.cleanup?.durableReuse === true, 'bug-solver repeated solve records durable worktree/branch reuse and cleanup metadata');
-  const gatedBaselineBeforeDirtyReuse = gatedSolveDetails?.baselinePath ? JSON.parse(readFileSync(gatedSolveDetails.baselinePath, 'utf8')) : undefined;
-  if (gatedSolveDetails?.worktreePath) writeFileSync(join(gatedSolveDetails.worktreePath, 'dirty-reused-worktree.txt'), 'dirty reuse should be refused before baseline\n');
-  expectExit('bug-solver workflow refuses dirty reused transaction worktree before baseline validation', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', gatedPrecheckDetails?.planPath || join(tmp, 'missing-gated-plan.json'), '--approved', '--json'], 1);
-  const dirtyReuseMetadata = gatedSolveDetails?.worktreeMetadataPath ? JSON.parse(readFileSync(gatedSolveDetails.worktreeMetadataPath, 'utf8')) : undefined;
-  const gatedBaselineAfterDirtyReuse = gatedSolveDetails?.baselinePath ? JSON.parse(readFileSync(gatedSolveDetails.baselinePath, 'utf8')) : undefined;
-  log(dirtyReuseMetadata?.status === 'refused_before_baseline_validation' && dirtyReuseMetadata?.baselineReadiness?.type === 'baseline_worktree_integrity_refusal' && dirtyReuseMetadata?.baselineReadiness?.assessment?.checks?.cleanWorktree === false && gatedBaselineAfterDirtyReuse?.completedAt === gatedBaselineBeforeDirtyReuse?.completedAt, 'bug-solver dirty reused worktree refusal is durable and does not rewrite baseline-validation.json');
+  const gatedStateAfterRepeat = gatedPrecheckDetails?.statePath ? JSON.parse(readFileSync(gatedPrecheckDetails.statePath, 'utf8')) : undefined;
+  log(gatedRepeatSolveDetails?.status === 'already_completed' && gatedRepeatSolveDetails?.idempotent === true && gatedStateAfterRepeat?.revision === gatedStateBeforeRepeat?.revision && gatedRepeatMetadata?.cleanup?.durableReuse === true, 'bug-solver repeated completed solve returns durable outcome without corrupting transaction state or cleanup metadata');
+  const gatedBaselineBeforeDirtyRepeat = gatedSolveDetails?.baselinePath ? JSON.parse(readFileSync(gatedSolveDetails.baselinePath, 'utf8')) : undefined;
+  if (gatedSolveDetails?.worktreePath) writeFileSync(join(gatedSolveDetails.worktreePath, 'dirty-reused-worktree.txt'), 'dirty completed transaction remains inspectable\n');
+  const dirtyCompletedRepeat = expectExit('bug-solver workflow repeated completed solve ignores dirty preserved worktree', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', gatedPrecheckDetails?.planPath || join(tmp, 'missing-gated-plan.json'), '--approved', '--json'], 0);
+  let dirtyCompletedRepeatDetails;
+  try { dirtyCompletedRepeatDetails = JSON.parse(dirtyCompletedRepeat.stdout); } catch { dirtyCompletedRepeatDetails = undefined; }
+  const gatedBaselineAfterDirtyRepeat = gatedSolveDetails?.baselinePath ? JSON.parse(readFileSync(gatedSolveDetails.baselinePath, 'utf8')) : undefined;
+  log(dirtyCompletedRepeatDetails?.status === 'already_completed' && gatedBaselineAfterDirtyRepeat?.completedAt === gatedBaselineBeforeDirtyRepeat?.completedAt && existsSync(join(gatedSolveDetails?.worktreePath || '', 'dirty-reused-worktree.txt')), 'bug-solver repeated completed solve leaves inspectable artifacts/worktree untouched and does not rewrite baseline evidence');
+  const gateIntegrityPrecheck = expectExit('bug-solver workflow precheck for solve gate integrity tampering succeeds', ['node', bugSolverCli, 'precheck', '--cwd', gatedSolveRepo, '--bug', 'Fix solve gate integrity tamper bug', '--json'], 0);
+  let gateIntegrityPrecheckDetails;
+  try { gateIntegrityPrecheckDetails = JSON.parse(gateIntegrityPrecheck.stdout); } catch { gateIntegrityPrecheckDetails = undefined; }
+  const gateIntegrityPlan = gateIntegrityPrecheckDetails?.planPath ? JSON.parse(readFileSync(gateIntegrityPrecheckDetails.planPath, 'utf8')) : undefined;
   const copiedRegisteredPlan = join(tmp, 'copied-registered-transaction-plan.json');
-  writeFileSync(copiedRegisteredPlan, JSON.stringify(gatedPlan, null, 2));
+  writeFileSync(copiedRegisteredPlan, JSON.stringify(gateIntegrityPlan, null, 2));
   expectExit('bug-solver workflow solve gate rejects copied transaction plans not at the registered durable path', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', copiedRegisteredPlan, '--approved', '--json'], 1);
-  const tamperedRegistryPath = gatedPrecheckDetails?.artifactRegistryPath;
+  const tamperedRegistryPath = gateIntegrityPrecheckDetails?.artifactRegistryPath;
   if (tamperedRegistryPath) {
     const originalRegistry = JSON.parse(readFileSync(tamperedRegistryPath, 'utf8'));
     const tamperedContract = join(tmp, 'tampered-validation-contract.json');
     writeFileSync(tamperedContract, JSON.stringify(bugContract || {}, null, 2));
     writeFileSync(tamperedRegistryPath, JSON.stringify({ ...originalRegistry, entries: originalRegistry.entries.map((entry) => entry.kind === 'validationContract' ? { ...entry, path: tamperedContract } : entry) }, null, 2));
-    expectExit('bug-solver workflow solve gate rejects artifact-registry validation contract mismatches before edits', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', gatedPrecheckDetails?.planPath || join(tmp, 'missing-gated-plan.json'), '--approved', '--json'], 1);
+    expectExit('bug-solver workflow solve gate rejects artifact-registry validation contract mismatches before edits', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', gateIntegrityPrecheckDetails?.planPath || join(tmp, 'missing-gated-plan.json'), '--approved', '--json'], 1);
   }
   const forgedInRepoContractPlan = join(tmp, 'forged-in-repo-contract-plan.json');
-  writeFileSync(forgedInRepoContractPlan, JSON.stringify({ ...gatedPlan, validation: { ...(gatedPlan?.validation || {}), contractPath: join(gatedSolveRepo, 'contract.json') }, validationContractPath: join(gatedSolveRepo, 'contract.json') }, null, 2));
+  writeFileSync(forgedInRepoContractPlan, JSON.stringify({ ...gateIntegrityPlan, validation: { ...(gateIntegrityPlan?.validation || {}), contractPath: join(gatedSolveRepo, 'contract.json') }, validationContractPath: join(gatedSolveRepo, 'contract.json') }, null, 2));
   expectExit('bug-solver workflow solve gate rejects validation contract paths inside target repo before edits', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', forgedInRepoContractPlan, '--approved', '--json'], 1);
   const dirtyPrecheckRepo = join(tmp, 'dirty-precheck-repo');
   mkdirSync(dirtyPrecheckRepo, { recursive: true });

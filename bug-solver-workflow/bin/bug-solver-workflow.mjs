@@ -2273,6 +2273,8 @@ async function createOrReuseTransactionWorktree({ cwd, transactionId, baseCommit
   const branchName = state?.branch?.plannedName || transactionBranchName(transactionId);
   const worktreePath = state?.worktree?.path || transactionWorktreePath(transactionId);
   const now = new Date().toISOString();
+  const existingMetadata = tryReadJson(artifactPaths.worktreeMetadata);
+  const recordedCleanup = existingMetadata?.cleanup && typeof existingMetadata.cleanup === "object" ? existingMetadata.cleanup : {};
   const before = await gitInfo(cwd);
   const branchRef = `refs/heads/${branchName}`;
   let branchAction = "created";
@@ -2342,18 +2344,92 @@ async function createOrReuseTransactionWorktree({ cwd, transactionId, baseCommit
       unchangedByIsolationSetup: callerWorktreeUnchanged,
     },
     cleanup: {
-      automatic: false,
-      owner: WORKFLOW,
-      durableReuse: true,
-      reason: "The transaction worktree/branch are preserved for implementation, review, resume, or explicit cleanup.",
-      safeRemovalCommand: `git -C ${JSON.stringify(repoRoot)} worktree remove ${JSON.stringify(worktreePath)}`,
-      safeBranchDeletionCommand: `git -C ${JSON.stringify(repoRoot)} branch -D ${JSON.stringify(branchName)}`,
+      automatic: recordedCleanup.automatic === true,
+      owner: recordedCleanup.owner || WORKFLOW,
+      durableReuse: recordedCleanup.durableReuse !== false,
+      deleteBranch: recordedCleanup.deleteBranch === true,
+      reason: recordedCleanup.reason || "The transaction worktree/branch are preserved for implementation, review, resume, or explicit cleanup.",
+      safeRemovalCommand: recordedCleanup.safeRemovalCommand || `git -C ${JSON.stringify(repoRoot)} worktree remove ${JSON.stringify(worktreePath)}`,
+      safeBranchDeletionCommand: recordedCleanup.safeBranchDeletionCommand || `git -C ${JSON.stringify(repoRoot)} branch -D ${JSON.stringify(branchName)}`,
     },
     evidencePaths: commonWorktreeEvidencePaths(artifactPaths),
   };
   writeJson(artifactPaths.worktreeMetadata, record);
   if (!callerWorktreeUnchanged) throw new Error(`Isolated worktree setup unexpectedly changed caller worktree status: before=${before.statusShort || "<clean>"}; after=${after.statusShort || "<clean>"}`);
   return record;
+}
+
+async function applyRecordedWorktreeCleanupPolicy({ transactionId, artifactPaths, repoRoot, branchName, worktreePath }) {
+  const now = new Date().toISOString();
+  const metadata = tryReadJson(artifactPaths.worktreeMetadata) || { schema: "pi-bug-solver-workflow/worktree-metadata/v1", transactionId };
+  const policy = metadata.cleanup || {};
+  const evidence = {
+    appliedAt: now,
+    policy: {
+      automatic: policy.automatic === true,
+      durableReuse: policy.durableReuse !== false,
+      deleteBranch: policy.deleteBranch === true,
+    },
+    status: "preserved_by_policy",
+    reason: policy.reason || "Recorded cleanup policy preserves transaction worktree for review/recovery.",
+    commands: [],
+    worktreeExistsBefore: existsSync(worktreePath),
+    worktreeExistsAfter: existsSync(worktreePath),
+    branchName,
+    worktreePath,
+  };
+  if (policy.automatic !== true) {
+    writeJson(artifactPaths.worktreeMetadata, { ...metadata, updatedAt: now, cleanup: { ...policy, automatic: false, durableReuse: policy.durableReuse !== false, lastApplication: evidence } });
+    return evidence;
+  }
+  if (existsSync(worktreePath)) {
+    const info = await gitInfo(worktreePath);
+    const dirty = info.dirty || parseGitStatusSignals(info.statusShort);
+    if (dirty.hasDirtyWorktree) {
+      evidence.status = "preserved_dirty_worktree";
+      evidence.reason = "Automatic cleanup was requested, but the transaction worktree has uncommitted changes and is preserved for inspection.";
+      evidence.dirty = dirty;
+    } else {
+      const remove = await runGit(repoRoot, ["worktree", "remove", worktreePath]);
+      evidence.commands.push({ command: `git worktree remove ${worktreePath}`, status: remove.status, stdout: remove.stdout.trim(), stderr: remove.stderr.trim() });
+      evidence.status = remove.status === 0 ? "worktree_removed" : "cleanup_failed_preserved";
+      evidence.reason = remove.status === 0 ? "Automatic cleanup removed the clean transaction worktree after durable final reporting." : "Automatic cleanup failed; artifacts and worktree metadata are preserved for inspection.";
+    }
+  } else {
+    evidence.status = "already_removed";
+    evidence.reason = "Automatic cleanup policy requested removal, and the transaction worktree was already absent.";
+  }
+  if (policy.deleteBranch === true && evidence.status === "worktree_removed") {
+    const del = await runGit(repoRoot, ["branch", "-D", branchName]);
+    evidence.commands.push({ command: `git branch -D ${branchName}`, status: del.status, stdout: del.stdout.trim(), stderr: del.stderr.trim() });
+    evidence.branchCleanupStatus = del.status === 0 ? "branch_deleted" : "branch_delete_failed_preserved";
+  }
+  evidence.worktreeExistsAfter = existsSync(worktreePath);
+  writeJson(artifactPaths.worktreeMetadata, { ...metadata, updatedAt: now, status: evidence.status, cleanup: { ...policy, lastApplication: evidence }, worktree: { ...(metadata.worktree || {}), path: worktreePath, exists: evidence.worktreeExistsAfter, cleanupStatus: evidence.status } });
+  return evidence;
+}
+
+function completedSolveResult({ run, transactionId, artifactPaths, state, finalReport, planPath }) {
+  const outcome = finalReport?.outcome || finalReport?.finalOutcome || state?.lifecycle?.outcome || null;
+  return {
+    ok: true,
+    action: "solve",
+    repeated: true,
+    idempotent: true,
+    status: "already_completed",
+    transactionId,
+    runId: run.runId,
+    planPath,
+    statePath: artifactPaths.state,
+    finalReportPath: artifactPaths.finalReport,
+    worktreeMetadataPath: artifactPaths.worktreeMetadata,
+    baselinePath: artifactPaths.baseline,
+    postValidationPath: artifactPaths.postValidation,
+    implementationEvidencePath: artifactPaths.implementationEvidence,
+    outcome,
+    terminalOutcome: deriveTerminalOutcome({ state, finalReport, activation: tryReadJson(join(artifactPaths.root, "activation-gate.json")) }),
+    message: "Transaction is already terminal/completed; repeated solve returned the durable outcome without rerunning edit-capable phases or modifying transaction state.",
+  };
 }
 
 async function createTransactionCommit({ transactionId, planArtifact, artifactPaths, worktreePath, callerCwd, baseCommit, branchName, postValidation, implementation, repairRecords }) {
@@ -2522,6 +2598,32 @@ async function solve(args, json) {
   try {
     currentPhase = "confirmation-gate";
     phaseStart(run, "confirmation-gate", { planPath, approved: true });
+    const earlyStatePath = planArtifact.statePath || plan.artifacts?.state || plan.evidencePaths?.state;
+    const earlyState = tryReadJson(earlyStatePath);
+    const earlyRegisteredPlanPath = earlyState?.artifacts?.transactionPlan || planArtifact.transactionPlanPath || plan.artifacts?.transactionPlan;
+    const earlyRegisteredPrecheckPath = earlyState?.artifacts?.precheck || planArtifact.precheckPath || plan.artifacts?.precheck;
+    const earlyExpectedSubmittedPath = plan.sourceKind === "precheck" ? earlyRegisteredPrecheckPath : earlyRegisteredPlanPath;
+    const earlySubmittedPathIsRegistered = earlyExpectedSubmittedPath && canonicalArtifactPath(planPath) === canonicalArtifactPath(earlyExpectedSubmittedPath);
+    if (earlyState?.lifecycle?.terminal === true && earlySubmittedPathIsRegistered) {
+      const earlyArtifactPaths = buildArtifactPaths(earlyState.artifacts?.root || dirname(earlyStatePath));
+      const finalReport = tryReadJson(earlyArtifactPaths.finalReport);
+      if (earlyState.lifecycle.status === "completed") {
+        const result = completedSolveResult({ run, transactionId, artifactPaths: earlyArtifactPaths, state: earlyState, finalReport, planPath });
+        phaseEvent(run, "confirmation-gate", { type: "repeated_solve_already_completed", transactionId, status: earlyState.lifecycle.status, finalReportPath: earlyArtifactPaths.finalReport, worktreeMetadataPath: earlyArtifactPaths.worktreeMetadata });
+        phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS, { repeated: true, status: "already_completed", finalReportPath: earlyArtifactPaths.finalReport });
+        completeRun(run, STATUSES.SUCCESS, { transactionId, repeated: true, status: "already_completed", finalReportPath: earlyArtifactPaths.finalReport });
+        if (json) console.log(JSON.stringify(result, null, 2));
+        else console.log(`transaction ${transactionId} already completed; final report: ${earlyArtifactPaths.finalReport}`);
+        return;
+      }
+      phaseEvent(run, "confirmation-gate", { type: "repeated_solve_terminal_refused", transactionId, status: earlyState.lifecycle.status, statePath: earlyStatePath, finalReportPath: earlyArtifactPaths.finalReport });
+      phaseEnd(run, "confirmation-gate", STATUSES.FAILED, { repeated: true, status: earlyState.lifecycle.status, statePath: earlyStatePath });
+      failRun(run, new Error(`Transaction ${transactionId} is already terminal with status ${earlyState.lifecycle.status}`), { transactionId, repeated: true, statePath: earlyStatePath });
+      const result = { ok: false, action: "solve", repeated: true, idempotent: true, status: "terminal_refused", transactionId, statePath: earlyStatePath, finalReportPath: earlyArtifactPaths.finalReport, worktreeMetadataPath: earlyArtifactPaths.worktreeMetadata, message: "Transaction is already terminal; repeated solve refused without rerunning edit-capable phases or modifying transaction state." };
+      if (json) console.log(JSON.stringify(result, null, 2));
+      else console.error(result.message);
+      process.exit(1);
+    }
     if (plan.status === "rejected_multi_bug" || multiplicity?.likelyMultiple || gate.exactlyOneBug === false || gate.splitRequired) throw new Error("Precheck classified this request as multiple bugs; split it before solving.");
     if (plan.editingAllowed === true) throw new Error("Refusing a plan that was not preserved as pre-implementation/editingAllowed=false.");
     if (!plan.validationContractPath) throw new Error("Transaction plan is missing a durable validation contract path.");
@@ -2531,10 +2633,20 @@ async function solve(args, json) {
     if (currentDirty.hasDirtyWorktree) throw new Error(`Refusing solve activation from a dirty caller worktree before edit-capable phases: ${currentDirty.statusShort}`);
     if (!gate.safeBeforeEditCapablePhase) throw new Error(`Transaction plan is unsafe before edit-capable phases: ${gate.reasons.join("; ")}`);
     const integrity = assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd });
+    const artifactPaths = integrity.artifactPaths;
+    if (integrity.state?.lifecycle?.terminal === true && integrity.state?.lifecycle?.status === "completed") {
+      const finalReport = tryReadJson(artifactPaths.finalReport);
+      const result = completedSolveResult({ run, transactionId, artifactPaths, state: integrity.state, finalReport, planPath });
+      phaseEvent(run, "confirmation-gate", { type: "repeated_solve_already_completed", transactionId, status: integrity.state.lifecycle.status, finalReportPath: artifactPaths.finalReport, worktreeMetadataPath: artifactPaths.worktreeMetadata });
+      phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS, { repeated: true, status: "already_completed", finalReportPath: artifactPaths.finalReport });
+      completeRun(run, STATUSES.SUCCESS, { transactionId, repeated: true, status: "already_completed", finalReportPath: artifactPaths.finalReport });
+      if (json) console.log(JSON.stringify(result, null, 2));
+      else console.log(`transaction ${transactionId} already completed; final report: ${artifactPaths.finalReport}`);
+      return;
+    }
     phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS, { integrity: "passed", validationAssertions: integrity.contract.assertions.length, artifactCount: integrity.registry.entries.length });
     currentPhase = "gated-activation";
     phaseStart(run, "gated-activation", { transactionId });
-    const artifactPaths = integrity.artifactPaths;
     const worktreeRecord = await createOrReuseTransactionWorktree({ cwd, transactionId, baseCommit: integrity.baseCommit, state: integrity.state, artifactPaths });
     const activation = {
       schema: "pi-bug-solver-workflow/gated-activation/v1",
@@ -2783,11 +2895,22 @@ async function solve(args, json) {
       });
     }
     if (updatedStateForRegistry) updateGlobalRegistry(updatedStateForRegistry);
+    const cleanupResult = await applyRecordedWorktreeCleanupPolicy({ transactionId, artifactPaths, repoRoot: integrity.state?.repo?.root || cwd, branchName: worktreeRecord.branch.name, worktreePath: worktreeRecord.worktree.path });
+    if (existsSync(artifactPaths.finalReport)) {
+      const finalReport = readJson(artifactPaths.finalReport);
+      writeJson(artifactPaths.finalReport, {
+        ...finalReport,
+        updatedAt: new Date().toISOString(),
+        cleanup: cleanupResult,
+        evidencePaths: { ...(finalReport.evidencePaths || {}), worktreeMetadata: artifactPaths.worktreeMetadata },
+      });
+    }
     emitArtifact(run, { kind: "file", title: "bug-solver final report", path: artifactPaths.finalReport });
-    phaseEnd(run, "transaction-commit-and-report", transactionCommit.status === "committed_for_review" ? STATUSES.SUCCESS : STATUSES.FAILED, { status: transactionCommit.status, commit: transactionCommit.commit, changedFiles: transactionCommit.changedFiles.length, branch: worktreeRecord.branch.name, finalReportPath: artifactPaths.finalReport, manualReviewRequired: true });
+    emitArtifact(run, { kind: "file", title: "bug-solver cleanup/worktree metadata", path: artifactPaths.worktreeMetadata });
+    phaseEnd(run, "transaction-commit-and-report", transactionCommit.status === "committed_for_review" ? STATUSES.SUCCESS : STATUSES.FAILED, { status: transactionCommit.status, commit: transactionCommit.commit, changedFiles: transactionCommit.changedFiles.length, branch: worktreeRecord.branch.name, finalReportPath: artifactPaths.finalReport, manualReviewRequired: true, cleanupStatus: cleanupResult.status });
 
-    completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence, repairAttemptsPath: artifactPaths.repairAttempts, postValidationPath: artifactPaths.postValidation, finalReportPath: artifactPaths.finalReport, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name, transactionCommit: transactionCommit.commit, finalStatus: outcome.status });
-    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence, repairAttemptsPath: artifactPaths.repairAttempts, postValidationPath: artifactPaths.postValidation, finalReportPath: artifactPaths.finalReport, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, preExistingFailureCount: baseline.failures.preExisting.length, newlyRegressedCount: postValidation.comparison.newlyRegressed.length, fixedCount: postValidation.comparison.fixed.length, unchangedPreExistingCount: postValidation.comparison.unchangedPreExisting.length, finalVerification: postValidation.finalVerification, status: "completed", outcome, editCapableResourcesCreated: true, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name, transactionCommit: transactionCommit.commit };
+    completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence, repairAttemptsPath: artifactPaths.repairAttempts, postValidationPath: artifactPaths.postValidation, finalReportPath: artifactPaths.finalReport, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name, transactionCommit: transactionCommit.commit, finalStatus: outcome.status, cleanupStatus: cleanupResult.status });
+    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence, repairAttemptsPath: artifactPaths.repairAttempts, postValidationPath: artifactPaths.postValidation, finalReportPath: artifactPaths.finalReport, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, preExistingFailureCount: baseline.failures.preExisting.length, newlyRegressedCount: postValidation.comparison.newlyRegressed.length, fixedCount: postValidation.comparison.fixed.length, unchangedPreExistingCount: postValidation.comparison.unchangedPreExisting.length, finalVerification: postValidation.finalVerification, status: "completed", outcome, cleanup: cleanupResult, editCapableResourcesCreated: true, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name, transactionCommit: transactionCommit.commit };
     if (json) console.log(JSON.stringify(result, null, 2));
     else console.log(`transaction ${transactionId} completed on ${worktreeRecord.branch.name}; final report: ${artifactPaths.finalReport}`);
   } catch (error) {
