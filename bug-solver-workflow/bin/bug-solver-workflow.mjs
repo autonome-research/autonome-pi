@@ -509,6 +509,60 @@ function classifyBaselineFailures(results) {
   }));
 }
 
+function baselineWorktreeIntegrityStatus({ worktreeGit, expectedBranch, baseCommit }) {
+  const dirty = worktreeGit?.dirty || parseGitStatusSignals(worktreeGit?.statusShort);
+  const checks = {
+    isGitRepo: worktreeGit?.isGitRepo === true,
+    cleanWorktree: dirty.hasDirtyWorktree === false,
+    branchMatchesExpected: (worktreeGit?.branch || "") === expectedBranch,
+    headMatchesRecordedBase: (worktreeGit?.head || "") === baseCommit,
+    atRecordedBaseCommit: (worktreeGit?.baseCommit || worktreeGit?.head || "") === baseCommit,
+  };
+  return {
+    ok: Object.values(checks).every(Boolean),
+    checks,
+    expected: { branch: expectedBranch, baseCommit },
+    observed: { branch: worktreeGit?.branch || null, head: worktreeGit?.head || null, statusShort: worktreeGit?.statusShort || "" },
+    dirty,
+  };
+}
+
+function recordBaselineWorktreeIntegrityRefusal({ transactionId, artifactPaths, worktreePath, assessment, phase }) {
+  const createdAt = new Date().toISOString();
+  const failure = {
+    type: "baseline_worktree_integrity_refusal",
+    phase,
+    transactionId,
+    createdAt,
+    worktreePath,
+    status: "refused_before_baseline_validation",
+    reason: "Baseline validation requires an unmodified isolated transaction worktree on the expected branch at the recorded base commit before baseline-validation.json may be written.",
+    assessment,
+    evidencePaths: { worktreeMetadata: artifactPaths.worktreeMetadata, failureClassifications: artifactPaths.failureClassifications, baseline: artifactPaths.baseline },
+  };
+  appendJsonl(artifactPaths.failureClassifications, failure);
+  const existing = tryReadJson(artifactPaths.worktreeMetadata) || { schema: "pi-bug-solver-workflow/worktree-metadata/v1", transactionId };
+  writeJson(artifactPaths.worktreeMetadata, {
+    ...existing,
+    updatedAt: createdAt,
+    status: "refused_before_baseline_validation",
+    baselineReadiness: failure,
+    worktree: { ...(existing.worktree || {}), path: worktreePath, status: "refused_before_baseline_validation", cleanAtBaselineStart: assessment.checks.cleanWorktree, head: assessment.observed.head, branch: assessment.observed.branch, statusShort: assessment.observed.statusShort },
+  });
+  return failure;
+}
+
+async function assertBaselineWorktreeReady({ transactionId, artifactPaths, worktreePath, expectedBranch, baseCommit, phase = "baseline-validation" }) {
+  const worktreeGit = await gitInfo(worktreePath);
+  const assessment = baselineWorktreeIntegrityStatus({ worktreeGit, expectedBranch, baseCommit });
+  if (!assessment.ok) {
+    recordBaselineWorktreeIntegrityRefusal({ transactionId, artifactPaths, worktreePath, assessment, phase });
+    const failedChecks = Object.entries(assessment.checks).filter(([, ok]) => !ok).map(([key]) => key).join(", ");
+    throw new Error(`Refusing baseline validation for transaction worktree ${worktreePath}: ${failedChecks}. Expected clean branch ${expectedBranch} at recorded base ${baseCommit}; observed branch=${assessment.observed.branch || "<none>"} head=${assessment.observed.head || "<none>"} status=${assessment.observed.statusShort || "<clean>"}`);
+  }
+  return assessment;
+}
+
 function commandKey(result) {
   return `${result.kind || "unknown"}\u0000${result.command || ""}`;
 }
@@ -658,9 +712,10 @@ async function runPostChangeValidation({ transactionId, planArtifact, artifactPa
   return record;
 }
 
-async function runBaselineValidation({ transactionId, planArtifact, artifactPaths, worktreePath, baseCommit, callerCwd }) {
+async function runBaselineValidation({ transactionId, planArtifact, artifactPaths, worktreePath, baseCommit, expectedBranch, callerCwd }) {
   const startedAt = new Date().toISOString();
   const commands = baselineCommandList(planArtifact);
+  const baselineReadiness = await assertBaselineWorktreeReady({ transactionId, artifactPaths, worktreePath, expectedBranch, baseCommit });
   const before = await gitInfo(worktreePath);
   const callerBefore = await gitInfo(callerCwd);
   const results = [];
@@ -681,6 +736,9 @@ async function runBaselineValidation({ transactionId, planArtifact, artifactPath
     baseCommit,
     worktreePath,
     unmodifiedTransactionBase: true,
+    baselineReadiness,
+    cleanUnmodifiedBaselineWorktreeVerified: true,
+    expectedBranch,
     beforeImplementation: true,
     commandOrder: commands.map((entry) => ({ kind: entry.kind, command: entry.command })),
     targetedBeforeBroad: !commands.some((entry, index) => entry.kind === "broad_validation" && commands.slice(index + 1).some((later) => later.kind === "targeted_user_test")),
@@ -1391,6 +1449,7 @@ async function createOrReuseTransactionWorktree({ cwd, transactionId, baseCommit
   }
 
   const worktreeGit = await gitInfo(worktreePath);
+  const isolationReadiness = baselineWorktreeIntegrityStatus({ worktreeGit, expectedBranch: branchName, baseCommit });
   const after = await gitInfo(cwd);
   const callerWorktreeUnchanged = (before.head || null) === (after.head || null) && (before.statusShort || "") === (after.statusShort || "");
   const record = {
@@ -1415,8 +1474,11 @@ async function createOrReuseTransactionWorktree({ cwd, transactionId, baseCommit
       rootedAtBaseCommit: baseCommit,
       head: worktreeGit.head || null,
       branch: worktreeGit.branch || null,
+      statusShort: worktreeGit.statusShort || "",
+      cleanAtBaselineStart: isolationReadiness.checks.cleanWorktree,
       externalToCallerWorktree: !sameOrInsidePath(worktreePath, cwd),
     },
+    baselineReadiness: isolationReadiness,
     callerWorktree: {
       path: cwd,
       headBefore: before.head || null,
@@ -1535,7 +1597,7 @@ async function solve(args, json) {
     phaseEnd(run, "gated-activation", STATUSES.SUCCESS, { artifactPath: file, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name });
 
     phaseStart(run, "baseline-validation", { transactionId, worktreePath: worktreeRecord.worktree.path, baselinePath: artifactPaths.baseline });
-    const baseline = await runBaselineValidation({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, baseCommit: integrity.baseCommit, callerCwd: cwd });
+    const baseline = await runBaselineValidation({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, baseCommit: integrity.baseCommit, expectedBranch: worktreeRecord.branch.name, callerCwd: cwd });
     if (existsSync(statePath)) {
       const state = readJson(statePath);
       const updatedState = {

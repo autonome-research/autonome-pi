@@ -235,6 +235,12 @@ try {
   try { gatedRepeatSolveDetails = JSON.parse(gatedRepeatSolve.stdout); } catch { gatedRepeatSolveDetails = undefined; }
   const gatedRepeatMetadata = gatedRepeatSolveDetails?.worktreeMetadataPath ? JSON.parse(readFileSync(gatedRepeatSolveDetails.worktreeMetadataPath, 'utf8')) : undefined;
   log(gatedRepeatMetadata?.worktree?.action === 'reused' && gatedRepeatMetadata?.branch?.action === 'reused' && gatedRepeatMetadata?.cleanup?.durableReuse === true, 'bug-solver repeated solve records durable worktree/branch reuse and cleanup metadata');
+  const gatedBaselineBeforeDirtyReuse = gatedSolveDetails?.baselinePath ? JSON.parse(readFileSync(gatedSolveDetails.baselinePath, 'utf8')) : undefined;
+  if (gatedSolveDetails?.worktreePath) writeFileSync(join(gatedSolveDetails.worktreePath, 'dirty-reused-worktree.txt'), 'dirty reuse should be refused before baseline\n');
+  expectExit('bug-solver workflow refuses dirty reused transaction worktree before baseline validation', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', gatedPrecheckDetails?.planPath || join(tmp, 'missing-gated-plan.json'), '--approved', '--json'], 1);
+  const dirtyReuseMetadata = gatedSolveDetails?.worktreeMetadataPath ? JSON.parse(readFileSync(gatedSolveDetails.worktreeMetadataPath, 'utf8')) : undefined;
+  const gatedBaselineAfterDirtyReuse = gatedSolveDetails?.baselinePath ? JSON.parse(readFileSync(gatedSolveDetails.baselinePath, 'utf8')) : undefined;
+  log(dirtyReuseMetadata?.status === 'refused_before_baseline_validation' && dirtyReuseMetadata?.baselineReadiness?.type === 'baseline_worktree_integrity_refusal' && dirtyReuseMetadata?.baselineReadiness?.assessment?.checks?.cleanWorktree === false && gatedBaselineAfterDirtyReuse?.completedAt === gatedBaselineBeforeDirtyReuse?.completedAt, 'bug-solver dirty reused worktree refusal is durable and does not rewrite baseline-validation.json');
   const copiedRegisteredPlan = join(tmp, 'copied-registered-transaction-plan.json');
   writeFileSync(copiedRegisteredPlan, JSON.stringify(gatedPlan, null, 2));
   expectExit('bug-solver workflow solve gate rejects copied transaction plans not at the registered durable path', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', copiedRegisteredPlan, '--approved', '--json'], 1);
