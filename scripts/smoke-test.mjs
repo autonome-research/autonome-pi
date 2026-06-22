@@ -176,6 +176,22 @@ try {
   let bugDirStatusDetails;
   try { bugDirStatusDetails = bugDirStatus?.stdout ? JSON.parse(bugDirStatus.stdout) : undefined; } catch { bugDirStatusDetails = undefined; }
   log(bugDirStatusDetails?.transactionId === bugPrecheckDetails?.transactionId && bugDirStatusDetails?.artifactRegistryPath === bugPrecheckDetails?.artifactRegistryPath, 'bug-solver status can recover transaction details from a directory without a target repo edit');
+  const statusStateBefore = bugPrecheckDetails?.statePath ? readFileSync(bugPrecheckDetails.statePath, 'utf8') : '';
+  const repeatedStatusById = bugPrecheckDetails?.transactionId ? expectExit('bug-solver repeated status by id remains read-only and recoverable', ['node', bugSolverCli, 'status', '--transaction-id', bugPrecheckDetails.transactionId, '--json'], 0) : undefined;
+  const repeatedStatusByDir = bugPrecheckDetails?.artifactDir ? expectExit('bug-solver repeated status by dir remains read-only and recoverable', ['node', bugSolverCli, 'status', '--transaction-dir', bugPrecheckDetails.artifactDir, '--json'], 0) : undefined;
+  let repeatedStatusByIdDetails;
+  let repeatedStatusByDirDetails;
+  try { repeatedStatusByIdDetails = repeatedStatusById?.stdout ? JSON.parse(repeatedStatusById.stdout) : undefined; } catch { repeatedStatusByIdDetails = undefined; }
+  try { repeatedStatusByDirDetails = repeatedStatusByDir?.stdout ? JSON.parse(repeatedStatusByDir.stdout) : undefined; } catch { repeatedStatusByDirDetails = undefined; }
+  const statusStateAfter = bugPrecheckDetails?.statePath ? readFileSync(bugPrecheckDetails.statePath, 'utf8') : '';
+  log(repeatedStatusByIdDetails?.readOnly === true && repeatedStatusByDirDetails?.readOnly === true && repeatedStatusByIdDetails?.transactionId === bugPrecheckDetails?.transactionId && repeatedStatusByDirDetails?.transactionId === bugPrecheckDetails?.transactionId && statusStateAfter === statusStateBefore, 'bug-solver repeated status invocations are read-only/idempotent and do not corrupt durable state');
+  const rejectedMultiArtifactRoot = join(tmp, 'rejected-multi-bug-artifacts');
+  const rejectedMultiId = 'smoke-rejected-multi-bug-no-artifacts';
+  const rejectedMultiBug = expectExit('bug-solver multi-bug precheck rejects before solve activation', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix login bug, repair billing bug', '--transaction-id', rejectedMultiId, '--json'], 1, { env: { PI_BUG_SOLVER_ARTIFACT_DIR: rejectedMultiArtifactRoot } });
+  let rejectedMultiDetails;
+  try { rejectedMultiDetails = rejectedMultiBug.stdout ? JSON.parse(rejectedMultiBug.stdout) : undefined; } catch { rejectedMultiDetails = undefined; }
+  const rejectedMultiState = rejectedMultiDetails?.statePath && existsSync(rejectedMultiDetails.statePath) ? JSON.parse(readFileSync(rejectedMultiDetails.statePath, 'utf8')) : undefined;
+  log(rejectedMultiBug.status === 1 && rejectedMultiDetails?.status === 'rejected_multi_bug' && rejectedMultiState?.lifecycle?.terminal === true && !existsSync(join(rejectedMultiDetails?.artifactDir || '', 'activation-gate.json')), 'bug-solver multi-bug rejection is durably classified terminal without edit-capable activation artifacts');
   const atomicValidationRepo = join(tmp, 'atomic-validation-command-repo');
   mkdirSync(atomicValidationRepo, { recursive: true });
   expectExit('bug-solver atomic-validation repo git init', ['git', 'init', '-q'], 0, { cwd: atomicValidationRepo });
@@ -236,7 +252,11 @@ try {
   log(repeatedState?.repo?.baseCommit === repeatedFirstHead && repeatedState?.branch?.baseCommit === repeatedFirstHead && repeatedState?.worktree?.rootedAtBaseCommit === repeatedFirstHead && repeatedPlan?.repo?.baseCommit === repeatedFirstHead && repeatedPlan?.repo?.dirtyAtPrecheck?.hasDirtyWorktree === false && repeatedSecondHead !== repeatedFirstHead, 'bug-solver repeated precheck preserves immutable base commit/ref, clean dirty-signal snapshot, branch, and worktree identity');
   log(repeatedState?.validation?.commands?.length === 0 && repeatedState?.validation?.userTestCommand === null && repeatedState?.repair?.maxRepairIterations === 8 && repeatedState?.allowlist?.current?.length === 0 && /validation commands differ/.test(repeatedConfigMismatch.stdout || repeatedConfigMismatch.stderr || '') && /user-test command differs/.test(repeatedConfigMismatch.stdout || repeatedConfigMismatch.stderr || '') && /max repairs differs/.test(repeatedConfigMismatch.stdout || repeatedConfigMismatch.stderr || '') && /allowlist differs/.test(repeatedConfigMismatch.stdout || repeatedConfigMismatch.stderr || ''), 'bug-solver repeated precheck rejects differing validation/user-test/repair/allowlist config without overwriting materialized state');
   log(repeatedState?.observations?.prechecks?.length >= 2 && repeatedState?.observations?.latestPrecheck?.repo?.head === repeatedSecondHead && repeatedState?.observations?.latestRejectedPrecheck?.type === 'repeated_precheck_configuration_rejected' && /repeated_precheck_configuration_rejected/.test(repeatedFailureLog) && repeatedPrecheckReport?.decisions?.some((decision) => decision.decision === 'reject_repeated_precheck_configuration_mismatch'), 'bug-solver repeated precheck durably records rejected configuration mismatch without corrupting existing transaction');
-  expectExit('bug-solver workflow solve requires explicit approval before activation', ['node', bugSolverCli, 'solve', '--cwd', repeatedPrecheckRepo, '--plan-path', repeatedFirstDetails?.planPath || join(tmp, 'missing-unapproved-plan.json'), '--json'], 1);
+  const unapprovedSolve = expectExit('bug-solver workflow solve requires explicit approval before activation', ['node', bugSolverCli, 'solve', '--cwd', repeatedPrecheckRepo, '--plan-path', repeatedFirstDetails?.planPath || join(tmp, 'missing-unapproved-plan.json'), '--json'], 1);
+  let unapprovedSolveDetails;
+  try { unapprovedSolveDetails = unapprovedSolve.stdout ? JSON.parse(unapprovedSolve.stdout) : undefined; } catch { unapprovedSolveDetails = undefined; }
+  const unapprovedState = repeatedFirstDetails?.statePath ? JSON.parse(readFileSync(repeatedFirstDetails.statePath, 'utf8')) : undefined;
+  log(unapprovedSolveDetails?.ok === false && !existsSync(join(repeatedFirstDetails?.artifactDir || '', 'activation-gate.json')) && unapprovedState?.lifecycle?.phase === 'precheck' && unapprovedState?.lifecycle?.status === 'awaiting_confirmation' && unapprovedState?.worktree?.status === 'not_created', 'bug-solver approval denial leaves transaction in precheck phase and creates no edit-capable activation artifacts');
   const gatedSolveRepo = join(tmp, 'gated-solve-repo');
   mkdirSync(gatedSolveRepo, { recursive: true });
   expectExit('bug-solver gated-solve repo git init', ['git', 'init', '-q'], 0, { cwd: gatedSolveRepo });
