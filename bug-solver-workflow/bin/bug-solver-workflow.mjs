@@ -285,7 +285,7 @@ function buildValidationContract({ transactionId, bug, cwd, validationCommands, 
     },
     {
       id: "outcome-based-final-verification",
-      description: "Final verification is outcome-based and validates that the bug is fixed rather than merely checking command exit codes.",
+      description: "Final verification is outcome-based and requires a targeted baseline-failure-to-post-pass transition plus durable implementation/repair evidence before reporting the bug fixed.",
       priority: "must",
       validationMethod: "both",
       evidenceRequired: ["state.validation.finalVerification.outcomeBased", "postValidation.outcomeComparison", "finalReport.finalVerification", "implementationEvidence.outcome"],
@@ -599,6 +599,43 @@ function classifyPostValidationFailures(comparison, postResults, artifactPaths) 
   return failures.map((failure) => ({ ...failure, postResult: postResults.find((result) => result.command === failure.command && result.kind === failure.kind) || null }));
 }
 
+function readJsonlRecords(file) {
+  if (!file || !existsSync(file)) return [];
+  try {
+    return readFileSync(file, "utf8").split(/\n+/).map((line) => line.trim()).filter(Boolean).flatMap((line) => {
+      try { return [JSON.parse(line)]; } catch { return []; }
+    });
+  } catch { return []; }
+}
+
+function gitSnapshotChanged(before, after) {
+  if (!before || !after) return false;
+  return (before.head || null) !== (after.head || null) || (before.statusShort || "") !== (after.statusShort || "");
+}
+
+function implementationBackedEvidence({ baseline, postBefore, postAfter, artifactPaths }) {
+  const records = readJsonlRecords(artifactPaths.implementationEvidence);
+  const explicitResolutionTypes = new Set(["implementation_change", "repair_change", "bug_resolution", "explicit_bug_resolution", "manual_bug_resolution", "repair_attempt"]);
+  const explicitResolution = records.find((record) => record?.explicitlyResolvedBug === true || record?.bugResolved === true || record?.resolvedBug === true || record?.implementationChangedWorktree === true || (explicitResolutionTypes.has(String(record?.type || "")) && ["resolved", "fixed", "changed", "implemented", "success", "passed"].includes(String(record?.status || record?.outcome || "").toLowerCase())));
+  const baselineAfter = baseline?.git?.after;
+  const worktreeChangedAfterBaseline = gitSnapshotChanged(baselineAfter, postBefore);
+  const worktreeChangedByPostValidation = gitSnapshotChanged(postBefore, postAfter);
+  const implementationEvidence = {
+    required: true,
+    evidencePath: artifactPaths.implementationEvidence,
+    worktreeChangedAfterBaseline,
+    worktreeChangedByPostValidation,
+    explicitlyResolvedBug: Boolean(explicitResolution),
+    durableEvidenceFound: worktreeChangedAfterBaseline || Boolean(explicitResolution),
+    baselineAfter: baselineAfter ? { head: baselineAfter.head || null, statusShort: baselineAfter.statusShort || "" } : null,
+    postValidationBefore: postBefore ? { head: postBefore.head || null, statusShort: postBefore.statusShort || "" } : null,
+    postValidationAfter: postAfter ? { head: postAfter.head || null, statusShort: postAfter.statusShort || "" } : null,
+    explicitResolutionRecord: explicitResolution ? { type: explicitResolution.type || null, status: explicitResolution.status || explicitResolution.outcome || null, createdAt: explicitResolution.createdAt || null } : null,
+    basis: worktreeChangedAfterBaseline ? "isolated transaction worktree changed after baseline and before final verification" : (explicitResolution ? "implementation evidence log explicitly records bug resolution" : "no implementation or repair evidence changed/resolved the isolated transaction worktree before final verification"),
+  };
+  return implementationEvidence;
+}
+
 function commandReproducedBug(result) {
   if (!result) return false;
   if (result.reproducedBug === true || result.bugReproduced === true) return true;
@@ -606,7 +643,7 @@ function commandReproducedBug(result) {
   return result.status !== 0;
 }
 
-function buildFinalVerification({ commands = [], baselineResults = [], postResults = [], comparison }) {
+function buildFinalVerification({ commands = [], baselineResults = [], postResults = [], comparison, implementationEvidence }) {
   const hasTargeted = commands.some((entry) => entry.kind === "targeted_user_test");
   const newlyRegressedCount = comparison.newlyRegressed.length;
   const targetedPostResults = postResults.filter((result) => result.kind === "targeted_user_test");
@@ -627,19 +664,26 @@ function buildFinalVerification({ commands = [], baselineResults = [], postResul
   const targetedNotReproduced = hasTargeted && targetedTransitions.length > 0 && targetedTransitions.every((item) => item.baselineStatus === 0 && item.postStatus === 0 && !item.baselineReproducedBug);
   const targetedFixed = hasTargeted && targetedTransitions.length > 0 && targetedTransitions.every((item) => item.fixedByOutcomeTransition);
   const missingTargetedRerun = hasTargeted && targetedPostResults.length === 0;
+  const implementationBacked = implementationEvidence?.durableEvidenceFound === true;
   let status;
   let bugFixed;
   let basis;
   let notReproduced = false;
+  let notImplemented = false;
   if (hasTargeted) {
     if (newlyRegressedCount > 0 || targetedFailures.length > 0 || missingTargetedRerun) {
       status = "failed";
       bugFixed = false;
       basis = "targeted reproduction/user test did not produce a clean baseline-failing-to-post-passing outcome transition, or post-change validation introduced regressions";
-    } else if (targetedFixed) {
+    } else if (targetedFixed && implementationBacked) {
       status = "passed";
       bugFixed = true;
-      basis = "targeted reproduction/user test reproduced the bug in baseline and passed after implementation";
+      basis = "targeted reproduction/user test reproduced the bug in baseline, passed after validation, and durable implementation evidence shows the isolated transaction worktree changed or the bug was explicitly resolved";
+    } else if (targetedFixed) {
+      status = "inconclusive";
+      bugFixed = false;
+      notImplemented = true;
+      basis = "targeted reproduction/user test had a baseline-failing-to-post-passing transition, but no durable implementation or repair evidence changed/resolved the isolated transaction worktree; refusing to report bugFixed from exit codes alone";
     } else if (targetedNotReproduced) {
       status = "inconclusive";
       bugFixed = false;
@@ -651,18 +695,22 @@ function buildFinalVerification({ commands = [], baselineResults = [], postResul
       basis = "targeted reproduction evidence lacked a baseline reproduction to post-change pass transition";
     }
   } else {
-    status = newlyRegressedCount > 0 ? "failed" : "passed";
-    bugFixed = newlyRegressedCount === 0;
-    basis = "no targeted command was provided; verified no newly-regressed validation outcomes against baseline evidence";
+    status = newlyRegressedCount > 0 ? "failed" : "inconclusive";
+    bugFixed = false;
+    basis = newlyRegressedCount > 0 ? "post-change validation introduced regressions" : "no targeted command was provided; final verification requires a targeted baseline-failure-to-post-pass transition plus implementation evidence before bugFixed can be true";
   }
   return {
     outcomeBased: true,
     status,
     bugFixed,
     notReproduced,
+    notImplemented,
     reproductionAware: true,
+    implementationBacked,
+    requiresImplementationEvidenceForSuccess: true,
     requiresBaselineReproductionForTargetedSuccess: true,
     basis,
+    implementationEvidence: implementationEvidence || { required: true, durableEvidenceFound: false },
     targetedFailures: targetedFailures.map((result) => ({ command: result.command, status: result.status, timedOut: result.timedOut })),
     targetedTransitions,
     newlyRegressedCount,
@@ -681,10 +729,11 @@ async function runPostChangeValidation({ transactionId, planArtifact, artifactPa
   const after = await gitInfo(worktreePath);
   const comparison = compareValidationResults({ baselineResults: baseline?.commandResults || [], postResults: results });
   const classifications = classifyPostValidationFailures(comparison, results, artifactPaths);
-  const finalVerification = buildFinalVerification({ commands, baselineResults: baseline?.commandResults || [], postResults: results, comparison });
+  const implementationEvidence = implementationBackedEvidence({ baseline, postBefore: before, postAfter: after, artifactPaths });
+  const finalVerification = buildFinalVerification({ commands, baselineResults: baseline?.commandResults || [], postResults: results, comparison, implementationEvidence });
   const status = commands.length === 0
     ? "skipped_no_commands"
-    : (comparison.newlyRegressed.length ? "completed_with_regressions" : (finalVerification.status === "failed" ? "completed_with_unfixed_targeted_failures" : (finalVerification.status === "inconclusive" ? "inconclusive_not_reproduced" : "passed_without_new_regressions")));
+    : (comparison.newlyRegressed.length ? "completed_with_regressions" : (finalVerification.status === "failed" ? "completed_with_unfixed_targeted_failures" : (finalVerification.status === "inconclusive" ? (finalVerification.notImplemented ? "inconclusive_not_implemented" : "inconclusive_not_reproduced") : "passed_without_new_regressions")));
   const record = {
     schema: "pi-bug-solver-workflow/post-change-validation/v1",
     transactionId,
@@ -702,6 +751,7 @@ async function runPostChangeValidation({ transactionId, planArtifact, artifactPa
     outcomeComparison: { fixed: comparison.fixed.length, unchangedPreExisting: comparison.unchangedPreExisting.length, newlyRegressed: comparison.newlyRegressed.length, stillPassing: comparison.stillPassing.length },
     finalVerification,
     failures: { classifications, fixed: comparison.fixed, unchangedPreExisting: comparison.unchangedPreExisting, regressions: comparison.newlyRegressed, status: classifications.length ? "classified" : "none" },
+    implementationEvidence,
     git: { before, after, worktreeChangedByPostValidation: (before.statusShort || "") !== (after.statusShort || "") },
     boundedOutput: { maxStdoutBytes: MAX_COMMAND_OUTPUT_BYTES, maxStderrBytes: MAX_COMMAND_OUTPUT_BYTES },
     evidencePaths: { baseline: artifactPaths.baseline, postValidation: artifactPaths.postValidation, failureClassifications: artifactPaths.failureClassifications, finalReport: artifactPaths.finalReport, state: artifactPaths.state },
@@ -1064,7 +1114,7 @@ function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, 
       finalVerification: {
         status: "pending",
         outcomeBased: true,
-        requiredFinding: "Verify the reported bug behavior is fixed, not only that validation commands exited successfully.",
+        requiredFinding: "Verify the reported bug behavior is fixed with targeted baseline-failure-to-post-pass evidence and durable implementation/repair evidence, not only successful command exit codes.",
         evidencePath: artifactPaths.implementationEvidence,
       },
       evidencePaths: commonSummary.evidencePaths,

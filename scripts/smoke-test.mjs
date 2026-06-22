@@ -224,11 +224,31 @@ try {
   const reproPrecheck = expectExit('bug-solver workflow precheck for reproduction-aware final verification succeeds', ['node', bugSolverCli, 'precheck', '--cwd', reproAwareRepo, '--bug', 'Fix reproduction-aware final verification bug', '--user-test-command', reproCommand, '--json'], 0);
   let reproPrecheckDetails;
   try { reproPrecheckDetails = JSON.parse(reproPrecheck.stdout); } catch { reproPrecheckDetails = undefined; }
-  const reproSolve = expectExit('bug-solver workflow approved solve requires baseline reproduction before final verification success', ['node', bugSolverCli, 'solve', '--cwd', reproAwareRepo, '--plan-path', reproPrecheckDetails?.planPath || join(tmp, 'missing-repro-plan.json'), '--approved', '--json'], 0);
+  const reproSolve = expectExit('bug-solver workflow approved solve does not report fixed without implementation evidence', ['node', bugSolverCli, 'solve', '--cwd', reproAwareRepo, '--plan-path', reproPrecheckDetails?.planPath || join(tmp, 'missing-repro-plan.json'), '--approved', '--json'], 0);
   let reproSolveDetails;
   try { reproSolveDetails = JSON.parse(reproSolve.stdout); } catch { reproSolveDetails = undefined; }
   const reproPostValidation = reproSolveDetails?.postValidationPath ? JSON.parse(readFileSync(reproSolveDetails.postValidationPath, 'utf8')) : undefined;
-  log(reproPostValidation?.finalVerification?.status === 'passed' && reproPostValidation?.finalVerification?.bugFixed === true && reproPostValidation?.finalVerification?.targetedTransitions?.[0]?.baselineStatus === 1 && reproPostValidation?.finalVerification?.targetedTransitions?.[0]?.postStatus === 0 && reproPostValidation?.finalVerification?.targetedTransitions?.[0]?.fixedByOutcomeTransition === true, 'bug-solver final verification passes only with targeted baseline reproduction followed by post-change pass');
+  log(reproPostValidation?.status === 'inconclusive_not_implemented' && reproPostValidation?.finalVerification?.status === 'inconclusive' && reproPostValidation?.finalVerification?.bugFixed === false && reproPostValidation?.finalVerification?.notImplemented === true && reproPostValidation?.finalVerification?.implementationBacked === false && reproPostValidation?.finalVerification?.targetedTransitions?.[0]?.baselineStatus === 1 && reproPostValidation?.finalVerification?.targetedTransitions?.[0]?.postStatus === 0 && reproPostValidation?.finalVerification?.targetedTransitions?.[0]?.fixedByOutcomeTransition === true, 'bug-solver final verification refuses bugFixed for a targeted pass transition without implementation evidence');
+
+  const backedRepo = join(tmp, 'implementation-backed-solve-repo');
+  mkdirSync(backedRepo, { recursive: true });
+  expectExit('bug-solver implementation-backed repo git init', ['git', 'init', '-q'], 0, { cwd: backedRepo });
+  expectExit('bug-solver implementation-backed repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: backedRepo });
+  expectExit('bug-solver implementation-backed repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: backedRepo });
+  writeFileSync(join(backedRepo, 'README.md'), 'implementation backed solve\n');
+  expectExit('bug-solver implementation-backed repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: backedRepo });
+  const backedMarker = join(tmp, 'implementation-backed-targeted-marker');
+  const backedCommand = `sh -c 'test -f ${JSON.stringify(backedMarker)} && exit 0; touch ${JSON.stringify(backedMarker)}; exit 1'`;
+  const backedPrecheck = expectExit('bug-solver workflow precheck for implementation-backed final verification succeeds', ['node', bugSolverCli, 'precheck', '--cwd', backedRepo, '--bug', 'Fix implementation-backed final verification bug', '--user-test-command', backedCommand, '--json'], 0);
+  let backedPrecheckDetails;
+  try { backedPrecheckDetails = JSON.parse(backedPrecheck.stdout); } catch { backedPrecheckDetails = undefined; }
+  const backedPlan = backedPrecheckDetails?.planPath ? JSON.parse(readFileSync(backedPrecheckDetails.planPath, 'utf8')) : undefined;
+  if (backedPlan?.evidencePaths?.implementation) writeFileSync(backedPlan.evidencePaths.implementation, `${JSON.stringify({ type: 'explicit_bug_resolution', status: 'resolved', explicitlyResolvedBug: true, createdAt: new Date().toISOString(), evidence: 'smoke test durable implementation-backed final verification marker' })}\n`, { flag: 'a' });
+  const backedSolve = expectExit('bug-solver workflow approved solve passes when targeted transition is implementation-backed', ['node', bugSolverCli, 'solve', '--cwd', backedRepo, '--plan-path', backedPrecheckDetails?.planPath || join(tmp, 'missing-backed-plan.json'), '--approved', '--json'], 0);
+  let backedSolveDetails;
+  try { backedSolveDetails = JSON.parse(backedSolve.stdout); } catch { backedSolveDetails = undefined; }
+  const backedPostValidation = backedSolveDetails?.postValidationPath ? JSON.parse(readFileSync(backedSolveDetails.postValidationPath, 'utf8')) : undefined;
+  log(backedPostValidation?.finalVerification?.status === 'passed' && backedPostValidation?.finalVerification?.bugFixed === true && backedPostValidation?.finalVerification?.implementationBacked === true && backedPostValidation?.finalVerification?.implementationEvidence?.explicitlyResolvedBug === true && backedPostValidation?.finalVerification?.targetedTransitions?.[0]?.fixedByOutcomeTransition === true, 'bug-solver final verification passes only when targeted transition has durable implementation/repair evidence');
 
   const gatedRepeatSolve = expectExit('bug-solver workflow repeated approved solve reuses isolated worktree safely', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', gatedPrecheckDetails?.planPath || join(tmp, 'missing-gated-plan.json'), '--approved', '--json'], 0);
   let gatedRepeatSolveDetails;
