@@ -657,13 +657,20 @@ function classifyPostValidationFailures(comparison, postResults, artifactPaths, 
   return failures;
 }
 
-function readJsonlRecords(file) {
+function readJsonlRecords(file, options = {}) {
   if (!file || !existsSync(file)) return [];
   try {
-    return readFileSync(file, "utf8").split(/\n+/).map((line) => line.trim()).filter(Boolean).flatMap((line) => {
+    const raw = readFileSync(file);
+    const maxBytes = Number.isFinite(options.maxBytes) ? Math.max(0, Math.floor(options.maxBytes)) : raw.length;
+    const text = raw.subarray(0, Math.min(raw.length, maxBytes)).toString("utf8");
+    return text.split(/\n+/).map((line) => line.trim()).filter(Boolean).flatMap((line) => {
       try { return [JSON.parse(line)]; } catch { return []; }
     });
   } catch { return []; }
+}
+
+function fileSizeBytes(file) {
+  try { return existsSync(file) ? statSync(file).size : 0; } catch { return 0; }
 }
 
 function gitSnapshotChanged(before, after) {
@@ -728,26 +735,40 @@ function allowlistEntryMatchesFile(entry, file) {
   return changed === allowed || changed.startsWith(`${allowed}/`);
 }
 
-function durableAllowlistPolicy({ planArtifact, artifactPaths }) {
+function durableAllowlistPolicy({ planArtifact, artifactPaths, decisionPrefixBytes, acceptanceWindowStartedAt }) {
   const initial = uniqueStrings([...(planArtifact?.allowlist?.current || []), ...(Array.isArray(planArtifact?.allowlist) ? planArtifact.allowlist : [])].map(normalizeAllowlistEntry));
-  const records = readJsonlRecords(artifactPaths.allowlistDecisions);
+  const prefixBytes = Number.isFinite(decisionPrefixBytes) ? Math.max(0, Math.floor(decisionPrefixBytes)) : undefined;
+  const records = readJsonlRecords(artifactPaths.allowlistDecisions, { maxBytes: prefixBytes });
+  const allRecords = prefixBytes === undefined ? records : readJsonlRecords(artifactPaths.allowlistDecisions);
   const acceptedExpansions = [];
   const rejectedExpansionRecords = [];
-  for (const record of records) {
+  const ignoredLateExpansionRecords = [];
+  const classifyExpansion = (record) => {
     const type = String(record?.type || record?.decision || "");
     const paths = allowlistRecordPaths(record);
     const justification = String(record?.justification || record?.reason || record?.rationale || "").trim();
-    if (!paths.length || !/(expansion|allowlist_add|allowlist-expansion|expand_allowlist|adaptive_allowlist)/i.test(type)) continue;
-    if (justification) acceptedExpansions.push({ ...record, paths, justification, evidencePath: artifactPaths.allowlistDecisions });
-    else rejectedExpansionRecords.push({ ...record, paths, reason: "missing durable justification", evidencePath: artifactPaths.allowlistDecisions });
+    if (!paths.length || !/(expansion|allowlist_add|allowlist-expansion|expand_allowlist|adaptive_allowlist)/i.test(type)) return null;
+    return { type, paths, justification };
+  };
+  for (const record of records) {
+    const expansion = classifyExpansion(record);
+    if (!expansion) continue;
+    if (expansion.justification) acceptedExpansions.push({ ...record, paths: expansion.paths, justification: expansion.justification, evidencePath: artifactPaths.allowlistDecisions, durableBeforeAcceptanceWindow: true, acceptanceWindowStartedAt: acceptanceWindowStartedAt || null });
+    else rejectedExpansionRecords.push({ ...record, paths: expansion.paths, reason: "missing durable justification", evidencePath: artifactPaths.allowlistDecisions });
   }
-  const configured = initial.length > 0 || acceptedExpansions.length > 0 || rejectedExpansionRecords.length > 0;
+  if (prefixBytes !== undefined && allRecords.length > records.length) {
+    for (const record of allRecords.slice(records.length)) {
+      const expansion = classifyExpansion(record);
+      if (expansion) ignoredLateExpansionRecords.push({ ...record, paths: expansion.paths, reason: "not durable before implementation acceptance window", evidencePath: artifactPaths.allowlistDecisions, durableBeforeAcceptanceWindow: false, acceptanceWindowStartedAt: acceptanceWindowStartedAt || null });
+    }
+  }
+  const configured = initial.length > 0 || acceptedExpansions.length > 0 || rejectedExpansionRecords.length > 0 || ignoredLateExpansionRecords.length > 0;
   const current = configured ? uniqueStrings([...initial, ...acceptedExpansions.flatMap((record) => record.paths)]) : ["**"];
-  return { initial, current, configured, decisions: records, acceptedExpansions, rejectedExpansionRecords, decisionsPath: artifactPaths.allowlistDecisions };
+  return { initial, current, configured, decisions: records, allDecisions: allRecords, acceptedExpansions, rejectedExpansionRecords, ignoredLateExpansionRecords, decisionsPath: artifactPaths.allowlistDecisions, decisionPrefixBytes: prefixBytes, acceptanceWindowStartedAt: acceptanceWindowStartedAt || null };
 }
 
-function evaluateAllowlist({ changedFiles, planArtifact, artifactPaths }) {
-  const policy = durableAllowlistPolicy({ planArtifact, artifactPaths });
+function evaluateAllowlist({ changedFiles, planArtifact, artifactPaths, decisionPrefixBytes, acceptanceWindowStartedAt }) {
+  const policy = durableAllowlistPolicy({ planArtifact, artifactPaths, decisionPrefixBytes, acceptanceWindowStartedAt });
   const outOfScope = policy.configured ? changedFiles.filter((file) => !policy.current.some((entry) => allowlistEntryMatchesFile(entry, file))) : [];
   return {
     ...policy,
@@ -759,8 +780,8 @@ function evaluateAllowlist({ changedFiles, planArtifact, artifactPaths }) {
     basis: !policy.configured
       ? "No allowlist entries were configured for this transaction; enforcement is recorded as unconfigured and repo-wide edits remain accepted for backward compatibility."
       : (outOfScope.length === 0
-        ? "All implementation changes are covered by the initial allowlist or by durable justified allowlist expansions written before acceptance."
-        : "Implementation attempted changes outside the current allowlist without a prior durable justified expansion; changes are recorded as rejected for manual review."),
+        ? "All implementation changes are covered by the initial allowlist or by durable justified allowlist expansions written before the implementation acceptance window."
+        : "Implementation attempted changes outside the current allowlist without a durable justified expansion that was present before the implementation acceptance window; changes are recorded as rejected for manual review."),
   };
 }
 
@@ -882,7 +903,10 @@ async function implementationBackedEvidence({ baseline, postBefore, postAfter, a
   const worktreeChangedByPostValidation = gitSnapshotChanged(postBefore, postAfter);
   const allowlistDecisions = readJsonlRecords(artifactPaths.allowlistDecisions);
   const rejectedOutOfScope = allowlistDecisions.filter((record) => record?.type === "out_of_scope_change_rejected");
-  const allowlistAccepted = rejectedOutOfScope.length === 0;
+  const allowlistImplementationRecords = records.filter((record) => record?.runnerOwnedImplementationMetadata === true && record?.type === "implementation_change" && record?.allowlist);
+  const latestAllowlistImplementation = allowlistImplementationRecords.sort((a, b) => (parseRecordTime(a.createdAt || a.completedAt) || 0) - (parseRecordTime(b.createdAt || b.completedAt) || 0)).at(-1);
+  const allowlistAccepted = latestAllowlistImplementation ? latestAllowlistImplementation.allowlist?.accepted === true : rejectedOutOfScope.length === 0;
+  const activeRejectedOutOfScope = allowlistAccepted ? [] : rejectedOutOfScope;
   const implementationBacked = Boolean(explicitResolution) || causalImplementation.found;
   const implementationEvidence = {
     required: true,
@@ -897,13 +921,15 @@ async function implementationBackedEvidence({ baseline, postBefore, postAfter, a
     causalImplementation,
     ignoredExplicitResolutionRecords,
     allowlistAccepted,
-    rejectedOutOfScope,
+    rejectedOutOfScope: activeRejectedOutOfScope,
+    historicalRejectedOutOfScope: rejectedOutOfScope,
+    latestAllowlistImplementation: latestAllowlistImplementation ? { createdAt: latestAllowlistImplementation.createdAt || latestAllowlistImplementation.completedAt || null, status: latestAllowlistImplementation.status || null, accepted: latestAllowlistImplementation.allowlist?.accepted === true, acceptedExpansions: latestAllowlistImplementation.allowlist?.acceptedExpansions || [], ignoredLateExpansionRecords: latestAllowlistImplementation.allowlist?.ignoredLateExpansionRecords || [] } : null,
     durableEvidenceFound: allowlistAccepted && implementationBacked,
     baselineAfter: baselineAfter ? { head: baselineAfter.head || null, statusShort: baselineAfter.statusShort || "" } : null,
     postValidationBefore: postBefore ? { head: postBefore.head || null, statusShort: postBefore.statusShort || "" } : null,
     postValidationAfter: postAfter ? { head: postAfter.head || null, statusShort: postAfter.statusShort || "" } : null,
     explicitResolutionRecord: explicitResolution ? { type: explicitResolution.type || null, status: explicitResolution.status || explicitResolution.outcome || null, createdAt: explicitResolution.createdAt || explicitResolution.completedAt || null, phase: explicitResolution.phase || explicitResolution.workflowPhase || null } : null,
-    basis: !allowlistAccepted ? "implementation changed files outside the adaptive allowlist without a prior durable justification, so the workflow refuses to count the change as accepted implementation evidence" : (explicitResolution ? "trusted post-baseline implementation/repair evidence explicitly records bug resolution tied to isolated worktree git evidence" : (causalImplementation.found ? causalImplementation.reason : "no trusted post-baseline implementation or repair evidence explicitly or causally ties the isolated worktree change to the bug resolution")),
+    basis: !allowlistAccepted ? "latest implementation attempt changed files outside the adaptive allowlist without an expansion that was durable before that attempt's acceptance window, so the workflow refuses to count the change as accepted implementation evidence" : (explicitResolution ? "trusted post-baseline implementation/repair evidence explicitly records bug resolution tied to isolated worktree git evidence" : (causalImplementation.found ? causalImplementation.reason : "no trusted post-baseline implementation or repair evidence explicitly or causally ties the isolated worktree change to the bug resolution")),
   };
   return implementationEvidence;
 }
@@ -1004,6 +1030,7 @@ function buildImplementationContext({ transactionId, planArtifact, artifactPaths
     adaptive: true,
     justificationRequiredForExpansion: true,
     expansionRecordShape: { type: "allowlist_expansion", paths: ["path/or/directory"], justification: "Why this scope is required by the failing reproduction" },
+    expansionOrdering: "An expansion must already be durably appended to allowlist-decisions.jsonl before the implementation acceptance window for the current attempt begins. Expansions appended during or after out-of-scope edits are ignored until a subsequent repair attempt snapshots them as already durable.",
   };
   const validationContractPath = planArtifact?.validationContractPath || validation.contractPath || artifactPaths.validationContract;
   const contractArtifact = existsSync(validationContractPath) ? tryReadJson(validationContractPath) : undefined;
@@ -1048,7 +1075,7 @@ function buildImplementationContext({ transactionId, planArtifact, artifactPaths
     workerInstructions: [
       "Run only inside isolatedWorktreePath; do not edit the caller worktree.",
       "Use the bug description, validation contract, baseline evidence, and allowlist policy as the implementation contract.",
-      "Write any durable implementation evidence to implementationEvidencePath and justify allowlist expansions in allowlistDecisions before relying on expanded scope.",
+      "Write any durable implementation evidence to implementationEvidencePath. Justify allowlist expansions in allowlistDecisions before the current attempt's implementation acceptance window; expansions appended during or after out-of-scope edits are not usable until a subsequent repair attempt.",
       "Leave post-change validation to the workflow; the runner will capture changed files from isolated-worktree git state after implementation.",
     ],
   };
@@ -1060,6 +1087,7 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
   const command = String(implementationCommand || "").trim();
   const implementationContext = buildImplementationContext({ transactionId, planArtifact, artifactPaths, worktreePath, baseline, implementationCommand: command });
   writeJson(artifactPaths.implementationContext, implementationContext);
+  const allowlistDecisionPrefixBytes = fileSizeBytes(artifactPaths.allowlistDecisions);
   const commandResult = command ? await runShellCommand(command, worktreePath, {
     PI_BUG_SOLVER_TRANSACTION_ID: transactionId,
     PI_BUG_SOLVER_WORKTREE: worktreePath,
@@ -1074,7 +1102,7 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
   }) : null;
   const after = await gitInfo(worktreePath);
   const changedFiles = await gitChangedFilesSince(worktreePath, baseline?.git?.after?.head || baseline?.baseCommit || planArtifact?.repo?.baseCommit);
-  const allowlist = evaluateAllowlist({ changedFiles, planArtifact, artifactPaths });
+  const allowlist = evaluateAllowlist({ changedFiles, planArtifact, artifactPaths, decisionPrefixBytes: allowlistDecisionPrefixBytes, acceptanceWindowStartedAt: startedAt });
   const worktreeChangedAfterBaseline = gitSnapshotChanged(baseline?.git?.after, after) || changedFiles.length > 0;
   const completedAt = new Date().toISOString();
   if (allowlist.outOfScopeFiles.length) {
@@ -1088,7 +1116,7 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
       decision: "reject_without_prior_justification",
       justificationRequired: true,
       evidencePath: artifactPaths.allowlistDecisions,
-      rationale: "The implementation phase observed changed files outside the adaptive allowlist before any durable justified expansion covered them.",
+      rationale: "The implementation phase observed changed files outside the adaptive allowlist before any durable justified expansion was present at the start of the implementation acceptance window.",
     }, FAILURE_CATEGORIES.ALLOWLIST, { allowlistDecisions: artifactPaths.allowlistDecisions, implementationEvidence: artifactPaths.implementationEvidence, failureClassifications: artifactPaths.failureClassifications });
     appendJsonl(artifactPaths.allowlistDecisions, allowlistFailure);
     appendJsonl(artifactPaths.failureClassifications, allowlistFailure);
@@ -1099,11 +1127,14 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
       createdAt: completedAt,
       changedFiles,
       currentAllowlist: allowlist.current,
-      acceptedExpansions: allowlist.acceptedExpansions.map((record) => ({ paths: record.paths, justification: record.justification, createdAt: record.createdAt || null })),
+      acceptedExpansions: allowlist.acceptedExpansions.map((record) => ({ paths: record.paths, justification: record.justification, createdAt: record.createdAt || null, durableBeforeAcceptanceWindow: record.durableBeforeAcceptanceWindow === true })),
+      ignoredLateExpansionRecords: allowlist.ignoredLateExpansionRecords.map((record) => ({ paths: record.paths, createdAt: record.createdAt || null, reason: record.reason })),
+      acceptanceWindowStartedAt: startedAt,
+      decisionPrefixBytes: allowlistDecisionPrefixBytes,
       evidencePath: artifactPaths.allowlistDecisions,
     });
   }
-  const finalAllowlist = evaluateAllowlist({ changedFiles, planArtifact, artifactPaths });
+  const finalAllowlist = evaluateAllowlist({ changedFiles, planArtifact, artifactPaths, decisionPrefixBytes: allowlistDecisionPrefixBytes, acceptanceWindowStartedAt: startedAt });
   const record = {
     schema: "pi-bug-solver-workflow/implementation-evidence/v1",
     type: "implementation_change",
@@ -1149,6 +1180,7 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
       allowlistDecisionsPath: artifactPaths.allowlistDecisions,
       requiredEvidencePaths: implementationContext.requiredEvidencePaths,
     },
+    allowlistAcceptanceWindow: { startedAt, decisionPrefixBytes: allowlistDecisionPrefixBytes, rule: "Only allowlist expansions durably present in allowlist-decisions.jsonl before this implementation acceptance window are accepted for this attempt; later expansions become eligible for a subsequent repair attempt." },
     note: command ? "Implementation command ran in the isolated transaction worktree after baseline validation and before post-change validation with durable bug/contract/baseline/allowlist/evidence context supplied via PI_BUG_SOLVER_IMPLEMENTATION_CONTEXT." : "No implementation command was supplied; the edit-capable implementation phase still recorded isolated-worktree git state between baseline and post-change validation.",
   };
   appendJsonl(artifactPaths.implementationEvidence, record);

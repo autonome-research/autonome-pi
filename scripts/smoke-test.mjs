@@ -416,6 +416,26 @@ try {
   const allowlistExpansionReport = allowlistExpansionSolveDetails?.postValidationPath ? JSON.parse(readFileSync(allowlistExpansionSolveDetails.postValidationPath, 'utf8')) : undefined;
   log(allowlistExpansionRecord?.allowlist?.accepted === true && allowlistExpansionRecord?.allowlist?.acceptedExpansions?.some((record) => record.paths?.includes('src') && record.justification) && allowlistExpansionReport?.finalVerification?.implementationBacked === true, 'bug-solver adaptive allowlist accepts expanded paths only when a durable justification exists before acceptance');
 
+  const lateExpansionRepo = join(tmp, 'allowlist-late-expansion-repair-repo');
+  mkdirSync(lateExpansionRepo, { recursive: true });
+  expectExit('bug-solver late-expansion repo git init', ['git', 'init', '-q'], 0, { cwd: lateExpansionRepo });
+  expectExit('bug-solver late-expansion repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: lateExpansionRepo });
+  expectExit('bug-solver late-expansion repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: lateExpansionRepo });
+  writeFileSync(join(lateExpansionRepo, 'README.md'), 'late allowlist expansion ordering\n');
+  expectExit('bug-solver late-expansion repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: lateExpansionRepo });
+  const lateExpansionPrecheck = expectExit('bug-solver workflow precheck records late-expansion repair transaction', ['node', bugSolverCli, 'precheck', '--cwd', lateExpansionRepo, '--bug', 'Fix late allowlist expansion ordering bug', '--allowlist', 'README.md', '--user-test-command', 'test -f src/out.txt', '--max-repairs', '1', '--json'], 0);
+  let lateExpansionPrecheckDetails;
+  try { lateExpansionPrecheckDetails = JSON.parse(lateExpansionPrecheck.stdout); } catch { lateExpansionPrecheckDetails = undefined; }
+  const lateExpansionCommand = 'mkdir -p src && printf \'%s\\n\' \'{"type":"allowlist_expansion","paths":["src"],"justification":"late expansion appended by implementation command"}\' >> "$PI_BUG_SOLVER_ALLOWLIST_DECISIONS" && touch src/out.txt';
+  const lateExpansionSolve = expectExit('bug-solver workflow rejects late allowlist expansion until subsequent repair attempt', ['node', bugSolverCli, 'solve', '--cwd', lateExpansionRepo, '--plan-path', lateExpansionPrecheckDetails?.planPath || join(tmp, 'missing-late-expansion-plan.json'), '--approved', '--implementation-command', lateExpansionCommand, '--json'], 0);
+  let lateExpansionSolveDetails;
+  try { lateExpansionSolveDetails = JSON.parse(lateExpansionSolve.stdout); } catch { lateExpansionSolveDetails = undefined; }
+  const lateExpansionRecords = lateExpansionSolveDetails?.implementationEvidencePath ? readFileSync(lateExpansionSolveDetails.implementationEvidencePath, 'utf8').trim().split(/\n+/).filter(Boolean).map((line) => JSON.parse(line)) : [];
+  const lateInitialRecord = lateExpansionRecords.find((record) => record.type === 'implementation_change' && record.phase === 'implementation');
+  const lateRepairRecord = [...lateExpansionRecords].reverse().find((record) => record.type === 'implementation_change' && record.phase === 'implementation');
+  const lateRepairAttempts = lateExpansionSolveDetails?.repairAttemptsPath ? readFileSync(lateExpansionSolveDetails.repairAttemptsPath, 'utf8').trim().split(/\n+/).filter(Boolean).map((line) => JSON.parse(line)) : [];
+  log(lateInitialRecord?.allowlist?.accepted === false && lateInitialRecord?.allowlist?.ignoredLateExpansionRecords?.some((record) => record.paths?.includes('src') && /not durable before/.test(record.reason || '')) && lateRepairRecord?.allowlist?.accepted === true && lateRepairRecord?.allowlist?.acceptedExpansions?.some((record) => record.paths?.includes('src') && record.durableBeforeAcceptanceWindow === true) && lateRepairAttempts.some((record) => record.type === 'repair_attempt_completed' && record.allowlistAccepted === true), 'bug-solver rejects allowlist expansions appended during out-of-scope edits until a subsequent repair attempt snapshots them as already durable');
+
   const gatedRepeatSolve = expectExit('bug-solver workflow repeated approved solve reuses isolated worktree safely', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', gatedPrecheckDetails?.planPath || join(tmp, 'missing-gated-plan.json'), '--approved', '--json'], 0);
   let gatedRepeatSolveDetails;
   try { gatedRepeatSolveDetails = JSON.parse(gatedRepeatSolve.stdout); } catch { gatedRepeatSolveDetails = undefined; }
