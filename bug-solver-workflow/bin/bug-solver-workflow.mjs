@@ -1118,7 +1118,11 @@ function repairBudgetFrom(planArtifact, args = {}) {
 }
 
 function implementationNeedsRepair(implementation) {
-  return !implementation?.allowlist?.accepted || (implementation?.commandResult && implementation.commandResult.status !== 0);
+  // Allowlist rejections are intentional safety outcomes, not auto-repairable
+  // implementation failures. Preserve the durable rejection evidence and allow
+  // final verification/reporting to complete so callers receive a JSON result
+  // instead of an unexpected repair-cap CLI failure.
+  return Boolean(implementation?.commandResult && implementation.commandResult.status !== 0);
 }
 
 function postValidationNeedsRepair(postValidation) {
