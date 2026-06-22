@@ -1280,6 +1280,10 @@ function repairFailureCategoryForImplementation(implementation) {
   return implementation?.allowlist?.accepted === false ? FAILURE_CATEGORIES.ALLOWLIST : FAILURE_CATEGORIES.IMPLEMENTATION;
 }
 
+function finalVerificationProvesBugFixed(finalVerification) {
+  return finalVerification?.status === "passed" && finalVerification?.bugFixed === true;
+}
+
 function postValidationNeedsRepair(postValidation) {
   return (postValidation?.comparison?.newlyRegressed?.length || 0) > 0 || postValidation?.finalVerification?.status === "failed";
 }
@@ -1372,6 +1376,85 @@ async function runRepairAttempt({ transactionId, planArtifact, artifactPaths, wo
     }, repairFailureCategoryForImplementation(implementation), { repairAttempts: artifactPaths.repairAttempts, implementationEvidence: artifactPaths.implementationEvidence, failureClassifications: artifactPaths.failureClassifications }));
   }
   return { repair: record, implementation };
+}
+
+function recordFinalVerificationGateFailure({ transactionId, artifactPaths, statePath, finalReportPath, postValidation, baseline, repairRecords = [], repairMax }) {
+  const now = new Date().toISOString();
+  const finalVerification = postValidation?.finalVerification || { status: "missing", bugFixed: false };
+  const reason = finalVerification.status === "passed" && finalVerification.bugFixed !== true
+    ? "final_verification_passed_without_bugFixed_true"
+    : `final_verification_${finalVerification.status || "missing"}`;
+  const record = withFailureCategory({
+    type: "final_verification_gate_failed",
+    phase: "final-verification-gate",
+    transactionId,
+    createdAt: now,
+    status: "terminal_failure_final_verification",
+    finalVerification,
+    reason,
+    evidencePath: artifactPaths.postValidation,
+    rationale: "The workflow refused to commit or mark the solve completed because outcome-based final verification did not prove both finalVerification.status='passed' and bugFixed=true.",
+    manualGuidance: [
+      "Inspect the post-change validation and final verification evidence.",
+      "If the targeted reproduction did not fail at baseline, provide a better reproduction command and start a new transaction.",
+      "If implementation evidence is missing or not causally tied to the reproduction, rerun with an implementation/repair command that records trusted isolated-worktree evidence.",
+      "Do not merge or cherry-pick this transaction as completed until final verification proves the bug is fixed.",
+    ],
+  }, FAILURE_CATEGORIES.FINAL_VERIFICATION, { postValidation: artifactPaths.postValidation, finalReport: finalReportPath, failureClassifications: artifactPaths.failureClassifications, state: statePath });
+  appendJsonl(artifactPaths.failureClassifications, record);
+  const outcome = {
+    status: "terminal_unsuccessful_final_verification",
+    finalStatus: record.status,
+    completed: false,
+    committed: false,
+    manualReviewRequired: true,
+    mergedIntoCallerBranch: false,
+    finalVerification,
+    guidance: record.manualGuidance,
+  };
+  if (existsSync(statePath)) {
+    const state = readJson(statePath);
+    const updatedState = {
+      ...state,
+      updatedAt: now,
+      revision: Number.isInteger(state.revision) ? state.revision + 1 : 1,
+      lifecycle: { ...(state.lifecycle || {}), status: record.status, phase: "final-verification-gate", terminal: true, outcome, lastError: record.rationale },
+      validation: { ...(state.validation || {}), finalVerification: { ...(state.validation?.finalVerification || {}), ...finalVerification, path: finalReportPath, evidencePath: artifactPaths.postValidation, gateStatus: record.status } },
+      failureClassification: { ...(state.failureClassification || {}), current: record, status: "failed_classified", classificationsPath: artifactPaths.failureClassifications },
+    };
+    writeJson(statePath, updatedState);
+    updateGlobalRegistry(updatedState);
+  }
+  if (existsSync(finalReportPath)) {
+    const finalReport = readJson(finalReportPath);
+    writeJson(finalReportPath, {
+      ...finalReport,
+      updatedAt: now,
+      status: record.status,
+      terminal: true,
+      outcome,
+      finalOutcome: outcome,
+      summary: { ...(finalReport.summary || {}), status: record.status, phase: "final-verification-gate", completed: false, committed: false, manualReviewRequired: true },
+      repairs: { ...(finalReport.repairs || {}), attempts: repairRecords.length, maxRepairIterations: repairMax, records: repairRecords, evidencePath: artifactPaths.repairAttempts },
+      failures: {
+        ...(finalReport.failures || {}),
+        preExisting: baseline?.failures?.preExisting || finalReport.failures?.preExisting || [],
+        fixed: postValidation?.failures?.fixed || finalReport.failures?.fixed || [],
+        unchangedPreExisting: postValidation?.failures?.unchangedPreExisting || finalReport.failures?.unchangedPreExisting || [],
+        regressions: postValidation?.failures?.regressions || finalReport.failures?.regressions || [],
+        classifications: [...(finalReport.failures?.classifications || []), record],
+        status: "failed_classified",
+      },
+      finalVerification,
+      manualNextSteps: record.manualGuidance,
+      decisions: [
+        ...(finalReport.decisions || []),
+        { decision: "refused_commit_without_proven_final_verification", createdAt: now, justification: record.rationale, finalVerification, evidencePath: artifactPaths.postValidation },
+      ],
+      evidencePaths: { ...(finalReport.evidencePaths || {}), baseline: artifactPaths.baseline, postValidation: artifactPaths.postValidation, repairAttempts: artifactPaths.repairAttempts, failureClassifications: artifactPaths.failureClassifications, finalReport: finalReportPath, state: statePath },
+    });
+  }
+  return record;
 }
 
 function recordRepairCapReached({ transactionId, artifactPaths, statePath, finalReportPath, maxRepairIterations, attempts, trigger }) {
@@ -2839,8 +2922,15 @@ async function solve(args, json) {
     if (updatedStateForRegistry) updateGlobalRegistry(updatedStateForRegistry);
     emitArtifact(run, { kind: "file", title: "bug-solver post-change validation", path: artifactPaths.postValidation });
     emitArtifact(run, { kind: "file", title: "bug-solver implementation evidence", path: artifactPaths.implementationEvidence });
-    phaseEnd(run, "post-change-validation", repairCapReached ? STATUSES.FAILED : (postValidation.failures.regressions.length === 0 && postValidation.finalVerification.status === "passed" ? STATUSES.SUCCESS : STATUSES.FAILED), { status: postValidation.status, commands: postValidation.commandResults.length, fixed: postValidation.comparison.fixed.length, unchangedPreExisting: postValidation.comparison.unchangedPreExisting.length, newlyRegressed: postValidation.comparison.newlyRegressed.length, targetedBeforeBroad: postValidation.targetedBeforeBroad, finalVerification: postValidation.finalVerification.status, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, repairCapReached });
+    const finalVerificationPassed = finalVerificationProvesBugFixed(postValidation.finalVerification);
+    phaseEnd(run, "post-change-validation", repairCapReached ? STATUSES.FAILED : (postValidation.failures.regressions.length === 0 && finalVerificationPassed ? STATUSES.SUCCESS : STATUSES.FAILED), { status: postValidation.status, commands: postValidation.commandResults.length, fixed: postValidation.comparison.fixed.length, unchangedPreExisting: postValidation.comparison.unchangedPreExisting.length, newlyRegressed: postValidation.comparison.newlyRegressed.length, targetedBeforeBroad: postValidation.targetedBeforeBroad, finalVerification: postValidation.finalVerification.status, bugFixed: postValidation.finalVerification.bugFixed === true, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, repairCapReached });
     if (repairCapReached) throw new Error(`Repair cap reached after ${repairRecords.length}/${repairMax} attempts; terminal failure recorded in ${artifactPaths.repairAttempts}`);
+    if (!finalVerificationPassed) {
+      currentPhase = "final-verification-gate";
+      const gateFailure = recordFinalVerificationGateFailure({ transactionId, artifactPaths, statePath, finalReportPath: artifactPaths.finalReport, postValidation, baseline, repairRecords, repairMax });
+      phaseEvent(run, "post-change-validation", { type: "final_verification_gate_failed", status: postValidation.finalVerification?.status || null, bugFixed: postValidation.finalVerification?.bugFixed === true, failureClassificationsPath: artifactPaths.failureClassifications, finalReportPath: artifactPaths.finalReport });
+      throw new Error(`${gateFailure.rationale} status=${postValidation.finalVerification?.status || "missing"}; bugFixed=${postValidation.finalVerification?.bugFixed === true}; final report: ${artifactPaths.finalReport}`);
+    }
 
     currentPhase = "transaction-commit-and-report";
     phaseStart(run, "transaction-commit-and-report", { transactionId, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name, finalReportPath: artifactPaths.finalReport });
@@ -2914,7 +3004,7 @@ async function solve(args, json) {
     if (json) console.log(JSON.stringify(result, null, 2));
     else console.log(`transaction ${transactionId} completed on ${worktreeRecord.branch.name}; final report: ${artifactPaths.finalReport}`);
   } catch (error) {
-    if (!/Repair cap reached/i.test(error?.message || String(error))) recordSolveFailureClassification({ transactionId: plan.transactionId, planArtifact, plan, planPath, phase: currentPhase, error });
+    if (!/Repair cap reached/i.test(error?.message || String(error)) && currentPhase !== "final-verification-gate") recordSolveFailureClassification({ transactionId: plan.transactionId, planArtifact, plan, planPath, phase: currentPhase, error });
     failRun(run, error, { transactionId: plan.transactionId, failurePhase: currentPhase });
     die(error.message || String(error), 1, json);
   }
