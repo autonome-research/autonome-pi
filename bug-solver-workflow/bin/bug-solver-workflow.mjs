@@ -14,6 +14,7 @@ import {
   phaseEvent,
   phaseStart,
 } from "../../thread-phase-visualizer/lib/store.mjs";
+import { assessPreImplementationGate, normalizeSolvePlanArtifact } from "../lib/m0-compat.mjs";
 
 const WORKFLOW = "bug-solver-workflow";
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
@@ -370,19 +371,21 @@ async function solve(args, json) {
   if (!args["plan-path"]) die("solve requires --plan-path from precheck", 1, json);
   const planPath = resolve(String(args["plan-path"]));
   if (!existsSync(planPath)) die(`precheck plan not found: ${planPath}`, 1, json);
-  const plan = readJson(planPath);
+  const planArtifact = readJson(planPath);
+  const plan = normalizeSolvePlanArtifact(planArtifact);
   const transactionId = plan.transactionId;
-  const planBugDescription = plan.transaction?.bugDescription || plan.bugDescription || plan.bug || "";
+  const planBugDescription = plan.transaction?.bugDescription || "";
   const currentMultiplicity = classifyBugCount(planBugDescription);
-  const storedMultiplicity = plan.transaction?.multiplicity || plan.multiplicity || {};
+  const storedMultiplicity = plan.transaction?.multiplicity || {};
   const multiplicity = currentMultiplicity.likelyMultiple ? currentMultiplicity : storedMultiplicity;
-  const exactlyOneBug = currentMultiplicity.likelyMultiple ? false : (plan.transaction?.exactlyOneBug ?? !storedMultiplicity.likelyMultiple);
+  const gate = assessPreImplementationGate(planArtifact, multiplicity);
   const run = createRun({ workflow: WORKFLOW, cwd, input: { action: "solve", transactionId }, metadata: { transactionId, mode: "solve" } });
   try {
     phaseStart(run, "confirmation-gate", { planPath, approved: true });
-    if (plan.status === "rejected_multi_bug" || multiplicity?.likelyMultiple || exactlyOneBug === false) throw new Error("Precheck classified this request as multiple bugs; split it before solving.");
+    if (plan.status === "rejected_multi_bug" || multiplicity?.likelyMultiple || gate.exactlyOneBug === false || gate.splitRequired) throw new Error("Precheck classified this request as multiple bugs; split it before solving.");
     if (plan.editingAllowed === true) throw new Error("Refusing a plan that was not preserved as pre-implementation/editingAllowed=false.");
-    if (!plan.validationContractPath && !plan.validation?.contractPath) throw new Error("Transaction plan is missing a durable validation contract path.");
+    if (!plan.validationContractPath) throw new Error("Transaction plan is missing a durable validation contract path.");
+    if (!gate.safeBeforeEditCapablePhase) throw new Error(`Transaction plan is unsafe before edit-capable phases: ${gate.reasons.join("; ")}`);
     phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS);
     phaseStart(run, "activation-scaffold", { transactionId });
     const activation = {
@@ -391,7 +394,7 @@ async function solve(args, json) {
       createdAt: new Date().toISOString(),
       status: "not_implemented_in_scaffold",
       planPath,
-      validationContractPath: plan.validationContractPath || plan.validation?.contractPath,
+      validationContractPath: plan.validationContractPath,
       evidencePaths: plan.evidencePaths || {},
       message: "Persistent extension entrypoint is registered. Later milestones implement isolated worktree solving and bounded repairs.",
     };
