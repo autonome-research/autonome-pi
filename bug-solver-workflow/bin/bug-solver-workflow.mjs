@@ -3016,6 +3016,7 @@ async function solve(args, json) {
     currentPhase = "transaction-commit-and-report";
     phaseStart(run, "transaction-commit-and-report", { transactionId, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name, finalReportPath: artifactPaths.finalReport });
     const transactionCommit = await createTransactionCommit({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, callerCwd: cwd, baseCommit: integrity.baseCommit, branchName: worktreeRecord.branch.name, postValidation, implementation, repairRecords });
+    if (process.env.PI_BUG_SOLVER_INTERRUPT_SOLVE_AFTER === "transaction_commit") throw new Error("Injected interruption after transaction commit creation before cleanup/final report/state completion");
     const outcome = {
       status: transactionCommit.status === "committed_for_review" ? "accepted_for_manual_review" : "accepted_without_commit",
       finalStatus: transactionCommit.status,
@@ -3028,6 +3029,7 @@ async function solve(args, json) {
       finalVerification: postValidation.finalVerification,
       guidance: transactionCommit.manualNextSteps,
     };
+    if (process.env.PI_BUG_SOLVER_INTERRUPT_SOLVE_BEFORE === "cleanup_final_report_update") throw new Error("Injected interruption before cleanup and final report update");
     const cleanupResult = await applyRecordedWorktreeCleanupPolicy({ transactionId, artifactPaths, repoRoot: integrity.state?.repo?.root || cwd, branchName: worktreeRecord.branch.name, worktreePath: worktreeRecord.worktree.path });
     if (existsSync(artifactPaths.finalReport)) {
       const finalReport = readJson(artifactPaths.finalReport);
@@ -3082,6 +3084,7 @@ async function solve(args, json) {
       writeJson(statePath, updatedState);
       updatedStateForRegistry = updatedState;
       updateGlobalRegistry(updatedStateForRegistry);
+      if (process.env.PI_BUG_SOLVER_INTERRUPT_SOLVE_AFTER === "completed_state") throw new Error("Injected interruption after completed state write before final workflow event/report handoff");
     }
     emitArtifact(run, { kind: "file", title: "bug-solver final report", path: artifactPaths.finalReport });
     emitArtifact(run, { kind: "file", title: "bug-solver cleanup/worktree metadata", path: artifactPaths.worktreeMetadata });
@@ -3092,7 +3095,7 @@ async function solve(args, json) {
     if (json) console.log(JSON.stringify(result, null, 2));
     else console.log(`transaction ${transactionId} completed on ${worktreeRecord.branch.name}; final report: ${artifactPaths.finalReport}`);
   } catch (error) {
-    if (!/Repair cap reached|partial completion/i.test(error?.message || String(error)) && currentPhase !== "final-verification-gate") recordSolveFailureClassification({ transactionId: plan.transactionId, planArtifact, plan, planPath, phase: currentPhase, error });
+    if (!/Repair cap reached|partial completion|Injected interruption after completed state write/i.test(error?.message || String(error)) && currentPhase !== "final-verification-gate") recordSolveFailureClassification({ transactionId: plan.transactionId, planArtifact, plan, planPath, phase: currentPhase, error });
     failRun(run, error, { transactionId: plan.transactionId, failurePhase: currentPhase });
     die(error.message || String(error), 1, json);
   }

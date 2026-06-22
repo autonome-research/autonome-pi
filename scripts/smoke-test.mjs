@@ -418,6 +418,41 @@ try {
   try { corruptCompletionSolveDetails = JSON.parse(corruptCompletionSolve.stdout); } catch { corruptCompletionSolveDetails = undefined; }
   log(corruptCompletionStatusDetails?.partialCompletion?.status === 'corrupt_completed_state' && corruptCompletionStatusDetails?.completionIntegrity?.status === 'partial_completion' && corruptCompletionSolveDetails?.ok === false && /partial completion/i.test(corruptCompletionSolveDetails?.error || ''), 'bug-solver repeated solve/status detect corrupt completed state without rerunning edit-capable phases');
 
+  async function runInterruptedFinalPhaseRegression({ name, interruptEnv, interruptedExit, repeatedExit }) {
+    const repo = join(tmp, `${name}-repo`);
+    mkdirSync(repo, { recursive: true });
+    expectExit(`bug-solver ${name} repo git init`, ['git', 'init', '-q'], 0, { cwd: repo });
+    expectExit(`bug-solver ${name} repo git config email`, ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: repo });
+    expectExit(`bug-solver ${name} repo git config name`, ['git', 'config', 'user.name', 'Test'], 0, { cwd: repo });
+    writeFileSync(join(repo, 'README.md'), `${name} before solve\n`);
+    expectExit(`bug-solver ${name} repo initial commit`, ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: repo });
+    const precheck = expectExit(`bug-solver ${name} precheck succeeds`, ['node', bugSolverCli, 'precheck', '--cwd', repo, '--bug', `Fix ${name} final phase interruption bug`, '--user-test-command', 'grep solved README.md', '--json'], 0);
+    let precheckDetails;
+    try { precheckDetails = JSON.parse(precheck.stdout); } catch { precheckDetails = undefined; }
+    const interruptedSolve = expectExit(`bug-solver ${name} injected final-phase interruption`, ['node', bugSolverCli, 'solve', '--cwd', repo, '--plan-path', precheckDetails?.planPath || join(tmp, `missing-${name}-plan.json`), '--approved', '--implementation-command', 'printf "solved\\n" >> README.md', '--json'], interruptedExit, { env: interruptEnv });
+    let interruptedDetails;
+    try { interruptedDetails = JSON.parse(interruptedSolve.stdout); } catch { interruptedDetails = undefined; }
+    const statusAfterInterrupt = expectExit(`bug-solver ${name} status after final-phase interruption`, ['node', bugSolverCli, 'status', '--transaction-id', precheckDetails?.transactionId || `missing-${name}`, '--json'], 0);
+    let statusAfterInterruptDetails;
+    try { statusAfterInterruptDetails = JSON.parse(statusAfterInterrupt.stdout); } catch { statusAfterInterruptDetails = undefined; }
+    const repeatedSolve = expectExit(`bug-solver ${name} repeated solve after final-phase interruption`, ['node', bugSolverCli, 'solve', '--cwd', repo, '--plan-path', precheckDetails?.planPath || join(tmp, `missing-${name}-plan.json`), '--approved', '--json'], repeatedExit);
+    let repeatedDetails;
+    try { repeatedDetails = JSON.parse(repeatedSolve.stdout); } catch { repeatedDetails = undefined; }
+    const statusAfterRepeat = expectExit(`bug-solver ${name} status after repeated solve`, ['node', bugSolverCli, 'status', '--transaction-id', precheckDetails?.transactionId || `missing-${name}`, '--json'], 0);
+    let statusAfterRepeatDetails;
+    try { statusAfterRepeatDetails = JSON.parse(statusAfterRepeat.stdout); } catch { statusAfterRepeatDetails = undefined; }
+    return { precheckDetails, interruptedDetails, statusAfterInterruptDetails, repeatedDetails, statusAfterRepeatDetails };
+  }
+
+  const commitInterrupt = await runInterruptedFinalPhaseRegression({ name: 'interrupt-after-transaction-commit', interruptEnv: { PI_BUG_SOLVER_INTERRUPT_SOLVE_AFTER: 'transaction_commit' }, interruptedExit: 1, repeatedExit: 1 });
+  log(commitInterrupt.interruptedDetails?.ok === false && commitInterrupt.statusAfterInterruptDetails?.status !== 'completed' && commitInterrupt.statusAfterInterruptDetails?.completionIntegrity?.status !== 'verified' && commitInterrupt.repeatedDetails?.ok === false && commitInterrupt.statusAfterRepeatDetails?.status !== 'completed' && commitInterrupt.statusAfterRepeatDetails?.completionIntegrity?.status !== 'verified', 'bug-solver injected interruption after transaction commit creation leaves durable state recoverable/non-terminal and repeated solve does not falsely complete or corrupt it');
+
+  const beforeCleanupInterrupt = await runInterruptedFinalPhaseRegression({ name: 'interrupt-before-cleanup-final-report', interruptEnv: { PI_BUG_SOLVER_INTERRUPT_SOLVE_BEFORE: 'cleanup_final_report_update' }, interruptedExit: 1, repeatedExit: 1 });
+  log(beforeCleanupInterrupt.interruptedDetails?.ok === false && beforeCleanupInterrupt.statusAfterInterruptDetails?.status !== 'completed' && beforeCleanupInterrupt.statusAfterInterruptDetails?.completionIntegrity?.status !== 'verified' && beforeCleanupInterrupt.repeatedDetails?.ok === false && beforeCleanupInterrupt.statusAfterRepeatDetails?.status !== 'completed' && beforeCleanupInterrupt.statusAfterRepeatDetails?.completionIntegrity?.status !== 'verified', 'bug-solver injected interruption before cleanup/final report update preserves non-completed durable state and repeated solve does not advertise completion');
+
+  const completedStateInterrupt = await runInterruptedFinalPhaseRegression({ name: 'interrupt-after-completed-state', interruptEnv: { PI_BUG_SOLVER_INTERRUPT_SOLVE_AFTER: 'completed_state' }, interruptedExit: 1, repeatedExit: 0 });
+  log(completedStateInterrupt.interruptedDetails?.ok === false && completedStateInterrupt.statusAfterInterruptDetails?.status === 'completed' && completedStateInterrupt.statusAfterInterruptDetails?.completionIntegrity?.status === 'verified' && completedStateInterrupt.repeatedDetails?.status === 'already_completed' && completedStateInterrupt.repeatedDetails?.idempotent === true && completedStateInterrupt.statusAfterRepeatDetails?.status === 'completed', 'bug-solver injected interruption after completed state write remains integrity-verified and repeated solve returns the durable completed outcome without rerunning');
+
   const unrelatedEditRepo = join(tmp, 'external-stateful-targeted-unrelated-edit-repo');
   mkdirSync(unrelatedEditRepo, { recursive: true });
   expectExit('bug-solver unrelated-edit repo git init', ['git', 'init', '-q'], 0, { cwd: unrelatedEditRepo });
