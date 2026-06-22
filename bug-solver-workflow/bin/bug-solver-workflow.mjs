@@ -545,6 +545,76 @@ function classifyPostValidationFailures(comparison, postResults, artifactPaths) 
   return failures.map((failure) => ({ ...failure, postResult: postResults.find((result) => result.command === failure.command && result.kind === failure.kind) || null }));
 }
 
+function commandReproducedBug(result) {
+  if (!result) return false;
+  if (result.reproducedBug === true || result.bugReproduced === true) return true;
+  if (["reproduced", "failed_reproduced", "bug_reproduced"].includes(String(result.outcome || result.reproductionOutcome || ""))) return true;
+  return result.status !== 0;
+}
+
+function buildFinalVerification({ commands = [], baselineResults = [], postResults = [], comparison }) {
+  const hasTargeted = commands.some((entry) => entry.kind === "targeted_user_test");
+  const newlyRegressedCount = comparison.newlyRegressed.length;
+  const targetedPostResults = postResults.filter((result) => result.kind === "targeted_user_test");
+  const targetedFailures = targetedPostResults.filter((result) => result.status !== 0);
+  const baselineByCommand = new Map(baselineResults.map((result) => [commandKey(result), result]));
+  const targetedTransitions = targetedPostResults.map((post) => {
+    const baseline = baselineByCommand.get(commandKey(post));
+    const baselineReproduced = commandReproducedBug(baseline);
+    return {
+      command: post.command,
+      baselineStatus: baseline ? baseline.status : "not_run",
+      postStatus: post.status,
+      baselineReproducedBug: baselineReproduced,
+      fixedByOutcomeTransition: baselineReproduced && post.status === 0,
+      timedOut: post.timedOut,
+    };
+  });
+  const targetedNotReproduced = hasTargeted && targetedTransitions.length > 0 && targetedTransitions.every((item) => item.baselineStatus === 0 && item.postStatus === 0 && !item.baselineReproducedBug);
+  const targetedFixed = hasTargeted && targetedTransitions.length > 0 && targetedTransitions.every((item) => item.fixedByOutcomeTransition);
+  const missingTargetedRerun = hasTargeted && targetedPostResults.length === 0;
+  let status;
+  let bugFixed;
+  let basis;
+  let notReproduced = false;
+  if (hasTargeted) {
+    if (newlyRegressedCount > 0 || targetedFailures.length > 0 || missingTargetedRerun) {
+      status = "failed";
+      bugFixed = false;
+      basis = "targeted reproduction/user test did not produce a clean baseline-failing-to-post-passing outcome transition, or post-change validation introduced regressions";
+    } else if (targetedFixed) {
+      status = "passed";
+      bugFixed = true;
+      basis = "targeted reproduction/user test reproduced the bug in baseline and passed after implementation";
+    } else if (targetedNotReproduced) {
+      status = "inconclusive";
+      bugFixed = false;
+      notReproduced = true;
+      basis = "targeted reproduction/user test passed at baseline, so it did not reproduce the bug and cannot prove the fix from exit codes alone";
+    } else {
+      status = "inconclusive";
+      bugFixed = false;
+      basis = "targeted reproduction evidence lacked a baseline reproduction to post-change pass transition";
+    }
+  } else {
+    status = newlyRegressedCount > 0 ? "failed" : "passed";
+    bugFixed = newlyRegressedCount === 0;
+    basis = "no targeted command was provided; verified no newly-regressed validation outcomes against baseline evidence";
+  }
+  return {
+    outcomeBased: true,
+    status,
+    bugFixed,
+    notReproduced,
+    reproductionAware: true,
+    requiresBaselineReproductionForTargetedSuccess: true,
+    basis,
+    targetedFailures: targetedFailures.map((result) => ({ command: result.command, status: result.status, timedOut: result.timedOut })),
+    targetedTransitions,
+    newlyRegressedCount,
+  };
+}
+
 async function runPostChangeValidation({ transactionId, planArtifact, artifactPaths, worktreePath, baseline }) {
   const startedAt = new Date().toISOString();
   const commands = baselineCommandList(planArtifact);
@@ -557,16 +627,10 @@ async function runPostChangeValidation({ transactionId, planArtifact, artifactPa
   const after = await gitInfo(worktreePath);
   const comparison = compareValidationResults({ baselineResults: baseline?.commandResults || [], postResults: results });
   const classifications = classifyPostValidationFailures(comparison, results, artifactPaths);
-  const targetedFailures = results.filter((result) => result.kind === "targeted_user_test" && result.status !== 0);
-  const status = commands.length === 0 ? "skipped_no_commands" : (comparison.newlyRegressed.length ? "completed_with_regressions" : (targetedFailures.length ? "completed_with_unfixed_targeted_failures" : "passed_without_new_regressions"));
-  const finalVerification = {
-    outcomeBased: true,
-    status: targetedFailures.length || comparison.newlyRegressed.length ? "failed" : "passed",
-    bugFixed: targetedFailures.length === 0,
-    basis: commands.some((entry) => entry.kind === "targeted_user_test") ? "targeted reproduction/user test commands passed after implementation" : "no targeted command was provided; verified no newly-regressed validation outcomes against baseline evidence",
-    targetedFailures: targetedFailures.map((result) => ({ command: result.command, status: result.status, timedOut: result.timedOut })),
-    newlyRegressedCount: comparison.newlyRegressed.length,
-  };
+  const finalVerification = buildFinalVerification({ commands, baselineResults: baseline?.commandResults || [], postResults: results, comparison });
+  const status = commands.length === 0
+    ? "skipped_no_commands"
+    : (comparison.newlyRegressed.length ? "completed_with_regressions" : (finalVerification.status === "failed" ? "completed_with_unfixed_targeted_failures" : (finalVerification.status === "inconclusive" ? "inconclusive_not_reproduced" : "passed_without_new_regressions")));
   const record = {
     schema: "pi-bug-solver-workflow/post-change-validation/v1",
     transactionId,
