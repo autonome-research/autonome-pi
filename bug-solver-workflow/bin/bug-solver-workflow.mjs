@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -149,10 +149,14 @@ function buildArtifactPaths(dir) {
     precheck: join(dir, "precheck.json"),
     transactionPlan: join(dir, "transaction-plan.json"),
     validationContract: join(dir, "validation-contract.json"),
+    artifactRegistry: join(dir, "artifact-registry.json"),
     baseline: join(dir, "evidence", "baseline-validation.json"),
     allowlistDecisions: join(dir, "allowlist-decisions.jsonl"),
     implementationEvidence: join(dir, "evidence", "implementation-evidence.jsonl"),
+    repairAttempts: join(dir, "repair-attempts.jsonl"),
+    failureClassifications: join(dir, "failure-classifications.jsonl"),
     finalReport: join(dir, "evidence", "final-report.json"),
+    intermediateReportsDir: join(dir, "reports"),
     state: join(dir, "state.json"),
   };
 }
@@ -172,6 +176,13 @@ function buildValidationContract({ transactionId, bug, cwd, validationCommands, 
       priority: "must",
       evidenceRequired: ["validation.userTestCommand", "validation.commands", "evidence.baseline", "evidence.implementation"],
       evidencePaths: [artifactPaths.baseline, artifactPaths.implementationEvidence],
+    },
+    {
+      id: "durable-transaction-state",
+      description: "Workflow state and evidence artifacts are external to the target repository and recoverable by transaction id.",
+      priority: "must",
+      evidenceRequired: ["state.lifecycle", "state.repo.baseCommit", "state.worktree", "artifactRegistry.entries"],
+      evidencePaths: [artifactPaths.state, artifactPaths.artifactRegistry],
     },
     {
       id: "baseline-aware-validation",
@@ -238,12 +249,18 @@ function buildTransactionPlan({ transactionId, cwd, bug, git, validationCommands
       decisionsPath: artifactPaths.allowlistDecisions,
     },
     artifacts: artifactPaths,
+    artifactRegistryPath: artifactPaths.artifactRegistry,
+    statePath: artifactPaths.state,
     evidencePaths: {
       precheck: artifactPaths.precheck,
       validationContract: artifactPaths.validationContract,
+      state: artifactPaths.state,
+      artifactRegistry: artifactPaths.artifactRegistry,
       baseline: artifactPaths.baseline,
       allowlistDecisions: artifactPaths.allowlistDecisions,
       implementation: artifactPaths.implementationEvidence,
+      repairAttempts: artifactPaths.repairAttempts,
+      failureClassifications: artifactPaths.failureClassifications,
       finalReport: artifactPaths.finalReport,
     },
   };
@@ -251,6 +268,7 @@ function buildTransactionPlan({ transactionId, cwd, bug, git, validationCommands
 
 function writeInitialJsonl(file, record) {
   mkdirSync(resolve(file, ".."), { recursive: true });
+  if (existsSync(file)) return;
   writeFileSync(file, `${JSON.stringify(record)}\n`, "utf8");
 }
 
@@ -281,9 +299,16 @@ async function gitInfo(cwd) {
   };
 }
 
-function writeJson(file, value) {
+function atomicWriteJson(file, value) {
   mkdirSync(resolve(file, ".."), { recursive: true });
-  writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  renameSync(tmp, file);
+  rmSync(tmp, { force: true });
+}
+
+function writeJson(file, value) {
+  atomicWriteJson(file, value);
 }
 
 function readJson(file) {
@@ -292,6 +317,163 @@ function readJson(file) {
 
 function transactionDir(transactionId) {
   return join(ARTIFACT_ROOT, "transactions", safeId(transactionId));
+}
+
+function registryIndexPath() {
+  return join(ARTIFACT_ROOT, "registry", "transactions.json");
+}
+
+function transactionBranchName(transactionId) {
+  return `bug-solver/${safeId(transactionId).slice(0, 60)}`;
+}
+
+function transactionWorktreePath(transactionId) {
+  return join(ARTIFACT_ROOT, "worktrees", safeId(transactionId));
+}
+
+function artifactRegistry({ transactionId, artifactPaths }) {
+  const entries = [
+    ["precheck", artifactPaths.precheck, "read-only precheck result and approval instructions"],
+    ["transactionPlan", artifactPaths.transactionPlan, "approval-gated transaction plan"],
+    ["validationContract", artifactPaths.validationContract, "pre-implementation validation assertions and evidence map"],
+    ["state", artifactPaths.state, "durable transaction lifecycle state"],
+    ["artifactRegistry", artifactPaths.artifactRegistry, "recoverable list of transaction artifacts"],
+    ["baselineValidation", artifactPaths.baseline, "baseline validation command evidence"],
+    ["allowlistDecisions", artifactPaths.allowlistDecisions, "initial allowlist and justified expansions"],
+    ["implementationEvidence", artifactPaths.implementationEvidence, "implementation and validation evidence log"],
+    ["repairAttempts", artifactPaths.repairAttempts, "bounded repair attempt log"],
+    ["failureClassifications", artifactPaths.failureClassifications, "classified failures and evidence"],
+    ["finalReport", artifactPaths.finalReport, "outcome-based final report"],
+  ].map(([kind, path, description]) => ({ kind, path, description, externalToTargetRepo: true }));
+  return {
+    schema: "pi-bug-solver-workflow/artifact-registry/v1",
+    transactionId,
+    artifactRoot: ARTIFACT_ROOT,
+    transactionDir: artifactPaths.root,
+    createdAt: new Date().toISOString(),
+    recoverableByTransactionId: true,
+    entries,
+  };
+}
+
+function assertExistingTransactionCompatible({ transactionId, cwd, bug, artifactPaths }) {
+  if (!existsSync(artifactPaths.state)) return;
+  const existing = readJson(artifactPaths.state);
+  const existingBug = existing.transaction?.bugDescription;
+  const existingCwd = existing.repo?.cwd;
+  if ((existingBug && existingBug !== bug) || (existingCwd && existingCwd !== cwd)) {
+    throw new Error(`transaction id ${transactionId} already exists for a different bug or repository; choose a new --transaction-id`);
+  }
+}
+
+function buildTransactionState({ transactionId, cwd, bug, git, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, status }) {
+  const now = new Date().toISOString();
+  const existing = existsSync(artifactPaths.state) ? readJson(artifactPaths.state) : {};
+  const createdAt = existing.createdAt || now;
+  const revision = Number.isInteger(existing.revision) ? existing.revision + 1 : 1;
+  const lifecycleStatus = status || (multiplicity.likelyMultiple ? "rejected_multi_bug" : "awaiting_confirmation");
+  return {
+    schema: "pi-bug-solver-workflow/state/v1",
+    transactionId,
+    createdAt,
+    updatedAt: now,
+    revision,
+    lifecycle: {
+      status: lifecycleStatus,
+      phase: "precheck",
+      terminal: lifecycleStatus === "rejected_multi_bug",
+      editingAllowed: false,
+      confirmationRequired: true,
+      readOnlyPrecheckComplete: true,
+    },
+    transaction: {
+      exactlyOneBug: !multiplicity.likelyMultiple,
+      bugDescription: bug,
+      multiplicity,
+    },
+    repo: {
+      cwd,
+      root: git.root || cwd,
+      isGitRepo: git.isGitRepo,
+      baseCommit: git.head || null,
+      baseRef: git.branch || "HEAD",
+      statusAtPrecheck: git.statusShort || "",
+    },
+    branch: {
+      baseCommit: git.head || null,
+      plannedName: transactionBranchName(transactionId),
+      currentName: null,
+      status: "not_created",
+    },
+    worktree: {
+      path: transactionWorktreePath(transactionId),
+      status: "not_created",
+      isolated: true,
+      rootedAtBaseCommit: git.head || null,
+    },
+    validation: {
+      commands: validationCommands,
+      userTestCommand: userTestCommand || null,
+      executionOrder: ["targeted_bug_reproduction", "broad_validation_commands"],
+      contractPath: artifactPaths.validationContract,
+      evidencePaths: {
+        baseline: artifactPaths.baseline,
+        implementation: artifactPaths.implementationEvidence,
+        finalReport: artifactPaths.finalReport,
+      },
+      baseline: { status: "pending", path: artifactPaths.baseline },
+      finalVerification: { status: "pending", outcomeBased: true, path: artifactPaths.finalReport },
+    },
+    allowlist: {
+      current: allowlist,
+      decisionsPath: artifactPaths.allowlistDecisions,
+    },
+    repair: {
+      maxRepairIterations,
+      attempts: 0,
+      remaining: maxRepairIterations,
+      attemptsPath: artifactPaths.repairAttempts,
+    },
+    failureClassification: {
+      current: null,
+      status: "none",
+      classificationsPath: artifactPaths.failureClassifications,
+    },
+    reports: {
+      finalReportPath: artifactPaths.finalReport,
+      intermediateReportsDir: artifactPaths.intermediateReportsDir,
+    },
+    artifacts: artifactPaths,
+    artifactRegistryPath: artifactPaths.artifactRegistry,
+    recoverableByTransactionId: true,
+  };
+}
+
+function updateGlobalRegistry(state) {
+  const file = registryIndexPath();
+  const existing = existsSync(file) ? readJson(file) : { schema: "pi-bug-solver-workflow/transaction-index/v1", artifactRoot: ARTIFACT_ROOT, transactions: {} };
+  const previous = existing.transactions?.[state.transactionId] || {};
+  const next = {
+    ...existing,
+    schema: "pi-bug-solver-workflow/transaction-index/v1",
+    artifactRoot: ARTIFACT_ROOT,
+    updatedAt: new Date().toISOString(),
+    transactions: {
+      ...(existing.transactions || {}),
+      [state.transactionId]: {
+        transactionId: state.transactionId,
+        status: state.lifecycle.status,
+        statePath: state.artifacts.state,
+        artifactDir: state.artifacts.root,
+        planPath: state.artifacts.transactionPlan,
+        baseCommit: state.repo.baseCommit,
+        updatedAt: state.updatedAt,
+        createdAt: previous.createdAt || state.createdAt,
+      },
+    },
+  };
+  writeJson(file, next);
+  return file;
 }
 
 async function precheck(args, json) {
@@ -312,6 +494,7 @@ async function precheck(args, json) {
     const userTestCommand = args["user-test-command"] ? String(Array.isArray(args["user-test-command"]) ? args["user-test-command"].at(-1) : args["user-test-command"]).trim() : null;
     const maxRepairIterations = parseMaxRepairs(args["max-repairs"] ?? args.maxRepairIterations);
     const artifactPaths = buildArtifactPaths(dir);
+    assertExistingTransactionCompatible({ transactionId, cwd, bug, artifactPaths });
     const allowlist = splitValues(args.allowlist || args["allow-list"]);
     const contract = buildValidationContract({ transactionId, bug, cwd, validationCommands, userTestCommand, artifactPaths });
     const plan = buildTransactionPlan({ transactionId, cwd, bug, git, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, contractPath: artifactPaths.validationContract });
@@ -344,18 +527,26 @@ async function precheck(args, json) {
       },
     };
     const file = artifactPaths.precheck;
+    const state = buildTransactionState({ transactionId, cwd, bug, git, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, status: record.status });
+    const registry = artifactRegistry({ transactionId, artifactPaths });
     writeJson(file, record);
-    writeJson(artifactPaths.transactionPlan, plan);
+    writeJson(artifactPaths.transactionPlan, { ...plan, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry });
     writeJson(artifactPaths.validationContract, contract);
+    writeJson(artifactPaths.artifactRegistry, registry);
     writeInitialJsonl(artifactPaths.allowlistDecisions, { type: "initial_allowlist", createdAt: record.createdAt, allowlist, justification: "Seeded during read-only precheck before implementation." });
-    writeJson(artifactPaths.state, { schema: "pi-bug-solver-workflow/state/v1", transactionId, status: record.status, phase: "precheck", planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract });
-    phaseEvent(run, "precheck", { message: "Recorded read-only bug transaction precheck", transactionId, status: record.status, artifactPath: file });
+    writeInitialJsonl(artifactPaths.repairAttempts, { type: "repair_counter_initialized", createdAt: record.createdAt, attempts: 0, maxRepairIterations, remaining: maxRepairIterations });
+    writeInitialJsonl(artifactPaths.failureClassifications, { type: "failure_classification_initialized", createdAt: record.createdAt, status: "none", classification: null });
+    writeJson(artifactPaths.state, state);
+    const registryIndex = updateGlobalRegistry(state);
+    phaseEvent(run, "precheck", { message: "Recorded read-only bug transaction precheck and durable state schema", transactionId, status: record.status, artifactPath: file, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry });
     emitArtifact(run, { kind: "file", title: "bug-solver precheck", path: file });
     emitArtifact(run, { kind: "file", title: "bug-solver transaction plan", path: artifactPaths.transactionPlan });
     emitArtifact(run, { kind: "file", title: "bug-solver validation contract", path: artifactPaths.validationContract });
-    phaseEnd(run, "precheck", multiplicity.likelyMultiple ? STATUSES.FAILED : STATUSES.SUCCESS, { status: record.status, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract });
-    completeRun(run, multiplicity.likelyMultiple ? STATUSES.FAILED : STATUSES.SUCCESS, { transactionId, precheckPath: file, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract });
-    const result = { ok: !multiplicity.likelyMultiple, action: "precheck", runId: run.runId, transactionId, precheckPath: file, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract, artifactDir: dir, status: record.status, confirmationRequired: true };
+    emitArtifact(run, { kind: "file", title: "bug-solver transaction state", path: artifactPaths.state });
+    emitArtifact(run, { kind: "file", title: "bug-solver artifact registry", path: artifactPaths.artifactRegistry });
+    phaseEnd(run, "precheck", multiplicity.likelyMultiple ? STATUSES.FAILED : STATUSES.SUCCESS, { status: record.status, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry });
+    completeRun(run, multiplicity.likelyMultiple ? STATUSES.FAILED : STATUSES.SUCCESS, { transactionId, precheckPath: file, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry });
+    const result = { ok: !multiplicity.likelyMultiple, action: "precheck", runId: run.runId, transactionId, precheckPath: file, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry, registryIndexPath: registryIndex, artifactDir: dir, status: record.status, confirmationRequired: true };
     if (json) console.log(JSON.stringify(result, null, 2));
     else console.log(`${record.status}: ${file}`);
     process.exit(multiplicity.likelyMultiple ? 1 : 0);
@@ -400,6 +591,20 @@ async function solve(args, json) {
     };
     const file = join(transactionDir(transactionId), "activation-scaffold.json");
     writeJson(file, activation);
+    const statePath = plan.artifacts?.state || join(transactionDir(transactionId), "state.json");
+    if (existsSync(statePath)) {
+      const state = readJson(statePath);
+      const updatedState = {
+        ...state,
+        updatedAt: new Date().toISOString(),
+        revision: Number.isInteger(state.revision) ? state.revision + 1 : 1,
+        lifecycle: { ...(state.lifecycle || {}), status: "activation_scaffold_recorded", phase: "activation-scaffold", editingAllowed: false, terminal: false },
+        reports: { ...(state.reports || {}), activationScaffoldPath: file },
+      };
+      writeJson(statePath, updatedState);
+      updateGlobalRegistry(updatedState);
+      emitArtifact(run, { kind: "file", title: "bug-solver transaction state", path: statePath });
+    }
     emitArtifact(run, { kind: "file", title: "bug-solver activation scaffold", path: file });
     phaseEnd(run, "activation-scaffold", STATUSES.SUCCESS, { artifactPath: file });
     completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file });
@@ -415,7 +620,24 @@ async function solve(args, json) {
 function status(args, json) {
   const transactionId = args["transaction-id"];
   const dir = transactionId ? transactionDir(transactionId) : join(ARTIFACT_ROOT, "transactions");
-  const result = { ok: true, action: "status", artifactRoot: ARTIFACT_ROOT, path: dir, exists: existsSync(dir) };
+  const statePath = transactionId ? join(dir, "state.json") : undefined;
+  const artifactRegistryPath = transactionId ? join(dir, "artifact-registry.json") : undefined;
+  const indexPath = registryIndexPath();
+  const state = statePath && existsSync(statePath) ? readJson(statePath) : undefined;
+  const result = {
+    ok: true,
+    action: "status",
+    artifactRoot: ARTIFACT_ROOT,
+    path: dir,
+    exists: existsSync(dir),
+    transactionId: transactionId || undefined,
+    statePath,
+    artifactRegistryPath,
+    registryIndexPath: indexPath,
+    status: state?.lifecycle?.status || state?.status,
+    recoverable: Boolean(state && artifactRegistryPath && existsSync(artifactRegistryPath)),
+    state,
+  };
   if (json) console.log(JSON.stringify(result, null, 2));
   else console.log(`${dir}${result.exists ? "" : " (missing)"}`);
 }
