@@ -104,12 +104,59 @@ function buildArgs(params: Record<string, any>, ctx: any): string[] {
 	if (params.planPath) args.push("--plan-path", params.planPath);
 	if (params.approved) args.push("--approved");
 	if (params.background) args.push("--background");
+	if (params.commandTimeoutMs !== undefined) args.push("--command-timeout-ms", String(params.commandTimeoutMs));
+	if (params.cleanup) args.push("--cleanup", params.cleanup);
+	if (params.deleteBranchOnCleanup) args.push("--delete-branch-on-cleanup");
 	if (params.userTestCommand) args.push("--user-test-command", params.userTestCommand);
 	if (params.implementationCommand) args.push("--implementation-command", params.implementationCommand);
 	if (params.maxRepairIterations !== undefined) args.push("--max-repairs", String(params.maxRepairIterations));
 	for (const entry of splitList(params.allowlist)) args.push("--allowlist", entry);
 	for (const command of commandList(params.validationCommands)) args.push("--validation-command", command);
 	return addSessionArgs(args, ctx);
+}
+
+function shellSplit(input: string): string[] {
+	const out: string[] = [];
+	let current = "";
+	let quote: "'" | '"' | undefined;
+	let escaping = false;
+	for (const ch of input) {
+		if (escaping) { current += ch; escaping = false; continue; }
+		if (ch === "\\") { escaping = true; continue; }
+		if (quote) {
+			if (ch === quote) quote = undefined;
+			else current += ch;
+			continue;
+		}
+		if (ch === "'" || ch === '"') { quote = ch; continue; }
+		if (/\s/.test(ch)) { if (current) { out.push(current); current = ""; } continue; }
+		current += ch;
+	}
+	if (current) out.push(current);
+	return out;
+}
+
+function cliParamsFromArgs(input: string): Record<string, any> {
+	const parts = shellSplit(input.trim());
+	const action = (parts.shift() || "precheck") as BugSolverAction;
+	const params: Record<string, any> = { action };
+	const bugParts: string[] = [];
+	const readValue = (i: number) => parts[i + 1] && !parts[i + 1].startsWith("--") ? parts[++i] : "true";
+	for (let i = 0; i < parts.length; i++) {
+		const part = parts[i];
+		if (!part.startsWith("--")) { bugParts.push(part); continue; }
+		const [rawKey, inline] = part.slice(2).split(/=(.*)/s, 2);
+		const value = inline !== undefined ? inline : readValue(i);
+		if (inline === undefined && value !== "true") i++;
+		const key = rawKey.replace(/-([a-z])/g, (_m, c) => c.toUpperCase());
+		if (["approved", "background", "deleteBranchOnCleanup"].includes(key)) params[key] = value === "true" || value === "1" || value === "yes";
+		else if (key === "validationCommand" || key === "validationCommands") params.validationCommands = [...(params.validationCommands || []), value];
+		else if (key === "maxRepairs") params.maxRepairIterations = Number(value);
+		else if (key === "commandTimeoutMs") params.commandTimeoutMs = Number(value);
+		else params[key] = value;
+	}
+	if (bugParts.length && !params.bug) params.bug = bugParts.join(" ");
+	return params;
 }
 
 export default function bugSolverWorkflow(pi: ExtensionAPI) {
@@ -150,7 +197,10 @@ export default function bugSolverWorkflow(pi: ExtensionAPI) {
 			transactionDir: Type.Optional(Type.String({ description: "Optional external transaction directory to inspect with action=status." })),
 			planPath: Type.Optional(Type.String({ description: "Precheck artifact/plan path produced by action=precheck." })),
 			approved: Type.Optional(Type.Boolean({ description: "Required true for action=solve after explicit precheck confirmation." })),
-			background: Type.Optional(Type.Boolean({ description: "Start action in the background and return immediately when supported." })),
+			background: Type.Optional(Type.Boolean({ description: "Start action in the background and return immediately with a pid; inspect durable state later with action=status." })),
+			commandTimeoutMs: Type.Optional(Type.Number({ description: "Safe per-command timeout in milliseconds for validation/implementation commands. Defaults to the CLI environment default." })),
+			cleanup: Type.Optional(StringEnum(["preserve", "auto"] as const, { description: "Transaction worktree cleanup policy after durable final reporting. Defaults to preserve for manual review." })),
+			deleteBranchOnCleanup: Type.Optional(Type.Boolean({ description: "When cleanup='auto', also delete the transaction branch after safely removing a clean worktree." })),
 			validationCommands: Type.Optional(Type.Array(Type.String(), { description: "Candidate broad validation commands to record for baseline-aware solve planning." })),
 			userTestCommand: Type.Optional(Type.String({ description: "Optional targeted bug-reproduction/user test command to run before broad validation." })),
 			implementationCommand: Type.Optional(Type.String({ description: "Optional edit-capable implementation command to run in the isolated transaction worktree after baseline validation and before post-change validation." })),
@@ -173,15 +223,14 @@ export default function bugSolverWorkflow(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("bug-solver", {
-		description: "Precheck/status/solve a single bug transaction with the bug-solver workflow",
+		description: "Precheck/status/solve a single bug transaction with the bug-solver workflow. Supports the same safe flags as the tool, for example: /bug-solver precheck --bug 'Fix X' --validation-command 'npm test', /bug-solver solve --plan-path <path> --approved --background, or /bug-solver status --transaction-id <id>.",
 		handler: async (args, ctx) => {
-			const parts = args.trim().split(/\s+/).filter(Boolean);
-			const action = (parts.shift() || "precheck") as BugSolverAction;
-			const cwd = resolveAgainstActive(activeCwd || ctx.cwd, undefined);
+			const params = cliParamsFromArgs(args);
+			const action = (params.action || "precheck") as BugSolverAction;
+			const cwd = resolveAgainstActive(activeCwd || ctx.cwd, params.cwd);
 			ctx.ui.setStatus("bug-solver", `${action} running...`);
 			try {
-				const scriptArgs = addSessionArgs([action, "--cwd", cwd, "--json", ...(parts.length ? ["--bug", parts.join(" ")] : [])], ctx);
-				const result = await runScript(scriptArgs, cwd, ctx.signal);
+				const result = await runScript(buildArgs({ ...params, action, cwd }, ctx), cwd, ctx.signal);
 				if (result.code !== 0) ctx.ui.notify(result.stderr || result.stdout || `bug-solver exited ${result.code}`, "error");
 				else ctx.ui.notify(truncate(result.stdout.trim(), 4000), "info");
 			} finally {

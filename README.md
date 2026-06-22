@@ -32,7 +32,7 @@ pi install git:git@github.com:Code4me2/pi-thread-phase-tools@main
 - `/code-review` runs code review workflows.
 - `dynamic_workflow` runs validated dynamic workflows from structured specs or JavaScript harnesses. `dynamic_thread_phase_workflow` remains as a deprecated compatibility alias.
 - `mission_workflow` plans and activates approved Droid/Missions-style software missions. Always run `action: "plan"` and get user approval before `action: "activate"`.
-- `bug_solver_workflow` prechecks and approval-gates a focused one-bug transaction. Always run `action: "precheck"` before `action: "solve"` with `approved: true`.
+- `bug_solver_workflow` prechecks and approval-gates a focused one-bug transaction. Always run `action: "precheck"` before `action: "solve"` with `approved: true`; use `action: "status"` with a transaction id/dir for read-only recovery. The tool and `/bug-solver` command also expose safe optional background, timeout, and cleanup parameters without changing existing inputs.
 - Tool/API inspection remains available through `thread_phase_runs`.
 - Workflow skills are included in the package and should load automatically when tasks ask for dynamic workflows, mission workflows, structured workflow specs, JS harness workflows, or multi-phase dynamic execution.
 

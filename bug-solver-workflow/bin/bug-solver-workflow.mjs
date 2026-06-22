@@ -4,6 +4,7 @@ import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSyn
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative as importPathRelative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   STATUSES,
   artifact as emitArtifact,
@@ -26,6 +27,7 @@ let ARTIFACT_ROOT = resolveArtifactRoot();
 
 function parseArgs(argv) {
   const out = { _: [] };
+  const booleanFlags = new Set(["json", "approved", "background", "delete-branch-on-cleanup", "auto-cleanup"]);
   const setArg = (key, value) => {
     if (out[key] === undefined) out[key] = value;
     else if (Array.isArray(out[key])) out[key].push(value);
@@ -38,6 +40,7 @@ function parseArgs(argv) {
       const eq = arg.indexOf("=");
       const key = arg.slice(2, eq === -1 ? undefined : eq);
       if (eq !== -1) setArg(key, arg.slice(eq + 1));
+      else if (booleanFlags.has(key)) setArg(key, true);
       else if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) setArg(key, argv[++i]);
       else setArg(key, true);
     } else out._.push(arg);
@@ -46,13 +49,46 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  return `Usage:\n  bug-solver-workflow precheck --bug <single bug> [--cwd <repo>] [--validation-command <cmd>]... [--user-test-command <cmd>] [--max-repairs <n>] [--allowlist <path>] [--json]\n  bug-solver-workflow solve --plan-path <transaction-plan.json|precheck.json> --approved [--cwd <repo>] [--implementation-command <cmd>] [--json]\n  bug-solver-workflow status [--transaction-id <id>|--transaction-dir <dir>] [--json]\n\nRepeat --validation-command for multiple broad commands; each value is stored and executed unchanged, including shell semicolons and commas inside the command. The solve action is intentionally approval-gated. Runtime artifacts are written outside the target repo under ${ARTIFACT_ROOT}.`;
+  return `Usage:\n  bug-solver-workflow precheck --bug <single bug> [--cwd <repo>] [--validation-command <cmd>]... [--user-test-command <cmd>] [--max-repairs <n>] [--allowlist <path>] [--command-timeout-ms <ms>] [--background] [--json]\n  bug-solver-workflow solve --plan-path <transaction-plan.json|precheck.json> --approved [--cwd <repo>] [--implementation-command <cmd>] [--cleanup preserve|auto] [--delete-branch-on-cleanup] [--command-timeout-ms <ms>] [--background] [--json]\n  bug-solver-workflow status [--transaction-id <id>|--transaction-dir <dir>] [--json]\n\nRepeat --validation-command for multiple broad commands; each value is stored and executed unchanged, including shell semicolons and commas inside the command. The solve action is intentionally approval-gated. Runtime artifacts are written outside the target repo under ${ARTIFACT_ROOT}. Use --background from the Pi extension or CLI to start a durable transaction and return a pid immediately; use status to inspect transaction state. Command timeouts default to ${DEFAULT_COMMAND_TIMEOUT_MS}ms and can be overridden safely with --command-timeout-ms or PI_BUG_SOLVER_COMMAND_TIMEOUT_MS.`;
 }
 
 function die(message, code = 1, json = false) {
   if (json) console.log(JSON.stringify({ ok: false, error: message }));
   else console.error(message);
   process.exit(code);
+}
+
+function argvWithoutBackground(argv) {
+  const out = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--background") continue;
+    if (arg.startsWith("--background=")) continue;
+    out.push(arg);
+  }
+  return out;
+}
+
+function maybeStartBackground(args, argv, json) {
+  if (!args.background) return false;
+  const childArgs = argvWithoutBackground(argv);
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...childArgs], {
+    cwd: process.cwd(),
+    env: { ...process.env, PI_BUG_SOLVER_BACKGROUND_PARENT: String(process.pid) },
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+  const result = {
+    ok: true,
+    background: true,
+    pid: child.pid,
+    action: String(args._?.[0] || args.action || "help"),
+    message: "bug-solver-workflow started in the background; inspect durable state with action=status, transactionId, or transactionDir.",
+  };
+  if (json) console.log(JSON.stringify(result, null, 2));
+  else console.log(`bug-solver-workflow background pid ${child.pid}; use status to inspect durable state.`);
+  return true;
 }
 
 function safeId(value) {
@@ -169,6 +205,45 @@ function parseMaxRepairs(value) {
   const parsed = Number.parseInt(String(Array.isArray(value) ? value.at(-1) : value), 10);
   if (!Number.isFinite(parsed) || parsed < 0 || parsed > 50) throw new Error("--max-repairs must be an integer from 0 to 50");
   return parsed;
+}
+
+function parseCommandTimeoutMs(value) {
+  if (value === undefined || value === false || value === "") return undefined;
+  const parsed = Number.parseInt(String(Array.isArray(value) ? value.at(-1) : value), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 24 * 60 * 60 * 1000) throw new Error("--command-timeout-ms must be an integer from 1 to 86400000");
+  return parsed;
+}
+
+function applyRuntimeArgs(args) {
+  const timeoutMs = parseCommandTimeoutMs(args["command-timeout-ms"] ?? args.commandTimeoutMs);
+  if (timeoutMs !== undefined) process.env.PI_BUG_SOLVER_COMMAND_TIMEOUT_MS = String(timeoutMs);
+}
+
+function cleanupPolicyFromArgs(args) {
+  const raw = args.cleanup ?? args["cleanup-policy"] ?? (args["auto-cleanup"] ? "auto" : undefined);
+  if (raw === undefined) return undefined;
+  const value = String(Array.isArray(raw) ? raw.at(-1) : raw).trim().toLowerCase();
+  if (!["preserve", "auto", "automatic"].includes(value)) throw new Error("--cleanup must be 'preserve' or 'auto'");
+  return {
+    automatic: value === "auto" || value === "automatic",
+    durableReuse: value === "preserve",
+    deleteBranch: Boolean(args["delete-branch-on-cleanup"] ?? args.deleteBranchOnCleanup),
+    owner: WORKFLOW,
+    configuredBy: "cli-or-extension-api",
+    configuredAt: new Date().toISOString(),
+    reason: value === "preserve"
+      ? "The caller requested preservation of the transaction worktree/branch for manual review or resume."
+      : "The caller requested safe automatic cleanup after durable final reporting; dirty transaction worktrees are preserved.",
+  };
+}
+
+function recordRequestedCleanupPolicy({ artifactPaths, transactionId, args }) {
+  const cleanup = cleanupPolicyFromArgs(args);
+  if (!cleanup) return undefined;
+  const now = new Date().toISOString();
+  const metadata = tryReadJson(artifactPaths.worktreeMetadata) || { schema: "pi-bug-solver-workflow/worktree-metadata/v1", transactionId };
+  writeJson(artifactPaths.worktreeMetadata, { ...metadata, transactionId, updatedAt: now, cleanup: { ...(metadata.cleanup || {}), ...cleanup } });
+  return cleanup;
 }
 
 const BUG_ACTION_PATTERN = /\b(fix|repair|resolve|correct|prevent|stop|address|debug|handle|ensure|make)\b/i;
@@ -2883,6 +2958,8 @@ async function solve(args, json) {
     if (!gate.safeBeforeEditCapablePhase) throw new Error(`Transaction plan is unsafe before edit-capable phases: ${gate.reasons.join("; ")}`);
     const integrity = assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd });
     const artifactPaths = integrity.artifactPaths;
+    const requestedCleanupPolicy = recordRequestedCleanupPolicy({ artifactPaths, transactionId, args });
+    if (requestedCleanupPolicy) phaseEvent(run, "confirmation-gate", { type: "cleanup_policy_recorded", cleanup: requestedCleanupPolicy, worktreeMetadataPath: artifactPaths.worktreeMetadata });
     const integrityFinalReport = tryReadJson(artifactPaths.finalReport);
     const recoverableCompletion = completionEvidenceIntegrity({ transactionId, state: null, finalReport: integrityFinalReport, artifactPaths });
     if (integrity.state?.lifecycle?.status !== "completed" && integrityFinalReport?.status === "completed" && recoverableCompletion.ok) {
@@ -3565,9 +3642,12 @@ async function status(args, json) {
 }
 
 async function main() {
-  const args = parseArgs(process.argv.slice(2));
-  const action = String(args._.shift() || args.action || "help");
+  const argv = process.argv.slice(2);
+  const args = parseArgs(argv);
   const json = Boolean(args.json);
+  if (maybeStartBackground(args, argv, json)) return;
+  applyRuntimeArgs(args);
+  const action = String(args._.shift() || args.action || "help");
   if (["help", "-h", "--help"].includes(action)) {
     if (json) console.log(JSON.stringify({ ok: true, usage: usage() }, null, 2));
     else console.log(usage());
