@@ -136,6 +136,26 @@ try {
   let bugDirStatusDetails;
   try { bugDirStatusDetails = bugDirStatus?.stdout ? JSON.parse(bugDirStatus.stdout) : undefined; } catch { bugDirStatusDetails = undefined; }
   log(bugDirStatusDetails?.transactionId === bugPrecheckDetails?.transactionId && bugDirStatusDetails?.artifactRegistryPath === bugPrecheckDetails?.artifactRegistryPath, 'bug-solver status can recover transaction details from a directory without a target repo edit');
+  const repeatedPrecheckRepo = join(tmp, 'repeated-precheck-repo');
+  mkdirSync(repeatedPrecheckRepo, { recursive: true });
+  expectExit('bug-solver repeated-precheck repo git init', ['git', 'init', '-q'], 0, { cwd: repeatedPrecheckRepo });
+  expectExit('bug-solver repeated-precheck repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: repeatedPrecheckRepo });
+  expectExit('bug-solver repeated-precheck repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: repeatedPrecheckRepo });
+  writeFileSync(join(repeatedPrecheckRepo, 'README.md'), 'first\n');
+  expectExit('bug-solver repeated-precheck repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m first'], 0, { cwd: repeatedPrecheckRepo });
+  const repeatedFirstHead = expectExit('bug-solver repeated-precheck captures first head', ['git', 'rev-parse', 'HEAD'], 0, { cwd: repeatedPrecheckRepo }).stdout.trim();
+  const stableTransactionId = 'smoke-repeated-precheck-identity';
+  const repeatedFirst = expectExit('bug-solver workflow first stable-id precheck succeeds', ['node', bugSolverCli, 'precheck', '--cwd', repeatedPrecheckRepo, '--bug', 'Fix repeated precheck identity bug', '--transaction-id', stableTransactionId, '--json'], 0);
+  let repeatedFirstDetails;
+  try { repeatedFirstDetails = JSON.parse(repeatedFirst.stdout); } catch { repeatedFirstDetails = undefined; }
+  writeFileSync(join(repeatedPrecheckRepo, 'README.md'), 'second\n');
+  expectExit('bug-solver repeated-precheck repo second commit', ['sh', '-c', 'git add README.md && git commit -q -m second'], 0, { cwd: repeatedPrecheckRepo });
+  const repeatedSecondHead = expectExit('bug-solver repeated-precheck captures second head', ['git', 'rev-parse', 'HEAD'], 0, { cwd: repeatedPrecheckRepo }).stdout.trim();
+  expectExit('bug-solver workflow repeated stable-id precheck succeeds', ['node', bugSolverCli, 'precheck', '--cwd', repeatedPrecheckRepo, '--bug', 'Fix repeated precheck identity bug', '--transaction-id', stableTransactionId, '--json'], 0);
+  const repeatedState = repeatedFirstDetails?.statePath ? JSON.parse(readFileSync(repeatedFirstDetails.statePath, 'utf8')) : undefined;
+  const repeatedPlan = repeatedFirstDetails?.planPath ? JSON.parse(readFileSync(repeatedFirstDetails.planPath, 'utf8')) : undefined;
+  log(repeatedState?.repo?.baseCommit === repeatedFirstHead && repeatedState?.branch?.baseCommit === repeatedFirstHead && repeatedState?.worktree?.rootedAtBaseCommit === repeatedFirstHead && repeatedPlan?.repo?.baseCommit === repeatedFirstHead && repeatedSecondHead !== repeatedFirstHead, 'bug-solver repeated precheck preserves immutable base commit/ref, branch, and worktree identity');
+  log(repeatedState?.observations?.prechecks?.length >= 2 && repeatedState?.observations?.latestPrecheck?.repo?.head === repeatedSecondHead, 'bug-solver repeated precheck records later repo observations separately from immutable identity');
   const visualizerStoreSource = readFileSync(join(root, 'thread-phase-visualizer/lib/store.mjs'), 'utf8');
   const visualizerIndexSource = readFileSync(join(root, 'thread-phase-visualizer/index.ts'), 'utf8');
   log(!/bug[-_]solver|pi-bug-solver/i.test(`${visualizerStoreSource}\n${visualizerIndexSource}`), 'generic thread-phase visualizer has no bug-solver-specific coupling');

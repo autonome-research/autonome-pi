@@ -332,6 +332,7 @@ function transactionWorktreePath(transactionId) {
 }
 
 function artifactRegistry({ transactionId, artifactPaths }) {
+  const existing = existsSync(artifactPaths.artifactRegistry) ? readJson(artifactPaths.artifactRegistry) : {};
   const entries = [
     ["precheck", artifactPaths.precheck, "read-only precheck result and approval instructions"],
     ["transactionPlan", artifactPaths.transactionPlan, "approval-gated transaction plan"],
@@ -350,19 +351,33 @@ function artifactRegistry({ transactionId, artifactPaths }) {
     transactionId,
     artifactRoot: ARTIFACT_ROOT,
     transactionDir: artifactPaths.root,
-    createdAt: new Date().toISOString(),
+    createdAt: existing.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
     recoverableByTransactionId: true,
     entries,
   };
 }
 
-function assertExistingTransactionCompatible({ transactionId, cwd, bug, artifactPaths }) {
+function assertExistingTransactionCompatible({ transactionId, cwd, bug, git, artifactPaths }) {
   if (!existsSync(artifactPaths.state)) return;
   const existing = readJson(artifactPaths.state);
   const existingBug = existing.transaction?.bugDescription;
   const existingCwd = existing.repo?.cwd;
-  if ((existingBug && existingBug !== bug) || (existingCwd && existingCwd !== cwd)) {
-    throw new Error(`transaction id ${transactionId} already exists for a different bug or repository; choose a new --transaction-id`);
+  const existingRoot = existing.repo?.root;
+  const currentRoot = git?.root || cwd;
+  const existingWorktreePath = existing.worktree?.path;
+  const expectedWorktreePath = transactionWorktreePath(transactionId);
+  const existingBranchName = existing.branch?.plannedName;
+  const expectedBranchName = transactionBranchName(transactionId);
+  const incompatible = [];
+  if (existing.transactionId && existing.transactionId !== transactionId) incompatible.push("state transactionId differs from requested transaction id");
+  if (existingBug && existingBug !== bug) incompatible.push("bug description differs from existing transaction");
+  if (existingCwd && existingCwd !== cwd) incompatible.push("repository cwd differs from existing transaction");
+  if (existingRoot && currentRoot && existingRoot !== currentRoot) incompatible.push("repository root differs from existing transaction");
+  if (existingWorktreePath && existingWorktreePath !== expectedWorktreePath) incompatible.push("isolated worktree path differs from transaction identity");
+  if (existingBranchName && existingBranchName !== expectedBranchName) incompatible.push("planned branch name differs from transaction identity");
+  if (incompatible.length) {
+    throw new Error(`transaction id ${transactionId} already exists for an incompatible transaction (${incompatible.join("; ")}); choose a new --transaction-id`);
   }
 }
 
@@ -372,6 +387,44 @@ function buildTransactionState({ transactionId, cwd, bug, git, validationCommand
   const createdAt = existing.createdAt || now;
   const revision = Number.isInteger(existing.revision) ? existing.revision + 1 : 1;
   const lifecycleStatus = status || (multiplicity.likelyMultiple ? "rejected_multi_bug" : "awaiting_confirmation");
+  const observation = {
+    observedAt: now,
+    cwd,
+    repo: {
+      root: git.root || cwd,
+      isGitRepo: git.isGitRepo,
+      head: git.head || null,
+      branch: git.branch || "HEAD",
+      statusShort: git.statusShort || "",
+    },
+    validationCommands,
+    userTestCommand: userTestCommand || null,
+    maxRepairIterations,
+    allowlist,
+    multiplicity,
+    status: lifecycleStatus,
+  };
+  const previousObservations = Array.isArray(existing.observations?.prechecks) ? existing.observations.prechecks : [];
+  const repoIdentity = existing.repo || {
+    cwd,
+    root: git.root || cwd,
+    isGitRepo: git.isGitRepo,
+    baseCommit: git.head || null,
+    baseRef: git.branch || "HEAD",
+    statusAtPrecheck: git.statusShort || "",
+  };
+  const branchIdentity = existing.branch || {
+    baseCommit: repoIdentity.baseCommit,
+    plannedName: transactionBranchName(transactionId),
+    currentName: null,
+    status: "not_created",
+  };
+  const worktreeIdentity = existing.worktree || {
+    path: transactionWorktreePath(transactionId),
+    status: "not_created",
+    isolated: true,
+    rootedAtBaseCommit: repoIdentity.baseCommit,
+  };
   return {
     schema: "pi-bug-solver-workflow/state/v1",
     transactionId,
@@ -391,26 +444,9 @@ function buildTransactionState({ transactionId, cwd, bug, git, validationCommand
       bugDescription: bug,
       multiplicity,
     },
-    repo: {
-      cwd,
-      root: git.root || cwd,
-      isGitRepo: git.isGitRepo,
-      baseCommit: git.head || null,
-      baseRef: git.branch || "HEAD",
-      statusAtPrecheck: git.statusShort || "",
-    },
-    branch: {
-      baseCommit: git.head || null,
-      plannedName: transactionBranchName(transactionId),
-      currentName: null,
-      status: "not_created",
-    },
-    worktree: {
-      path: transactionWorktreePath(transactionId),
-      status: "not_created",
-      isolated: true,
-      rootedAtBaseCommit: git.head || null,
-    },
+    repo: repoIdentity,
+    branch: branchIdentity,
+    worktree: worktreeIdentity,
     validation: {
       commands: validationCommands,
       userTestCommand: userTestCommand || null,
@@ -443,8 +479,14 @@ function buildTransactionState({ transactionId, cwd, bug, git, validationCommand
       finalReportPath: artifactPaths.finalReport,
       intermediateReportsDir: artifactPaths.intermediateReportsDir,
     },
-    artifacts: artifactPaths,
-    artifactRegistryPath: artifactPaths.artifactRegistry,
+    artifacts: existing.artifacts || artifactPaths,
+    artifactRegistryPath: existing.artifactRegistryPath || artifactPaths.artifactRegistry,
+    observations: {
+      ...(existing.observations || {}),
+      prechecks: [...previousObservations, observation].slice(-25),
+      latestPrecheck: observation,
+    },
+    immutableIdentityPreserved: Boolean(existing.createdAt),
     recoverableByTransactionId: true,
   };
 }
@@ -494,7 +536,7 @@ async function precheck(args, json) {
     const userTestCommand = args["user-test-command"] ? String(Array.isArray(args["user-test-command"]) ? args["user-test-command"].at(-1) : args["user-test-command"]).trim() : null;
     const maxRepairIterations = parseMaxRepairs(args["max-repairs"] ?? args.maxRepairIterations);
     const artifactPaths = buildArtifactPaths(dir);
-    assertExistingTransactionCompatible({ transactionId, cwd, bug, artifactPaths });
+    assertExistingTransactionCompatible({ transactionId, cwd, bug, git, artifactPaths });
     const allowlist = splitValues(args.allowlist || args["allow-list"]);
     const contract = buildValidationContract({ transactionId, bug, cwd, validationCommands, userTestCommand, artifactPaths });
     const plan = buildTransactionPlan({ transactionId, cwd, bug, git, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, contractPath: artifactPaths.validationContract });
@@ -529,8 +571,32 @@ async function precheck(args, json) {
     const file = artifactPaths.precheck;
     const state = buildTransactionState({ transactionId, cwd, bug, git, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, status: record.status });
     const registry = artifactRegistry({ transactionId, artifactPaths });
-    writeJson(file, record);
-    writeJson(artifactPaths.transactionPlan, { ...plan, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry });
+    const recordForWrite = {
+      ...record,
+      plannedSafety: { ...record.plannedSafety, immutableBaseCommit: state.repo.baseCommit, immutableBaseRef: state.repo.baseRef },
+      immutableTransactionIdentity: {
+        repo: state.repo,
+        branch: state.branch,
+        worktree: state.worktree,
+        artifactRegistryPath: state.artifactRegistryPath,
+      },
+      currentObservation: state.observations?.latestPrecheck,
+    };
+    const planForWrite = {
+      ...plan,
+      repo: state.repo,
+      immutableTransactionIdentity: {
+        repo: state.repo,
+        branch: state.branch,
+        worktree: state.worktree,
+        artifactRegistryPath: state.artifactRegistryPath,
+      },
+      latestObservation: state.observations?.latestPrecheck,
+      statePath: artifactPaths.state,
+      artifactRegistryPath: artifactPaths.artifactRegistry,
+    };
+    writeJson(file, recordForWrite);
+    writeJson(artifactPaths.transactionPlan, planForWrite);
     writeJson(artifactPaths.validationContract, contract);
     writeJson(artifactPaths.artifactRegistry, registry);
     writeInitialJsonl(artifactPaths.allowlistDecisions, { type: "initial_allowlist", createdAt: record.createdAt, allowlist, justification: "Seeded during read-only precheck before implementation." });
