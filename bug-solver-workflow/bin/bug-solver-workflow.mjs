@@ -194,6 +194,7 @@ function buildArtifactPaths(dir) {
     validationContract: join(dir, "validation-contract.json"),
     artifactRegistry: join(dir, "artifact-registry.json"),
     baseline: join(dir, "evidence", "baseline-validation.json"),
+    postValidation: join(dir, "evidence", "post-change-validation.json"),
     allowlistDecisions: join(dir, "allowlist-decisions.jsonl"),
     implementationEvidence: join(dir, "evidence", "implementation-evidence.jsonl"),
     repairAttempts: join(dir, "repair-attempts.jsonl"),
@@ -247,16 +248,16 @@ function buildValidationContract({ transactionId, bug, cwd, validationCommands, 
       description: "Baseline command results are recorded before implementation and later compared so pre-existing failures are not reported as new regressions.",
       priority: "must",
       validationMethod: "both",
-      evidenceRequired: ["baseline.status", "baseline.commandResults", "finalReport.failures.regressions"],
-      evidencePaths: [artifactPaths.baseline, artifactPaths.finalReport],
+      evidenceRequired: ["baseline.status", "baseline.commandResults", "postValidation.comparison", "finalReport.failures.regressions"],
+      evidencePaths: [artifactPaths.baseline, artifactPaths.postValidation, artifactPaths.finalReport],
     },
     {
       id: "bug-reproduction-before-broad-validation",
       description: "Targeted reproduction or user-provided test commands run before broad validation commands when available.",
       priority: "must",
       validationMethod: "both",
-      evidenceRequired: ["validation.userTestCommand", "validation.executionOrder", "baseline.commands.executionOrder", "implementationEvidence.commands"],
-      evidencePaths: [artifactPaths.transactionPlan, artifactPaths.baseline, artifactPaths.implementationEvidence, artifactPaths.finalReport],
+      evidenceRequired: ["validation.userTestCommand", "validation.executionOrder", "baseline.commands.executionOrder", "postValidation.commands.executionOrder", "implementationEvidence.commands"],
+      evidencePaths: [artifactPaths.transactionPlan, artifactPaths.baseline, artifactPaths.postValidation, artifactPaths.implementationEvidence, artifactPaths.finalReport],
     },
     {
       id: "allowlisted-scope-control",
@@ -287,8 +288,8 @@ function buildValidationContract({ transactionId, bug, cwd, validationCommands, 
       description: "Final verification is outcome-based and validates that the bug is fixed rather than merely checking command exit codes.",
       priority: "must",
       validationMethod: "both",
-      evidenceRequired: ["state.validation.finalVerification.outcomeBased", "finalReport.finalVerification", "implementationEvidence.outcome"],
-      evidencePaths: [artifactPaths.finalReport, artifactPaths.implementationEvidence, artifactPaths.state],
+      evidenceRequired: ["state.validation.finalVerification.outcomeBased", "postValidation.outcomeComparison", "finalReport.finalVerification", "implementationEvidence.outcome"],
+      evidencePaths: [artifactPaths.postValidation, artifactPaths.finalReport, artifactPaths.implementationEvidence, artifactPaths.state],
     },
     {
       id: "reviewable-transaction-output",
@@ -401,6 +402,7 @@ function buildTransactionPlan({ transactionId, cwd, bug, git, validationCommands
       state: artifactPaths.state,
       artifactRegistry: artifactPaths.artifactRegistry,
       baseline: artifactPaths.baseline,
+      postValidation: artifactPaths.postValidation,
       allowlistDecisions: artifactPaths.allowlistDecisions,
       implementation: artifactPaths.implementationEvidence,
       repairAttempts: artifactPaths.repairAttempts,
@@ -505,6 +507,91 @@ function classifyBaselineFailures(results) {
     evidence: { stdout: result.stdout, stderr: result.stderr, completedAt: result.completedAt },
     rationale: "The command failed against the unmodified transaction-base worktree before implementation, so later matching failures are classified as pre-existing rather than regressions.",
   }));
+}
+
+function commandKey(result) {
+  return `${result.kind || "unknown"}\u0000${result.command || ""}`;
+}
+
+function compareValidationResults({ baselineResults = [], postResults = [] }) {
+  const baselineByCommand = new Map(baselineResults.map((result) => [commandKey(result), result]));
+  const postByCommand = new Map(postResults.map((result) => [commandKey(result), result]));
+  const fixed = [];
+  const unchangedPreExisting = [];
+  const newlyRegressed = [];
+  const stillPassing = [];
+  const notRerun = [];
+  for (const baseline of baselineResults) {
+    const post = postByCommand.get(commandKey(baseline));
+    if (!post) {
+      if (baseline.status !== 0) notRerun.push({ command: baseline.command, kind: baseline.kind, baselineStatus: baseline.status });
+      continue;
+    }
+    if (baseline.status !== 0 && post.status === 0) fixed.push({ command: post.command, kind: post.kind, baselineStatus: baseline.status, postStatus: post.status });
+    else if (baseline.status !== 0 && post.status !== 0) unchangedPreExisting.push({ command: post.command, kind: post.kind, baselineStatus: baseline.status, postStatus: post.status, timedOut: post.timedOut });
+    else if (baseline.status === 0 && post.status !== 0) newlyRegressed.push({ command: post.command, kind: post.kind, baselineStatus: baseline.status, postStatus: post.status, timedOut: post.timedOut });
+    else stillPassing.push({ command: post.command, kind: post.kind, status: post.status });
+  }
+  for (const post of postResults) {
+    if (!baselineByCommand.has(commandKey(post)) && post.status !== 0) newlyRegressed.push({ command: post.command, kind: post.kind, baselineStatus: "not_run", postStatus: post.status, timedOut: post.timedOut });
+  }
+  return { fixed, unchangedPreExisting, newlyRegressed, stillPassing, notRerun };
+}
+
+function classifyPostValidationFailures(comparison, postResults, artifactPaths) {
+  const failures = [];
+  for (const item of comparison.unchangedPreExisting) failures.push({ type: "unchanged_pre_existing_failure", phase: "post-change-validation", ...item, evidencePath: artifactPaths.postValidation, rationale: "The same command failed in baseline before implementation and still fails after changes, so it is not a new regression." });
+  for (const item of comparison.newlyRegressed) failures.push({ type: "new_regression", phase: "post-change-validation", ...item, evidencePath: artifactPaths.postValidation, rationale: "The command passed or was absent in baseline evidence but failed after changes." });
+  return failures.map((failure) => ({ ...failure, postResult: postResults.find((result) => result.command === failure.command && result.kind === failure.kind) || null }));
+}
+
+async function runPostChangeValidation({ transactionId, planArtifact, artifactPaths, worktreePath, baseline }) {
+  const startedAt = new Date().toISOString();
+  const commands = baselineCommandList(planArtifact);
+  const before = await gitInfo(worktreePath);
+  const results = [];
+  for (const entry of commands) {
+    const result = await runShellCommand(entry.command, worktreePath);
+    results.push({ ...entry, ...result });
+  }
+  const after = await gitInfo(worktreePath);
+  const comparison = compareValidationResults({ baselineResults: baseline?.commandResults || [], postResults: results });
+  const classifications = classifyPostValidationFailures(comparison, results, artifactPaths);
+  const targetedFailures = results.filter((result) => result.kind === "targeted_user_test" && result.status !== 0);
+  const status = commands.length === 0 ? "skipped_no_commands" : (comparison.newlyRegressed.length ? "completed_with_regressions" : (targetedFailures.length ? "completed_with_unfixed_targeted_failures" : "passed_without_new_regressions"));
+  const finalVerification = {
+    outcomeBased: true,
+    status: targetedFailures.length || comparison.newlyRegressed.length ? "failed" : "passed",
+    bugFixed: targetedFailures.length === 0,
+    basis: commands.some((entry) => entry.kind === "targeted_user_test") ? "targeted reproduction/user test commands passed after implementation" : "no targeted command was provided; verified no newly-regressed validation outcomes against baseline evidence",
+    targetedFailures: targetedFailures.map((result) => ({ command: result.command, status: result.status, timedOut: result.timedOut })),
+    newlyRegressedCount: comparison.newlyRegressed.length,
+  };
+  const record = {
+    schema: "pi-bug-solver-workflow/post-change-validation/v1",
+    transactionId,
+    createdAt: startedAt,
+    completedAt: new Date().toISOString(),
+    status,
+    worktreePath,
+    afterImplementation: true,
+    baselineEvidencePath: artifactPaths.baseline,
+    commandOrder: commands.map((entry) => ({ kind: entry.kind, command: entry.command })),
+    targetedBeforeBroad: !commands.some((entry, index) => entry.kind === "broad_validation" && commands.slice(index + 1).some((later) => later.kind === "targeted_user_test")),
+    commands: { targeted: commands.filter((entry) => entry.kind === "targeted_user_test").map((entry) => entry.command), broadValidation: commands.filter((entry) => entry.kind === "broad_validation").map((entry) => entry.command), executionOrder: commands.map((entry) => entry.kind), executed: results.map((result) => ({ kind: result.kind, command: result.command, status: result.status, timedOut: result.timedOut, durationMs: result.durationMs })) },
+    commandResults: results,
+    comparison,
+    outcomeComparison: { fixed: comparison.fixed.length, unchangedPreExisting: comparison.unchangedPreExisting.length, newlyRegressed: comparison.newlyRegressed.length, stillPassing: comparison.stillPassing.length },
+    finalVerification,
+    failures: { classifications, fixed: comparison.fixed, unchangedPreExisting: comparison.unchangedPreExisting, regressions: comparison.newlyRegressed, status: classifications.length ? "classified" : "none" },
+    git: { before, after, worktreeChangedByPostValidation: (before.statusShort || "") !== (after.statusShort || "") },
+    boundedOutput: { maxStdoutBytes: MAX_COMMAND_OUTPUT_BYTES, maxStderrBytes: MAX_COMMAND_OUTPUT_BYTES },
+    evidencePaths: { baseline: artifactPaths.baseline, postValidation: artifactPaths.postValidation, failureClassifications: artifactPaths.failureClassifications, finalReport: artifactPaths.finalReport, state: artifactPaths.state },
+  };
+  writeJson(artifactPaths.postValidation, record);
+  for (const classification of classifications) appendJsonl(artifactPaths.failureClassifications, { ...classification, transactionId, createdAt: record.completedAt, postValidationEvidencePath: artifactPaths.postValidation });
+  appendJsonl(artifactPaths.implementationEvidence, { type: "post_change_validation", transactionId, createdAt: record.completedAt, commands: record.commands, outcome: record.finalVerification, comparison: record.outcomeComparison, evidencePath: artifactPaths.postValidation });
+  return record;
 }
 
 async function runBaselineValidation({ transactionId, planArtifact, artifactPaths, worktreePath, baseCommit, callerCwd }) {
@@ -704,6 +791,7 @@ function artifactRegistry({ transactionId, artifactPaths }) {
     ["state", artifactPaths.state, "durable transaction lifecycle state"],
     ["artifactRegistry", artifactPaths.artifactRegistry, "recoverable list of transaction artifacts"],
     ["baselineValidation", artifactPaths.baseline, "baseline validation command evidence"],
+    ["postChangeValidation", artifactPaths.postValidation, "post-implementation validation results compared against baseline evidence"],
     ["allowlistDecisions", artifactPaths.allowlistDecisions, "initial allowlist and justified expansions"],
     ["implementationEvidence", artifactPaths.implementationEvidence, "implementation and validation evidence log"],
     ["repairAttempts", artifactPaths.repairAttempts, "bounded repair attempt log"],
@@ -794,6 +882,7 @@ function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, 
     commits: { transactionBranch: null, commits: [], status: "not_created" },
     evidencePaths: {
       baseline: artifactPaths.baseline,
+      postValidation: artifactPaths.postValidation,
       implementation: artifactPaths.implementationEvidence,
       allowlistDecisions: artifactPaths.allowlistDecisions,
       repairAttempts: artifactPaths.repairAttempts,
@@ -813,6 +902,17 @@ function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, 
       status: "pending",
       reason: "Baseline validation is recorded as required at precheck and must be executed before implementation in solve.",
       commands: commonSummary.commands,
+      evidencePaths: commonSummary.evidencePaths,
+    },
+    postValidation: {
+      schema: "pi-bug-solver-workflow/post-change-validation/v1",
+      transactionId,
+      createdAt,
+      status: "pending",
+      reason: "Post-change validation runs after implementation and compares targeted-to-broad command results against baseline evidence.",
+      commands: commonSummary.commands,
+      comparison: { fixed: [], unchangedPreExisting: [], newlyRegressed: [], stillPassing: [], notRerun: [] },
+      finalVerification: { status: "pending", outcomeBased: true },
       evidencePaths: commonSummary.evidencePaths,
     },
     implementationEvidence: { type: "implementation_evidence_initialized", createdAt, transactionId, status: "pending", decisions: [], commands: [], evidencePaths: commonSummary.evidencePaths },
@@ -1129,6 +1229,7 @@ async function precheck(args, json) {
         writeJson(artifactPaths.transactionPlan, planForWrite);
         writeJson(artifactPaths.validationContract, contract);
         writeInitialJson(artifactPaths.baseline, pendingArtifacts.baseline);
+        writeInitialJson(artifactPaths.postValidation, pendingArtifacts.postValidation);
         writeInitialJsonl(artifactPaths.allowlistDecisions, { type: "initial_allowlist", createdAt: record.createdAt, allowlist, justification: "Seeded during read-only precheck before implementation." });
         writeInitialJsonl(artifactPaths.implementationEvidence, pendingArtifacts.implementationEvidence);
         writeInitialJsonl(artifactPaths.repairAttempts, { type: "repair_counter_initialized", createdAt: record.createdAt, attempts: 0, maxRepairIterations, remaining: maxRepairIterations });
@@ -1170,6 +1271,7 @@ async function precheck(args, json) {
     emitArtifact(run, { kind: "file", title: "bug-solver transaction state", path: artifactPaths.state });
     emitArtifact(run, { kind: "file", title: "bug-solver artifact registry", path: artifactPaths.artifactRegistry });
     emitArtifact(run, { kind: "file", title: "bug-solver pending baseline evidence", path: artifactPaths.baseline });
+    emitArtifact(run, { kind: "file", title: "bug-solver pending post-change validation evidence", path: artifactPaths.postValidation });
     emitArtifact(run, { kind: "file", title: "bug-solver precheck intermediate report", path: artifactPaths.precheckReport });
     emitArtifact(run, { kind: "file", title: "bug-solver pending final report", path: artifactPaths.finalReport });
     emitArtifact(run, { kind: "file", title: "bug-solver worktree metadata", path: artifactPaths.worktreeMetadata });
@@ -1399,8 +1501,52 @@ async function solve(args, json) {
     emitArtifact(run, { kind: "file", title: "bug-solver failure classifications", path: artifactPaths.failureClassifications });
     phaseEnd(run, "baseline-validation", baseline.status === "passed" || baseline.status === "skipped_no_commands" || baseline.status === "completed_with_pre_existing_failures" ? STATUSES.SUCCESS : STATUSES.FAILED, { status: baseline.status, commands: baseline.commandResults.length, preExistingFailures: baseline.failures.preExisting.length, targetedBeforeBroad: baseline.targetedBeforeBroad });
 
-    completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, baselineStatus: baseline.status, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name });
-    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, baselineStatus: baseline.status, preExistingFailureCount: baseline.failures.preExisting.length, status: "baseline_validation_recorded", editCapableResourcesCreated: true, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name };
+    phaseStart(run, "post-change-validation", { transactionId, worktreePath: worktreeRecord.worktree.path, baselinePath: artifactPaths.baseline, postValidationPath: artifactPaths.postValidation });
+    const postValidation = await runPostChangeValidation({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, baseline });
+    if (existsSync(statePath)) {
+      const state = readJson(statePath);
+      const updatedState = {
+        ...state,
+        updatedAt: postValidation.completedAt,
+        revision: Number.isInteger(state.revision) ? state.revision + 1 : 1,
+        lifecycle: { ...(state.lifecycle || {}), status: "post_change_validation_recorded", phase: "post-change-validation", terminal: false },
+        validation: {
+          ...(state.validation || {}),
+          postValidation: { status: postValidation.status, path: artifactPaths.postValidation, completedAt: postValidation.completedAt, targetedBeforeBroad: postValidation.targetedBeforeBroad, outcomeComparison: postValidation.outcomeComparison },
+          finalVerification: { ...(state.validation?.finalVerification || {}), ...postValidation.finalVerification, path: artifactPaths.finalReport, evidencePath: artifactPaths.postValidation },
+        },
+        failureClassification: { ...(state.failureClassification || {}), current: postValidation.failures.classifications.at(-1) || baseline.failures.preExisting.at(-1) || null, status: postValidation.failures.classifications.length ? "post_validation_classified" : (baseline.failures.preExisting.length ? "pre_existing_failures" : "none"), classificationsPath: artifactPaths.failureClassifications },
+      };
+      writeJson(statePath, updatedState);
+      updatedStateForRegistry = updatedState;
+    }
+    if (existsSync(artifactPaths.finalReport)) {
+      const finalReport = readJson(artifactPaths.finalReport);
+      writeJson(artifactPaths.finalReport, {
+        ...finalReport,
+        updatedAt: postValidation.completedAt,
+        status: "post_change_validation_recorded",
+        commands: postValidation.commands,
+        failures: {
+          ...(finalReport.failures || {}),
+          preExisting: baseline.failures.preExisting,
+          fixed: postValidation.failures.fixed,
+          unchangedPreExisting: postValidation.failures.unchangedPreExisting,
+          regressions: postValidation.failures.regressions,
+          classifications: [...(baseline.failures.preExisting || []), ...(postValidation.failures.classifications || [])],
+          status: postValidation.failures.status,
+        },
+        finalVerification: postValidation.finalVerification,
+        evidencePaths: { ...(finalReport.evidencePaths || {}), baseline: artifactPaths.baseline, postValidation: artifactPaths.postValidation, failureClassifications: artifactPaths.failureClassifications },
+      });
+    }
+    if (updatedStateForRegistry) updateGlobalRegistry(updatedStateForRegistry);
+    emitArtifact(run, { kind: "file", title: "bug-solver post-change validation", path: artifactPaths.postValidation });
+    emitArtifact(run, { kind: "file", title: "bug-solver implementation evidence", path: artifactPaths.implementationEvidence });
+    phaseEnd(run, "post-change-validation", postValidation.failures.regressions.length === 0 && postValidation.finalVerification.status === "passed" ? STATUSES.SUCCESS : STATUSES.FAILED, { status: postValidation.status, commands: postValidation.commandResults.length, fixed: postValidation.comparison.fixed.length, unchangedPreExisting: postValidation.comparison.unchangedPreExisting.length, newlyRegressed: postValidation.comparison.newlyRegressed.length, targetedBeforeBroad: postValidation.targetedBeforeBroad, finalVerification: postValidation.finalVerification.status });
+
+    completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, postValidationPath: artifactPaths.postValidation, baselineStatus: baseline.status, postValidationStatus: postValidation.status, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name });
+    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, postValidationPath: artifactPaths.postValidation, baselineStatus: baseline.status, postValidationStatus: postValidation.status, preExistingFailureCount: baseline.failures.preExisting.length, newlyRegressedCount: postValidation.comparison.newlyRegressed.length, fixedCount: postValidation.comparison.fixed.length, unchangedPreExistingCount: postValidation.comparison.unchangedPreExisting.length, finalVerification: postValidation.finalVerification, status: "post_change_validation_recorded", editCapableResourcesCreated: true, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name };
     if (json) console.log(JSON.stringify(result, null, 2));
     else console.log(`gated activation recorded: ${file}`);
   } catch (error) {
@@ -1567,7 +1713,7 @@ function assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd }) {
   }
 
   const lifecycle = state.lifecycle || {};
-  const allowedLifecycleStatuses = new Set(["awaiting_confirmation", "isolated_worktree_ready", "baseline_validation_recorded"]);
+  const allowedLifecycleStatuses = new Set(["awaiting_confirmation", "isolated_worktree_ready", "baseline_validation_recorded", "post_change_validation_recorded"]);
   if (!allowedLifecycleStatuses.has(String(lifecycle.status || "")) || lifecycle.terminal === true) throw new Error(`Transaction state lifecycle is not eligible for solve activation: ${lifecycle.status || "missing"}`);
   if (lifecycle.readOnlyPrecheckComplete !== true || lifecycle.materializationComplete !== true || lifecycle.editingAllowed !== false || lifecycle.confirmationRequired !== true) throw new Error("Transaction state lifecycle does not preserve the durable read-only precheck approval gate.");
   if (state.transaction?.exactlyOneBug !== true || state.transaction?.multiplicity?.likelyMultiple !== false) throw new Error("Transaction state does not authorize exactly one bug for solve activation.");
@@ -1696,6 +1842,7 @@ function loadTransactionInspection(dir, transactionIdHint) {
         state: fileSummary(paths.state),
         artifactRegistry: fileSummary(paths.artifactRegistry),
         baseline: fileSummary(paths.baseline),
+        postValidation: fileSummary(paths.postValidation),
         implementationEvidence: fileSummary(paths.implementationEvidence),
         allowlistDecisions: fileSummary(paths.allowlistDecisions),
         repairAttempts: fileSummary(paths.repairAttempts),
