@@ -166,6 +166,23 @@ try {
   let bugDirStatusDetails;
   try { bugDirStatusDetails = bugDirStatus?.stdout ? JSON.parse(bugDirStatus.stdout) : undefined; } catch { bugDirStatusDetails = undefined; }
   log(bugDirStatusDetails?.transactionId === bugPrecheckDetails?.transactionId && bugDirStatusDetails?.artifactRegistryPath === bugPrecheckDetails?.artifactRegistryPath, 'bug-solver status can recover transaction details from a directory without a target repo edit');
+  const interruptedArtifactRoot = join(tmp, 'interrupted-precheck-artifacts');
+  const interruptedTransactionId = 'smoke-interrupted-precheck-registry-last';
+  const interruptedTransactionDir = join(interruptedArtifactRoot, 'transactions', interruptedTransactionId);
+  const interruptedPrecheck = expectExit('bug-solver interrupted precheck fails after files before registry', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix interrupted precheck registry consistency bug', '--transaction-id', interruptedTransactionId, '--json'], 1, { env: { PI_BUG_SOLVER_ARTIFACT_DIR: interruptedArtifactRoot, PI_BUG_SOLVER_INTERRUPT_PRECHECK_AFTER: 'files' } });
+  const interruptedStatePath = join(interruptedTransactionDir, 'state.json');
+  const interruptedRegistryPath = join(interruptedTransactionDir, 'artifact-registry.json');
+  const interruptedState = existsSync(interruptedStatePath) ? JSON.parse(readFileSync(interruptedStatePath, 'utf8')) : undefined;
+  const registryLastStatusResult = expectExit('bug-solver status reports interrupted registry-last precheck as incomplete', ['node', bugSolverCli, 'status', '--cwd', root, '--transaction-id', interruptedTransactionId, '--json'], 0, { env: { PI_BUG_SOLVER_ARTIFACT_DIR: interruptedArtifactRoot } });
+  let registryLastStatus;
+  try { registryLastStatus = JSON.parse(registryLastStatusResult.stdout); } catch { registryLastStatus = undefined; }
+  log(interruptedPrecheck.status === 1 && interruptedState?.lifecycle?.materializationComplete === false && interruptedState?.lifecycle?.materializationStatus === 'awaiting_artifact_registry' && !existsSync(interruptedRegistryPath) && registryLastStatus?.precheckMaterialization?.status === 'incomplete', 'bug-solver interrupted precheck does not mark state materialization complete before artifact registry exists and status remains recoverable');
+  const registryLastRetry = expectExit('bug-solver retry after interrupted precheck completes registry-last materialization', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix interrupted precheck registry consistency bug', '--transaction-id', interruptedTransactionId, '--json'], 0, { env: { PI_BUG_SOLVER_ARTIFACT_DIR: interruptedArtifactRoot } });
+  let registryLastRetryDetails;
+  try { registryLastRetryDetails = JSON.parse(registryLastRetry.stdout); } catch { registryLastRetryDetails = undefined; }
+  const retriedState = existsSync(interruptedStatePath) ? JSON.parse(readFileSync(interruptedStatePath, 'utf8')) : undefined;
+  const retriedRegistry = existsSync(interruptedRegistryPath) ? JSON.parse(readFileSync(interruptedRegistryPath, 'utf8')) : undefined;
+  log(retriedState?.lifecycle?.materializationComplete === true && retriedState?.lifecycle?.materializationStatus === 'complete' && Boolean(retriedState?.lifecycle?.artifactRegistryVerifiedAt) && retriedRegistry?.materializationComplete === true && registryLastRetryDetails?.artifactRegistryPath === interruptedRegistryPath, 'bug-solver retry only marks state complete after artifact registry is written and verified');
   const repeatedPrecheckRepo = join(tmp, 'repeated-precheck-repo');
   mkdirSync(repeatedPrecheckRepo, { recursive: true });
   expectExit('bug-solver repeated-precheck repo git init', ['git', 'init', '-q'], 0, { cwd: repeatedPrecheckRepo });

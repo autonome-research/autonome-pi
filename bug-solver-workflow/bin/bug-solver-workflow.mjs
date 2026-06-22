@@ -2048,13 +2048,17 @@ async function precheck(args, json) {
           },
           evidencePaths: commonWorktreeEvidencePaths(artifactPaths),
         });
-        state.lifecycle.materializationComplete = true;
-        state.lifecycle.materializationStatus = "complete";
+        state.lifecycle.materializationComplete = false;
+        state.lifecycle.materializationStatus = "awaiting_artifact_registry";
         writeJson(artifactPaths.state, state);
         verifyRegisteredArtifactsExist(registry, { includeRegistry: false });
         if (process.env.PI_BUG_SOLVER_INTERRUPT_PRECHECK_AFTER === "files") throw new Error("Injected interruption after precheck files materialized before artifact registry write");
         writeJson(artifactPaths.artifactRegistry, registry);
         verifyRegisteredArtifactsExist(registry, { includeRegistry: true });
+        state.lifecycle.materializationComplete = true;
+        state.lifecycle.materializationStatus = "complete";
+        state.lifecycle.artifactRegistryVerifiedAt = new Date().toISOString();
+        writeJson(artifactPaths.state, state);
         clearPrecheckIncompleteMarker(artifactPaths);
         registryIndex = updateGlobalRegistry(state);
       } catch (error) {
