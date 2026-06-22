@@ -26,6 +26,14 @@ function isExplicitBoolean(value) {
   return typeof value === "boolean";
 }
 
+function explicitFalse(value) {
+  return value === false;
+}
+
+function explicitTrue(value) {
+  return value === true;
+}
+
 function firstString(...values) {
   for (const value of values) {
     if (typeof value === "string" && value.trim()) return value;
@@ -55,6 +63,9 @@ export function normalizeSolvePlanArtifact(artifact) {
     transactionId: input.transactionId,
     status: input.status,
     editingAllowed: boolOr(input.editingAllowed, false),
+    hasExplicitEditingAllowed: isExplicitBoolean(input.editingAllowed),
+    confirmationRequired: isExplicitBoolean(input.confirmationRequired) ? input.confirmationRequired : undefined,
+    readOnly: isExplicitBoolean(input.readOnly) ? input.readOnly : undefined,
     transaction: {
       // Do not infer exactly-one-bug safety from missing fields. The solve gate
       // must see explicit precheck/plan evidence before any edit-capable phase.
@@ -89,7 +100,9 @@ export function assessPreImplementationGate(artifact, multiplicityOverride) {
   if (!hasExplicitOneBugSafetyEvidence) reasons.push("missing explicit one-bug safety evidence");
   if (!plan.transactionId) reasons.push("missing transactionId");
   if (plan.status === "rejected_multi_bug" || splitRequired || exactlyOneBug === false) reasons.push("multi-bug or split-required transaction");
-  if (plan.editingAllowed === true) reasons.push("plan was not preserved as pre-implementation/editingAllowed=false");
+  if (!plan.hasExplicitEditingAllowed || !explicitFalse(plan.editingAllowed)) reasons.push("missing explicit pre-implementation editing lock (editingAllowed=false)");
+  if (!explicitTrue(plan.confirmationRequired)) reasons.push("missing explicit confirmationRequired=true approval marker");
+  if (plan.sourceKind === "precheck" && !explicitTrue(plan.readOnly)) reasons.push("missing explicit readOnly=true precheck marker");
   if (!plan.validationContractPath) reasons.push("missing durable validation contract path");
 
   return {
