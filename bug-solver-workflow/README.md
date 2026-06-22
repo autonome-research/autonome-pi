@@ -44,6 +44,8 @@ node bug-solver-workflow/bin/bug-solver-workflow.mjs solve \
 
 Pass each broad validation command as its own repeated `--validation-command` flag. The workflow stores and executes each flag value atomically, so shell punctuation inside a command (for example `;`, `&&`, pipes, or commas in arguments) is preserved for both baseline and post-change validation instead of being treated as a command separator.
 
+More copy/paste examples, including Pi tool and `/bug-solver` invocations, are in [`examples/cli-and-tool-invocations.md`](examples/cli-and-tool-invocations.md).
+
 Inspect resumable transaction state at any time without touching the target repository:
 
 ```bash
@@ -55,6 +57,19 @@ node bug-solver-workflow/bin/bug-solver-workflow.mjs status \
   --transaction-dir ~/.pi/agent/bug-solver-workflow/transactions/<id> \
   --json
 ```
+
+## Workflow behavior reference
+
+1. **Precheck (read-only and approval-gated).** `precheck` records repo/base metadata, dirty-worktree signals, exactly-one-bug analysis, validation commands, targeted reproduction/user test command, max repair iterations, allowlist policy, approval instructions, and all evidence/report locations. It rejects unsafe artifact roots and marks `editingAllowed=false`; no edit-capable implementation phase can start until a human reviews the plan and calls `solve` with `approved: true`.
+2. **Plan safety and activation.** `solve` refuses unapproved plans, multi-bug/split-required plans, dirty or moved caller worktrees, base-HEAD mismatches, in-repository artifact paths, missing immutable metadata, and missing validation-contract evidence mappings before it creates any edit-capable context.
+3. **External durable artifacts.** Transaction state lives outside the target repository, normally under `~/.pi/agent/bug-solver-workflow/transactions/<transaction-id>/`, with a registry under `~/.pi/agent/bug-solver-workflow/registry/transactions.json`. Key files include `transaction-plan.json`, `validation-contract.json`, `state.json`, `artifact-registry.json`, `allowlist-decisions.jsonl`, `failure-classifications.jsonl`, `repair-attempts.jsonl`, `evidence/baseline-validation.json`, `evidence/post-change-validation.json`, `reports/precheck-report.json`, and `reports/final-report.json`.
+4. **Isolated transaction branch/worktree.** Implementation runs on a reviewable `bug-solver/<transaction-id>` branch in an external git worktree rooted at the recorded base commit. The caller worktree is checked for unexpected mutation and is not silently merged. Successful transactions leave a branch/commit and metadata for manual review unless cleanup policy explicitly removes safe temporary worktrees.
+5. **Validation order and baseline behavior.** Baseline validation runs before implementation in the isolated worktree. When a targeted reproduction/user test command is present, it runs before broad validation commands; post-change validation uses the same targeted-to-broad order. Baseline evidence is later compared to post-change evidence so pre-existing failures are separated from fixed failures and new regressions.
+6. **Adaptive allowlist.** Initial `--allowlist` paths restrict accepted implementation changes. Out-of-scope changes are rejected and classified. Scope can expand only by durable, pre-attempt JSONL decisions in `allowlist-decisions.jsonl` with a non-empty justification explaining why the failing reproduction requires the new paths.
+7. **Failure classifications.** The workflow records actionable categories in `failure-classifications.jsonl` and reports: `precheck_plan`, `command_validation`, `targeted_reproduction`, `implementation`, `allowlist`, `git_worktree`, `lifecycle`, and `final_verification`.
+8. **Capped repair loop.** Implementation failures, allowlist rejections, regressions, and failed final verification can enter repair. Each attempt is appended to `repair-attempts.jsonl`, linked to evidence, and revalidated. The loop stops at `maxRepairIterations` and records terminal cap evidence instead of retrying indefinitely.
+9. **Outcome-based final verification.** Success requires more than passing exit codes: the targeted bug reproduction must have demonstrated the bug at baseline and pass after the change, and trusted implementation/repair evidence must causally support the bug fix. Without a targeted reproduction or trusted implementation evidence, final verification is inconclusive/unsuccessful and no transaction commit is marked completed.
+10. **Reports and status.** Intermediate and final reports summarize decisions, commands, baseline/post-change comparisons, failures, repairs, commits/branches, cleanup metadata, and evidence paths. `status` is read-only and can recover by transaction id or transaction directory after interruption or repeated invocation.
 
 ## Safety and observability
 

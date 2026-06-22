@@ -32,7 +32,7 @@ pi install git:git@github.com:Code4me2/pi-thread-phase-tools@main
 - `/code-review` runs code review workflows.
 - `dynamic_workflow` runs validated dynamic workflows from structured specs or JavaScript harnesses. `dynamic_thread_phase_workflow` remains as a deprecated compatibility alias.
 - `mission_workflow` plans and activates approved Droid/Missions-style software missions. Always run `action: "plan"` and get user approval before `action: "activate"`.
-- `bug_solver_workflow` prechecks and approval-gates a focused one-bug transaction. Always run `action: "precheck"` before `action: "solve"` with `approved: true`; use `action: "status"` with a transaction id/dir for read-only recovery. The tool and `/bug-solver` command also expose safe optional background, timeout, and cleanup parameters without changing existing inputs.
+- `bug_solver_workflow` prechecks and approval-gates a focused one-bug transaction. Always run `action: "precheck"` before `action: "solve"` with `approved: true`; use `action: "status"` with a transaction id/dir for read-only recovery. The tool and `/bug-solver` command also expose safe optional background, timeout, and cleanup parameters without changing existing inputs. Runtime artifacts, reports, validation evidence, allowlist decisions, repair attempts, and failure classifications are external to the target repo under `~/.pi/agent/bug-solver-workflow/`; solving runs on a reviewable `bug-solver/<transaction>` branch in an isolated external worktree, runs targeted reproduction before broad validation, compares post-change results to the baseline, caps repairs, and leaves final reports for manual review instead of silently merging. See `bug-solver-workflow/README.md` and `bug-solver-workflow/examples/cli-and-tool-invocations.md` for CLI, `/bug-solver`, and `bug_solver_workflow` examples.
 - Tool/API inspection remains available through `thread_phase_runs`.
 - Workflow skills are included in the package and should load automatically when tasks ask for dynamic workflows, mission workflows, structured workflow specs, JS harness workflows, or multi-phase dynamic execution.
 
@@ -55,6 +55,7 @@ Recent changes:
 - The generic visualizer now deduplicates repeated artifact paths, closes phase-event-only phases when a workflow reaches a terminal status, and keeps compact run/monitor summaries focused on recent or active phases instead of dumping every historical phase/artifact.
 - Thread-phase dependency is `^4.1.0`; global `@autonome-research/thread-phase-cli` was updated to `4.1.0` for improved cancellation/error/fanout primitives.
 - Mission continuation/failure-mode notes are in `docs/mission-workflow-continuation.md`; read `/home/velvet/droid_flows.md` first for Droid/Missions design context.
+- Bug-solver workflow docs cover read-only precheck approval, unsafe-plan refusal, durable external artifacts, transaction branches/worktrees, validation ordering and baseline behavior, adaptive allowlist expansion with justification, capped repairs, failure classifications, outcome-based final verification, status recovery, and manual final-review reports.
 
 ## Remaining work
 
