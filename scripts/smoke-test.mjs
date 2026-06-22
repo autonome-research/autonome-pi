@@ -396,6 +396,27 @@ try {
   const implementationStateAfterRepeat = implementationPhasePrecheckDetails?.statePath ? JSON.parse(readFileSync(implementationPhasePrecheckDetails.statePath, 'utf8')) : undefined;
   const implementationWorktreeMetadataAfterRepeat = implementationPhaseSolveDetails?.worktreeMetadataPath ? JSON.parse(readFileSync(implementationPhaseSolveDetails.worktreeMetadataPath, 'utf8')) : undefined;
   log(implementationRepeatDetails?.status === 'already_completed' && implementationRepeatDetails?.idempotent === true && implementationStateAfterRepeat?.lifecycle?.status === 'completed' && implementationStateAfterRepeat?.revision === implementationStateBeforeRepeat?.revision && implementationWorktreeMetadataAfterRepeat?.cleanup?.lastApplication?.status === 'preserved_by_policy', 'bug-solver repeated completed solve is idempotent and preserves recorded worktree cleanup policy');
+  const implementationFinalReportPath = implementationPhaseSolveDetails?.finalReportPath;
+  const implementationStatePath = implementationPhasePrecheckDetails?.statePath;
+  const implementationFinalReportBeforeInterruption = implementationFinalReportPath ? JSON.parse(readFileSync(implementationFinalReportPath, 'utf8')) : undefined;
+  const implementationStateBeforeInterruption = implementationStatePath ? JSON.parse(readFileSync(implementationStatePath, 'utf8')) : undefined;
+  if (implementationStatePath && implementationStateBeforeInterruption) writeFileSync(implementationStatePath, `${JSON.stringify({ ...implementationStateBeforeInterruption, lifecycle: { ...(implementationStateBeforeInterruption.lifecycle || {}), status: 'post_change_validation_recorded', terminal: false, outcome: undefined } }, null, 2)}\n`);
+  const partialCompletionStatus = expectExit('bug-solver status reports complete final report with incomplete state as recoverable partial completion', ['node', bugSolverCli, 'status', '--transaction-id', implementationPhasePrecheckDetails?.transactionId || 'missing-implementation-transaction', '--json'], 0);
+  let partialCompletionStatusDetails;
+  try { partialCompletionStatusDetails = JSON.parse(partialCompletionStatus.stdout); } catch { partialCompletionStatusDetails = undefined; }
+  const recoveredCompletionSolve = expectExit('bug-solver repeated solve recovers completed state from verified final-report evidence', ['node', bugSolverCli, 'solve', '--cwd', implementationPhaseRepo, '--plan-path', implementationPhasePrecheckDetails?.planPath || join(tmp, 'missing-implementation-phase-plan.json'), '--approved', '--json'], 0);
+  let recoveredCompletionDetails;
+  try { recoveredCompletionDetails = JSON.parse(recoveredCompletionSolve.stdout); } catch { recoveredCompletionDetails = undefined; }
+  const recoveredCompletionState = implementationStatePath ? JSON.parse(readFileSync(implementationStatePath, 'utf8')) : undefined;
+  log(partialCompletionStatusDetails?.partialCompletion?.status === 'final_report_complete_state_incomplete' && recoveredCompletionDetails?.status === 'completed_recovered' && recoveredCompletionDetails?.recovered === true && recoveredCompletionState?.lifecycle?.status === 'completed' && recoveredCompletionState?.lifecycle?.completionProtocol?.recoveredCompletedStateFromFinalReport === true, 'bug-solver solve completion protocol recovers interrupted state advancement only after verified final-report evidence');
+  if (implementationFinalReportPath && implementationFinalReportBeforeInterruption) writeFileSync(implementationFinalReportPath, `${JSON.stringify({ ...implementationFinalReportBeforeInterruption, commits: { ...(implementationFinalReportBeforeInterruption.commits || {}), records: [] } }, null, 2)}\n`);
+  const corruptCompletionStatus = expectExit('bug-solver status reports completed state with unverifiable final report as corrupt partial completion', ['node', bugSolverCli, 'status', '--transaction-id', implementationPhasePrecheckDetails?.transactionId || 'missing-implementation-transaction', '--json'], 0);
+  let corruptCompletionStatusDetails;
+  try { corruptCompletionStatusDetails = JSON.parse(corruptCompletionStatus.stdout); } catch { corruptCompletionStatusDetails = undefined; }
+  const corruptCompletionSolve = expectExit('bug-solver repeated solve refuses completed state without verified final-report evidence', ['node', bugSolverCli, 'solve', '--cwd', implementationPhaseRepo, '--plan-path', implementationPhasePrecheckDetails?.planPath || join(tmp, 'missing-implementation-phase-plan.json'), '--approved', '--json'], 1);
+  let corruptCompletionSolveDetails;
+  try { corruptCompletionSolveDetails = JSON.parse(corruptCompletionSolve.stdout); } catch { corruptCompletionSolveDetails = undefined; }
+  log(corruptCompletionStatusDetails?.partialCompletion?.status === 'corrupt_completed_state' && corruptCompletionStatusDetails?.completionIntegrity?.status === 'partial_completion' && corruptCompletionSolveDetails?.ok === false && /partial completion/i.test(corruptCompletionSolveDetails?.error || ''), 'bug-solver repeated solve/status detect corrupt completed state without rerunning edit-capable phases');
 
   const unrelatedEditRepo = join(tmp, 'external-stateful-targeted-unrelated-edit-repo');
   mkdirSync(unrelatedEditRepo, { recursive: true });

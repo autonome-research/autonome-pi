@@ -2492,7 +2492,60 @@ async function applyRecordedWorktreeCleanupPolicy({ transactionId, artifactPaths
   return evidence;
 }
 
+function completionEvidenceIntegrity({ transactionId, state, finalReport, artifactPaths }) {
+  const stateCompleted = state?.lifecycle?.status === "completed";
+  const reportCompleted = finalReport?.status === "completed" || finalReport?.terminal === true;
+  if (!stateCompleted && !reportCompleted) return { ok: true, status: "not_terminal", problems: [] };
+  const problems = [];
+  if (!finalReport || finalReport.unreadable) problems.push(`final report is ${finalReport?.unreadable ? "unreadable" : "missing"}`);
+  if (finalReport) {
+    if (finalReport.schema !== "pi-bug-solver-workflow/final-report/v1") problems.push("final report schema is missing or unrecognized");
+    if (transactionId && finalReport.transactionId !== transactionId) problems.push("final report transaction id does not match state/plan");
+    if (finalReport.status !== "completed" || finalReport.terminal !== true) problems.push("final report is not terminal completed");
+    const outcome = finalReport.outcome || finalReport.finalOutcome;
+    if (!outcome || (outcome.status !== "accepted_for_manual_review" && outcome.status !== "accepted_without_commit")) problems.push("final report outcome is missing accepted review status");
+    if (outcome?.manualReviewRequired !== true || outcome?.mergedIntoCallerBranch !== false) problems.push("final report outcome does not preserve manual-review/no-merge evidence");
+    if (!finalReport.commits || !Array.isArray(finalReport.commits.records) || finalReport.commits.records.length === 0) problems.push("final report is missing transaction commit/outcome records");
+    if (finalReport.finalVerification?.status !== "passed" || finalReport.finalVerification?.bugFixed !== true) problems.push("final report does not prove outcome-based final verification");
+    if (artifactPaths) {
+      const evidencePaths = finalReport.evidencePaths || {};
+      for (const [key, expected] of Object.entries({ finalReport: artifactPaths.finalReport, state: artifactPaths.state, worktreeMetadata: artifactPaths.worktreeMetadata, postValidation: artifactPaths.postValidation })) {
+        if (expected && canonicalArtifactPath(evidencePaths[key] || "") !== canonicalArtifactPath(expected)) problems.push(`final report evidencePaths.${key} does not match durable artifact path`);
+      }
+    }
+  }
+  if (stateCompleted) {
+    const stateOutcome = state.lifecycle.outcome;
+    if (!stateOutcome || (stateOutcome.status !== "accepted_for_manual_review" && stateOutcome.status !== "accepted_without_commit")) problems.push("completed state is missing accepted outcome evidence");
+    if (finalReport && JSON.stringify(stateOutcome || null) !== JSON.stringify(finalReport.outcome || finalReport.finalOutcome || null)) problems.push("completed state outcome does not match final report outcome");
+  }
+  return { ok: problems.length === 0, status: problems.length === 0 ? "verified" : "partial_completion", problems };
+}
+
+function recoverCompletedStateFromFinalReport({ statePath, state, finalReport, artifactPaths }) {
+  if (!statePath || !state || !finalReport) return state;
+  const outcome = finalReport.outcome || finalReport.finalOutcome;
+  const record = finalReport.commits?.records?.at(-1) || {};
+  const now = new Date().toISOString();
+  const recoveredState = {
+    ...state,
+    updatedAt: now,
+    revision: Number.isInteger(state.revision) ? state.revision + 1 : 1,
+    lifecycle: { ...(state.lifecycle || {}), status: "completed", phase: "transaction-commit-and-report", terminal: true, outcome, completionProtocol: { finalReportVerifiedBeforeCompletedState: true, recoveredCompletedStateFromFinalReport: true, recoveredAt: now, finalReportPath: artifactPaths.finalReport } },
+    branch: { ...(state.branch || {}), head: record.commit || finalReport.outcome?.transactionCommit || state.branch?.head || null, status: record.status === "committed_for_review" ? "committed_for_review" : "ready_for_review" },
+    implementation: { ...(state.implementation || {}), changedFiles: finalReport.changedFiles || record.changedFiles || state.implementation?.changedFiles || [], transactionCommit: record.commit || finalReport.outcome?.transactionCommit || state.implementation?.transactionCommit || null },
+    validation: { ...(state.validation || {}), finalVerification: { ...(state.validation?.finalVerification || {}), ...(finalReport.finalVerification || {}), path: artifactPaths.finalReport, evidencePath: artifactPaths.postValidation } },
+    reports: { ...(state.reports || {}), finalReportPath: artifactPaths.finalReport },
+  };
+  const integrity = completionEvidenceIntegrity({ transactionId: recoveredState.transactionId, state: recoveredState, finalReport, artifactPaths });
+  if (!integrity.ok) throw new Error(`Cannot recover completed state from final report: ${integrity.problems.join("; ")}`);
+  writeJson(statePath, recoveredState);
+  updateGlobalRegistry(recoveredState);
+  return recoveredState;
+}
+
 function completedSolveResult({ run, transactionId, artifactPaths, state, finalReport, planPath }) {
+  const completionIntegrity = completionEvidenceIntegrity({ transactionId, state, finalReport, artifactPaths });
   const outcome = finalReport?.outcome || finalReport?.finalOutcome || state?.lifecycle?.outcome || null;
   return {
     ok: true,
@@ -2511,7 +2564,8 @@ function completedSolveResult({ run, transactionId, artifactPaths, state, finalR
     implementationEvidencePath: artifactPaths.implementationEvidence,
     outcome,
     terminalOutcome: deriveTerminalOutcome({ state, finalReport, activation: tryReadJson(join(artifactPaths.root, "activation-gate.json")) }),
-    message: "Transaction is already terminal/completed; repeated solve returned the durable outcome without rerunning edit-capable phases or modifying transaction state.",
+    completionIntegrity,
+    message: "Transaction is already terminal/completed with verified final-report commit/outcome evidence; repeated solve returned the durable outcome without rerunning edit-capable phases or modifying transaction state.",
   };
 }
 
@@ -2691,12 +2745,25 @@ async function solve(args, json) {
       const earlyArtifactPaths = buildArtifactPaths(earlyState.artifacts?.root || dirname(earlyStatePath));
       const finalReport = tryReadJson(earlyArtifactPaths.finalReport);
       if (earlyState.lifecycle.status === "completed") {
+        const completionIntegrity = completionEvidenceIntegrity({ transactionId, state: earlyState, finalReport, artifactPaths: earlyArtifactPaths });
+        if (!completionIntegrity.ok) throw new Error(`Transaction ${transactionId} has partial completion: state.json advertises completed but final-report commit/outcome evidence is not verified (${completionIntegrity.problems.join("; ")}). Repeated solve will not rerun edit-capable phases; inspect status/final report and recover from durable artifacts.`);
         const result = completedSolveResult({ run, transactionId, artifactPaths: earlyArtifactPaths, state: earlyState, finalReport, planPath });
-        phaseEvent(run, "confirmation-gate", { type: "repeated_solve_already_completed", transactionId, status: earlyState.lifecycle.status, finalReportPath: earlyArtifactPaths.finalReport, worktreeMetadataPath: earlyArtifactPaths.worktreeMetadata });
-        phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS, { repeated: true, status: "already_completed", finalReportPath: earlyArtifactPaths.finalReport });
-        completeRun(run, STATUSES.SUCCESS, { transactionId, repeated: true, status: "already_completed", finalReportPath: earlyArtifactPaths.finalReport });
+        phaseEvent(run, "confirmation-gate", { type: "repeated_solve_already_completed", transactionId, status: earlyState.lifecycle.status, finalReportPath: earlyArtifactPaths.finalReport, worktreeMetadataPath: earlyArtifactPaths.worktreeMetadata, completionIntegrity });
+        phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS, { repeated: true, status: "already_completed", finalReportPath: earlyArtifactPaths.finalReport, completionIntegrity });
+        completeRun(run, STATUSES.SUCCESS, { transactionId, repeated: true, status: "already_completed", finalReportPath: earlyArtifactPaths.finalReport, completionIntegrity });
         if (json) console.log(JSON.stringify(result, null, 2));
         else console.log(`transaction ${transactionId} already completed; final report: ${earlyArtifactPaths.finalReport}`);
+        return;
+      }
+      const recoverableCompletion = completionEvidenceIntegrity({ transactionId, state: null, finalReport, artifactPaths: earlyArtifactPaths });
+      if (earlyState.lifecycle.status !== "completed" && finalReport?.status === "completed" && recoverableCompletion.ok) {
+        const recoveredState = recoverCompletedStateFromFinalReport({ statePath: earlyStatePath, state: earlyState, finalReport, artifactPaths: earlyArtifactPaths });
+        const result = completedSolveResult({ run, transactionId, artifactPaths: earlyArtifactPaths, state: recoveredState, finalReport, planPath });
+        phaseEvent(run, "confirmation-gate", { type: "partial_completion_recovered", transactionId, previousStatus: earlyState.lifecycle.status, status: recoveredState.lifecycle.status, finalReportPath: earlyArtifactPaths.finalReport, completionIntegrity: recoverableCompletion });
+        phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS, { repeated: true, status: "completed_recovered", finalReportPath: earlyArtifactPaths.finalReport, completionIntegrity: recoverableCompletion });
+        completeRun(run, STATUSES.SUCCESS, { transactionId, repeated: true, status: "completed_recovered", finalReportPath: earlyArtifactPaths.finalReport, completionIntegrity: recoverableCompletion });
+        if (json) console.log(JSON.stringify({ ...result, status: "completed_recovered", recovered: true }, null, 2));
+        else console.log(`transaction ${transactionId} completed state recovered from final report: ${earlyArtifactPaths.finalReport}`);
         return;
       }
       phaseEvent(run, "confirmation-gate", { type: "repeated_solve_terminal_refused", transactionId, status: earlyState.lifecycle.status, statePath: earlyStatePath, finalReportPath: earlyArtifactPaths.finalReport });
@@ -2717,12 +2784,26 @@ async function solve(args, json) {
     if (!gate.safeBeforeEditCapablePhase) throw new Error(`Transaction plan is unsafe before edit-capable phases: ${gate.reasons.join("; ")}`);
     const integrity = assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd });
     const artifactPaths = integrity.artifactPaths;
+    const integrityFinalReport = tryReadJson(artifactPaths.finalReport);
+    const recoverableCompletion = completionEvidenceIntegrity({ transactionId, state: null, finalReport: integrityFinalReport, artifactPaths });
+    if (integrity.state?.lifecycle?.status !== "completed" && integrityFinalReport?.status === "completed" && recoverableCompletion.ok) {
+      const recoveredState = recoverCompletedStateFromFinalReport({ statePath: artifactPaths.state, state: integrity.state, finalReport: integrityFinalReport, artifactPaths });
+      const result = completedSolveResult({ run, transactionId, artifactPaths, state: recoveredState, finalReport: integrityFinalReport, planPath });
+      phaseEvent(run, "confirmation-gate", { type: "partial_completion_recovered", transactionId, previousStatus: integrity.state?.lifecycle?.status || null, status: recoveredState.lifecycle.status, finalReportPath: artifactPaths.finalReport, completionIntegrity: recoverableCompletion });
+      phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS, { repeated: true, status: "completed_recovered", finalReportPath: artifactPaths.finalReport, completionIntegrity: recoverableCompletion });
+      completeRun(run, STATUSES.SUCCESS, { transactionId, repeated: true, status: "completed_recovered", finalReportPath: artifactPaths.finalReport, completionIntegrity: recoverableCompletion });
+      if (json) console.log(JSON.stringify({ ...result, status: "completed_recovered", recovered: true }, null, 2));
+      else console.log(`transaction ${transactionId} completed state recovered from final report: ${artifactPaths.finalReport}`);
+      return;
+    }
     if (integrity.state?.lifecycle?.terminal === true && integrity.state?.lifecycle?.status === "completed") {
-      const finalReport = tryReadJson(artifactPaths.finalReport);
+      const finalReport = integrityFinalReport;
+      const completionIntegrity = completionEvidenceIntegrity({ transactionId, state: integrity.state, finalReport, artifactPaths });
+      if (!completionIntegrity.ok) throw new Error(`Transaction ${transactionId} has partial completion: state.json advertises completed but final-report commit/outcome evidence is not verified (${completionIntegrity.problems.join("; ")}). Repeated solve will not rerun edit-capable phases; inspect status/final report and recover from durable artifacts.`);
       const result = completedSolveResult({ run, transactionId, artifactPaths, state: integrity.state, finalReport, planPath });
-      phaseEvent(run, "confirmation-gate", { type: "repeated_solve_already_completed", transactionId, status: integrity.state.lifecycle.status, finalReportPath: artifactPaths.finalReport, worktreeMetadataPath: artifactPaths.worktreeMetadata });
-      phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS, { repeated: true, status: "already_completed", finalReportPath: artifactPaths.finalReport });
-      completeRun(run, STATUSES.SUCCESS, { transactionId, repeated: true, status: "already_completed", finalReportPath: artifactPaths.finalReport });
+      phaseEvent(run, "confirmation-gate", { type: "repeated_solve_already_completed", transactionId, status: integrity.state.lifecycle.status, finalReportPath: artifactPaths.finalReport, worktreeMetadataPath: artifactPaths.worktreeMetadata, completionIntegrity });
+      phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS, { repeated: true, status: "already_completed", finalReportPath: artifactPaths.finalReport, completionIntegrity });
+      completeRun(run, STATUSES.SUCCESS, { transactionId, repeated: true, status: "already_completed", finalReportPath: artifactPaths.finalReport, completionIntegrity });
       if (json) console.log(JSON.stringify(result, null, 2));
       else console.log(`transaction ${transactionId} already completed; final report: ${artifactPaths.finalReport}`);
       return;
@@ -2947,28 +3028,21 @@ async function solve(args, json) {
       finalVerification: postValidation.finalVerification,
       guidance: transactionCommit.manualNextSteps,
     };
-    if (existsSync(statePath)) {
-      const state = readJson(statePath);
-      const updatedState = {
-        ...state,
-        updatedAt: transactionCommit.completedAt,
-        revision: Number.isInteger(state.revision) ? state.revision + 1 : 1,
-        lifecycle: { ...(state.lifecycle || {}), status: "completed", phase: "transaction-commit-and-report", terminal: true, outcome },
-        branch: { ...(state.branch || {}), head: transactionCommit.commit || state.branch?.head || integrity.baseCommit, status: transactionCommit.status === "committed_for_review" ? "committed_for_review" : "ready_for_review" },
-        implementation: { ...(state.implementation || {}), changedFiles: transactionCommit.changedFiles, transactionCommit: transactionCommit.commit },
-        validation: { ...(state.validation || {}), finalVerification: { ...(state.validation?.finalVerification || {}), ...postValidation.finalVerification, path: artifactPaths.finalReport, evidencePath: artifactPaths.postValidation } },
-        reports: { ...(state.reports || {}), finalReportPath: artifactPaths.finalReport },
-      };
-      writeJson(statePath, updatedState);
-      updatedStateForRegistry = updatedState;
-    }
+    const cleanupResult = await applyRecordedWorktreeCleanupPolicy({ transactionId, artifactPaths, repoRoot: integrity.state?.repo?.root || cwd, branchName: worktreeRecord.branch.name, worktreePath: worktreeRecord.worktree.path });
     if (existsSync(artifactPaths.finalReport)) {
       const finalReport = readJson(artifactPaths.finalReport);
       writeJson(artifactPaths.finalReport, {
         ...finalReport,
-        updatedAt: transactionCommit.completedAt,
+        updatedAt: new Date().toISOString(),
         status: "completed",
         terminal: true,
+        completionProtocol: {
+          schema: "pi-bug-solver-workflow/completion-protocol/v1",
+          status: "final_report_written_before_state_completed",
+          stateAdvertisesCompletedAfterVerifiedFinalReport: true,
+          verifiedBeforeStateCompletion: false,
+          evidenceVerifiedAt: null,
+        },
         outcome,
         finalOutcome: outcome,
         summary: { ...(finalReport.summary || {}), status: "completed", phase: "transaction-commit-and-report", changedFiles: transactionCommit.changedFiles, finalStatus: outcome.status, manualReviewRequired: true },
@@ -2981,19 +3055,33 @@ async function solve(args, json) {
         changedFiles: transactionCommit.changedFiles,
         manualNextSteps: transactionCommit.manualNextSteps,
         finalVerification: postValidation.finalVerification,
+        cleanup: cleanupResult,
         evidencePaths: { ...(finalReport.evidencePaths || {}), baseline: artifactPaths.baseline, postValidation: artifactPaths.postValidation, implementation: artifactPaths.implementationEvidence, allowlistDecisions: artifactPaths.allowlistDecisions, repairAttempts: artifactPaths.repairAttempts, failureClassifications: artifactPaths.failureClassifications, finalReport: artifactPaths.finalReport, worktreeMetadata: artifactPaths.worktreeMetadata, state: statePath },
       });
+      const reportBeforeCompletedState = readJson(artifactPaths.finalReport);
+      const reportIntegrity = completionEvidenceIntegrity({ transactionId, state: null, finalReport: reportBeforeCompletedState, artifactPaths });
+      if (!reportIntegrity.ok) throw new Error(`Completion protocol refused to mark state completed because final-report evidence was not verified: ${reportIntegrity.problems.join("; ")}`);
+      writeJson(artifactPaths.finalReport, { ...reportBeforeCompletedState, completionProtocol: { ...(reportBeforeCompletedState.completionProtocol || {}), verifiedBeforeStateCompletion: true, evidenceVerifiedAt: new Date().toISOString(), integrity: reportIntegrity } });
+    } else {
+      throw new Error(`Completion protocol refused to mark state completed because final report is missing: ${artifactPaths.finalReport}`);
     }
-    if (updatedStateForRegistry) updateGlobalRegistry(updatedStateForRegistry);
-    const cleanupResult = await applyRecordedWorktreeCleanupPolicy({ transactionId, artifactPaths, repoRoot: integrity.state?.repo?.root || cwd, branchName: worktreeRecord.branch.name, worktreePath: worktreeRecord.worktree.path });
-    if (existsSync(artifactPaths.finalReport)) {
-      const finalReport = readJson(artifactPaths.finalReport);
-      writeJson(artifactPaths.finalReport, {
-        ...finalReport,
-        updatedAt: new Date().toISOString(),
-        cleanup: cleanupResult,
-        evidencePaths: { ...(finalReport.evidencePaths || {}), worktreeMetadata: artifactPaths.worktreeMetadata },
-      });
+    if (existsSync(statePath)) {
+      const state = readJson(statePath);
+      const updatedState = {
+        ...state,
+        updatedAt: transactionCommit.completedAt,
+        revision: Number.isInteger(state.revision) ? state.revision + 1 : 1,
+        lifecycle: { ...(state.lifecycle || {}), status: "completed", phase: "transaction-commit-and-report", terminal: true, outcome, completionProtocol: { finalReportVerifiedBeforeCompletedState: true, finalReportPath: artifactPaths.finalReport } },
+        branch: { ...(state.branch || {}), head: transactionCommit.commit || state.branch?.head || integrity.baseCommit, status: transactionCommit.status === "committed_for_review" ? "committed_for_review" : "ready_for_review" },
+        implementation: { ...(state.implementation || {}), changedFiles: transactionCommit.changedFiles, transactionCommit: transactionCommit.commit },
+        validation: { ...(state.validation || {}), finalVerification: { ...(state.validation?.finalVerification || {}), ...postValidation.finalVerification, path: artifactPaths.finalReport, evidencePath: artifactPaths.postValidation } },
+        reports: { ...(state.reports || {}), finalReportPath: artifactPaths.finalReport },
+      };
+      const completedIntegrity = completionEvidenceIntegrity({ transactionId, state: updatedState, finalReport: readJson(artifactPaths.finalReport), artifactPaths });
+      if (!completedIntegrity.ok) throw new Error(`Completion protocol refused to persist completed state because final-report/state evidence mismatch remained: ${completedIntegrity.problems.join("; ")}`);
+      writeJson(statePath, updatedState);
+      updatedStateForRegistry = updatedState;
+      updateGlobalRegistry(updatedStateForRegistry);
     }
     emitArtifact(run, { kind: "file", title: "bug-solver final report", path: artifactPaths.finalReport });
     emitArtifact(run, { kind: "file", title: "bug-solver cleanup/worktree metadata", path: artifactPaths.worktreeMetadata });
@@ -3004,7 +3092,7 @@ async function solve(args, json) {
     if (json) console.log(JSON.stringify(result, null, 2));
     else console.log(`transaction ${transactionId} completed on ${worktreeRecord.branch.name}; final report: ${artifactPaths.finalReport}`);
   } catch (error) {
-    if (!/Repair cap reached/i.test(error?.message || String(error)) && currentPhase !== "final-verification-gate") recordSolveFailureClassification({ transactionId: plan.transactionId, planArtifact, plan, planPath, phase: currentPhase, error });
+    if (!/Repair cap reached|partial completion/i.test(error?.message || String(error)) && currentPhase !== "final-verification-gate") recordSolveFailureClassification({ transactionId: plan.transactionId, planArtifact, plan, planPath, phase: currentPhase, error });
     failRun(run, error, { transactionId: plan.transactionId, failurePhase: currentPhase });
     die(error.message || String(error), 1, json);
   }
@@ -3231,6 +3319,12 @@ function loadTransactionInspection(dir, transactionIdHint) {
   const lock = tryReadJson(paths.precheckLock);
   const lockInspection = inspectPrecheckLock(paths.precheckLock);
   const finalReport = tryReadJson(paths.finalReport);
+  const completionIntegrity = completionEvidenceIntegrity({ transactionId: state?.transactionId || plan?.transactionId || precheck?.transactionId || transactionIdHint, state, finalReport, artifactPaths: paths });
+  const partialCompletion = state?.lifecycle?.status === "completed" && !completionIntegrity.ok
+    ? { status: "corrupt_completed_state", recoverableByRerun: false, problems: completionIntegrity.problems, message: "state.json advertises completed but verified final-report commit/outcome evidence is missing or inconsistent." }
+    : (state?.lifecycle?.status !== "completed" && finalReport?.status === "completed" && completionIntegrity.ok
+      ? { status: "final_report_complete_state_incomplete", recoverableByRerun: true, problems: [], message: "final-report commit/outcome evidence is complete but state.json was not advanced; repeat solve can recover the completed state without rerunning edit-capable phases." }
+      : null);
   const worktreeMetadata = tryReadJson(paths.worktreeMetadata);
   const activation = tryReadJson(join(dir, "activation-gate.json")) || tryReadJson(join(dir, "activation-scaffold.json"));
   const transactionId = state?.transactionId || plan?.transactionId || precheck?.transactionId || transactionIdHint;
@@ -3260,6 +3354,8 @@ function loadTransactionInspection(dir, transactionIdHint) {
     latestPhase: state?.lifecycle?.phase || (incompleteMarker || lockInspection.exists ? "precheck-materialization" : null),
     status: state?.lifecycle?.status || state?.status || plan?.status || precheck?.status || (incompleteMarker ? "precheck_incomplete" : lockInspection.recoverable ? "precheck_lock_recoverable" : null),
     terminalOutcome: deriveTerminalOutcome({ state, finalReport, activation }),
+    completionIntegrity,
+    partialCompletion,
     precheckMaterialization: {
       status: materializationStatus,
       complete: materializationStatus === "complete",
