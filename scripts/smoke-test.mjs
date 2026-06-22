@@ -253,6 +253,28 @@ try {
   const fakeEvidencePostValidation = fakeEvidenceSolveDetails?.postValidationPath ? JSON.parse(readFileSync(fakeEvidenceSolveDetails.postValidationPath, 'utf8')) : undefined;
   log(fakeEvidencePostValidation?.status === 'inconclusive_not_implemented' && fakeEvidencePostValidation?.finalVerification?.status === 'inconclusive' && fakeEvidencePostValidation?.finalVerification?.bugFixed === false && fakeEvidencePostValidation?.finalVerification?.implementationBacked === false && fakeEvidencePostValidation?.finalVerification?.notImplemented === true && fakeEvidencePostValidation?.finalVerification?.targetedTransitions?.[0]?.baselineStatus === 1 && fakeEvidencePostValidation?.finalVerification?.targetedTransitions?.[0]?.postStatus === 0 && fakeEvidencePostValidation?.finalVerification?.implementationEvidence?.explicitlyResolvedBug === false && fakeEvidencePostValidation?.finalVerification?.implementationEvidence?.ignoredExplicitResolutionRecords?.some((record) => record.reason === 'not_tied_to_isolated_worktree_change_or_commit'), 'bug-solver final verification ignores fake explicit resolution evidence from an externally stateful targeted command unless tied to a trusted isolated worktree implementation change');
 
+  const fakeClaimRepo = join(tmp, 'fake-claimed-change-solve-repo');
+  mkdirSync(fakeClaimRepo, { recursive: true });
+  expectExit('bug-solver fake-claimed-change repo git init', ['git', 'init', '-q'], 0, { cwd: fakeClaimRepo });
+  expectExit('bug-solver fake-claimed-change repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: fakeClaimRepo });
+  expectExit('bug-solver fake-claimed-change repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: fakeClaimRepo });
+  writeFileSync(join(fakeClaimRepo, 'README.md'), 'fake claimed change solve\n');
+  expectExit('bug-solver fake-claimed-change repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: fakeClaimRepo });
+  const fakeClaimMarker = join(tmp, 'fake-claimed-change-targeted-marker');
+  const fakeClaimMetadata = join(tmp, 'fake-claimed-change-metadata.json');
+  const fakeClaimScript = join(tmp, 'fake-claimed-change-targeted-command.mjs');
+  writeFileSync(fakeClaimScript, `#!/usr/bin/env node\nimport { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst marker = ${JSON.stringify(fakeClaimMarker)};\nconst metadataPath = ${JSON.stringify(fakeClaimMetadata)};\nif (!existsSync(marker)) { writeFileSync(marker, 'baseline reproduced\\n'); process.exit(1); }\nconst metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));\nappendFileSync(metadata.implementationEvidencePath, JSON.stringify({ type: 'explicit_bug_resolution', status: 'resolved', phase: 'implementation', owner: 'bug-solver-workflow', transactionId: metadata.transactionId, worktreePath: process.cwd(), createdAt: new Date(Date.now() + 1000).toISOString(), evidence: 'fake claimed changed file from validation command', changedFiles: ['README.md'] }) + '\\n');\nprocess.exit(0);\n`);
+  const fakeClaimPrecheck = expectExit('bug-solver workflow precheck for fake claimed changed-files evidence succeeds', ['node', bugSolverCli, 'precheck', '--cwd', fakeClaimRepo, '--bug', 'Fix fake claimed changed-files final verification bug', '--user-test-command', `node ${JSON.stringify(fakeClaimScript)}`, '--json'], 0);
+  let fakeClaimPrecheckDetails;
+  try { fakeClaimPrecheckDetails = JSON.parse(fakeClaimPrecheck.stdout); } catch { fakeClaimPrecheckDetails = undefined; }
+  const fakeClaimPlan = fakeClaimPrecheckDetails?.planPath ? JSON.parse(readFileSync(fakeClaimPrecheckDetails.planPath, 'utf8')) : undefined;
+  writeFileSync(fakeClaimMetadata, JSON.stringify({ transactionId: fakeClaimPrecheckDetails?.transactionId, implementationEvidencePath: fakeClaimPlan?.evidencePaths?.implementation }, null, 2));
+  const fakeClaimSolve = expectExit('bug-solver workflow approved solve rejects fake claimed changed-files evidence', ['node', bugSolverCli, 'solve', '--cwd', fakeClaimRepo, '--plan-path', fakeClaimPrecheckDetails?.planPath || join(tmp, 'missing-fake-claim-plan.json'), '--approved', '--json'], 0);
+  let fakeClaimSolveDetails;
+  try { fakeClaimSolveDetails = JSON.parse(fakeClaimSolve.stdout); } catch { fakeClaimSolveDetails = undefined; }
+  const fakeClaimPostValidation = fakeClaimSolveDetails?.postValidationPath ? JSON.parse(readFileSync(fakeClaimSolveDetails.postValidationPath, 'utf8')) : undefined;
+  log(fakeClaimPostValidation?.finalVerification?.bugFixed === false && fakeClaimPostValidation?.finalVerification?.implementationBacked === false && fakeClaimPostValidation?.finalVerification?.implementationEvidence?.explicitResolutionCorroborationRequired === true && fakeClaimPostValidation?.finalVerification?.implementationEvidence?.ignoredExplicitResolutionRecords?.some((record) => record.reason === 'claimed_change_not_corroborated_by_isolated_worktree_git_evidence'), 'bug-solver final verification rejects explicit bug resolution records whose claimed changed files are not corroborated by isolated worktree git diff/status evidence');
+
   const backedRepo = join(tmp, 'implementation-backed-solve-repo');
   mkdirSync(backedRepo, { recursive: true });
   expectExit('bug-solver implementation-backed repo git init', ['git', 'init', '-q'], 0, { cwd: backedRepo });

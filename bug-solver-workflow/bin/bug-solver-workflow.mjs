@@ -613,6 +613,34 @@ function gitSnapshotChanged(before, after) {
   return (before.head || null) !== (after.head || null) || (before.statusShort || "") !== (after.statusShort || "");
 }
 
+function normalizeChangedFilePath(file) {
+  return String(file || "").trim().replace(/^\"|\"$/g, "").replace(/\\/g, "/");
+}
+
+function changedFilesFromStatusShort(statusShort) {
+  return String(statusShort || "").split(/\n+/).map((line) => line.trimEnd()).filter(Boolean).map((line) => {
+    const body = line.slice(3).trim();
+    const renamed = body.includes(" -> ") ? body.split(" -> ").at(-1) : body;
+    return normalizeChangedFilePath(renamed);
+  }).filter(Boolean);
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values.map(normalizeChangedFilePath).filter(Boolean))];
+}
+
+async function gitChangedFilesSince(cwd, baseCommit) {
+  if (!cwd || !baseCommit) return [];
+  const committed = await runGit(cwd, ["diff", "--name-only", `${baseCommit}..HEAD`]);
+  const uncommitted = await runGit(cwd, ["diff", "--name-only"]);
+  const staged = await runGit(cwd, ["diff", "--cached", "--name-only"]);
+  return uniqueStrings([
+    ...(committed.status === 0 ? committed.stdout.split(/\n+/) : []),
+    ...(uncommitted.status === 0 ? uncommitted.stdout.split(/\n+/) : []),
+    ...(staged.status === 0 ? staged.stdout.split(/\n+/) : []),
+  ]);
+}
+
 function explicitResolutionCandidate(record) {
   const explicitResolutionTypes = new Set(["implementation_change", "repair_change", "bug_resolution", "explicit_bug_resolution", "repair_attempt"]);
   return record?.explicitlyResolvedBug === true
@@ -627,7 +655,7 @@ function parseRecordTime(value) {
   return Number.isFinite(time) ? time : undefined;
 }
 
-function trustedExplicitResolutionRecord(record, { baseline, baselineAfter }) {
+function trustedExplicitResolutionRecord(record, { baseline, baselineAfter, postBefore, actualChangedFiles = [] }) {
   if (!explicitResolutionCandidate(record)) return { trusted: false, reason: "not_explicit_resolution" };
   const trustedPhases = new Set(["implementation", "repair", "repair-attempt", "implementation-repair", "bounded-repair-loop"]);
   const phase = String(record.phase || record.workflowPhase || record.producedByPhase || "");
@@ -646,19 +674,41 @@ function trustedExplicitResolutionRecord(record, { baseline, baselineAfter }) {
   const worktreePath = baseline?.worktreePath;
   const recordWorktreePath = record.worktreePath || record.isolatedWorktreePath || record.worktree?.path;
   if (!worktreePath || !recordWorktreePath || resolve(String(recordWorktreePath)) !== resolve(String(worktreePath))) return { trusted: false, reason: "worktree_mismatch" };
-  const changedFiles = Array.isArray(record.changedFiles) ? record.changedFiles : (Array.isArray(record.filesChanged) ? record.filesChanged : []);
+
+  const actualHeadChanged = Boolean(baselineAfter?.head && postBefore?.head && postBefore.head !== baselineAfter.head);
+  const actualStatusChanged = Boolean((postBefore?.statusShort || "") !== (baselineAfter?.statusShort || ""));
+  const actualFiles = uniqueStrings([...actualChangedFiles, ...changedFilesFromStatusShort(postBefore?.statusShort)]);
+  const actualChangedAfterBaseline = actualHeadChanged || actualStatusChanged || actualFiles.length > 0;
+  const changedFiles = uniqueStrings(Array.isArray(record.changedFiles) ? record.changedFiles : (Array.isArray(record.filesChanged) ? record.filesChanged : []));
   const commit = record.commit || record.commitHash || record.head || record.git?.after?.head || record.git?.commit;
   const afterStatus = record.git?.after?.statusShort ?? record.statusShortAfter ?? record.worktreeStatusAfter;
-  const changedSnapshot = gitSnapshotChanged(record.git?.before || baselineAfter, record.git?.after || (commit || afterStatus !== undefined ? { head: commit || baselineAfter?.head || null, statusShort: afterStatus || "" } : null));
-  const tiedToWorktreeChange = record.implementationChangedWorktree === true || record.worktreeChangedAfterBaseline === true || changedFiles.length > 0 || (commit && commit !== baselineAfter?.head) || changedSnapshot;
-  if (!tiedToWorktreeChange) return { trusted: false, reason: "not_tied_to_isolated_worktree_change_or_commit" };
-  return { trusted: true, reason: "trusted_post_baseline_implementation_or_repair_evidence" };
+  const recordAfter = record.git?.after || (commit || afterStatus !== undefined ? { head: commit || baselineAfter?.head || null, statusShort: afterStatus || "" } : null);
+  const changedSnapshot = gitSnapshotChanged(record.git?.before || baselineAfter, recordAfter);
+  const claimedChanged = record.implementationChangedWorktree === true || record.worktreeChangedAfterBaseline === true || changedFiles.length > 0 || Boolean(commit && commit !== baselineAfter?.head) || changedSnapshot;
+  if (!claimedChanged) return { trusted: false, reason: "not_tied_to_isolated_worktree_change_or_commit" };
+
+  const runnerOwnedMetadata = record.runnerOwnedImplementationMetadata === true
+    && record.validationCommandProduced !== true
+    && Number(record.runnerProcessPid) === process.pid
+    && ["implementation", "repair", "repair-attempt", "implementation-repair", "bounded-repair-loop"].includes(phase);
+  if (runnerOwnedMetadata) return { trusted: true, reason: "trusted_runner_owned_implementation_or_repair_metadata" };
+
+  if (!actualChangedAfterBaseline) return { trusted: false, reason: "claimed_change_not_corroborated_by_isolated_worktree_git_evidence" };
+  if (commit && postBefore?.head && commit !== postBefore.head) return { trusted: false, reason: "claimed_commit_not_observed_in_isolated_worktree" };
+  if (changedFiles.length > 0) {
+    const actualSet = new Set(actualFiles);
+    const missing = changedFiles.filter((file) => !actualSet.has(file));
+    if (missing.length > 0) return { trusted: false, reason: "claimed_changed_files_not_observed_in_isolated_worktree", missingChangedFiles: missing };
+  }
+  if (recordAfter?.head && postBefore?.head && recordAfter.head !== postBefore.head) return { trusted: false, reason: "claimed_git_after_head_not_observed_in_isolated_worktree" };
+  return { trusted: true, reason: "trusted_post_baseline_resolution_corroborated_by_isolated_worktree_git_evidence" };
 }
 
-function implementationBackedEvidence({ baseline, postBefore, postAfter, artifactPaths }) {
+async function implementationBackedEvidence({ baseline, postBefore, postAfter, artifactPaths }) {
   const records = readJsonlRecords(artifactPaths.implementationEvidence);
   const baselineAfter = baseline?.git?.after;
-  const assessedExplicitRecords = records.filter(explicitResolutionCandidate).map((record) => ({ record, assessment: trustedExplicitResolutionRecord(record, { baseline, baselineAfter }) }));
+  const actualChangedFiles = await gitChangedFilesSince(postBefore?.root || baseline?.worktreePath, baselineAfter?.head);
+  const assessedExplicitRecords = records.filter(explicitResolutionCandidate).map((record) => ({ record, assessment: trustedExplicitResolutionRecord(record, { baseline, baselineAfter, postBefore, actualChangedFiles }) }));
   const explicitResolution = assessedExplicitRecords.find((entry) => entry.assessment.trusted)?.record;
   const ignoredExplicitResolutionRecords = assessedExplicitRecords.filter((entry) => !entry.assessment.trusted).map((entry) => ({ type: entry.record?.type || null, status: entry.record?.status || entry.record?.outcome || null, createdAt: entry.record?.createdAt || entry.record?.completedAt || null, reason: entry.assessment.reason }));
   const worktreeChangedAfterBaseline = gitSnapshotChanged(baselineAfter, postBefore);
@@ -668,8 +718,10 @@ function implementationBackedEvidence({ baseline, postBefore, postAfter, artifac
     evidencePath: artifactPaths.implementationEvidence,
     worktreeChangedAfterBaseline,
     worktreeChangedByPostValidation,
+    actualChangedFilesAfterBaseline: actualChangedFiles,
     explicitlyResolvedBug: Boolean(explicitResolution),
     trustedExplicitResolutionRequired: true,
+    explicitResolutionCorroborationRequired: true,
     ignoredExplicitResolutionRecords,
     durableEvidenceFound: worktreeChangedAfterBaseline || Boolean(explicitResolution),
     baselineAfter: baselineAfter ? { head: baselineAfter.head || null, statusShort: baselineAfter.statusShort || "" } : null,
@@ -774,7 +826,7 @@ async function runPostChangeValidation({ transactionId, planArtifact, artifactPa
   const after = await gitInfo(worktreePath);
   const comparison = compareValidationResults({ baselineResults: baseline?.commandResults || [], postResults: results });
   const classifications = classifyPostValidationFailures(comparison, results, artifactPaths);
-  const implementationEvidence = implementationBackedEvidence({ baseline, postBefore: before, postAfter: after, artifactPaths });
+  const implementationEvidence = await implementationBackedEvidence({ baseline, postBefore: before, postAfter: after, artifactPaths });
   const finalVerification = buildFinalVerification({ commands, baselineResults: baseline?.commandResults || [], postResults: results, comparison, implementationEvidence });
   const status = commands.length === 0
     ? "skipped_no_commands"
