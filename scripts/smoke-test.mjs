@@ -313,6 +313,44 @@ try {
   const implementationPhasePostValidation = implementationPhaseSolveDetails?.postValidationPath ? JSON.parse(readFileSync(implementationPhaseSolveDetails.postValidationPath, 'utf8')) : undefined;
   log(implementationPhaseRecord?.editCapable === true && implementationPhaseRecord?.commandProvided === true && implementationPhaseRecord?.worktreeChangedAfterBaseline === true && implementationPhaseRecord?.changedFiles?.includes('README.md') && implementationPhasePostValidation?.finalVerification?.targetedTransitions?.[0]?.baselineStatus === 1 && implementationPhasePostValidation?.finalVerification?.targetedTransitions?.[0]?.postStatus === 0 && implementationPhasePostValidation?.finalVerification?.targetedTransitions?.[0]?.fixedByOutcomeTransition === true && implementationPhasePostValidation?.finalVerification?.bugFixed === true && implementationPhasePostValidation?.finalVerification?.implementationBacked === true, 'bug-solver solve proves a successful outcome-based bug fix: targeted command fails at baseline, implementation changes isolated worktree, targeted command passes afterward, and finalVerification.bugFixed is true');
 
+  const allowlistBlockedRepo = join(tmp, 'allowlist-blocked-repo');
+  mkdirSync(allowlistBlockedRepo, { recursive: true });
+  expectExit('bug-solver allowlist-blocked repo git init', ['git', 'init', '-q'], 0, { cwd: allowlistBlockedRepo });
+  expectExit('bug-solver allowlist-blocked repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: allowlistBlockedRepo });
+  expectExit('bug-solver allowlist-blocked repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: allowlistBlockedRepo });
+  writeFileSync(join(allowlistBlockedRepo, 'README.md'), 'allowlist blocked before solve\n');
+  expectExit('bug-solver allowlist-blocked repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: allowlistBlockedRepo });
+  const allowlistBlockedPrecheck = expectExit('bug-solver workflow precheck records restrictive allowlist', ['node', bugSolverCli, 'precheck', '--cwd', allowlistBlockedRepo, '--bug', 'Fix allowlist blocked bug', '--allowlist', 'README.md', '--user-test-command', 'test -f src/out.txt', '--json'], 0);
+  let allowlistBlockedPrecheckDetails;
+  try { allowlistBlockedPrecheckDetails = JSON.parse(allowlistBlockedPrecheck.stdout); } catch { allowlistBlockedPrecheckDetails = undefined; }
+  const allowlistBlockedSolve = expectExit('bug-solver workflow detects out-of-scope implementation changes', ['node', bugSolverCli, 'solve', '--cwd', allowlistBlockedRepo, '--plan-path', allowlistBlockedPrecheckDetails?.planPath || join(tmp, 'missing-allowlist-blocked-plan.json'), '--approved', '--implementation-command', 'mkdir -p src && touch src/out.txt', '--json'], 0);
+  let allowlistBlockedSolveDetails;
+  try { allowlistBlockedSolveDetails = JSON.parse(allowlistBlockedSolve.stdout); } catch { allowlistBlockedSolveDetails = undefined; }
+  const allowlistBlockedRecords = allowlistBlockedSolveDetails?.implementationEvidencePath ? readFileSync(allowlistBlockedSolveDetails.implementationEvidencePath, 'utf8').trim().split(/\n+/).filter(Boolean).map((line) => JSON.parse(line)) : [];
+  const allowlistBlockedRecord = allowlistBlockedRecords.find((record) => record.phase === 'implementation' && record.runnerOwnedImplementationMetadata === true);
+  const allowlistBlockedPost = allowlistBlockedSolveDetails?.postValidationPath ? JSON.parse(readFileSync(allowlistBlockedSolveDetails.postValidationPath, 'utf8')) : undefined;
+  log(allowlistBlockedRecord?.status === 'blocked_out_of_scope_changes' && allowlistBlockedRecord?.allowlist?.accepted === false && allowlistBlockedRecord?.allowlist?.outOfScopeFiles?.includes('src/out.txt') && allowlistBlockedPost?.finalVerification?.implementationBacked === false && allowlistBlockedPost?.finalVerification?.implementationEvidence?.allowlistAccepted === false, 'bug-solver allowlist enforcement blocks out-of-scope changes without a durable justified expansion');
+
+  const allowlistExpansionRepo = join(tmp, 'allowlist-expansion-repo');
+  mkdirSync(allowlistExpansionRepo, { recursive: true });
+  expectExit('bug-solver allowlist-expansion repo git init', ['git', 'init', '-q'], 0, { cwd: allowlistExpansionRepo });
+  expectExit('bug-solver allowlist-expansion repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: allowlistExpansionRepo });
+  expectExit('bug-solver allowlist-expansion repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: allowlistExpansionRepo });
+  writeFileSync(join(allowlistExpansionRepo, 'README.md'), 'allowlist expansion before solve\n');
+  expectExit('bug-solver allowlist-expansion repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: allowlistExpansionRepo });
+  const allowlistExpansionPrecheck = expectExit('bug-solver workflow precheck records expandable allowlist', ['node', bugSolverCli, 'precheck', '--cwd', allowlistExpansionRepo, '--bug', 'Fix allowlist expansion bug', '--allowlist', 'README.md', '--user-test-command', 'test -f src/out.txt', '--json'], 0);
+  let allowlistExpansionPrecheckDetails;
+  try { allowlistExpansionPrecheckDetails = JSON.parse(allowlistExpansionPrecheck.stdout); } catch { allowlistExpansionPrecheckDetails = undefined; }
+  const allowlistExpansionPlan = allowlistExpansionPrecheckDetails?.planPath ? JSON.parse(readFileSync(allowlistExpansionPrecheckDetails.planPath, 'utf8')) : undefined;
+  if (allowlistExpansionPlan?.allowlist?.decisionsPath) writeFileSync(allowlistExpansionPlan.allowlist.decisionsPath, `${JSON.stringify({ type: 'allowlist_expansion', createdAt: new Date().toISOString(), paths: ['src'], justification: 'The failing reproduction requires adding the missing src/out.txt artifact.' })}\n`, { flag: 'a' });
+  const allowlistExpansionSolve = expectExit('bug-solver workflow accepts justified allowlist expansion', ['node', bugSolverCli, 'solve', '--cwd', allowlistExpansionRepo, '--plan-path', allowlistExpansionPrecheckDetails?.planPath || join(tmp, 'missing-allowlist-expansion-plan.json'), '--approved', '--implementation-command', 'mkdir -p src && touch src/out.txt', '--json'], 0);
+  let allowlistExpansionSolveDetails;
+  try { allowlistExpansionSolveDetails = JSON.parse(allowlistExpansionSolve.stdout); } catch { allowlistExpansionSolveDetails = undefined; }
+  const allowlistExpansionRecords = allowlistExpansionSolveDetails?.implementationEvidencePath ? readFileSync(allowlistExpansionSolveDetails.implementationEvidencePath, 'utf8').trim().split(/\n+/).filter(Boolean).map((line) => JSON.parse(line)) : [];
+  const allowlistExpansionRecord = allowlistExpansionRecords.find((record) => record.phase === 'implementation' && record.runnerOwnedImplementationMetadata === true);
+  const allowlistExpansionReport = allowlistExpansionSolveDetails?.postValidationPath ? JSON.parse(readFileSync(allowlistExpansionSolveDetails.postValidationPath, 'utf8')) : undefined;
+  log(allowlistExpansionRecord?.allowlist?.accepted === true && allowlistExpansionRecord?.allowlist?.acceptedExpansions?.some((record) => record.paths?.includes('src') && record.justification) && allowlistExpansionReport?.finalVerification?.implementationBacked === true, 'bug-solver adaptive allowlist accepts expanded paths only when a durable justification exists before acceptance');
+
   const gatedRepeatSolve = expectExit('bug-solver workflow repeated approved solve reuses isolated worktree safely', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', gatedPrecheckDetails?.planPath || join(tmp, 'missing-gated-plan.json'), '--approved', '--json'], 0);
   let gatedRepeatSolveDetails;
   try { gatedRepeatSolveDetails = JSON.parse(gatedRepeatSolve.stdout); } catch { gatedRepeatSolveDetails = undefined; }
