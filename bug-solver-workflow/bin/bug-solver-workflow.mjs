@@ -196,6 +196,7 @@ function buildArtifactPaths(dir) {
     baseline: join(dir, "evidence", "baseline-validation.json"),
     postValidation: join(dir, "evidence", "post-change-validation.json"),
     allowlistDecisions: join(dir, "allowlist-decisions.jsonl"),
+    implementationContext: join(dir, "evidence", "implementation-context.json"),
     implementationEvidence: join(dir, "evidence", "implementation-evidence.jsonl"),
     repairAttempts: join(dir, "repair-attempts.jsonl"),
     failureClassifications: join(dir, "failure-classifications.jsonl"),
@@ -240,8 +241,8 @@ function buildValidationContract({ transactionId, bug, cwd, validationCommands, 
       description: "Solve implementation must run in an isolated transaction worktree/branch rooted at the recorded base and not mutate the caller worktree directly.",
       priority: "must",
       validationMethod: "both",
-      evidenceRequired: ["state.worktree.isolated", "state.worktree.rootedAtBaseCommit", "state.branch.plannedName", "transactionPlan.immutableTransactionIdentity", "worktreeMetadata.cleanup"],
-      evidencePaths: [artifactPaths.state, artifactPaths.transactionPlan, artifactPaths.worktreeMetadata, artifactPaths.finalReport],
+      evidenceRequired: ["state.worktree.isolated", "state.worktree.rootedAtBaseCommit", "state.branch.plannedName", "transactionPlan.immutableTransactionIdentity", "worktreeMetadata.cleanup", "implementationContext.worktreePath"],
+      evidencePaths: [artifactPaths.state, artifactPaths.transactionPlan, artifactPaths.worktreeMetadata, artifactPaths.implementationContext, artifactPaths.finalReport],
     },
     {
       id: "baseline-aware-validation",
@@ -272,8 +273,8 @@ function buildValidationContract({ transactionId, bug, cwd, validationCommands, 
       description: "Failures are classified into actionable categories and recorded with durable evidence.",
       priority: "must",
       validationMethod: "both",
-      evidenceRequired: ["failureClassification.current", "failureClassifications.jsonl", "finalReport.failures.classifications"],
-      evidencePaths: [artifactPaths.failureClassifications, artifactPaths.implementationEvidence, artifactPaths.finalReport],
+      evidenceRequired: ["failureClassification.current", "failureClassifications.jsonl", "finalReport.failures.classifications", "implementationContext.failureClassificationPath"],
+      evidencePaths: [artifactPaths.failureClassifications, artifactPaths.implementationContext, artifactPaths.implementationEvidence, artifactPaths.finalReport],
     },
     {
       id: "capped-repair-loop",
@@ -404,6 +405,7 @@ function buildTransactionPlan({ transactionId, cwd, bug, git, validationCommands
       baseline: artifactPaths.baseline,
       postValidation: artifactPaths.postValidation,
       allowlistDecisions: artifactPaths.allowlistDecisions,
+      implementationContext: artifactPaths.implementationContext,
       implementation: artifactPaths.implementationEvidence,
       repairAttempts: artifactPaths.repairAttempts,
       failureClassifications: artifactPaths.failureClassifications,
@@ -890,17 +892,82 @@ function implementationCommandFrom({ args = {}, planArtifact = {} }) {
   return raw ? String(raw).trim() : "";
 }
 
+function buildImplementationContext({ transactionId, planArtifact, artifactPaths, worktreePath, baseline, implementationCommand }) {
+  const validation = planArtifact?.validation || {};
+  const bugDescription = planArtifact?.transaction?.bugDescription || planArtifact?.bug || planArtifact?.bugDescription || "";
+  const allowlistPolicy = {
+    current: planArtifact?.allowlist?.initial || planArtifact?.allowlist?.current || planArtifact?.allowlist || [],
+    decisionsPath: artifactPaths.allowlistDecisions,
+    adaptive: true,
+    justificationRequiredForExpansion: true,
+    expansionRecordShape: { type: "allowlist_expansion", paths: ["path/or/directory"], justification: "Why this scope is required by the failing reproduction" },
+  };
+  const validationContractPath = planArtifact?.validationContractPath || validation.contractPath || artifactPaths.validationContract;
+  const contractArtifact = existsSync(validationContractPath) ? tryReadJson(validationContractPath) : undefined;
+  const requiredEvidencePaths = {
+    baseline: artifactPaths.baseline,
+    validationContract: validationContractPath,
+    implementationContext: artifactPaths.implementationContext,
+    implementationEvidence: artifactPaths.implementationEvidence,
+    postValidation: artifactPaths.postValidation,
+    allowlistDecisions: artifactPaths.allowlistDecisions,
+    failureClassifications: artifactPaths.failureClassifications,
+    finalReport: artifactPaths.finalReport,
+    state: artifactPaths.state,
+    worktreeMetadata: artifactPaths.worktreeMetadata,
+  };
+  return {
+    schema: "pi-bug-solver-workflow/implementation-context/v1",
+    transactionId,
+    createdAt: new Date().toISOString(),
+    status: "ready_for_implementation",
+    phase: "implementation",
+    isolatedWorktreePath: worktreePath,
+    bugDescription,
+    validationContractPath: requiredEvidencePaths.validationContract,
+    baselineEvidencePath: artifactPaths.baseline,
+    baselineSummary: {
+      status: baseline?.status || null,
+      completedAt: baseline?.completedAt || null,
+      commandOrder: baseline?.commandOrder || baseline?.commands?.executionOrder || [],
+      preExistingFailureCount: baseline?.failures?.preExisting?.length || 0,
+      targetedBeforeBroad: baseline?.targetedBeforeBroad === true,
+    },
+    validationContractSummary: {
+      assertionCount: Array.isArray(contractArtifact?.assertions) ? contractArtifact.assertions.length : undefined,
+      commands: validation.commands || planArtifact?.validationCommands || [],
+      userTestCommand: validation.userTestCommand || planArtifact?.userTestCommand || null,
+      executionOrder: validation.executionOrder || ["targeted_bug_reproduction", "broad_validation_commands"],
+    },
+    allowlistPolicy,
+    requiredEvidencePaths,
+    implementationCommand: implementationCommand || null,
+    workerInstructions: [
+      "Run only inside isolatedWorktreePath; do not edit the caller worktree.",
+      "Use the bug description, validation contract, baseline evidence, and allowlist policy as the implementation contract.",
+      "Write any durable implementation evidence to implementationEvidencePath and justify allowlist expansions in allowlistDecisions before relying on expanded scope.",
+      "Leave post-change validation to the workflow; the runner will capture changed files from isolated-worktree git state after implementation.",
+    ],
+  };
+}
+
 async function runImplementationPhase({ transactionId, planArtifact, artifactPaths, worktreePath, baseline, implementationCommand }) {
   const startedAt = new Date().toISOString();
   const before = await gitInfo(worktreePath);
   const command = String(implementationCommand || "").trim();
+  const implementationContext = buildImplementationContext({ transactionId, planArtifact, artifactPaths, worktreePath, baseline, implementationCommand: command });
+  writeJson(artifactPaths.implementationContext, implementationContext);
   const commandResult = command ? await runShellCommand(command, worktreePath, {
     PI_BUG_SOLVER_TRANSACTION_ID: transactionId,
     PI_BUG_SOLVER_WORKTREE: worktreePath,
+    PI_BUG_SOLVER_BUG_DESCRIPTION: implementationContext.bugDescription,
+    PI_BUG_SOLVER_VALIDATION_CONTRACT: implementationContext.validationContractPath,
     PI_BUG_SOLVER_BASELINE_EVIDENCE: artifactPaths.baseline,
+    PI_BUG_SOLVER_IMPLEMENTATION_CONTEXT: artifactPaths.implementationContext,
     PI_BUG_SOLVER_IMPLEMENTATION_EVIDENCE: artifactPaths.implementationEvidence,
     PI_BUG_SOLVER_POST_VALIDATION_EVIDENCE: artifactPaths.postValidation,
     PI_BUG_SOLVER_ALLOWLIST_DECISIONS: artifactPaths.allowlistDecisions,
+    PI_BUG_SOLVER_REQUIRED_EVIDENCE_PATHS: JSON.stringify(implementationContext.requiredEvidencePaths),
   }) : null;
   const after = await gitInfo(worktreePath);
   const changedFiles = await gitChangedFilesSince(worktreePath, baseline?.git?.after?.head || baseline?.baseCommit || planArtifact?.repo?.baseCommit);
@@ -950,7 +1017,10 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
     worktreePath,
     isolatedWorktreePath: worktreePath,
     baselineEvidencePath: artifactPaths.baseline,
+    implementationContextPath: artifactPaths.implementationContext,
     implementationEvidencePath: artifactPaths.implementationEvidence,
+    validationContractPath: implementationContext.validationContractPath,
+    requiredEvidencePaths: implementationContext.requiredEvidencePaths,
     planEvidencePath: planArtifact?.evidencePaths?.precheck || planArtifact?.artifacts?.precheck || null,
     editCapable: true,
     commandProvided: Boolean(command),
@@ -965,7 +1035,15 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
     git: { before, after },
     evidencePath: artifactPaths.implementationEvidence,
     evidenceTiedToWorktreeGitState: true,
-    note: command ? "Implementation command ran in the isolated transaction worktree after baseline validation and before post-change validation." : "No implementation command was supplied; the edit-capable implementation phase still recorded isolated-worktree git state between baseline and post-change validation.",
+    workerContext: {
+      path: artifactPaths.implementationContext,
+      bugDescriptionProvided: Boolean(implementationContext.bugDescription),
+      validationContractPath: implementationContext.validationContractPath,
+      baselineEvidencePath: artifactPaths.baseline,
+      allowlistDecisionsPath: artifactPaths.allowlistDecisions,
+      requiredEvidencePaths: implementationContext.requiredEvidencePaths,
+    },
+    note: command ? "Implementation command ran in the isolated transaction worktree after baseline validation and before post-change validation with durable bug/contract/baseline/allowlist/evidence context supplied via PI_BUG_SOLVER_IMPLEMENTATION_CONTEXT." : "No implementation command was supplied; the edit-capable implementation phase still recorded isolated-worktree git state between baseline and post-change validation.",
   };
   appendJsonl(artifactPaths.implementationEvidence, record);
   return record;
@@ -1219,6 +1297,7 @@ function artifactRegistry({ transactionId, artifactPaths }) {
     ["baselineValidation", artifactPaths.baseline, "baseline validation command evidence"],
     ["postChangeValidation", artifactPaths.postValidation, "post-implementation validation results compared against baseline evidence"],
     ["allowlistDecisions", artifactPaths.allowlistDecisions, "initial allowlist and justified expansions"],
+    ["implementationContext", artifactPaths.implementationContext, "implementation worker context containing bug, validation contract, baseline evidence, allowlist policy, and required evidence paths"],
     ["implementationEvidence", artifactPaths.implementationEvidence, "implementation and validation evidence log"],
     ["repairAttempts", artifactPaths.repairAttempts, "bounded repair attempt log"],
     ["failureClassifications", artifactPaths.failureClassifications, "classified failures and evidence"],
@@ -1309,6 +1388,7 @@ function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, 
     evidencePaths: {
       baseline: artifactPaths.baseline,
       postValidation: artifactPaths.postValidation,
+      implementationContext: artifactPaths.implementationContext,
       implementation: artifactPaths.implementationEvidence,
       allowlistDecisions: artifactPaths.allowlistDecisions,
       repairAttempts: artifactPaths.repairAttempts,
@@ -1340,6 +1420,21 @@ function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, 
       comparison: { fixed: [], unchangedPreExisting: [], newlyRegressed: [], stillPassing: [], notRerun: [] },
       finalVerification: { status: "pending", outcomeBased: true },
       evidencePaths: commonSummary.evidencePaths,
+    },
+    implementationContext: {
+      schema: "pi-bug-solver-workflow/implementation-context/v1",
+      transactionId,
+      createdAt,
+      status: "pending_baseline",
+      bugDescription: bug,
+      requiredInputs: ["bugDescription", "validationContractPath", "baselineEvidencePath", "allowlistPolicy", "requiredEvidencePaths", "isolatedWorktreePath"],
+      validationContractPath: artifactPaths.validationContract,
+      baselineEvidencePath: artifactPaths.baseline,
+      allowlistPolicy: { current: allowlist, decisionsPath: artifactPaths.allowlistDecisions, justificationRequiredForExpansion: true },
+      requiredEvidencePaths: commonSummary.evidencePaths,
+      implementationEvidencePath: artifactPaths.implementationEvidence,
+      failureClassificationPath: artifactPaths.failureClassifications,
+      note: "Pending context is materialized during precheck and refreshed after baseline validation immediately before the edit-capable implementation routine runs.",
     },
     implementationEvidence: { type: "implementation_evidence_initialized", createdAt, transactionId, status: "pending", decisions: [], commands: [], evidencePaths: commonSummary.evidencePaths },
     precheckReport: {
@@ -1657,6 +1752,7 @@ async function precheck(args, json) {
         writeInitialJson(artifactPaths.baseline, pendingArtifacts.baseline);
         writeInitialJson(artifactPaths.postValidation, pendingArtifacts.postValidation);
         writeInitialJsonl(artifactPaths.allowlistDecisions, { type: "initial_allowlist", createdAt: record.createdAt, allowlist, justification: "Seeded during read-only precheck before implementation." });
+        writeInitialJson(artifactPaths.implementationContext, pendingArtifacts.implementationContext);
         writeInitialJsonl(artifactPaths.implementationEvidence, pendingArtifacts.implementationEvidence);
         writeInitialJsonl(artifactPaths.repairAttempts, { type: "repair_counter_initialized", createdAt: record.createdAt, attempts: 0, maxRepairIterations, remaining: maxRepairIterations });
         writeInitialJsonl(artifactPaths.failureClassifications, { type: "failure_classification_initialized", createdAt: record.createdAt, status: "none", classification: null });
@@ -1698,6 +1794,7 @@ async function precheck(args, json) {
     emitArtifact(run, { kind: "file", title: "bug-solver artifact registry", path: artifactPaths.artifactRegistry });
     emitArtifact(run, { kind: "file", title: "bug-solver pending baseline evidence", path: artifactPaths.baseline });
     emitArtifact(run, { kind: "file", title: "bug-solver pending post-change validation evidence", path: artifactPaths.postValidation });
+    emitArtifact(run, { kind: "file", title: "bug-solver pending implementation context", path: artifactPaths.implementationContext });
     emitArtifact(run, { kind: "file", title: "bug-solver precheck intermediate report", path: artifactPaths.precheckReport });
     emitArtifact(run, { kind: "file", title: "bug-solver pending final report", path: artifactPaths.finalReport });
     emitArtifact(run, { kind: "file", title: "bug-solver worktree metadata", path: artifactPaths.worktreeMetadata });
@@ -1931,7 +2028,7 @@ async function solve(args, json) {
     emitArtifact(run, { kind: "file", title: "bug-solver failure classifications", path: artifactPaths.failureClassifications });
     phaseEnd(run, "baseline-validation", baseline.status === "passed" || baseline.status === "skipped_no_commands" || baseline.status === "completed_with_pre_existing_failures" ? STATUSES.SUCCESS : STATUSES.FAILED, { status: baseline.status, commands: baseline.commandResults.length, preExistingFailures: baseline.failures.preExisting.length, targetedBeforeBroad: baseline.targetedBeforeBroad });
 
-    phaseStart(run, "implementation", { transactionId, worktreePath: worktreeRecord.worktree.path, baselinePath: artifactPaths.baseline, implementationEvidencePath: artifactPaths.implementationEvidence });
+    phaseStart(run, "implementation", { transactionId, worktreePath: worktreeRecord.worktree.path, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence });
     const implementation = await runImplementationPhase({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, baseline, implementationCommand: implementationCommandFrom({ args, planArtifact }) });
     if (existsSync(statePath)) {
       const state = readJson(statePath);
@@ -1940,7 +2037,7 @@ async function solve(args, json) {
         updatedAt: implementation.completedAt,
         revision: Number.isInteger(state.revision) ? state.revision + 1 : 1,
         lifecycle: { ...(state.lifecycle || {}), status: "implementation_recorded", phase: "implementation", terminal: false },
-        implementation: { status: implementation.status, path: artifactPaths.implementationEvidence, completedAt: implementation.completedAt, commandProvided: implementation.commandProvided, changedFiles: implementation.changedFiles, worktreeChangedAfterBaseline: implementation.worktreeChangedAfterBaseline, allowlist: implementation.allowlist },
+        implementation: { status: implementation.status, path: artifactPaths.implementationEvidence, contextPath: artifactPaths.implementationContext, completedAt: implementation.completedAt, commandProvided: implementation.commandProvided, changedFiles: implementation.changedFiles, worktreeChangedAfterBaseline: implementation.worktreeChangedAfterBaseline, allowlist: implementation.allowlist, requiredEvidencePaths: implementation.requiredEvidencePaths },
         allowlist: { ...(state.allowlist || {}), current: implementation.allowlist.current, decisionsPath: artifactPaths.allowlistDecisions, lastEnforcement: implementation.allowlist },
       };
       writeJson(statePath, updatedState);
@@ -1952,16 +2049,17 @@ async function solve(args, json) {
         ...finalReport,
         updatedAt: implementation.completedAt,
         status: "implementation_recorded",
-        repairs: { ...(finalReport.repairs || {}), implementationPhase: { status: implementation.status, commandProvided: implementation.commandProvided, changedFiles: implementation.changedFiles, evidencePath: artifactPaths.implementationEvidence } },
+        repairs: { ...(finalReport.repairs || {}), implementationPhase: { status: implementation.status, commandProvided: implementation.commandProvided, changedFiles: implementation.changedFiles, contextPath: artifactPaths.implementationContext, evidencePath: artifactPaths.implementationEvidence } },
         decisions: [
           ...(finalReport.decisions || []),
           { decision: implementation.allowlist.accepted ? "allowlist_enforced" : "out_of_scope_change_blocked", createdAt: implementation.completedAt, justification: implementation.allowlist.basis, allowlist: implementation.allowlist, evidencePath: artifactPaths.allowlistDecisions },
         ],
         allowlist: implementation.allowlist,
-        evidencePaths: { ...(finalReport.evidencePaths || {}), implementation: artifactPaths.implementationEvidence, allowlistDecisions: artifactPaths.allowlistDecisions },
+        evidencePaths: { ...(finalReport.evidencePaths || {}), implementationContext: artifactPaths.implementationContext, implementation: artifactPaths.implementationEvidence, allowlistDecisions: artifactPaths.allowlistDecisions },
       });
     }
     if (updatedStateForRegistry) updateGlobalRegistry(updatedStateForRegistry);
+    emitArtifact(run, { kind: "file", title: "bug-solver implementation context", path: artifactPaths.implementationContext });
     emitArtifact(run, { kind: "file", title: "bug-solver implementation evidence", path: artifactPaths.implementationEvidence });
     phaseEnd(run, "implementation", !implementation.allowlist.accepted || (implementation.commandResult?.status && implementation.commandResult.status !== 0) ? STATUSES.FAILED : STATUSES.SUCCESS, { status: implementation.status, commandProvided: implementation.commandProvided, changedFiles: implementation.changedFiles.length, worktreeChangedAfterBaseline: implementation.worktreeChangedAfterBaseline, allowlistAccepted: implementation.allowlist.accepted, outOfScopeFiles: implementation.allowlist.outOfScopeFiles });
 
@@ -2009,8 +2107,8 @@ async function solve(args, json) {
     emitArtifact(run, { kind: "file", title: "bug-solver implementation evidence", path: artifactPaths.implementationEvidence });
     phaseEnd(run, "post-change-validation", postValidation.failures.regressions.length === 0 && postValidation.finalVerification.status === "passed" ? STATUSES.SUCCESS : STATUSES.FAILED, { status: postValidation.status, commands: postValidation.commandResults.length, fixed: postValidation.comparison.fixed.length, unchangedPreExisting: postValidation.comparison.unchangedPreExisting.length, newlyRegressed: postValidation.comparison.newlyRegressed.length, targetedBeforeBroad: postValidation.targetedBeforeBroad, finalVerification: postValidation.finalVerification.status });
 
-    completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationEvidencePath: artifactPaths.implementationEvidence, postValidationPath: artifactPaths.postValidation, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name });
-    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationEvidencePath: artifactPaths.implementationEvidence, postValidationPath: artifactPaths.postValidation, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, preExistingFailureCount: baseline.failures.preExisting.length, newlyRegressedCount: postValidation.comparison.newlyRegressed.length, fixedCount: postValidation.comparison.fixed.length, unchangedPreExistingCount: postValidation.comparison.unchangedPreExisting.length, finalVerification: postValidation.finalVerification, status: "post_change_validation_recorded", editCapableResourcesCreated: true, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name };
+    completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence, postValidationPath: artifactPaths.postValidation, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name });
+    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence, postValidationPath: artifactPaths.postValidation, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, preExistingFailureCount: baseline.failures.preExisting.length, newlyRegressedCount: postValidation.comparison.newlyRegressed.length, fixedCount: postValidation.comparison.fixed.length, unchangedPreExistingCount: postValidation.comparison.unchangedPreExisting.length, finalVerification: postValidation.finalVerification, status: "post_change_validation_recorded", editCapableResourcesCreated: true, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name };
     if (json) console.log(JSON.stringify(result, null, 2));
     else console.log(`gated activation recorded: ${file}`);
   } catch (error) {
