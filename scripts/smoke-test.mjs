@@ -201,8 +201,17 @@ try {
   let gatedSolveDetails;
   try { gatedSolveDetails = JSON.parse(gatedSolve.stdout); } catch { gatedSolveDetails = undefined; }
   const gatedActivation = gatedSolveDetails?.activationPath ? JSON.parse(readFileSync(gatedSolveDetails.activationPath, 'utf8')) : undefined;
-  log(gatedActivation?.schema === 'pi-bug-solver-workflow/gated-activation/v1' && gatedActivation?.integrityChecks?.validationContract === 'materialized_with_evidence_map' && gatedActivation?.editCapableResourcesCreated === false, 'bug-solver approved solve writes real gated activation without edit-capable resources');
+  const gatedWorktreeMetadata = gatedSolveDetails?.worktreeMetadataPath ? JSON.parse(readFileSync(gatedSolveDetails.worktreeMetadataPath, 'utf8')) : undefined;
   const gatedPlan = gatedPrecheckDetails?.planPath ? JSON.parse(readFileSync(gatedPrecheckDetails.planPath, 'utf8')) : undefined;
+  const gatedState = gatedPrecheckDetails?.statePath ? JSON.parse(readFileSync(gatedPrecheckDetails.statePath, 'utf8')) : undefined;
+  const gatedCallerStatusAfterSolve = expectExit('bug-solver gated solve caller worktree remains clean', ['git', 'status', '--short'], 0, { cwd: gatedSolveRepo }).stdout.trim();
+  const gatedWorktreeHead = gatedSolveDetails?.worktreePath ? expectExit('bug-solver gated solve worktree is rooted at recorded base', ['git', 'rev-parse', 'HEAD'], 0, { cwd: gatedSolveDetails.worktreePath }).stdout.trim() : '';
+  log(gatedActivation?.schema === 'pi-bug-solver-workflow/gated-activation/v1' && gatedActivation?.integrityChecks?.validationContract === 'materialized_with_evidence_map' && gatedActivation?.editCapableResourcesCreated === true && existsSync(gatedSolveDetails?.worktreePath || '') && gatedWorktreeMetadata?.status === 'ready' && gatedWorktreeMetadata?.branch?.baseCommit === gatedPlan?.repo?.baseCommit && gatedWorktreeHead === gatedPlan?.repo?.baseCommit && gatedCallerStatusAfterSolve === '' && gatedState?.worktree?.status === 'ready', 'bug-solver approved solve creates isolated transaction worktree/branch at recorded base without dirtying caller worktree');
+  const gatedRepeatSolve = expectExit('bug-solver workflow repeated approved solve reuses isolated worktree safely', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', gatedPrecheckDetails?.planPath || join(tmp, 'missing-gated-plan.json'), '--approved', '--json'], 0);
+  let gatedRepeatSolveDetails;
+  try { gatedRepeatSolveDetails = JSON.parse(gatedRepeatSolve.stdout); } catch { gatedRepeatSolveDetails = undefined; }
+  const gatedRepeatMetadata = gatedRepeatSolveDetails?.worktreeMetadataPath ? JSON.parse(readFileSync(gatedRepeatSolveDetails.worktreeMetadataPath, 'utf8')) : undefined;
+  log(gatedRepeatMetadata?.worktree?.action === 'reused' && gatedRepeatMetadata?.branch?.action === 'reused' && gatedRepeatMetadata?.cleanup?.durableReuse === true, 'bug-solver repeated solve records durable worktree/branch reuse and cleanup metadata');
   const forgedInRepoContractPlan = join(tmp, 'forged-in-repo-contract-plan.json');
   writeFileSync(forgedInRepoContractPlan, JSON.stringify({ ...gatedPlan, validation: { ...(gatedPlan?.validation || {}), contractPath: join(gatedSolveRepo, 'contract.json') }, validationContractPath: join(gatedSolveRepo, 'contract.json') }, null, 2));
   expectExit('bug-solver workflow solve gate rejects validation contract paths inside target repo before edits', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', forgedInRepoContractPlan, '--approved', '--json'], 1);

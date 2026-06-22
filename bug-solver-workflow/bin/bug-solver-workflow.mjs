@@ -197,6 +197,7 @@ function buildArtifactPaths(dir) {
     repairAttempts: join(dir, "repair-attempts.jsonl"),
     failureClassifications: join(dir, "failure-classifications.jsonl"),
     finalReport: join(dir, "evidence", "final-report.json"),
+    worktreeMetadata: join(dir, "worktree-metadata.json"),
     intermediateReportsDir: join(dir, "reports"),
     precheckReport: join(dir, "reports", "precheck-report.json"),
     state: join(dir, "state.json"),
@@ -236,8 +237,8 @@ function buildValidationContract({ transactionId, bug, cwd, validationCommands, 
       description: "Solve implementation must run in an isolated transaction worktree/branch rooted at the recorded base and not mutate the caller worktree directly.",
       priority: "must",
       validationMethod: "both",
-      evidenceRequired: ["state.worktree.isolated", "state.worktree.rootedAtBaseCommit", "state.branch.plannedName", "transactionPlan.immutableTransactionIdentity"],
-      evidencePaths: [artifactPaths.state, artifactPaths.transactionPlan, artifactPaths.finalReport],
+      evidenceRequired: ["state.worktree.isolated", "state.worktree.rootedAtBaseCommit", "state.branch.plannedName", "transactionPlan.immutableTransactionIdentity", "worktreeMetadata.cleanup"],
+      evidencePaths: [artifactPaths.state, artifactPaths.transactionPlan, artifactPaths.worktreeMetadata, artifactPaths.finalReport],
     },
     {
       id: "baseline-aware-validation",
@@ -403,6 +404,7 @@ function buildTransactionPlan({ transactionId, cwd, bug, git, validationCommands
       repairAttempts: artifactPaths.repairAttempts,
       failureClassifications: artifactPaths.failureClassifications,
       finalReport: artifactPaths.finalReport,
+      worktreeMetadata: artifactPaths.worktreeMetadata,
     },
   };
 }
@@ -590,6 +592,7 @@ function artifactRegistry({ transactionId, artifactPaths }) {
     ["failureClassifications", artifactPaths.failureClassifications, "classified failures and evidence"],
     ["precheckReport", artifactPaths.precheckReport, "intermediate report summarizing precheck decisions, commands, failures, repairs, commits, and evidence paths"],
     ["finalReport", artifactPaths.finalReport, "outcome-based final report"],
+    ["worktreeMetadata", artifactPaths.worktreeMetadata, "isolated transaction worktree/branch creation, reuse, and cleanup metadata"],
   ].map(([kind, path, description]) => ({
     kind,
     path,
@@ -642,6 +645,17 @@ function clearPrecheckIncompleteMarker(artifactPaths) {
   rmSync(artifactPaths.precheckIncomplete, { force: true });
 }
 
+function commonWorktreeEvidencePaths(artifactPaths) {
+  return {
+    state: artifactPaths.state,
+    transactionPlan: artifactPaths.transactionPlan,
+    activationGate: join(artifactPaths.root, "activation-gate.json"),
+    worktreeMetadata: artifactPaths.worktreeMetadata,
+    finalReport: artifactPaths.finalReport,
+    artifactRegistry: artifactPaths.artifactRegistry,
+  };
+}
+
 function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, createdAt }) {
   const commonSummary = {
     transactionId,
@@ -668,6 +682,7 @@ function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, 
       failureClassifications: artifactPaths.failureClassifications,
       precheckReport: artifactPaths.precheckReport,
       finalReport: artifactPaths.finalReport,
+      worktreeMetadata: artifactPaths.worktreeMetadata,
       artifactRegistry: artifactPaths.artifactRegistry,
       state: artifactPaths.state,
     },
@@ -823,6 +838,7 @@ function buildTransactionState({ transactionId, cwd, bug, git, validationCommand
         baseline: artifactPaths.baseline,
         implementation: artifactPaths.implementationEvidence,
         finalReport: artifactPaths.finalReport,
+        worktreeMetadata: artifactPaths.worktreeMetadata,
       },
       baseline: { status: "pending", path: artifactPaths.baseline },
       finalVerification: { status: "pending", outcomeBased: true, path: artifactPaths.finalReport },
@@ -1001,6 +1017,20 @@ async function precheck(args, json) {
         writeInitialJsonl(artifactPaths.failureClassifications, { type: "failure_classification_initialized", createdAt: record.createdAt, status: "none", classification: null });
         writeJson(artifactPaths.precheckReport, pendingArtifacts.precheckReport);
         writeInitialJson(artifactPaths.finalReport, pendingArtifacts.finalReport);
+        writeInitialJson(artifactPaths.worktreeMetadata, {
+          schema: "pi-bug-solver-workflow/worktree-metadata/v1",
+          transactionId,
+          createdAt: record.createdAt,
+          status: "pending_activation",
+          branch: state.branch,
+          worktree: state.worktree,
+          cleanup: {
+            automatic: false,
+            reason: "No isolated transaction worktree is created during read-only precheck.",
+            safeRemovalCommand: `git -C ${JSON.stringify(state.repo.root || cwd)} worktree remove ${JSON.stringify(state.worktree.path)}`,
+          },
+          evidencePaths: commonWorktreeEvidencePaths(artifactPaths),
+        });
         state.lifecycle.materializationComplete = true;
         state.lifecycle.materializationStatus = "complete";
         writeJson(artifactPaths.state, state);
@@ -1024,6 +1054,7 @@ async function precheck(args, json) {
     emitArtifact(run, { kind: "file", title: "bug-solver pending baseline evidence", path: artifactPaths.baseline });
     emitArtifact(run, { kind: "file", title: "bug-solver precheck intermediate report", path: artifactPaths.precheckReport });
     emitArtifact(run, { kind: "file", title: "bug-solver pending final report", path: artifactPaths.finalReport });
+    emitArtifact(run, { kind: "file", title: "bug-solver worktree metadata", path: artifactPaths.worktreeMetadata });
     phaseEnd(run, "precheck", multiplicity.likelyMultiple ? STATUSES.FAILED : STATUSES.SUCCESS, { status: record.status, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry });
     completeRun(run, multiplicity.likelyMultiple ? STATUSES.FAILED : STATUSES.SUCCESS, { transactionId, precheckPath: file, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry });
     const result = { ok: !multiplicity.likelyMultiple, action: "precheck", runId: run.runId, transactionId, precheckPath: file, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry, registryIndexPath: registryIndex, artifactDir: dir, status: record.status, confirmationRequired: true };
@@ -1034,6 +1065,96 @@ async function precheck(args, json) {
     failRun(run, error, { transactionId });
     throw error;
   }
+}
+
+async function revParse(cwd, ref) {
+  const result = await runGit(cwd, ["rev-parse", "--verify", ref]);
+  if (result.status !== 0) return undefined;
+  return result.stdout.trim();
+}
+
+async function createOrReuseTransactionWorktree({ cwd, transactionId, baseCommit, state, artifactPaths }) {
+  const repoRoot = state?.repo?.root || cwd;
+  const branchName = state?.branch?.plannedName || transactionBranchName(transactionId);
+  const worktreePath = state?.worktree?.path || transactionWorktreePath(transactionId);
+  const now = new Date().toISOString();
+  const before = await gitInfo(cwd);
+  const branchRef = `refs/heads/${branchName}`;
+  let branchAction = "created";
+  let worktreeAction = "created";
+  let branchHead = await revParse(repoRoot, branchRef);
+  if (branchHead) {
+    branchAction = "reused";
+    if (branchHead !== baseCommit) throw new Error(`Refusing to reuse transaction branch ${branchName}: head ${branchHead} is not the recorded base ${baseCommit}.`);
+  } else {
+    const branchResult = await runGit(repoRoot, ["branch", branchName, baseCommit]);
+    if (branchResult.status !== 0) throw new Error(`Unable to create transaction branch ${branchName} at ${baseCommit}: ${(branchResult.stderr || branchResult.stdout).trim()}`);
+    branchHead = await revParse(repoRoot, branchRef);
+  }
+
+  if (existsSync(worktreePath)) {
+    const wtRoot = await runGit(worktreePath, ["rev-parse", "--show-toplevel"]);
+    const wtHead = await runGit(worktreePath, ["rev-parse", "HEAD"]);
+    const wtBranch = await runGit(worktreePath, ["branch", "--show-current"]);
+    if (wtRoot.status !== 0 || resolve(wtRoot.stdout.trim()) !== resolve(worktreePath) || wtHead.stdout.trim() !== baseCommit || wtBranch.stdout.trim() !== branchName) {
+      throw new Error(`Refusing to reuse non-matching transaction worktree at ${worktreePath}; expected branch ${branchName} at recorded base ${baseCommit}.`);
+    }
+    worktreeAction = "reused";
+  } else {
+    mkdirSync(dirname(worktreePath), { recursive: true });
+    const addResult = await runGit(repoRoot, ["worktree", "add", worktreePath, branchName]);
+    if (addResult.status !== 0) throw new Error(`Unable to create isolated transaction worktree ${worktreePath}: ${(addResult.stderr || addResult.stdout).trim()}`);
+  }
+
+  const worktreeGit = await gitInfo(worktreePath);
+  const after = await gitInfo(cwd);
+  const callerWorktreeUnchanged = (before.head || null) === (after.head || null) && (before.statusShort || "") === (after.statusShort || "");
+  const record = {
+    schema: "pi-bug-solver-workflow/worktree-metadata/v1",
+    transactionId,
+    updatedAt: now,
+    status: "ready",
+    isolated: true,
+    branch: {
+      name: branchName,
+      ref: branchRef,
+      action: branchAction,
+      baseCommit,
+      head: branchHead || baseCommit,
+      rootedAtBaseCommit: true,
+    },
+    worktree: {
+      path: worktreePath,
+      action: worktreeAction,
+      status: "ready",
+      isolated: true,
+      rootedAtBaseCommit: baseCommit,
+      head: worktreeGit.head || null,
+      branch: worktreeGit.branch || null,
+      externalToCallerWorktree: !sameOrInsidePath(worktreePath, cwd),
+    },
+    callerWorktree: {
+      path: cwd,
+      headBefore: before.head || null,
+      statusBefore: before.statusShort || "",
+      headAfter: after.head || null,
+      statusAfter: after.statusShort || "",
+      directMutationDetected: !callerWorktreeUnchanged,
+      unchangedByIsolationSetup: callerWorktreeUnchanged,
+    },
+    cleanup: {
+      automatic: false,
+      owner: WORKFLOW,
+      durableReuse: true,
+      reason: "The transaction worktree/branch are preserved for implementation, review, resume, or explicit cleanup.",
+      safeRemovalCommand: `git -C ${JSON.stringify(repoRoot)} worktree remove ${JSON.stringify(worktreePath)}`,
+      safeBranchDeletionCommand: `git -C ${JSON.stringify(repoRoot)} branch -D ${JSON.stringify(branchName)}`,
+    },
+    evidencePaths: commonWorktreeEvidencePaths(artifactPaths),
+  };
+  writeJson(artifactPaths.worktreeMetadata, record);
+  if (!callerWorktreeUnchanged) throw new Error(`Isolated worktree setup unexpectedly changed caller worktree status: before=${before.statusShort || "<clean>"}; after=${after.statusShort || "<clean>"}`);
+  return record;
 }
 
 async function solve(args, json) {
@@ -1066,18 +1187,23 @@ async function solve(args, json) {
     const integrity = assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd });
     phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS, { integrity: "passed", validationAssertions: integrity.contract.assertions.length, artifactCount: integrity.registry.entries.length });
     phaseStart(run, "gated-activation", { transactionId });
+    const artifactPaths = buildArtifactPaths(transactionDir(transactionId));
+    const worktreeRecord = await createOrReuseTransactionWorktree({ cwd, transactionId, baseCommit: integrity.baseCommit, state: integrity.state, artifactPaths });
     const activation = {
       schema: "pi-bug-solver-workflow/gated-activation/v1",
       transactionId,
       createdAt: new Date().toISOString(),
-      status: "approved_gate_passed",
+      status: "isolated_worktree_ready",
       editingAllowed: false,
-      editCapableResourcesCreated: false,
+      callerWorktreeEditingAllowed: false,
+      implementationWorktreeEditingAllowed: true,
+      editCapableResourcesCreated: true,
       planPath,
       validationContractPath: plan.validationContractPath,
       statePath: plan.artifacts?.state || plan.evidencePaths?.state,
       artifactRegistryPath: plan.artifactRegistryPath || plan.artifacts?.artifactRegistry || plan.evidencePaths?.artifactRegistry,
-      evidencePaths: plan.evidencePaths || {},
+      worktreeMetadataPath: artifactPaths.worktreeMetadata,
+      evidencePaths: { ...(plan.evidencePaths || {}), worktreeMetadata: artifactPaths.worktreeMetadata },
       integrityChecks: {
         approved: true,
         exactlyOneBug: true,
@@ -1085,8 +1211,12 @@ async function solve(args, json) {
         validationContract: "materialized_with_evidence_map",
         externalArtifacts: "verified",
         safePlanSchema: plan.sourceKind,
+        callerWorktreeUnchanged: worktreeRecord.callerWorktree.unchangedByIsolationSetup,
       },
-      message: "Solve confirmation gate passed. Later edit-capable phases may create isolated resources only after these durable safety checks.",
+      branch: worktreeRecord.branch,
+      worktree: worktreeRecord.worktree,
+      cleanup: worktreeRecord.cleanup,
+      message: "Solve confirmation gate passed and an isolated transaction worktree/branch rooted at the recorded base is ready. Implementation must run in that worktree; the caller worktree was not mutated directly.",
     };
     const file = join(transactionDir(transactionId), "activation-gate.json");
     writeJson(file, activation);
@@ -1097,17 +1227,29 @@ async function solve(args, json) {
         ...state,
         updatedAt: new Date().toISOString(),
         revision: Number.isInteger(state.revision) ? state.revision + 1 : 1,
-        lifecycle: { ...(state.lifecycle || {}), status: "activation_gate_passed", phase: "gated-activation", editingAllowed: false, terminal: false },
-        reports: { ...(state.reports || {}), activationGatePath: file },
+        lifecycle: {
+          ...(state.lifecycle || {}),
+          status: "isolated_worktree_ready",
+          phase: "gated-activation",
+          editingAllowed: false,
+          callerWorktreeEditingAllowed: false,
+          implementationWorktreeEditingAllowed: true,
+          editCapableResourcesCreated: true,
+          terminal: false,
+        },
+        branch: { ...(state.branch || {}), ...worktreeRecord.branch, plannedName: worktreeRecord.branch.name, currentName: worktreeRecord.branch.name, status: "ready" },
+        worktree: { ...(state.worktree || {}), ...worktreeRecord.worktree, status: "ready" },
+        reports: { ...(state.reports || {}), activationGatePath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata },
       };
       writeJson(statePath, updatedState);
       updateGlobalRegistry(updatedState);
       emitArtifact(run, { kind: "file", title: "bug-solver transaction state", path: statePath });
     }
     emitArtifact(run, { kind: "file", title: "bug-solver gated activation", path: file });
-    phaseEnd(run, "gated-activation", STATUSES.SUCCESS, { artifactPath: file });
-    completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file });
-    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file, status: activation.status, editCapableResourcesCreated: false };
+    emitArtifact(run, { kind: "file", title: "bug-solver worktree metadata", path: artifactPaths.worktreeMetadata });
+    phaseEnd(run, "gated-activation", STATUSES.SUCCESS, { artifactPath: file, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name });
+    completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name });
+    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, status: activation.status, editCapableResourcesCreated: true, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name };
     if (json) console.log(JSON.stringify(result, null, 2));
     else console.log(`gated activation recorded: ${file}`);
   } catch (error) {
@@ -1229,7 +1371,7 @@ function assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd }) {
   const state = readJson(stateFile);
   if (state?.schema !== "pi-bug-solver-workflow/state/v1") throw new Error(`Transaction state has unsafe or unrecognized schema: ${state?.schema || "missing"}`);
   if (state.transactionId !== plan.transactionId) throw new Error("Transaction state id does not match solve plan id.");
-  assertImmutableBaseMetadata({ planArtifact, state, git });
+  const baseCommit = assertImmutableBaseMetadata({ planArtifact, state, git });
   const registryFile = assertExistingExternalFile(artifactRegistryPath, "artifactRegistry", context);
   const registry = readJson(registryFile);
   if (registry?.schema !== "pi-bug-solver-workflow/artifact-registry/v1" || registry.materializationComplete !== true || !Array.isArray(registry.entries) || registry.entries.length === 0) throw new Error("Artifact registry must be materialized before solve activation.");
@@ -1251,7 +1393,7 @@ function assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd }) {
     }
     assertExistingExternalFile(artifactPath, `plan.artifactPath.${index}`, context);
   }
-  return { state, registry, contract };
+  return { state, registry, contract, baseCommit };
 }
 
 function deriveTerminalOutcome({ state, finalReport, activation }) {
@@ -1277,6 +1419,7 @@ function loadTransactionInspection(dir, transactionIdHint) {
   const lock = tryReadJson(paths.precheckLock);
   const lockInspection = inspectPrecheckLock(paths.precheckLock);
   const finalReport = tryReadJson(paths.finalReport);
+  const worktreeMetadata = tryReadJson(paths.worktreeMetadata);
   const activation = tryReadJson(join(dir, "activation-gate.json")) || tryReadJson(join(dir, "activation-scaffold.json"));
   const transactionId = state?.transactionId || plan?.transactionId || precheck?.transactionId || transactionIdHint;
   const reportsDir = state?.reports?.intermediateReportsDir || paths.intermediateReportsDir;
@@ -1319,7 +1462,7 @@ function loadTransactionInspection(dir, transactionIdHint) {
     },
     repo: state?.repo || plan?.repo || (precheck ? { cwd: precheck.cwd, ...(precheck.git || {}) } : undefined),
     branch: state?.branch || { plannedName: transactionId ? transactionBranchName(transactionId) : undefined, status: "unknown" },
-    worktree: { ...(state?.worktree || {}), path: worktreePath, exists: existsSync(worktreePath) },
+    worktree: { ...(state?.worktree || {}), ...(worktreeMetadata?.worktree || {}), path: worktreePath, exists: existsSync(worktreePath), metadataPath: paths.worktreeMetadata, metadata: worktreeMetadata },
     validation: state?.validation || plan?.validation,
     repair: { ...(state?.repair || {}), latestAttempt: latestRepairAttempt },
     failureClassification: { ...(state?.failureClassification || {}), latest: latestFailureClassification },
@@ -1328,6 +1471,7 @@ function loadTransactionInspection(dir, transactionIdHint) {
       precheckReport: fileSummary(state?.reports?.precheckReportPath || paths.precheckReport),
       activationGate: fileSummary(join(dir, "activation-gate.json")),
       activationScaffold: fileSummary(join(dir, "activation-scaffold.json")),
+      worktreeMetadata: fileSummary(paths.worktreeMetadata),
       intermediateReportsDir: reportsDir,
       intermediateReports: listJsonReports(reportsDir),
     },
@@ -1346,6 +1490,7 @@ function loadTransactionInspection(dir, transactionIdHint) {
         repairAttempts: fileSummary(paths.repairAttempts),
         failureClassifications: fileSummary(paths.failureClassifications),
         finalReport: fileSummary(paths.finalReport),
+        worktreeMetadata: fileSummary(paths.worktreeMetadata),
       },
     },
     state,

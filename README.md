@@ -9,7 +9,7 @@ Private Pi package for thread-phase workflow visualization and example workflows
 - `code-review-workflow` — git diff/commit code review workflow using Pi subagents.
 - `dynamic-workflows` — validated ad-hoc workflow runner for dynamic workflows planned in chat, with structured spec mode and advanced JavaScript harness mode.
 - `mission-workflow` — Droid/Missions-style long-running software mission extension with plan approval, validation contracts, strict handoffs, per-feature worktrees/commits, command + adversarial validators, durable registry/resume, coverage artifacts, and repair loops.
-- `bug-solver-workflow` — persistent one-bug-per-transaction solver extension scaffold with read-only precheck, approval-gated activation surface, durable external artifacts, and thread-phase observability.
+- `bug-solver-workflow` — persistent one-bug-per-transaction solver extension scaffold with read-only precheck, approval-gated activation surface, durable external artifacts, isolated transaction worktrees/branches, and thread-phase observability.
 - `skills/dynamic-workflows` and `skills/mission-workflow` — on-demand Pi skills that teach other sessions/configurations how to use these workflow tools safely.
 
 ## Install
