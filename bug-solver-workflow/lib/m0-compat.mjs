@@ -22,6 +22,10 @@ function boolOr(value, fallback) {
   return typeof value === "boolean" ? value : fallback;
 }
 
+function isExplicitBoolean(value) {
+  return typeof value === "boolean";
+}
+
 function firstString(...values) {
   for (const value of values) {
     if (typeof value === "string" && value.trim()) return value;
@@ -42,6 +46,9 @@ export function normalizeSolvePlanArtifact(artifact) {
   const transaction = asObject(input.transaction);
   const validation = asObject(input.validation);
   const evidencePaths = asObject(input.evidencePaths);
+  const transactionMultiplicity = asObject(transaction.multiplicity);
+  const topLevelMultiplicity = asObject(input.multiplicity);
+  const multiplicity = isExplicitBoolean(transactionMultiplicity.likelyMultiple) ? transactionMultiplicity : topLevelMultiplicity;
 
   return {
     schema: input.schema,
@@ -49,30 +56,39 @@ export function normalizeSolvePlanArtifact(artifact) {
     status: input.status,
     editingAllowed: boolOr(input.editingAllowed, false),
     transaction: {
-      exactlyOneBug: boolOr(transaction.exactlyOneBug, input.multiplicity?.likelyMultiple === undefined ? undefined : !input.multiplicity.likelyMultiple),
+      // Do not infer exactly-one-bug safety from missing fields. The solve gate
+      // must see explicit precheck/plan evidence before any edit-capable phase.
+      exactlyOneBug: isExplicitBoolean(transaction.exactlyOneBug) ? transaction.exactlyOneBug : undefined,
       bugDescription: firstString(transaction.bugDescription, input.bugDescription, input.bug),
-      multiplicity: asObject(transaction.multiplicity).likelyMultiple !== undefined ? transaction.multiplicity : asObject(input.multiplicity),
-      splitRequired: boolOr(transaction.splitRequired, boolOr(input.multiplicity?.likelyMultiple, false)),
+      multiplicity,
+      splitRequired: isExplicitBoolean(transaction.splitRequired) ? transaction.splitRequired : (isExplicitBoolean(multiplicity.likelyMultiple) ? multiplicity.likelyMultiple : undefined),
     },
     validationContractPath: firstString(input.validationContractPath, validation.contractPath),
     evidencePaths,
     artifacts: asObject(input.artifacts),
-    sourceKind: isBugSolverPrecheckArtifact(input) ? "precheck" : isBugSolverTransactionPlan(input) ? "transaction-plan" : "legacy-compatible-plan",
+    sourceKind: isBugSolverPrecheckArtifact(input) ? "precheck" : isBugSolverTransactionPlan(input) ? "transaction-plan" : "unrecognized-schema",
   };
 }
 
 export function assessPreImplementationGate(artifact, multiplicityOverride) {
   const plan = normalizeSolvePlanArtifact(artifact);
-  const effectiveMultiplicity = asObject(multiplicityOverride).likelyMultiple !== undefined
-    ? asObject(multiplicityOverride)
-    : asObject(plan.transaction.multiplicity);
-  const exactlyOneBug = effectiveMultiplicity.likelyMultiple
-    ? false
-    : boolOr(plan.transaction.exactlyOneBug, !effectiveMultiplicity.likelyMultiple);
+  const overrideMultiplicity = asObject(multiplicityOverride);
+  const artifactMultiplicity = asObject(plan.transaction.multiplicity);
+  const effectiveMultiplicity = isExplicitBoolean(overrideMultiplicity.likelyMultiple) ? overrideMultiplicity : artifactMultiplicity;
+  const hasExplicitMultiplicity = isExplicitBoolean(artifactMultiplicity.likelyMultiple);
+  const hasExplicitExactlyOneBug = isExplicitBoolean(plan.transaction.exactlyOneBug);
+  const recognizedSchema = plan.sourceKind === "precheck" || plan.sourceKind === "transaction-plan";
+  const hasExplicitOneBugSafetyEvidence = plan.sourceKind === "transaction-plan"
+    ? hasExplicitExactlyOneBug && plan.transaction.exactlyOneBug === true && hasExplicitMultiplicity && artifactMultiplicity.likelyMultiple === false
+    : plan.sourceKind === "precheck" && hasExplicitMultiplicity && artifactMultiplicity.likelyMultiple === false;
+  const exactlyOneBug = effectiveMultiplicity.likelyMultiple === true ? false : (hasExplicitExactlyOneBug ? plan.transaction.exactlyOneBug : (hasExplicitOneBugSafetyEvidence ? true : undefined));
+  const splitRequired = plan.transaction.splitRequired === true || effectiveMultiplicity.likelyMultiple === true;
   const reasons = [];
 
+  if (!recognizedSchema) reasons.push("unrecognized bug-solver plan schema");
+  if (!hasExplicitOneBugSafetyEvidence) reasons.push("missing explicit one-bug safety evidence");
   if (!plan.transactionId) reasons.push("missing transactionId");
-  if (plan.status === "rejected_multi_bug" || effectiveMultiplicity.likelyMultiple || exactlyOneBug === false || plan.transaction.splitRequired) reasons.push("multi-bug or split-required transaction");
+  if (plan.status === "rejected_multi_bug" || splitRequired || exactlyOneBug === false) reasons.push("multi-bug or split-required transaction");
   if (plan.editingAllowed === true) reasons.push("plan was not preserved as pre-implementation/editingAllowed=false");
   if (!plan.validationContractPath) reasons.push("missing durable validation contract path");
 
@@ -82,7 +98,7 @@ export function assessPreImplementationGate(artifact, multiplicityOverride) {
     status: plan.status,
     editingAllowed: plan.editingAllowed,
     exactlyOneBug,
-    splitRequired: Boolean(plan.transaction.splitRequired || effectiveMultiplicity.likelyMultiple),
+    splitRequired: Boolean(splitRequired),
     validationContractPath: plan.validationContractPath,
     safeBeforeEditCapablePhase: reasons.length === 0,
     reasons,
