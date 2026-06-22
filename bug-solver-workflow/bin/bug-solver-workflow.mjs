@@ -157,6 +157,7 @@ function buildArtifactPaths(dir) {
     failureClassifications: join(dir, "failure-classifications.jsonl"),
     finalReport: join(dir, "evidence", "final-report.json"),
     intermediateReportsDir: join(dir, "reports"),
+    precheckReport: join(dir, "reports", "precheck-report.json"),
     state: join(dir, "state.json"),
   };
 }
@@ -311,6 +312,11 @@ function writeJson(file, value) {
   atomicWriteJson(file, value);
 }
 
+function writeInitialJson(file, value) {
+  if (existsSync(file)) return;
+  atomicWriteJson(file, value);
+}
+
 function readJson(file) {
   return JSON.parse(readFileSync(file, "utf8"));
 }
@@ -344,8 +350,16 @@ function artifactRegistry({ transactionId, artifactPaths }) {
     ["implementationEvidence", artifactPaths.implementationEvidence, "implementation and validation evidence log"],
     ["repairAttempts", artifactPaths.repairAttempts, "bounded repair attempt log"],
     ["failureClassifications", artifactPaths.failureClassifications, "classified failures and evidence"],
+    ["precheckReport", artifactPaths.precheckReport, "intermediate report summarizing precheck decisions, commands, failures, repairs, commits, and evidence paths"],
     ["finalReport", artifactPaths.finalReport, "outcome-based final report"],
-  ].map(([kind, path, description]) => ({ kind, path, description, externalToTargetRepo: true }));
+  ].map(([kind, path, description]) => ({
+    kind,
+    path,
+    description,
+    externalToTargetRepo: true,
+    lifecycleStatus: "materialized_at_precheck",
+    durableAtPrecheck: true,
+  }));
   return {
     schema: "pi-bug-solver-workflow/artifact-registry/v1",
     transactionId,
@@ -355,6 +369,75 @@ function artifactRegistry({ transactionId, artifactPaths }) {
     updatedAt: new Date().toISOString(),
     recoverableByTransactionId: true,
     entries,
+  };
+}
+
+function initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, createdAt }) {
+  const commonSummary = {
+    transactionId,
+    bugDescription: bug,
+    repoPath: cwd,
+    status: multiplicity.likelyMultiple ? "rejected_multi_bug" : "awaiting_confirmation",
+    createdAt,
+    phase: "precheck",
+    commands: {
+      targeted: userTestCommand ? [userTestCommand] : [],
+      broadValidation: validationCommands,
+      executionOrder: ["targeted_bug_reproduction", "broad_validation_commands"],
+      executed: [],
+      pendingReason: "Commands are not executed during read-only precheck; baseline validation is pending solve activation.",
+    },
+    failures: { classifications: [], status: "none_recorded" },
+    repairs: { attempts: 0, maxRepairIterations, records: [] },
+    commits: { transactionBranch: null, commits: [], status: "not_created" },
+    evidencePaths: {
+      baseline: artifactPaths.baseline,
+      implementation: artifactPaths.implementationEvidence,
+      allowlistDecisions: artifactPaths.allowlistDecisions,
+      repairAttempts: artifactPaths.repairAttempts,
+      failureClassifications: artifactPaths.failureClassifications,
+      precheckReport: artifactPaths.precheckReport,
+      finalReport: artifactPaths.finalReport,
+      artifactRegistry: artifactPaths.artifactRegistry,
+      state: artifactPaths.state,
+    },
+  };
+  return {
+    baseline: {
+      schema: "pi-bug-solver-workflow/baseline-validation/v1",
+      transactionId,
+      createdAt,
+      status: "pending",
+      reason: "Baseline validation is recorded as required at precheck and must be executed before implementation in solve.",
+      commands: commonSummary.commands,
+      evidencePaths: commonSummary.evidencePaths,
+    },
+    implementationEvidence: { type: "implementation_evidence_initialized", createdAt, transactionId, status: "pending", decisions: [], commands: [], evidencePaths: commonSummary.evidencePaths },
+    precheckReport: {
+      schema: "pi-bug-solver-workflow/intermediate-report/v1",
+      reportKind: "precheck",
+      summary: commonSummary,
+      decisions: [
+        { decision: "read_only_precheck_complete", justification: "Precheck materialized durable transaction state and evidence placeholders outside the target repository." },
+        { decision: multiplicity.likelyMultiple ? "reject_multi_bug" : "await_confirmation", justification: multiplicity.likelyMultiple ? "Multiplicity signals require split transactions." : "Exactly-one-bug activation requires explicit approval before edits." },
+      ],
+      evidencePaths: commonSummary.evidencePaths,
+    },
+    finalReport: {
+      schema: "pi-bug-solver-workflow/final-report/v1",
+      transactionId,
+      createdAt,
+      status: "pending",
+      terminal: false,
+      outcome: null,
+      summary: commonSummary,
+      decisions: [],
+      commands: commonSummary.commands,
+      failures: commonSummary.failures,
+      repairs: commonSummary.repairs,
+      commits: commonSummary.commits,
+      evidencePaths: commonSummary.evidencePaths,
+    },
   };
 }
 
@@ -478,6 +561,7 @@ function buildTransactionState({ transactionId, cwd, bug, git, validationCommand
     reports: {
       finalReportPath: artifactPaths.finalReport,
       intermediateReportsDir: artifactPaths.intermediateReportsDir,
+      precheckReportPath: artifactPaths.precheckReport,
     },
     artifacts: existing.artifacts || artifactPaths,
     artifactRegistryPath: existing.artifactRegistryPath || artifactPaths.artifactRegistry,
@@ -571,6 +655,7 @@ async function precheck(args, json) {
     const file = artifactPaths.precheck;
     const state = buildTransactionState({ transactionId, cwd, bug, git, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, status: record.status });
     const registry = artifactRegistry({ transactionId, artifactPaths });
+    const pendingArtifacts = initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, createdAt: record.createdAt });
     const recordForWrite = {
       ...record,
       plannedSafety: { ...record.plannedSafety, immutableBaseCommit: state.repo.baseCommit, immutableBaseRef: state.repo.baseRef },
@@ -599,9 +684,13 @@ async function precheck(args, json) {
     writeJson(artifactPaths.transactionPlan, planForWrite);
     writeJson(artifactPaths.validationContract, contract);
     writeJson(artifactPaths.artifactRegistry, registry);
+    writeInitialJson(artifactPaths.baseline, pendingArtifacts.baseline);
     writeInitialJsonl(artifactPaths.allowlistDecisions, { type: "initial_allowlist", createdAt: record.createdAt, allowlist, justification: "Seeded during read-only precheck before implementation." });
+    writeInitialJsonl(artifactPaths.implementationEvidence, pendingArtifacts.implementationEvidence);
     writeInitialJsonl(artifactPaths.repairAttempts, { type: "repair_counter_initialized", createdAt: record.createdAt, attempts: 0, maxRepairIterations, remaining: maxRepairIterations });
     writeInitialJsonl(artifactPaths.failureClassifications, { type: "failure_classification_initialized", createdAt: record.createdAt, status: "none", classification: null });
+    writeJson(artifactPaths.precheckReport, pendingArtifacts.precheckReport);
+    writeInitialJson(artifactPaths.finalReport, pendingArtifacts.finalReport);
     writeJson(artifactPaths.state, state);
     const registryIndex = updateGlobalRegistry(state);
     phaseEvent(run, "precheck", { message: "Recorded read-only bug transaction precheck and durable state schema", transactionId, status: record.status, artifactPath: file, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry });
@@ -610,6 +699,9 @@ async function precheck(args, json) {
     emitArtifact(run, { kind: "file", title: "bug-solver validation contract", path: artifactPaths.validationContract });
     emitArtifact(run, { kind: "file", title: "bug-solver transaction state", path: artifactPaths.state });
     emitArtifact(run, { kind: "file", title: "bug-solver artifact registry", path: artifactPaths.artifactRegistry });
+    emitArtifact(run, { kind: "file", title: "bug-solver pending baseline evidence", path: artifactPaths.baseline });
+    emitArtifact(run, { kind: "file", title: "bug-solver precheck intermediate report", path: artifactPaths.precheckReport });
+    emitArtifact(run, { kind: "file", title: "bug-solver pending final report", path: artifactPaths.finalReport });
     phaseEnd(run, "precheck", multiplicity.likelyMultiple ? STATUSES.FAILED : STATUSES.SUCCESS, { status: record.status, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry });
     completeRun(run, multiplicity.likelyMultiple ? STATUSES.FAILED : STATUSES.SUCCESS, { transactionId, precheckPath: file, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry });
     const result = { ok: !multiplicity.likelyMultiple, action: "precheck", runId: run.runId, transactionId, precheckPath: file, planPath: artifactPaths.transactionPlan, validationContractPath: artifactPaths.validationContract, statePath: artifactPaths.state, artifactRegistryPath: artifactPaths.artifactRegistry, registryIndexPath: registryIndex, artifactDir: dir, status: record.status, confirmationRequired: true };
@@ -771,6 +863,7 @@ function loadTransactionInspection(dir, transactionIdHint) {
     failureClassification: { ...(state?.failureClassification || {}), latest: latestFailureClassification },
     reports: {
       finalReport: fileSummary(state?.reports?.finalReportPath || paths.finalReport),
+      precheckReport: fileSummary(state?.reports?.precheckReportPath || paths.precheckReport),
       activationScaffold: fileSummary(join(dir, "activation-scaffold.json")),
       intermediateReportsDir: reportsDir,
       intermediateReports: listJsonReports(reportsDir),
