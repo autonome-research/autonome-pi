@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative as importPathRelative, resolve } from "node:path";
@@ -386,23 +386,54 @@ function isProcessAlive(pid) {
   catch { return false; }
 }
 
+function inspectPrecheckLock(lock) {
+  if (!lock || !existsSync(lock)) return { exists: false, recoverable: false, status: "absent" };
+  let stat;
+  let raw = "";
+  try { stat = statSync(lock); } catch (error) { return { exists: false, recoverable: true, status: "stat_failed", reason: error.message || String(error) }; }
+  try { raw = readFileSync(lock, "utf8"); } catch (error) { return { exists: true, recoverable: false, status: "unreadable", reason: error.message || String(error), size: stat.size, mtime: stat.mtime.toISOString() }; }
+  const base = { exists: true, size: stat.size, mtime: stat.mtime.toISOString(), ageMs: Math.max(0, Date.now() - stat.mtimeMs) };
+  if (!raw.trim()) return { ...base, recoverable: true, status: "empty_stale", reason: "Lock file is empty; this can only be left by an interrupted non-atomic legacy lock writer." };
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (error) { return { ...base, recoverable: true, status: "malformed_stale", reason: error.message || String(error) }; }
+  if (parsed?.schema !== "pi-bug-solver-workflow/precheck-lock/v1" || !Number.isInteger(parsed?.pid)) {
+    return { ...base, recoverable: true, status: "malformed_stale", lock: parsed, reason: "Lock JSON is missing the expected schema or integer pid." };
+  }
+  const alive = isProcessAlive(parsed.pid);
+  return { ...base, recoverable: !alive, status: alive ? "active" : "stale_dead_pid", lock: parsed, pidAlive: alive };
+}
+
+function writePrecheckLockAtomic(lock, body) {
+  mkdirSync(resolve(lock, ".."), { recursive: true });
+  const tmp = `${lock}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(body)}\n`, "utf8");
+  try {
+    linkSync(tmp, lock);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+function acquirePrecheckLock(lock, body) {
+  try {
+    writePrecheckLockAtomic(lock, body);
+    return undefined;
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    const inspection = inspectPrecheckLock(lock);
+    if (!inspection.recoverable) throw new Error(`precheck materialization is already in progress for ${body.transactionId}; lock=${lock}; status=${inspection.status}`);
+    rmSync(lock, { force: true });
+    writePrecheckLockAtomic(lock, { ...body, recoveredStaleLock: inspection });
+    return inspection;
+  }
+}
+
 function withPrecheckLock(paths, transactionId, fn) {
   mkdirSync(paths.root, { recursive: true });
   const lock = paths.precheckLock;
   const now = new Date().toISOString();
-  try {
-    const fd = openSync(lock, "wx");
-    closeSync(fd);
-    writeFileSync(lock, `${JSON.stringify({ schema: "pi-bug-solver-workflow/precheck-lock/v1", transactionId, pid: process.pid, createdAt: now })}\n`, "utf8");
-  } catch (error) {
-    const existing = tryReadJson(lock);
-    if (existing?.pid && !isProcessAlive(existing.pid)) rmSync(lock, { force: true });
-    else throw new Error(`precheck materialization is already in progress for ${transactionId}; lock=${lock}`);
-    const fd = openSync(lock, "wx");
-    closeSync(fd);
-    writeFileSync(lock, `${JSON.stringify({ schema: "pi-bug-solver-workflow/precheck-lock/v1", transactionId, pid: process.pid, createdAt: now, recoveredStaleLock: existing || null })}\n`, "utf8");
-  }
-  return Promise.resolve().then(fn).finally(() => rmSync(lock, { force: true }));
+  const recoveredLock = acquirePrecheckLock(lock, { schema: "pi-bug-solver-workflow/precheck-lock/v1", transactionId, pid: process.pid, createdAt: now });
+  return Promise.resolve().then(() => fn(recoveredLock)).finally(() => rmSync(lock, { force: true }));
 }
 
 function transactionDir(transactionId) {
@@ -977,6 +1008,7 @@ function loadTransactionInspection(dir, transactionIdHint) {
   const artifactRegistryDoc = tryReadJson(paths.artifactRegistry);
   const incompleteMarker = tryReadJson(paths.precheckIncomplete);
   const lock = tryReadJson(paths.precheckLock);
+  const lockInspection = inspectPrecheckLock(paths.precheckLock);
   const finalReport = tryReadJson(paths.finalReport);
   const activation = tryReadJson(join(dir, "activation-scaffold.json"));
   const transactionId = state?.transactionId || plan?.transactionId || precheck?.transactionId || transactionIdHint;
@@ -986,9 +1018,11 @@ function loadTransactionInspection(dir, transactionIdHint) {
   const missingRegisteredArtifacts = artifactEntries.filter((entry) => !entry.exists).map((entry) => ({ kind: entry.kind, path: entry.path }));
   const materializationStatus = artifactRegistryDoc?.materializationComplete === true && missingRegisteredArtifacts.length === 0
     ? "complete"
-    : incompleteMarker?.status === "incomplete" || lock?.schema
-      ? "incomplete"
-      : artifactRegistryDoc ? "corrupt_missing_registered_artifacts" : "not_materialized";
+    : lockInspection.exists && lockInspection.recoverable
+      ? "recoverable_stale_lock"
+      : incompleteMarker?.status === "incomplete" || lockInspection.status === "active"
+        ? "incomplete"
+        : artifactRegistryDoc ? "corrupt_missing_registered_artifacts" : "not_materialized";
   const worktreePath = state?.worktree?.path || plan?.worktree?.path || transactionWorktreePath(transactionId || transactionIdHint || "unknown");
   const latestFailureClassification = lastJsonlRecord(state?.failureClassification?.classificationsPath || paths.failureClassifications);
   const latestRepairAttempt = lastJsonlRecord(state?.repair?.attemptsPath || paths.repairAttempts);
@@ -996,13 +1030,13 @@ function loadTransactionInspection(dir, transactionIdHint) {
     transactionId,
     transactionDir: dir,
     exists: existsSync(dir),
-    recoverable: Boolean((state || incompleteMarker || artifactRegistryDoc) && existsSync(dir)),
+    recoverable: Boolean((state || incompleteMarker || artifactRegistryDoc || lockInspection.recoverable) && existsSync(dir)),
     statePath: paths.state,
     planPath: paths.transactionPlan,
     precheckPath: paths.precheck,
     artifactRegistryPath: paths.artifactRegistry,
-    latestPhase: state?.lifecycle?.phase || (incompleteMarker ? "precheck-materialization" : null),
-    status: state?.lifecycle?.status || state?.status || plan?.status || precheck?.status || (incompleteMarker ? "precheck_incomplete" : null),
+    latestPhase: state?.lifecycle?.phase || (incompleteMarker || lockInspection.exists ? "precheck-materialization" : null),
+    status: state?.lifecycle?.status || state?.status || plan?.status || precheck?.status || (incompleteMarker ? "precheck_incomplete" : lockInspection.recoverable ? "precheck_lock_recoverable" : null),
     terminalOutcome: deriveTerminalOutcome({ state, finalReport, activation }),
     precheckMaterialization: {
       status: materializationStatus,
@@ -1011,6 +1045,8 @@ function loadTransactionInspection(dir, transactionIdHint) {
       incompleteMarker: incompleteMarker || null,
       lockPath: paths.precheckLock,
       lock: lock || null,
+      lockInspection,
+      lockRecoverable: Boolean(lockInspection.recoverable),
       missingRegisteredArtifacts,
       registryWrittenLast: Boolean(artifactRegistryDoc && materializationStatus === "complete"),
     },

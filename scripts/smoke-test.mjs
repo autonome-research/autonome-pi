@@ -199,6 +199,20 @@ try {
   try { interruptedRetryDetails = JSON.parse(interruptedRetry.stdout); } catch { interruptedRetryDetails = undefined; }
   const interruptedRegistry = interruptedRetryDetails?.artifactRegistryPath ? JSON.parse(readFileSync(interruptedRetryDetails.artifactRegistryPath, 'utf8')) : undefined;
   log(interruptedRegistry?.materializationComplete === true && interruptedRegistry.entries.every((entry) => existsSync(entry.path)), 'bug-solver writes artifact registry only after all registered artifacts exist on retry');
+  const malformedLockArtifacts = join(tmp, 'malformed-lock-bug-solver-artifacts');
+  const malformedLockId = 'smoke-malformed-precheck-lock';
+  const malformedLockDir = join(malformedLockArtifacts, 'transactions', malformedLockId);
+  mkdirSync(malformedLockDir, { recursive: true });
+  writeFileSync(join(malformedLockDir, '.precheck.lock'), '{not-json');
+  const malformedLockStatus = expectExit('bug-solver status marks malformed precheck lock recoverable', ['node', bugSolverCli, 'status', '--cwd', interruptedRepo, '--transaction-id', malformedLockId, '--json'], 0, { env: { PI_BUG_SOLVER_ARTIFACT_DIR: malformedLockArtifacts } });
+  let malformedLockStatusDetails;
+  try { malformedLockStatusDetails = JSON.parse(malformedLockStatus.stdout); } catch { malformedLockStatusDetails = undefined; }
+  log(malformedLockStatusDetails?.recoverable === true && malformedLockStatusDetails?.precheckMaterialization?.status === 'recoverable_stale_lock' && malformedLockStatusDetails?.precheckMaterialization?.lockRecoverable === true, 'bug-solver stale malformed precheck lock is explicitly recoverable in status');
+  const malformedLockRetry = expectExit('bug-solver retry recovers malformed precheck lock and completes', ['node', bugSolverCli, 'precheck', '--cwd', interruptedRepo, '--bug', 'Fix malformed precheck lock recovery bug', '--transaction-id', malformedLockId, '--json'], 0, { env: { PI_BUG_SOLVER_ARTIFACT_DIR: malformedLockArtifacts } });
+  let malformedLockRetryDetails;
+  try { malformedLockRetryDetails = JSON.parse(malformedLockRetry.stdout); } catch { malformedLockRetryDetails = undefined; }
+  const malformedLockRegistry = malformedLockRetryDetails?.artifactRegistryPath ? JSON.parse(readFileSync(malformedLockRetryDetails.artifactRegistryPath, 'utf8')) : undefined;
+  log(malformedLockRegistry?.materializationComplete === true && !existsSync(join(malformedLockDir, '.precheck.lock')), 'bug-solver retry removes malformed stale lock without corrupting durable state');
   const visualizerStoreSource = readFileSync(join(root, 'thread-phase-visualizer/lib/store.mjs'), 'utf8');
   const visualizerIndexSource = readFileSync(join(root, 'thread-phase-visualizer/index.ts'), 'utf8');
   log(!/bug[-_]solver|pi-bug-solver/i.test(`${visualizerStoreSource}\n${visualizerIndexSource}`), 'generic thread-phase visualizer has no bug-solver-specific coupling');
