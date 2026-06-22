@@ -93,6 +93,7 @@ function buildArgs(params: Record<string, any>, ctx: any): string[] {
 	const args = [String(params.action || "precheck"), "--cwd", params.cwd, "--json"];
 	if (params.bug) args.push("--bug", params.bug);
 	if (params.transactionId) args.push("--transaction-id", params.transactionId);
+	if (params.transactionDir) args.push("--transaction-dir", params.transactionDir);
 	if (params.planPath) args.push("--plan-path", params.planPath);
 	if (params.approved) args.push("--approved");
 	if (params.background) args.push("--background");
@@ -138,6 +139,7 @@ export default function bugSolverWorkflow(pi: ExtensionAPI) {
 			bug: Type.Optional(Type.String({ description: "Single bug report or transaction goal. Required for precheck/solve." })),
 			cwd: Type.Optional(Type.String({ description: "Repository directory. Defaults to Pi's active cwd." })),
 			transactionId: Type.Optional(Type.String({ description: "Optional stable transaction id for artifacts/registry lookup." })),
+			transactionDir: Type.Optional(Type.String({ description: "Optional external transaction directory to inspect with action=status." })),
 			planPath: Type.Optional(Type.String({ description: "Precheck artifact/plan path produced by action=precheck." })),
 			approved: Type.Optional(Type.Boolean({ description: "Required true for action=solve after explicit precheck confirmation." })),
 			background: Type.Optional(Type.Boolean({ description: "Start action in the background and return immediately when supported." })),

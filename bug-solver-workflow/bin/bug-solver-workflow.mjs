@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -42,7 +42,7 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  return `Usage:\n  bug-solver-workflow precheck --bug <single bug> [--cwd <repo>] [--validation-command <cmd>] [--user-test-command <cmd>] [--max-repairs <n>] [--allowlist <path>] [--json]\n  bug-solver-workflow solve --plan-path <transaction-plan.json|precheck.json> --approved [--cwd <repo>] [--json]\n  bug-solver-workflow status [--transaction-id <id>] [--json]\n\nThe solve action is intentionally approval-gated. Runtime artifacts are written outside the target repo under ${ARTIFACT_ROOT}.`;
+  return `Usage:\n  bug-solver-workflow precheck --bug <single bug> [--cwd <repo>] [--validation-command <cmd>] [--user-test-command <cmd>] [--max-repairs <n>] [--allowlist <path>] [--json]\n  bug-solver-workflow solve --plan-path <transaction-plan.json|precheck.json> --approved [--cwd <repo>] [--json]\n  bug-solver-workflow status [--transaction-id <id>|--transaction-dir <dir>] [--json]\n\nThe solve action is intentionally approval-gated. Runtime artifacts are written outside the target repo under ${ARTIFACT_ROOT}.`;
 }
 
 function die(message, code = 1, json = false) {
@@ -617,29 +617,170 @@ async function solve(args, json) {
   }
 }
 
+function tryReadJson(file) {
+  if (!file || !existsSync(file)) return undefined;
+  try { return readJson(file); } catch (error) { return { unreadable: true, error: error.message || String(error), path: file }; }
+}
+
+function fileSummary(file) {
+  if (!file || !existsSync(file)) return { path: file, exists: false };
+  try {
+    const stat = statSync(file);
+    return { path: file, exists: true, size: stat.size, mtime: stat.mtime.toISOString(), isDirectory: stat.isDirectory() };
+  } catch (error) {
+    return { path: file, exists: false, error: error.message || String(error) };
+  }
+}
+
+function listJsonReports(dir) {
+  if (!dir || !existsSync(dir)) return [];
+  try {
+    return readdirSync(dir)
+      .map((name) => join(dir, name))
+      .filter((file) => {
+        try { return statSync(file).isFile() && /\.(json|jsonl|md|txt)$/i.test(file); } catch { return false; }
+      })
+      .map((file) => fileSummary(file))
+      .sort((a, b) => String(b.mtime || "").localeCompare(String(a.mtime || "")));
+  } catch {
+    return [];
+  }
+}
+
+function lastJsonlRecord(file) {
+  if (!file || !existsSync(file)) return undefined;
+  try {
+    const lines = readFileSync(file, "utf8").trim().split(/\n+/).filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try { return JSON.parse(lines[i]); } catch { /* keep scanning */ }
+    }
+  } catch { /* ignored: status is best-effort and read-only */ }
+  return undefined;
+}
+
+function deriveTerminalOutcome({ state, finalReport, activation }) {
+  const lifecycle = state?.lifecycle || {};
+  const status = lifecycle.status || state?.status || finalReport?.status || activation?.status;
+  const terminalByStatus = new Set(["completed", "succeeded", "success", "failed", "cancelled", "rejected_multi_bug"]);
+  const terminal = Boolean(lifecycle.terminal || terminalByStatus.has(String(status || "")) || finalReport?.terminal === true);
+  return {
+    terminal,
+    status: status || null,
+    outcome: finalReport?.outcome || finalReport?.finalOutcome || (terminal ? status : null) || null,
+    reason: finalReport?.reason || finalReport?.summary || activation?.message || null,
+  };
+}
+
+function loadTransactionInspection(dir, transactionIdHint) {
+  const paths = buildArtifactPaths(dir);
+  const state = tryReadJson(paths.state);
+  const plan = tryReadJson(paths.transactionPlan);
+  const precheck = tryReadJson(paths.precheck);
+  const artifactRegistryDoc = tryReadJson(paths.artifactRegistry);
+  const finalReport = tryReadJson(paths.finalReport);
+  const activation = tryReadJson(join(dir, "activation-scaffold.json"));
+  const transactionId = state?.transactionId || plan?.transactionId || precheck?.transactionId || transactionIdHint;
+  const reportsDir = state?.reports?.intermediateReportsDir || paths.intermediateReportsDir;
+  const artifactEntries = (artifactRegistryDoc?.entries || []).map((entry) => ({ ...entry, exists: existsSync(entry.path) }));
+  const worktreePath = state?.worktree?.path || plan?.worktree?.path || transactionWorktreePath(transactionId || transactionIdHint || "unknown");
+  const latestFailureClassification = lastJsonlRecord(state?.failureClassification?.classificationsPath || paths.failureClassifications);
+  const latestRepairAttempt = lastJsonlRecord(state?.repair?.attemptsPath || paths.repairAttempts);
+  return {
+    transactionId,
+    transactionDir: dir,
+    exists: existsSync(dir),
+    recoverable: Boolean(state && existsSync(paths.artifactRegistry)),
+    statePath: paths.state,
+    planPath: paths.transactionPlan,
+    precheckPath: paths.precheck,
+    artifactRegistryPath: paths.artifactRegistry,
+    latestPhase: state?.lifecycle?.phase || null,
+    status: state?.lifecycle?.status || state?.status || plan?.status || precheck?.status || null,
+    terminalOutcome: deriveTerminalOutcome({ state, finalReport, activation }),
+    repo: state?.repo || plan?.repo || (precheck ? { cwd: precheck.cwd, ...(precheck.git || {}) } : undefined),
+    branch: state?.branch || { plannedName: transactionId ? transactionBranchName(transactionId) : undefined, status: "unknown" },
+    worktree: { ...(state?.worktree || {}), path: worktreePath, exists: existsSync(worktreePath) },
+    validation: state?.validation || plan?.validation,
+    repair: { ...(state?.repair || {}), latestAttempt: latestRepairAttempt },
+    failureClassification: { ...(state?.failureClassification || {}), latest: latestFailureClassification },
+    reports: {
+      finalReport: fileSummary(state?.reports?.finalReportPath || paths.finalReport),
+      activationScaffold: fileSummary(join(dir, "activation-scaffold.json")),
+      intermediateReportsDir: reportsDir,
+      intermediateReports: listJsonReports(reportsDir),
+    },
+    artifacts: {
+      entries: artifactEntries,
+      registry: artifactRegistryDoc,
+      files: {
+        precheck: fileSummary(paths.precheck),
+        transactionPlan: fileSummary(paths.transactionPlan),
+        validationContract: fileSummary(paths.validationContract),
+        state: fileSummary(paths.state),
+        artifactRegistry: fileSummary(paths.artifactRegistry),
+        baseline: fileSummary(paths.baseline),
+        implementationEvidence: fileSummary(paths.implementationEvidence),
+        allowlistDecisions: fileSummary(paths.allowlistDecisions),
+        repairAttempts: fileSummary(paths.repairAttempts),
+        failureClassifications: fileSummary(paths.failureClassifications),
+        finalReport: fileSummary(paths.finalReport),
+      },
+    },
+    state,
+  };
+}
+
+function listTransactionDirs() {
+  const root = join(ARTIFACT_ROOT, "transactions");
+  if (!existsSync(root)) return [];
+  try {
+    return readdirSync(root)
+      .map((name) => join(root, name))
+      .filter((dir) => {
+        try { return statSync(dir).isDirectory(); } catch { return false; }
+      });
+  } catch {
+    return [];
+  }
+}
+
 function status(args, json) {
   const transactionId = args["transaction-id"];
-  const dir = transactionId ? transactionDir(transactionId) : join(ARTIFACT_ROOT, "transactions");
-  const statePath = transactionId ? join(dir, "state.json") : undefined;
-  const artifactRegistryPath = transactionId ? join(dir, "artifact-registry.json") : undefined;
+  const transactionDirArg = args["transaction-dir"];
   const indexPath = registryIndexPath();
-  const state = statePath && existsSync(statePath) ? readJson(statePath) : undefined;
+  const registry = tryReadJson(indexPath);
+  const dir = transactionDirArg ? resolve(String(transactionDirArg)) : transactionId ? (registry?.transactions?.[transactionId]?.artifactDir || transactionDir(transactionId)) : join(ARTIFACT_ROOT, "transactions");
+  const inspection = transactionId || transactionDirArg ? loadTransactionInspection(dir, transactionId) : undefined;
+  const transactions = inspection ? undefined : listTransactionDirs().map((candidate) => {
+    const summary = loadTransactionInspection(candidate);
+    return {
+      transactionId: summary.transactionId,
+      transactionDir: summary.transactionDir,
+      status: summary.status,
+      latestPhase: summary.latestPhase,
+      terminalOutcome: summary.terminalOutcome,
+      statePath: summary.statePath,
+      worktree: summary.worktree,
+      reports: summary.reports,
+      recoverable: summary.recoverable,
+    };
+  });
   const result = {
     ok: true,
     action: "status",
+    readOnly: true,
+    targetRepositoryEdited: false,
     artifactRoot: ARTIFACT_ROOT,
     path: dir,
     exists: existsSync(dir),
-    transactionId: transactionId || undefined,
-    statePath,
-    artifactRegistryPath,
+    transactionId: transactionId || inspection?.transactionId || undefined,
     registryIndexPath: indexPath,
-    status: state?.lifecycle?.status || state?.status,
-    recoverable: Boolean(state && artifactRegistryPath && existsSync(artifactRegistryPath)),
-    state,
+    registry,
+    ...(inspection || { transactions }),
   };
   if (json) console.log(JSON.stringify(result, null, 2));
-  else console.log(`${dir}${result.exists ? "" : " (missing)"}`);
+  else if (inspection) console.log(`${inspection.transactionId || dir}: ${inspection.status || "unknown"} (${inspection.latestPhase || "no phase"})`);
+  else console.log(`${dir}${result.exists ? "" : " (missing)"} — ${transactions.length} transaction(s)`);
 }
 
 async function main() {

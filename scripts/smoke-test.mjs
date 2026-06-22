@@ -128,6 +128,14 @@ try {
   const bugRunEvents = bugPrecheckDetails?.runId ? storeApi.readRun(bugPrecheckDetails.runId) : [];
   const genericThreadPhaseTypes = new Set(['workflow_start', 'phase_start', 'phase_event', 'artifact', 'phase_end', 'workflow_end']);
   log(bugRunEvents.length >= 6 && bugRunEvents.every((event) => event.schema === 'thread-phase-ui/v1' && genericThreadPhaseTypes.has(event.type)) && bugRunEvents.some((event) => event.type === 'artifact' && event.artifact?.path === bugPrecheckDetails.precheckPath), 'bug-solver observability persists only generic thread-phase event types');
+  const bugStatus = bugPrecheckDetails?.transactionId ? expectExit('bug-solver workflow status inspects transaction state by id', ['node', bugSolverCli, 'status', '--transaction-id', bugPrecheckDetails.transactionId, '--json'], 0) : undefined;
+  let bugStatusDetails;
+  try { bugStatusDetails = bugStatus?.stdout ? JSON.parse(bugStatus.stdout) : undefined; } catch { bugStatusDetails = undefined; }
+  log(bugStatusDetails?.readOnly === true && bugStatusDetails?.targetRepositoryEdited === false && bugStatusDetails?.recoverable === true && bugStatusDetails?.latestPhase === 'precheck' && bugStatusDetails?.reports?.finalReport?.path && bugStatusDetails?.worktree?.path && bugStatusDetails?.terminalOutcome?.terminal === false, 'bug-solver status reports recoverable state, latest phase, reports, worktree, and non-terminal outcome');
+  const bugDirStatus = bugPrecheckDetails?.artifactDir ? expectExit('bug-solver workflow status inspects explicit transaction directory', ['node', bugSolverCli, 'status', '--transaction-dir', bugPrecheckDetails.artifactDir, '--json'], 0) : undefined;
+  let bugDirStatusDetails;
+  try { bugDirStatusDetails = bugDirStatus?.stdout ? JSON.parse(bugDirStatus.stdout) : undefined; } catch { bugDirStatusDetails = undefined; }
+  log(bugDirStatusDetails?.transactionId === bugPrecheckDetails?.transactionId && bugDirStatusDetails?.artifactRegistryPath === bugPrecheckDetails?.artifactRegistryPath, 'bug-solver status can recover transaction details from a directory without a target repo edit');
   const visualizerStoreSource = readFileSync(join(root, 'thread-phase-visualizer/lib/store.mjs'), 'utf8');
   const visualizerIndexSource = readFileSync(join(root, 'thread-phase-visualizer/index.ts'), 'utf8');
   log(!/bug[-_]solver|pi-bug-solver/i.test(`${visualizerStoreSource}\n${visualizerIndexSource}`), 'generic thread-phase visualizer has no bug-solver-specific coupling');

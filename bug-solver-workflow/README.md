@@ -10,7 +10,7 @@ Actions:
 
 - `precheck` — read-only intake for exactly one bug. Records git/base metadata, multiplicity signals, a stable transaction plan, a durable validation contract, candidate broad validation commands, optional targeted user test command, repair budget, allowlist policy, artifact locations, evidence paths, and approval instructions outside the target repository.
 - `solve` — approval-gated activation surface. Requires `approved: true` and a `planPath` from precheck; rejects multi-bug/split-required plans before any edit-capable phase. Later milestones will implement isolated worktree solving and bounded repairs behind this gate.
-- `status` — reports the external artifact root or a specific transaction directory.
+- `status` — read-only inspection of the external artifact root, a transaction id, or a transaction directory. It summarizes durable state, latest phase, report paths, isolated worktree/branch locations, failure/repair tails, and terminal outcomes without editing the target repository.
 
 ## CLI
 
@@ -36,13 +36,25 @@ node bug-solver-workflow/bin/bug-solver-workflow.mjs solve \
   --json
 ```
 
+Inspect resumable transaction state at any time without touching the target repository:
+
+```bash
+node bug-solver-workflow/bin/bug-solver-workflow.mjs status \
+  --transaction-id <id> \
+  --json
+
+node bug-solver-workflow/bin/bug-solver-workflow.mjs status \
+  --transaction-dir ~/.pi/agent/bug-solver-workflow/transactions/<id> \
+  --json
+```
+
 ## Safety and observability
 
 - The extension is committed source in this package tree; it does not generate its harness under `/tmp`.
 - Runtime state is persisted outside the target repository under `~/.pi/agent/bug-solver-workflow/` by default.
 - Workflow events use the existing generic `thread-phase-ui/v1` store with workflow name `bug-solver-workflow`; no bug-solver logic is added to the generic visualizer.
 - `precheck` writes `precheck.json`, `transaction-plan.json`, `validation-contract.json`, `state.json`, `artifact-registry.json`, `allowlist-decisions.jsonl`, `repair-attempts.jsonl`, `failure-classifications.jsonl`, and evidence path placeholders before implementation begins.
-- The transaction state schema (`pi-bug-solver-workflow/state/v1`) records lifecycle status/phase, immutable base commit, target branch and isolated worktree metadata, validation evidence paths, repair counters, failure-classification paths, final report paths, and the artifact registry path. The global registry at `~/.pi/agent/bug-solver-workflow/registry/transactions.json` makes each transaction recoverable by id.
+- The transaction state schema (`pi-bug-solver-workflow/state/v1`) records lifecycle status/phase, immutable base commit, target branch and isolated worktree metadata, validation evidence paths, repair counters, failure-classification paths, final report paths, and the artifact registry path. The global registry at `~/.pi/agent/bug-solver-workflow/registry/transactions.json` makes each transaction recoverable by id. `status --transaction-id` uses that registry and the transaction directory to reconstruct resume/status details, including latest phase, durable reports, branch/worktree locations, and terminal outcome.
 - The transaction plan schema (`pi-bug-solver-workflow/transaction-plan/v1`) is intentionally stable: it contains exactly-one-bug status, repo/base metadata, validation/user-test commands, max repair iterations (default 8), baseline evidence metadata, allowlist policy, artifact paths, state path, artifact registry path, and final evidence paths.
 - The validation contract schema (`pi-bug-solver-workflow/validation-contract/v1`) records explicit must-level assertions and maps each assertion to durable workflow evidence paths before any edit-capable phase.
 - `solve` is intentionally confirmation-gated and refuses multi-bug prechecks/plans, including comma-separated independent clauses such as `Fix login bug, repair billing bug`.
