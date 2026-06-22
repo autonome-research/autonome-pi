@@ -277,6 +277,8 @@ function buildTransactionPlan({ transactionId, cwd, bug, git, validationCommands
       baseCommit: git.head || null,
       baseRef: git.branch || "HEAD",
       statusAtPrecheck: git.statusShort || "",
+      dirtyAtPrecheck: git.dirty || parseGitStatusSignals(git.statusShort),
+      cleanAtPrecheck: !(git.dirty || parseGitStatusSignals(git.statusShort)).hasDirtyWorktree,
       isGitRepo: git.isGitRepo,
     },
     validation: {
@@ -328,17 +330,43 @@ function runGit(cwd, args) {
   });
 }
 
+function parseGitStatusSignals(statusShort) {
+  const lines = String(statusShort || "").split(/\n/).filter(Boolean);
+  const entries = lines.map((line) => {
+    const x = line.slice(0, 1);
+    const y = line.slice(1, 2);
+    const path = line.slice(3).trim();
+    return { raw: line, index: x, workingTree: y, path, untracked: x === "?" && y === "?", staged: x !== " " && x !== "?", unstaged: y !== " " && y !== "?" };
+  });
+  return {
+    hasDirtyWorktree: entries.length > 0,
+    statusShort: String(statusShort || ""),
+    counts: {
+      total: entries.length,
+      staged: entries.filter((entry) => entry.staged).length,
+      unstaged: entries.filter((entry) => entry.unstaged).length,
+      untracked: entries.filter((entry) => entry.untracked).length,
+    },
+    entries,
+  };
+}
+
 async function gitInfo(cwd) {
   const root = await runGit(cwd, ["rev-parse", "--show-toplevel"]);
   const head = await runGit(cwd, ["rev-parse", "HEAD"]);
   const branch = await runGit(cwd, ["branch", "--show-current"]);
   const status = await runGit(cwd, ["status", "--short"]);
+  const statusShort = status.status === 0 ? status.stdout.trimEnd() : undefined;
+  const dirty = parseGitStatusSignals(statusShort);
   return {
     isGitRepo: root.status === 0,
     root: root.status === 0 ? root.stdout.trim() : undefined,
     head: head.status === 0 ? head.stdout.trim() : undefined,
+    baseCommit: head.status === 0 ? head.stdout.trim() : undefined,
     branch: branch.status === 0 ? branch.stdout.trim() : undefined,
-    statusShort: status.status === 0 ? status.stdout.trimEnd() : undefined,
+    baseRef: branch.status === 0 ? (branch.stdout.trim() || "HEAD") : undefined,
+    statusShort,
+    dirty,
     errors: [root, head, status].filter((r) => r.status !== 0).map((r) => (r.stderr || r.stdout || "git failed").trim()),
   };
 }
@@ -626,8 +654,11 @@ function buildTransactionState({ transactionId, cwd, bug, git, validationCommand
       root: git.root || cwd,
       isGitRepo: git.isGitRepo,
       head: git.head || null,
+      baseCommit: git.baseCommit || git.head || null,
       branch: git.branch || "HEAD",
+      baseRef: git.baseRef || git.branch || "HEAD",
       statusShort: git.statusShort || "",
+      dirty: git.dirty || parseGitStatusSignals(git.statusShort),
     },
     validationCommands,
     userTestCommand: userTestCommand || null,
@@ -641,9 +672,11 @@ function buildTransactionState({ transactionId, cwd, bug, git, validationCommand
     cwd,
     root: git.root || cwd,
     isGitRepo: git.isGitRepo,
-    baseCommit: git.head || null,
-    baseRef: git.branch || "HEAD",
+    baseCommit: git.baseCommit || git.head || null,
+    baseRef: git.baseRef || git.branch || "HEAD",
     statusAtPrecheck: git.statusShort || "",
+    dirtyAtPrecheck: git.dirty || parseGitStatusSignals(git.statusShort),
+    cleanAtPrecheck: !(git.dirty || parseGitStatusSignals(git.statusShort)).hasDirtyWorktree,
   };
   const branchIdentity = existing.branch || {
     baseCommit: repoIdentity.baseCommit,
@@ -797,7 +830,9 @@ async function precheck(args, json) {
       evidencePaths: plan.evidencePaths,
       plannedSafety: {
         worktreeIsolation: true,
-        immutableBaseCommit: git.head,
+        immutableBaseCommit: git.baseCommit || git.head,
+        cleanWorktreeRequiredForSolve: true,
+        dirtyWorktreeDetected: Boolean(git.dirty?.hasDirtyWorktree),
         externalArtifactsDir: dir,
         artifactRoot: artifactRootSafety.artifactRoot,
         targetRoot: artifactRootSafety.targetRoot,
@@ -810,8 +845,16 @@ async function precheck(args, json) {
     const state = buildTransactionState({ transactionId, cwd, bug, git, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, status: record.status });
     const registry = artifactRegistry({ transactionId, artifactPaths });
     const pendingArtifacts = initialPendingArtifacts({ transactionId, cwd, bug, validationCommands, userTestCommand, maxRepairIterations, allowlist, multiplicity, artifactPaths, createdAt: record.createdAt });
+    const readOnlyAuditBefore = { head: git.head || null, statusShort: git.statusShort || "", dirty: git.dirty || parseGitStatusSignals(git.statusShort) };
     const recordForWrite = {
       ...record,
+      readOnlyAudit: {
+        operations: ["git rev-parse --show-toplevel", "git rev-parse HEAD", "git branch --show-current", "git status --short", "external artifact writes only"],
+        targetRepositoryEdited: false,
+        editingAllowed: false,
+        before: readOnlyAuditBefore,
+        after: null,
+      },
       plannedSafety: { ...record.plannedSafety, immutableBaseCommit: state.repo.baseCommit, immutableBaseRef: state.repo.baseRef },
       immutableTransactionIdentity: {
         repo: state.repo,
@@ -838,7 +881,16 @@ async function precheck(args, json) {
     await withPrecheckLock(artifactPaths, transactionId, async () => {
       try {
         writePrecheckIncompleteMarker({ artifactPaths, transactionId, state, stage: "starting_materialization" });
-        writeJson(file, recordForWrite);
+        const latestGitBeforeWrite = await gitInfo(cwd);
+        const finalRecordForWrite = {
+          ...recordForWrite,
+          readOnlyAudit: {
+            ...recordForWrite.readOnlyAudit,
+            after: { head: latestGitBeforeWrite.head || null, statusShort: latestGitBeforeWrite.statusShort || "", dirty: latestGitBeforeWrite.dirty || parseGitStatusSignals(latestGitBeforeWrite.statusShort) },
+            unchangedDuringPrecheck: (readOnlyAuditBefore.head || null) === (latestGitBeforeWrite.head || null) && (readOnlyAuditBefore.statusShort || "") === (latestGitBeforeWrite.statusShort || ""),
+          },
+        };
+        writeJson(file, finalRecordForWrite);
         writeJson(artifactPaths.transactionPlan, planForWrite);
         writeJson(artifactPaths.validationContract, contract);
         writeInitialJson(artifactPaths.baseline, pendingArtifacts.baseline);
@@ -905,6 +957,11 @@ async function solve(args, json) {
     if (plan.status === "rejected_multi_bug" || multiplicity?.likelyMultiple || gate.exactlyOneBug === false || gate.splitRequired) throw new Error("Precheck classified this request as multiple bugs; split it before solving.");
     if (plan.editingAllowed === true) throw new Error("Refusing a plan that was not preserved as pre-implementation/editingAllowed=false.");
     if (!plan.validationContractPath) throw new Error("Transaction plan is missing a durable validation contract path.");
+    const precheckDirty = planDirtySignals(planArtifact);
+    const currentDirty = git.dirty || parseGitStatusSignals(git.statusShort);
+    if (precheckDirty.hasDirtyWorktree) throw new Error(`Refusing unsafe plan recorded against a dirty worktree before edit-capable phases: ${precheckDirty.statusShort}`);
+    if (currentDirty.hasDirtyWorktree) throw new Error(`Refusing solve activation from a dirty caller worktree before edit-capable phases: ${currentDirty.statusShort}`);
+    if (planArtifact?.repo?.baseCommit && git.head && planArtifact.repo.baseCommit !== git.head) throw new Error(`Refusing solve activation because caller HEAD ${git.head} differs from recorded base ${planArtifact.repo.baseCommit}; rerun precheck at the intended base.`);
     if (!gate.safeBeforeEditCapablePhase) throw new Error(`Transaction plan is unsafe before edit-capable phases: ${gate.reasons.join("; ")}`);
     phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS);
     phaseStart(run, "activation-scaffold", { transactionId });
@@ -985,6 +1042,12 @@ function lastJsonlRecord(file) {
     }
   } catch { /* ignored: status is best-effort and read-only */ }
   return undefined;
+}
+
+function planDirtySignals(plan) {
+  const repo = plan?.repo || {};
+  const dirty = repo.dirtyAtPrecheck || repo.dirty || parseGitStatusSignals(repo.statusAtPrecheck || repo.statusShort || "");
+  return dirty;
 }
 
 function deriveTerminalOutcome({ state, finalReport, activation }) {

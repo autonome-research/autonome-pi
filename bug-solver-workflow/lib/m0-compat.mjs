@@ -41,6 +41,16 @@ function firstString(...values) {
   return undefined;
 }
 
+function dirtyStatus(repo) {
+  const value = asObject(repo);
+  const dirty = asObject(value.dirtyAtPrecheck || value.dirty);
+  const statusShort = firstString(value.statusAtPrecheck, value.statusShort, dirty.statusShort) || "";
+  return {
+    hasDirtyWorktree: dirty.hasDirtyWorktree === true || Boolean(statusShort.trim()),
+    statusShort,
+  };
+}
+
 export function isBugSolverPrecheckArtifact(value) {
   return asObject(value).schema === BUG_SOLVER_SCHEMAS.precheck;
 }
@@ -77,6 +87,7 @@ export function normalizeSolvePlanArtifact(artifact) {
     validationContractPath: firstString(input.validationContractPath, validation.contractPath),
     evidencePaths,
     artifacts: asObject(input.artifacts),
+    repo: asObject(input.repo),
     sourceKind: isBugSolverPrecheckArtifact(input) ? "precheck" : isBugSolverTransactionPlan(input) ? "transaction-plan" : "unrecognized-schema",
   };
 }
@@ -104,6 +115,7 @@ export function assessPreImplementationGate(artifact, multiplicityOverride) {
   if (!explicitTrue(plan.confirmationRequired)) reasons.push("missing explicit confirmationRequired=true approval marker");
   if (plan.sourceKind === "precheck" && !explicitTrue(plan.readOnly)) reasons.push("missing explicit readOnly=true precheck marker");
   if (!plan.validationContractPath) reasons.push("missing durable validation contract path");
+  if (dirtyStatus(plan.repo).hasDirtyWorktree) reasons.push("precheck recorded dirty worktree signals");
 
   return {
     transactionId: plan.transactionId,
