@@ -613,11 +613,54 @@ function gitSnapshotChanged(before, after) {
   return (before.head || null) !== (after.head || null) || (before.statusShort || "") !== (after.statusShort || "");
 }
 
+function explicitResolutionCandidate(record) {
+  const explicitResolutionTypes = new Set(["implementation_change", "repair_change", "bug_resolution", "explicit_bug_resolution", "repair_attempt"]);
+  return record?.explicitlyResolvedBug === true
+    || record?.bugResolved === true
+    || record?.resolvedBug === true
+    || record?.implementationChangedWorktree === true
+    || (explicitResolutionTypes.has(String(record?.type || "")) && ["resolved", "fixed", "changed", "implemented", "success", "passed"].includes(String(record?.status || record?.outcome || "").toLowerCase()));
+}
+
+function parseRecordTime(value) {
+  const time = Date.parse(String(value || ""));
+  return Number.isFinite(time) ? time : undefined;
+}
+
+function trustedExplicitResolutionRecord(record, { baseline, baselineAfter }) {
+  if (!explicitResolutionCandidate(record)) return { trusted: false, reason: "not_explicit_resolution" };
+  const trustedPhases = new Set(["implementation", "repair", "repair-attempt", "implementation-repair", "bounded-repair-loop"]);
+  const phase = String(record.phase || record.workflowPhase || record.producedByPhase || "");
+  const producer = record.producer || record.source || {};
+  const trustedProducer = record.trustedImplementationEvidence === true
+    || record.producedByTrustedPhase === true
+    || record.owner === WORKFLOW
+    || record.workflow === WORKFLOW
+    || producer.workflow === WORKFLOW
+    || producer.name === WORKFLOW;
+  if (!trustedProducer || !trustedPhases.has(phase)) return { trusted: false, reason: "not_from_trusted_implementation_or_repair_phase" };
+  const baselineCompletedAt = parseRecordTime(baseline?.completedAt);
+  const createdAt = parseRecordTime(record.createdAt || record.completedAt);
+  if (!baselineCompletedAt || !createdAt || createdAt <= baselineCompletedAt) return { trusted: false, reason: "not_after_baseline" };
+  if (!baseline?.transactionId || record.transactionId !== baseline.transactionId) return { trusted: false, reason: "transaction_mismatch" };
+  const worktreePath = baseline?.worktreePath;
+  const recordWorktreePath = record.worktreePath || record.isolatedWorktreePath || record.worktree?.path;
+  if (!worktreePath || !recordWorktreePath || resolve(String(recordWorktreePath)) !== resolve(String(worktreePath))) return { trusted: false, reason: "worktree_mismatch" };
+  const changedFiles = Array.isArray(record.changedFiles) ? record.changedFiles : (Array.isArray(record.filesChanged) ? record.filesChanged : []);
+  const commit = record.commit || record.commitHash || record.head || record.git?.after?.head || record.git?.commit;
+  const afterStatus = record.git?.after?.statusShort ?? record.statusShortAfter ?? record.worktreeStatusAfter;
+  const changedSnapshot = gitSnapshotChanged(record.git?.before || baselineAfter, record.git?.after || (commit || afterStatus !== undefined ? { head: commit || baselineAfter?.head || null, statusShort: afterStatus || "" } : null));
+  const tiedToWorktreeChange = record.implementationChangedWorktree === true || record.worktreeChangedAfterBaseline === true || changedFiles.length > 0 || (commit && commit !== baselineAfter?.head) || changedSnapshot;
+  if (!tiedToWorktreeChange) return { trusted: false, reason: "not_tied_to_isolated_worktree_change_or_commit" };
+  return { trusted: true, reason: "trusted_post_baseline_implementation_or_repair_evidence" };
+}
+
 function implementationBackedEvidence({ baseline, postBefore, postAfter, artifactPaths }) {
   const records = readJsonlRecords(artifactPaths.implementationEvidence);
-  const explicitResolutionTypes = new Set(["implementation_change", "repair_change", "bug_resolution", "explicit_bug_resolution", "manual_bug_resolution", "repair_attempt"]);
-  const explicitResolution = records.find((record) => record?.explicitlyResolvedBug === true || record?.bugResolved === true || record?.resolvedBug === true || record?.implementationChangedWorktree === true || (explicitResolutionTypes.has(String(record?.type || "")) && ["resolved", "fixed", "changed", "implemented", "success", "passed"].includes(String(record?.status || record?.outcome || "").toLowerCase())));
   const baselineAfter = baseline?.git?.after;
+  const assessedExplicitRecords = records.filter(explicitResolutionCandidate).map((record) => ({ record, assessment: trustedExplicitResolutionRecord(record, { baseline, baselineAfter }) }));
+  const explicitResolution = assessedExplicitRecords.find((entry) => entry.assessment.trusted)?.record;
+  const ignoredExplicitResolutionRecords = assessedExplicitRecords.filter((entry) => !entry.assessment.trusted).map((entry) => ({ type: entry.record?.type || null, status: entry.record?.status || entry.record?.outcome || null, createdAt: entry.record?.createdAt || entry.record?.completedAt || null, reason: entry.assessment.reason }));
   const worktreeChangedAfterBaseline = gitSnapshotChanged(baselineAfter, postBefore);
   const worktreeChangedByPostValidation = gitSnapshotChanged(postBefore, postAfter);
   const implementationEvidence = {
@@ -626,12 +669,14 @@ function implementationBackedEvidence({ baseline, postBefore, postAfter, artifac
     worktreeChangedAfterBaseline,
     worktreeChangedByPostValidation,
     explicitlyResolvedBug: Boolean(explicitResolution),
+    trustedExplicitResolutionRequired: true,
+    ignoredExplicitResolutionRecords,
     durableEvidenceFound: worktreeChangedAfterBaseline || Boolean(explicitResolution),
     baselineAfter: baselineAfter ? { head: baselineAfter.head || null, statusShort: baselineAfter.statusShort || "" } : null,
     postValidationBefore: postBefore ? { head: postBefore.head || null, statusShort: postBefore.statusShort || "" } : null,
     postValidationAfter: postAfter ? { head: postAfter.head || null, statusShort: postAfter.statusShort || "" } : null,
-    explicitResolutionRecord: explicitResolution ? { type: explicitResolution.type || null, status: explicitResolution.status || explicitResolution.outcome || null, createdAt: explicitResolution.createdAt || null } : null,
-    basis: worktreeChangedAfterBaseline ? "isolated transaction worktree changed after baseline and before final verification" : (explicitResolution ? "implementation evidence log explicitly records bug resolution" : "no implementation or repair evidence changed/resolved the isolated transaction worktree before final verification"),
+    explicitResolutionRecord: explicitResolution ? { type: explicitResolution.type || null, status: explicitResolution.status || explicitResolution.outcome || null, createdAt: explicitResolution.createdAt || explicitResolution.completedAt || null, phase: explicitResolution.phase || explicitResolution.workflowPhase || null } : null,
+    basis: worktreeChangedAfterBaseline ? "isolated transaction worktree changed after baseline and before final verification" : (explicitResolution ? "trusted post-baseline implementation/repair evidence records bug resolution tied to the isolated transaction worktree change or commit" : "no trusted post-baseline implementation or repair evidence changed/resolved the isolated transaction worktree before final verification"),
   };
   return implementationEvidence;
 }
