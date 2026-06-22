@@ -114,6 +114,15 @@ try {
 
   const bugSolverCli = join(root, 'bug-solver-workflow/bin/bug-solver-workflow.mjs');
   expectExit('bug-solver workflow CLI help succeeds', ['node', bugSolverCli, '--help'], 0);
+  const inRepoArtifactDir = join(root, '.bug-solver-artifacts-smoke');
+  rmSync(inRepoArtifactDir, { recursive: true, force: true });
+  const inRepoArtifactResult = expectExit('bug-solver workflow rejects absolute in-repo artifact root', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix malicious in-repo artifact root bug', '--json'], 1, { env: { PI_BUG_SOLVER_ARTIFACT_DIR: inRepoArtifactDir } });
+  log(!existsSync(inRepoArtifactDir) && /outside the repository/i.test(inRepoArtifactResult.stdout || inRepoArtifactResult.stderr || ''), 'bug-solver refuses malicious in-repo PI_BUG_SOLVER_ARTIFACT_DIR before writing artifacts');
+  const relativeInRepoArtifactDir = '.bug-solver-relative-artifacts-smoke';
+  const relativeInRepoArtifactPath = join(root, relativeInRepoArtifactDir);
+  rmSync(relativeInRepoArtifactPath, { recursive: true, force: true });
+  const relativeArtifactResult = expectExit('bug-solver workflow rejects relative in-repo artifact root', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix accidental relative artifact root bug', '--json'], 1, { env: { PI_BUG_SOLVER_ARTIFACT_DIR: relativeInRepoArtifactDir } });
+  log(!existsSync(relativeInRepoArtifactPath) && /outside the repository/i.test(relativeArtifactResult.stdout || relativeArtifactResult.stderr || ''), 'bug-solver refuses accidental relative in-repo PI_BUG_SOLVER_ARTIFACT_DIR before writing artifacts');
   const bugPrecheck = expectExit('bug-solver workflow precheck writes durable artifact', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix smoke-test bug transaction', '--json'], 0);
   let bugPrecheckDetails;
   try { bugPrecheckDetails = JSON.parse(bugPrecheck.stdout); } catch { bugPrecheckDetails = undefined; }

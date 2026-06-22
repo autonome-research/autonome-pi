@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative as importPathRelative, resolve } from "node:path";
 import {
   STATUSES,
   artifact as emitArtifact,
@@ -18,7 +18,8 @@ import { assessPreImplementationGate, normalizeSolvePlanArtifact } from "../lib/
 
 const WORKFLOW = "bug-solver-workflow";
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
-const ARTIFACT_ROOT = process.env.PI_BUG_SOLVER_ARTIFACT_DIR || join(AGENT_DIR, "bug-solver-workflow");
+const DEFAULT_ARTIFACT_ROOT = join(AGENT_DIR, "bug-solver-workflow");
+let ARTIFACT_ROOT = resolveArtifactRoot();
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -63,6 +64,29 @@ function splitValues(value) {
   if (!value) return [];
   const values = Array.isArray(value) ? value : [value];
   return values.flatMap((item) => String(item).split(/[;,]/)).map((s) => s.trim()).filter(Boolean);
+}
+
+function expandHomePath(input) {
+  const value = String(input || "");
+  if (value === "~") return homedir();
+  if (value.startsWith("~/")) return join(homedir(), value.slice(2));
+  return value;
+}
+
+function resolveArtifactRoot() {
+  return resolve(expandHomePath(process.env.PI_BUG_SOLVER_ARTIFACT_DIR || DEFAULT_ARTIFACT_ROOT));
+}
+
+function sameOrInsidePath(candidate, parent) {
+  const child = resolve(candidate);
+  const base = resolve(parent);
+  const relative = pathRelative(base, child);
+  return relative === "" || (!relative.startsWith("..") && !isAbsolute(relative));
+}
+
+function pathRelative(from, to) {
+  // Keep path.relative out of the import list churn above and normalize Windows separators for tests.
+  return importPathRelative(from, to).replace(/\\/g, "/");
 }
 
 function splitValidationCommands(args) {
@@ -300,6 +324,19 @@ async function gitInfo(cwd) {
     statusShort: status.status === 0 ? status.stdout.trimEnd() : undefined,
     errors: [root, head, status].filter((r) => r.status !== 0).map((r) => (r.stderr || r.stdout || "git failed").trim()),
   };
+}
+
+function validateArtifactRootExternal({ cwd, git }) {
+  const artifactRoot = resolveArtifactRoot();
+  const targetRoot = resolve(git?.root || cwd);
+  const targetCwd = resolve(cwd);
+  const inTargetRoot = sameOrInsidePath(artifactRoot, targetRoot);
+  const inTargetCwd = sameOrInsidePath(artifactRoot, targetCwd);
+  if (inTargetRoot || inTargetCwd) {
+    throw new Error(`Refusing PI_BUG_SOLVER_ARTIFACT_DIR inside the target repository/cwd. artifactRoot=${artifactRoot}; targetRoot=${targetRoot}; cwd=${targetCwd}. Choose an external durable directory outside the repository.`);
+  }
+  ARTIFACT_ROOT = artifactRoot;
+  return { artifactRoot, targetRoot, targetCwd, externalToTargetRepo: true };
 }
 
 function atomicWriteJson(file, value) {
@@ -669,15 +706,16 @@ async function precheck(args, json) {
   const bug = String(args.bug || args._.join(" ")).trim();
   if (!bug) die("precheck requires --bug describing exactly one bug", 1, json);
 
+  const git = await gitInfo(cwd);
+  const artifactRootSafety = validateArtifactRootExternal({ cwd, git });
   const transactionId = args["transaction-id"] || `${safeId(bug).slice(0, 40)}-${hashText(`${cwd}\n${bug}\n${Date.now()}\n${randomUUID()}`)}`;
-  const run = createRun({ workflow: WORKFLOW, cwd, input: { action: "precheck", transactionId }, metadata: { transactionId, mode: "precheck" } });
+  const run = createRun({ workflow: WORKFLOW, cwd, input: { action: "precheck", transactionId }, metadata: { transactionId, mode: "precheck", artifactRoot: artifactRootSafety.artifactRoot } });
   const dir = transactionDir(transactionId);
   mkdirSync(dir, { recursive: true });
 
   try {
-    phaseStart(run, "precheck", { transactionId, cwd });
+    phaseStart(run, "precheck", { transactionId, cwd, artifactRoot: artifactRootSafety.artifactRoot });
     const multiplicity = classifyBugCount(bug);
-    const git = await gitInfo(cwd);
     const validationCommands = splitValidationCommands(args);
     const userTestCommand = args["user-test-command"] ? String(Array.isArray(args["user-test-command"]) ? args["user-test-command"].at(-1) : args["user-test-command"]).trim() : null;
     const maxRepairIterations = parseMaxRepairs(args["max-repairs"] ?? args.maxRepairIterations);
@@ -710,6 +748,9 @@ async function precheck(args, json) {
         worktreeIsolation: true,
         immutableBaseCommit: git.head,
         externalArtifactsDir: dir,
+        artifactRoot: artifactRootSafety.artifactRoot,
+        targetRoot: artifactRootSafety.targetRoot,
+        externalToTargetRepo: artifactRootSafety.externalToTargetRepo,
         threadPhaseWorkflow: WORKFLOW,
         validationAssertionsMappedBeforeImplementation: true,
       },
@@ -793,6 +834,8 @@ async function precheck(args, json) {
 
 async function solve(args, json) {
   const cwd = resolve(String(args.cwd || process.cwd()));
+  const git = await gitInfo(cwd);
+  validateArtifactRootExternal({ cwd, git });
   if (!args.approved) die("solve requires --approved after explicit precheck confirmation", 1, json);
   if (!args["plan-path"]) die("solve requires --plan-path from precheck", 1, json);
   const planPath = resolve(String(args["plan-path"]));
@@ -999,7 +1042,10 @@ function listTransactionDirs() {
   }
 }
 
-function status(args, json) {
+async function status(args, json) {
+  const cwd = resolve(String(args.cwd || process.cwd()));
+  const git = await gitInfo(cwd);
+  validateArtifactRootExternal({ cwd, git });
   const transactionId = args["transaction-id"];
   const transactionDirArg = args["transaction-dir"];
   const indexPath = registryIndexPath();
