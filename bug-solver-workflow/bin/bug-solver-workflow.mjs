@@ -19,6 +19,8 @@ import { assessPreImplementationGate, normalizeSolvePlanArtifact } from "../lib/
 const WORKFLOW = "bug-solver-workflow";
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 const DEFAULT_ARTIFACT_ROOT = join(AGENT_DIR, "bug-solver-workflow");
+const MAX_COMMAND_OUTPUT_BYTES = 24_000;
+const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 let ARTIFACT_ROOT = resolveArtifactRoot();
 
 function parseArgs(argv) {
@@ -425,6 +427,122 @@ function runGit(cwd, args) {
     child.on("error", (error) => resolve({ status: 1, stdout, stderr: error.message }));
     child.on("close", (code) => resolve({ status: code ?? 0, stdout, stderr }));
   });
+}
+
+function boundedAppend(current, chunk, maxBytes = MAX_COMMAND_OUTPUT_BYTES) {
+  if (Buffer.byteLength(current, "utf8") >= maxBytes) return current;
+  let next = current + chunk;
+  while (Buffer.byteLength(next, "utf8") > maxBytes) next = next.slice(0, -1);
+  return next;
+}
+
+function outputTruncationMetadata(text, totalBytes, maxBytes = MAX_COMMAND_OUTPUT_BYTES) {
+  return {
+    text,
+    bytes: totalBytes,
+    capturedBytes: Buffer.byteLength(text, "utf8"),
+    truncated: totalBytes > Buffer.byteLength(text, "utf8") || totalBytes > maxBytes,
+    maxBytes,
+  };
+}
+
+function commandTimeoutMs() {
+  const parsed = Number.parseInt(String(process.env.PI_BUG_SOLVER_COMMAND_TIMEOUT_MS || DEFAULT_COMMAND_TIMEOUT_MS), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_COMMAND_TIMEOUT_MS;
+}
+
+function runShellCommand(command, cwd) {
+  const startedAt = new Date().toISOString();
+  const timeoutMs = commandTimeoutMs();
+  return new Promise((resolve) => {
+    const child = spawn("sh", ["-c", command], { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    let stdout = "";
+    let stderr = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+    }, timeoutMs);
+    child.stdout.on("data", (d) => { const text = d.toString(); stdoutBytes += Buffer.byteLength(text, "utf8"); stdout = boundedAppend(stdout, text); });
+    child.stderr.on("data", (d) => { const text = d.toString(); stderrBytes += Buffer.byteLength(text, "utf8"); stderr = boundedAppend(stderr, text); });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      resolve({ command, cwd, startedAt, completedAt: new Date().toISOString(), status: 1, signal: null, timedOut, durationMs: Date.now() - Date.parse(startedAt), stdout: outputTruncationMetadata(stdout, stdoutBytes), stderr: outputTruncationMetadata(error.message || stderr, stderrBytes + Buffer.byteLength(error.message || "", "utf8")), timeoutMs });
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ command, cwd, startedAt, completedAt: new Date().toISOString(), status: timedOut ? 124 : (code ?? 0), signal, timedOut, durationMs: Date.now() - Date.parse(startedAt), stdout: outputTruncationMetadata(stdout, stdoutBytes), stderr: outputTruncationMetadata(stderr, stderrBytes), timeoutMs });
+    });
+  });
+}
+
+function appendJsonl(file, record) {
+  mkdirSync(resolve(file, ".."), { recursive: true });
+  writeFileSync(file, `${JSON.stringify(record)}\n`, { encoding: "utf8", flag: "a" });
+}
+
+function baselineCommandList(planArtifact) {
+  const validation = planArtifact?.validation || {};
+  const targeted = validation.userTestCommand || planArtifact?.userTestCommand;
+  const broad = Array.isArray(validation.commands) ? validation.commands : (Array.isArray(planArtifact?.validationCommands) ? planArtifact.validationCommands : []);
+  const commands = [];
+  if (targeted && String(targeted).trim()) commands.push({ kind: "targeted_user_test", command: String(targeted).trim(), order: 0 });
+  for (const command of broad.map(String).map((s) => s.trim()).filter(Boolean)) commands.push({ kind: "broad_validation", command, order: commands.length });
+  return commands;
+}
+
+function classifyBaselineFailures(results) {
+  return results.filter((result) => result.status !== 0).map((result) => ({
+    type: "pre_existing_failure",
+    phase: "baseline-validation",
+    command: result.command,
+    commandKind: result.kind,
+    status: result.status,
+    timedOut: result.timedOut,
+    evidence: { stdout: result.stdout, stderr: result.stderr, completedAt: result.completedAt },
+    rationale: "The command failed against the unmodified transaction-base worktree before implementation, so later matching failures are classified as pre-existing rather than regressions.",
+  }));
+}
+
+async function runBaselineValidation({ transactionId, planArtifact, artifactPaths, worktreePath, baseCommit, callerCwd }) {
+  const startedAt = new Date().toISOString();
+  const commands = baselineCommandList(planArtifact);
+  const before = await gitInfo(worktreePath);
+  const callerBefore = await gitInfo(callerCwd);
+  const results = [];
+  for (const entry of commands) {
+    const result = await runShellCommand(entry.command, worktreePath);
+    results.push({ ...entry, ...result });
+  }
+  const after = await gitInfo(worktreePath);
+  const callerAfter = await gitInfo(callerCwd);
+  const failureClassifications = classifyBaselineFailures(results);
+  const status = commands.length === 0 ? "skipped_no_commands" : (results.some((result) => result.status !== 0) ? "completed_with_pre_existing_failures" : "passed");
+  const record = {
+    schema: "pi-bug-solver-workflow/baseline-validation/v1",
+    transactionId,
+    createdAt: startedAt,
+    completedAt: new Date().toISOString(),
+    status,
+    baseCommit,
+    worktreePath,
+    unmodifiedTransactionBase: true,
+    beforeImplementation: true,
+    commandOrder: commands.map((entry) => ({ kind: entry.kind, command: entry.command })),
+    targetedBeforeBroad: !commands.some((entry, index) => entry.kind === "broad_validation" && commands.slice(index + 1).some((later) => later.kind === "targeted_user_test")),
+    commands: { targeted: commands.filter((entry) => entry.kind === "targeted_user_test").map((entry) => entry.command), broadValidation: commands.filter((entry) => entry.kind === "broad_validation").map((entry) => entry.command), executionOrder: commands.map((entry) => entry.kind), executed: results.map((result) => ({ kind: result.kind, command: result.command, status: result.status, timedOut: result.timedOut, durationMs: result.durationMs })) },
+    commandResults: results,
+    failures: { preExisting: failureClassifications, regressions: [], status: failureClassifications.length ? "pre_existing_failures_detected" : "none" },
+    git: { before, after, callerBefore, callerAfter, worktreeChangedByBaseline: (before.statusShort || "") !== (after.statusShort || ""), callerWorktreeChangedByBaseline: (callerBefore.statusShort || "") !== (callerAfter.statusShort || "") || (callerBefore.head || null) !== (callerAfter.head || null) },
+    boundedOutput: { maxStdoutBytes: MAX_COMMAND_OUTPUT_BYTES, maxStderrBytes: MAX_COMMAND_OUTPUT_BYTES },
+    evidencePaths: { baseline: artifactPaths.baseline, failureClassifications: artifactPaths.failureClassifications, finalReport: artifactPaths.finalReport, state: artifactPaths.state },
+  };
+  writeJson(artifactPaths.baseline, record);
+  for (const classification of failureClassifications) appendJsonl(artifactPaths.failureClassifications, { ...classification, transactionId, createdAt: record.completedAt, baselineEvidencePath: artifactPaths.baseline });
+  return record;
 }
 
 function parseGitStatusSignals(statusShort) {
@@ -1221,6 +1339,7 @@ async function solve(args, json) {
     const file = join(transactionDir(transactionId), "activation-gate.json");
     writeJson(file, activation);
     const statePath = plan.artifacts?.state || join(transactionDir(transactionId), "state.json");
+    let updatedStateForRegistry;
     if (existsSync(statePath)) {
       const state = readJson(statePath);
       const updatedState = {
@@ -1242,14 +1361,46 @@ async function solve(args, json) {
         reports: { ...(state.reports || {}), activationGatePath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata },
       };
       writeJson(statePath, updatedState);
-      updateGlobalRegistry(updatedState);
+      updatedStateForRegistry = updatedState;
       emitArtifact(run, { kind: "file", title: "bug-solver transaction state", path: statePath });
     }
     emitArtifact(run, { kind: "file", title: "bug-solver gated activation", path: file });
     emitArtifact(run, { kind: "file", title: "bug-solver worktree metadata", path: artifactPaths.worktreeMetadata });
     phaseEnd(run, "gated-activation", STATUSES.SUCCESS, { artifactPath: file, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name });
-    completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name });
-    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, status: activation.status, editCapableResourcesCreated: true, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name };
+
+    phaseStart(run, "baseline-validation", { transactionId, worktreePath: worktreeRecord.worktree.path, baselinePath: artifactPaths.baseline });
+    const baseline = await runBaselineValidation({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, baseCommit: integrity.baseCommit, callerCwd: cwd });
+    if (existsSync(statePath)) {
+      const state = readJson(statePath);
+      const updatedState = {
+        ...state,
+        updatedAt: new Date().toISOString(),
+        revision: Number.isInteger(state.revision) ? state.revision + 1 : 1,
+        lifecycle: { ...(state.lifecycle || {}), status: "baseline_validation_recorded", phase: "baseline-validation", terminal: false },
+        validation: { ...(state.validation || {}), baseline: { status: baseline.status, path: artifactPaths.baseline, completedAt: baseline.completedAt, preExistingFailureCount: baseline.failures.preExisting.length, targetedBeforeBroad: baseline.targetedBeforeBroad } },
+        failureClassification: { ...(state.failureClassification || {}), current: baseline.failures.preExisting.at(-1) || null, status: baseline.failures.preExisting.length ? "pre_existing_failures" : "none", classificationsPath: artifactPaths.failureClassifications },
+      };
+      writeJson(statePath, updatedState);
+      updatedStateForRegistry = updatedState;
+    }
+    if (existsSync(artifactPaths.finalReport)) {
+      const finalReport = readJson(artifactPaths.finalReport);
+      writeJson(artifactPaths.finalReport, {
+        ...finalReport,
+        updatedAt: baseline.completedAt,
+        status: "baseline_validation_recorded",
+        commands: baseline.commands,
+        failures: { ...(finalReport.failures || {}), preExisting: baseline.failures.preExisting, regressions: [], status: baseline.failures.status },
+        evidencePaths: { ...(finalReport.evidencePaths || {}), baseline: artifactPaths.baseline, failureClassifications: artifactPaths.failureClassifications },
+      });
+    }
+    if (updatedStateForRegistry) updateGlobalRegistry(updatedStateForRegistry);
+    emitArtifact(run, { kind: "file", title: "bug-solver baseline validation", path: artifactPaths.baseline });
+    emitArtifact(run, { kind: "file", title: "bug-solver failure classifications", path: artifactPaths.failureClassifications });
+    phaseEnd(run, "baseline-validation", baseline.status === "passed" || baseline.status === "skipped_no_commands" || baseline.status === "completed_with_pre_existing_failures" ? STATUSES.SUCCESS : STATUSES.FAILED, { status: baseline.status, commands: baseline.commandResults.length, preExistingFailures: baseline.failures.preExisting.length, targetedBeforeBroad: baseline.targetedBeforeBroad });
+
+    completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, baselineStatus: baseline.status, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name });
+    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, baselineStatus: baseline.status, preExistingFailureCount: baseline.failures.preExisting.length, status: "baseline_validation_recorded", editCapableResourcesCreated: true, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name };
     if (json) console.log(JSON.stringify(result, null, 2));
     else console.log(`gated activation recorded: ${file}`);
   } catch (error) {
@@ -1416,7 +1567,7 @@ function assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd }) {
   }
 
   const lifecycle = state.lifecycle || {};
-  const allowedLifecycleStatuses = new Set(["awaiting_confirmation", "isolated_worktree_ready"]);
+  const allowedLifecycleStatuses = new Set(["awaiting_confirmation", "isolated_worktree_ready", "baseline_validation_recorded"]);
   if (!allowedLifecycleStatuses.has(String(lifecycle.status || "")) || lifecycle.terminal === true) throw new Error(`Transaction state lifecycle is not eligible for solve activation: ${lifecycle.status || "missing"}`);
   if (lifecycle.readOnlyPrecheckComplete !== true || lifecycle.materializationComplete !== true || lifecycle.editingAllowed !== false || lifecycle.confirmationRequired !== true) throw new Error("Transaction state lifecycle does not preserve the durable read-only precheck approval gate.");
   if (state.transaction?.exactlyOneBug !== true || state.transaction?.multiplicity?.likelyMultiple !== false) throw new Error("Transaction state does not authorize exactly one bug for solve activation.");
