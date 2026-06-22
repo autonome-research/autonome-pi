@@ -98,6 +98,7 @@ function buildArgs(params: Record<string, any>, ctx: any): string[] {
 	if (params.approved) args.push("--approved");
 	if (params.background) args.push("--background");
 	if (params.userTestCommand) args.push("--user-test-command", params.userTestCommand);
+	if (params.implementationCommand) args.push("--implementation-command", params.implementationCommand);
 	if (params.maxRepairIterations !== undefined) args.push("--max-repairs", String(params.maxRepairIterations));
 	for (const entry of splitList(params.allowlist)) args.push("--allowlist", entry);
 	for (const command of splitList(params.validationCommands)) args.push("--validation-command", command);
@@ -145,6 +146,7 @@ export default function bugSolverWorkflow(pi: ExtensionAPI) {
 			background: Type.Optional(Type.Boolean({ description: "Start action in the background and return immediately when supported." })),
 			validationCommands: Type.Optional(Type.Array(Type.String(), { description: "Candidate broad validation commands to record for baseline-aware solve planning." })),
 			userTestCommand: Type.Optional(Type.String({ description: "Optional targeted bug-reproduction/user test command to run before broad validation." })),
+			implementationCommand: Type.Optional(Type.String({ description: "Optional edit-capable implementation command to run in the isolated transaction worktree after baseline validation and before post-change validation." })),
 			maxRepairIterations: Type.Optional(Type.Number({ description: "Maximum bounded repair attempts for the transaction. Defaults to 8." })),
 			allowlist: Type.Optional(Type.Array(Type.String(), { description: "Initial file/path allowlist for implementation scope control." })),
 		}),

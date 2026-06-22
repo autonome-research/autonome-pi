@@ -295,6 +295,24 @@ try {
   const backedPostValidation = backedSolveDetails?.postValidationPath ? JSON.parse(readFileSync(backedSolveDetails.postValidationPath, 'utf8')) : undefined;
   log(backedPostValidation?.finalVerification?.status === 'inconclusive' && backedPostValidation?.finalVerification?.bugFixed === false && backedPostValidation?.finalVerification?.implementationBacked === false && backedPostValidation?.finalVerification?.notImplemented === true && backedPostValidation?.finalVerification?.implementationEvidence?.explicitlyResolvedBug === false && backedPostValidation?.finalVerification?.implementationEvidence?.trustedExplicitResolutionRequired === true && backedPostValidation?.finalVerification?.implementationEvidence?.ignoredExplicitResolutionRecords?.some((record) => record.reason === 'not_from_trusted_implementation_or_repair_phase') && backedPostValidation?.finalVerification?.targetedTransitions?.[0]?.fixedByOutcomeTransition === true, 'bug-solver final verification ignores pre-existing or manually injected implementation-evidence.jsonl resolution records for bugFixed');
 
+  const implementationPhaseRepo = join(tmp, 'implementation-phase-solve-repo');
+  mkdirSync(implementationPhaseRepo, { recursive: true });
+  expectExit('bug-solver implementation-phase repo git init', ['git', 'init', '-q'], 0, { cwd: implementationPhaseRepo });
+  expectExit('bug-solver implementation-phase repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: implementationPhaseRepo });
+  expectExit('bug-solver implementation-phase repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: implementationPhaseRepo });
+  writeFileSync(join(implementationPhaseRepo, 'README.md'), 'implementation phase before solve\n');
+  expectExit('bug-solver implementation-phase repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: implementationPhaseRepo });
+  const implementationPhasePrecheck = expectExit('bug-solver workflow precheck for implementation command succeeds', ['node', bugSolverCli, 'precheck', '--cwd', implementationPhaseRepo, '--bug', 'Fix implementation phase command bug', '--user-test-command', 'grep solved README.md', '--json'], 0);
+  let implementationPhasePrecheckDetails;
+  try { implementationPhasePrecheckDetails = JSON.parse(implementationPhasePrecheck.stdout); } catch { implementationPhasePrecheckDetails = undefined; }
+  const implementationPhaseSolve = expectExit('bug-solver workflow approved solve runs implementation command between baseline and post validation', ['node', bugSolverCli, 'solve', '--cwd', implementationPhaseRepo, '--plan-path', implementationPhasePrecheckDetails?.planPath || join(tmp, 'missing-implementation-phase-plan.json'), '--approved', '--implementation-command', 'printf "solved\\n" >> README.md', '--json'], 0);
+  let implementationPhaseSolveDetails;
+  try { implementationPhaseSolveDetails = JSON.parse(implementationPhaseSolve.stdout); } catch { implementationPhaseSolveDetails = undefined; }
+  const implementationPhaseEvidenceRecords = implementationPhaseSolveDetails?.implementationEvidencePath ? readFileSync(implementationPhaseSolveDetails.implementationEvidencePath, 'utf8').trim().split(/\n+/).filter(Boolean).map((line) => JSON.parse(line)) : [];
+  const implementationPhaseRecord = implementationPhaseEvidenceRecords.find((record) => record.phase === 'implementation' && record.runnerOwnedImplementationMetadata === true);
+  const implementationPhasePostValidation = implementationPhaseSolveDetails?.postValidationPath ? JSON.parse(readFileSync(implementationPhaseSolveDetails.postValidationPath, 'utf8')) : undefined;
+  log(implementationPhaseRecord?.editCapable === true && implementationPhaseRecord?.commandProvided === true && implementationPhaseRecord?.worktreeChangedAfterBaseline === true && implementationPhaseRecord?.changedFiles?.includes('README.md') && implementationPhasePostValidation?.finalVerification?.bugFixed === true && implementationPhasePostValidation?.finalVerification?.implementationBacked === true, 'bug-solver solve runs edit-capable implementation phase after baseline and ties implementation evidence to isolated-worktree git state before outcome-based final verification');
+
   const gatedRepeatSolve = expectExit('bug-solver workflow repeated approved solve reuses isolated worktree safely', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', gatedPrecheckDetails?.planPath || join(tmp, 'missing-gated-plan.json'), '--approved', '--json'], 0);
   let gatedRepeatSolveDetails;
   try { gatedRepeatSolveDetails = JSON.parse(gatedRepeatSolve.stdout); } catch { gatedRepeatSolveDetails = undefined; }
