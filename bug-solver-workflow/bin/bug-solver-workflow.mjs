@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative as importPathRelative, resolve } from "node:path";
 import {
@@ -21,6 +21,7 @@ const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "age
 const DEFAULT_ARTIFACT_ROOT = join(AGENT_DIR, "bug-solver-workflow");
 const MAX_COMMAND_OUTPUT_BYTES = 24_000;
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
+const RUNNER_EVIDENCE_SECRET = randomUUID();
 let ARTIFACT_ROOT = resolveArtifactRoot();
 
 function parseArgs(argv) {
@@ -60,6 +61,47 @@ function safeId(value) {
 
 function hashText(text, len = 10) {
   return createHash("sha256").update(String(text)).digest("hex").slice(0, len);
+}
+
+function stableJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+}
+
+function runnerEvidencePayload(record) {
+  const { runnerEvidenceSeal, runnerEvidenceSealVersion, runnerEvidenceTrustBoundary, ...payload } = record || {};
+  return payload;
+}
+
+function sealRunnerOwnedEvidence(record) {
+  const sealed = {
+    ...record,
+    runnerEvidenceSealVersion: "pi-bug-solver-runner-owned-evidence-seal/v1",
+    runnerEvidenceTrustBoundary: "Created by the bug-solver runner after the edit-capable command completed; validation/user-test commands do not receive the in-memory seal secret and cannot mint trusted runner-owned implementation metadata.",
+  };
+  sealed.runnerEvidenceSeal = createHmac("sha256", RUNNER_EVIDENCE_SECRET).update(stableJson(runnerEvidencePayload(sealed))).digest("hex");
+  return sealed;
+}
+
+function hasValidRunnerOwnedEvidenceSeal(record) {
+  if (!record || record.runnerEvidenceSealVersion !== "pi-bug-solver-runner-owned-evidence-seal/v1" || typeof record.runnerEvidenceSeal !== "string") return false;
+  const expected = createHmac("sha256", RUNNER_EVIDENCE_SECRET).update(stableJson(runnerEvidencePayload(record))).digest("hex");
+  return record.runnerEvidenceSeal === expected;
+}
+
+function trustedRunnerOwnedImplementationRecord(record, { baseline } = {}) {
+  const phase = String(record?.phase || record?.workflowPhase || record?.producedByPhase || "");
+  const createdAt = parseRecordTime(record?.createdAt || record?.completedAt);
+  const baselineCompletedAt = parseRecordTime(baseline?.completedAt);
+  const recordWorktreePath = record?.worktreePath || record?.isolatedWorktreePath || record?.worktree?.path;
+  return record?.runnerOwnedImplementationMetadata === true
+    && record?.validationCommandProduced !== true
+    && record?.transactionId === baseline?.transactionId
+    && baselineCompletedAt && createdAt && createdAt > baselineCompletedAt
+    && ["implementation", "repair", "repair-attempt", "implementation-repair", "bounded-repair-loop"].includes(phase)
+    && recordWorktreePath && baseline?.worktreePath && resolve(String(recordWorktreePath)) === resolve(String(baseline.worktreePath))
+    && hasValidRunnerOwnedEvidenceSeal(record);
 }
 
 function splitValues(value) {
@@ -946,11 +988,8 @@ function trustedExplicitResolutionRecord(record, { baseline, baselineAfter, post
   const claimedChanged = record.implementationChangedWorktree === true || record.worktreeChangedAfterBaseline === true || changedFiles.length > 0 || Boolean(commit && commit !== baselineAfter?.head) || changedSnapshot;
   if (!claimedChanged) return { trusted: false, reason: "not_tied_to_isolated_worktree_change_or_commit" };
 
-  const runnerOwnedMetadata = record.runnerOwnedImplementationMetadata === true
-    && record.validationCommandProduced !== true
-    && Number(record.runnerProcessPid) === process.pid
-    && ["implementation", "repair", "repair-attempt", "implementation-repair", "bounded-repair-loop"].includes(phase);
-  if (runnerOwnedMetadata) return { trusted: true, reason: "trusted_runner_owned_implementation_or_repair_metadata" };
+  const runnerOwnedMetadata = trustedRunnerOwnedImplementationRecord(record, { baseline });
+  if (runnerOwnedMetadata) return { trusted: true, reason: "trusted_runner_owned_implementation_or_repair_metadata_with_runner_seal" };
 
   if (!actualChangedAfterBaseline) return { trusted: false, reason: "claimed_change_not_corroborated_by_isolated_worktree_git_evidence" };
   if (commit && postBefore?.head && commit !== postBefore.head) return { trusted: false, reason: "claimed_commit_not_observed_in_isolated_worktree" };
@@ -976,18 +1015,7 @@ function commandPathOverlapsChangedFile(commandPath, changedFile) {
 
 function causallyRelevantImplementationChange({ records, commands = [], baseline, baselineAfter, postBefore, actualChangedFiles }) {
   const targetedPathRefs = uniqueStrings(commands.filter((entry) => entry.kind === "targeted_user_test").flatMap((entry) => commandReferencedPaths(entry.command)));
-  const trustedRunnerRecords = records.filter((record) => {
-    const phase = String(record?.phase || record?.workflowPhase || record?.producedByPhase || "");
-    const recordWorktreePath = record?.worktreePath || record?.isolatedWorktreePath || record?.worktree?.path;
-    const createdAt = parseRecordTime(record?.createdAt || record?.completedAt);
-    const baselineCompletedAt = parseRecordTime(baseline?.completedAt);
-    return record?.runnerOwnedImplementationMetadata === true
-      && record?.validationCommandProduced !== true
-      && record?.transactionId === baseline?.transactionId
-      && baselineCompletedAt && createdAt && createdAt > baselineCompletedAt
-      && ["implementation", "repair", "repair-attempt", "implementation-repair", "bounded-repair-loop"].includes(phase)
-      && recordWorktreePath && baseline?.worktreePath && resolve(String(recordWorktreePath)) === resolve(String(baseline.worktreePath));
-  });
+  const trustedRunnerRecords = records.filter((record) => trustedRunnerOwnedImplementationRecord(record, { baseline }));
   const runnerChangedFiles = uniqueStrings([...actualChangedFiles, ...trustedRunnerRecords.flatMap((record) => Array.isArray(record.changedFiles) ? record.changedFiles : [])]);
   const matchingChangedFiles = runnerChangedFiles.filter((file) => targetedPathRefs.some((ref) => commandPathOverlapsChangedFile(ref, file)));
   const actualWorktreeChanged = gitSnapshotChanged(baselineAfter, postBefore) || actualChangedFiles.length > 0;
@@ -1014,7 +1042,7 @@ async function implementationBackedEvidence({ baseline, postBefore, postAfter, a
   const worktreeChangedByPostValidation = gitSnapshotChanged(postBefore, postAfter);
   const allowlistDecisions = readJsonlRecords(artifactPaths.allowlistDecisions);
   const rejectedOutOfScope = allowlistDecisions.filter((record) => record?.type === "out_of_scope_change_rejected");
-  const allowlistImplementationRecords = records.filter((record) => record?.runnerOwnedImplementationMetadata === true && record?.type === "implementation_change" && record?.allowlist);
+  const allowlistImplementationRecords = records.filter((record) => trustedRunnerOwnedImplementationRecord(record, { baseline }) && record?.type === "implementation_change" && record?.allowlist);
   const latestAllowlistImplementation = allowlistImplementationRecords.sort((a, b) => (parseRecordTime(a.createdAt || a.completedAt) || 0) - (parseRecordTime(b.createdAt || b.completedAt) || 0)).at(-1);
   const allowlistAccepted = latestAllowlistImplementation ? latestAllowlistImplementation.allowlist?.accepted === true : rejectedOutOfScope.length === 0;
   const activeRejectedOutOfScope = allowlistAccepted ? [] : rejectedOutOfScope;
@@ -1249,7 +1277,7 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
     });
   }
   const finalAllowlist = evaluateAllowlist({ changedFiles, planArtifact, artifactPaths, decisionPrefixBytes: allowlistDecisionPrefixBytes, acceptanceWindowStartedAt: startedAt });
-  const record = {
+  const record = sealRunnerOwnedEvidence({
     schema: "pi-bug-solver-workflow/implementation-evidence/v1",
     type: "implementation_change",
     transactionId,
@@ -1297,7 +1325,7 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
     },
     allowlistAcceptanceWindow: { startedAt, decisionPrefixBytes: allowlistDecisionPrefixBytes, rule: "Only allowlist expansions durably present in allowlist-decisions.jsonl before this implementation acceptance window are accepted for this attempt; later expansions become eligible for a subsequent repair attempt." },
     note: command ? "Implementation command ran in the isolated transaction worktree after baseline validation and before post-change validation with durable bug/contract/baseline/allowlist/evidence context supplied via PI_BUG_SOLVER_IMPLEMENTATION_CONTEXT." : "No implementation command was supplied; the edit-capable implementation phase still recorded isolated-worktree git state between baseline and post-change validation.",
-  };
+  });
   appendJsonl(artifactPaths.implementationEvidence, record);
   if (callerMutation.detected && failOnCallerMutation) {
     appendJsonl(artifactPaths.failureClassifications, callerMutation.classification);
