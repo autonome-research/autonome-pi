@@ -483,8 +483,8 @@ try {
     return { precheckDetails, interruptedDetails, statusAfterInterruptDetails, repeatedDetails, statusAfterRepeatDetails };
   }
 
-  const commitInterrupt = await runInterruptedFinalPhaseRegression({ name: 'interrupt-after-transaction-commit', interruptEnv: { PI_BUG_SOLVER_INTERRUPT_SOLVE_AFTER: 'transaction_commit' }, interruptedExit: 1, repeatedExit: 1 });
-  log(commitInterrupt.interruptedDetails?.ok === false && commitInterrupt.statusAfterInterruptDetails?.status !== 'completed' && commitInterrupt.statusAfterInterruptDetails?.completionIntegrity?.status !== 'verified' && commitInterrupt.repeatedDetails?.ok === false && commitInterrupt.statusAfterRepeatDetails?.status !== 'completed' && commitInterrupt.statusAfterRepeatDetails?.completionIntegrity?.status !== 'verified', 'bug-solver injected interruption after transaction commit creation leaves durable state recoverable/non-terminal and repeated solve does not falsely complete or corrupt it');
+  const commitInterrupt = await runInterruptedFinalPhaseRegression({ name: 'interrupt-after-transaction-commit', interruptEnv: { PI_BUG_SOLVER_INTERRUPT_SOLVE_AFTER: 'transaction_commit' }, interruptedExit: 1, repeatedExit: 0 });
+  log(commitInterrupt.interruptedDetails?.ok === false && commitInterrupt.statusAfterInterruptDetails?.partialCompletion?.status === 'final_report_complete_state_incomplete' && commitInterrupt.repeatedDetails?.status === 'completed_recovered' && commitInterrupt.repeatedDetails?.recovered === true && commitInterrupt.statusAfterRepeatDetails?.status === 'completed' && commitInterrupt.statusAfterRepeatDetails?.completionIntegrity?.status === 'verified', 'bug-solver injected interruption after transaction commit creation recovers from verified final-report evidence on repeated solve');
 
   const beforeCleanupInterrupt = await runInterruptedFinalPhaseRegression({ name: 'interrupt-before-cleanup-final-report', interruptEnv: { PI_BUG_SOLVER_INTERRUPT_SOLVE_BEFORE: 'cleanup_final_report_update' }, interruptedExit: 1, repeatedExit: 1 });
   log(beforeCleanupInterrupt.interruptedDetails?.ok === false && beforeCleanupInterrupt.statusAfterInterruptDetails?.status !== 'completed' && beforeCleanupInterrupt.statusAfterInterruptDetails?.completionIntegrity?.status !== 'verified' && beforeCleanupInterrupt.repeatedDetails?.ok === false && beforeCleanupInterrupt.statusAfterRepeatDetails?.status !== 'completed' && beforeCleanupInterrupt.statusAfterRepeatDetails?.completionIntegrity?.status !== 'verified', 'bug-solver injected interruption before cleanup/final report update preserves non-completed durable state and repeated solve does not advertise completion');
@@ -567,6 +567,73 @@ try {
   const allowlistExpansionSolve = expectExit('bug-solver workflow accepts justified allowlist expansion', ['node', bugSolverCli, 'solve', '--cwd', allowlistExpansionRepo, '--plan-path', allowlistExpansionPrecheckDetails?.planPath || join(tmp, 'missing-allowlist-expansion-plan.json'), '--approved', '--implementation-command', 'mkdir -p src && touch src/out.txt', '--json'], 0);
   let allowlistExpansionSolveDetails;
   try { allowlistExpansionSolveDetails = JSON.parse(allowlistExpansionSolve.stdout); } catch { allowlistExpansionSolveDetails = undefined; }
+
+  const implementationCommitRepo = join(tmp, 'implementation-created-commit-repo');
+  mkdirSync(implementationCommitRepo, { recursive: true });
+  expectExit('bug-solver implementation-created-commit repo git init', ['git', 'init', '-q'], 0, { cwd: implementationCommitRepo });
+  expectExit('bug-solver implementation-created-commit repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: implementationCommitRepo });
+  expectExit('bug-solver implementation-created-commit repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: implementationCommitRepo });
+  writeFileSync(join(implementationCommitRepo, 'README.md'), 'implementation commit before solve\n');
+  expectExit('bug-solver implementation-created-commit repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: implementationCommitRepo });
+  const implementationCommitPrecheck = expectExit('bug-solver workflow precheck for implementation-created commit guard succeeds', ['node', bugSolverCli, 'precheck', '--cwd', implementationCommitRepo, '--bug', 'Fix implementation-created commit bug', '--user-test-command', 'grep solved README.md', '--json'], 0);
+  let implementationCommitPrecheckDetails;
+  try { implementationCommitPrecheckDetails = JSON.parse(implementationCommitPrecheck.stdout); } catch { implementationCommitPrecheckDetails = undefined; }
+  const implementationCommitSolve = expectExit('bug-solver workflow refuses implementation-created commits before final report', ['node', bugSolverCli, 'solve', '--cwd', implementationCommitRepo, '--plan-path', implementationCommitPrecheckDetails?.planPath || join(tmp, 'missing-implementation-commit-plan.json'), '--approved', '--implementation-command', 'printf "solved\\n" >> README.md && git add README.md && git -c user.name=Impl -c user.email=impl@example.com commit -q -m impl', '--json'], 1);
+  log(/HEAD is already ahead|Implementation commands must leave commit creation/i.test(implementationCommitSolve.stdout || implementationCommitSolve.stderr || ''), 'bug-solver refuses implementation commands that create their own commits instead of reporting accepted_without_commit');
+
+  const postValidationMutationRepo = join(tmp, 'post-validation-mutation-repo');
+  mkdirSync(postValidationMutationRepo, { recursive: true });
+  expectExit('bug-solver post-validation mutation repo git init', ['git', 'init', '-q'], 0, { cwd: postValidationMutationRepo });
+  expectExit('bug-solver post-validation mutation repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: postValidationMutationRepo });
+  expectExit('bug-solver post-validation mutation repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: postValidationMutationRepo });
+  writeFileSync(join(postValidationMutationRepo, 'README.md'), 'post validation mutation before solve\n');
+  expectExit('bug-solver post-validation mutation repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: postValidationMutationRepo });
+  const postValidationMutationScript = join(postValidationMutationRepo, 'repro.js');
+  writeFileSync(postValidationMutationScript, `const fs=require('fs');\nconst solved=fs.readFileSync('README.md','utf8').includes('solved');\nif (solved) fs.writeFileSync('validation-generated.txt','untrusted validation artifact\\n');\nprocess.exit(solved ? 0 : 1);\n`);
+  expectExit('bug-solver post-validation mutation script commit', ['sh', '-c', 'git add repro.js && git commit -q -m repro'], 0, { cwd: postValidationMutationRepo });
+  const postValidationMutationPrecheck = expectExit('bug-solver workflow precheck for post-validation mutation guard succeeds', ['node', bugSolverCli, 'precheck', '--cwd', postValidationMutationRepo, '--bug', 'Fix post validation mutation bug', '--user-test-command', 'node repro.js', '--max-repairs', '0', '--json'], 0);
+  let postValidationMutationPrecheckDetails;
+  try { postValidationMutationPrecheckDetails = JSON.parse(postValidationMutationPrecheck.stdout); } catch { postValidationMutationPrecheckDetails = undefined; }
+  expectExit('bug-solver workflow refuses post-validation worktree mutations before commit', ['node', bugSolverCli, 'solve', '--cwd', postValidationMutationRepo, '--plan-path', postValidationMutationPrecheckDetails?.planPath || join(tmp, 'missing-post-validation-mutation-plan.json'), '--approved', '--implementation-command', 'printf "solved\\n" >> README.md', '--json'], 1);
+  const postValidationMutationPlan = postValidationMutationPrecheckDetails?.planPath ? JSON.parse(readFileSync(postValidationMutationPrecheckDetails.planPath, 'utf8')) : undefined;
+  const postValidationMutationEvidence = postValidationMutationPlan?.evidencePaths?.postValidation ? JSON.parse(readFileSync(postValidationMutationPlan.evidencePaths.postValidation, 'utf8')) : undefined;
+  const postValidationMutationCommitCheck = run('bug-solver post-validation mutation branch commit check', ['git', 'log', '--oneline', '--all', '--', 'validation-generated.txt'], { cwd: postValidationMutationRepo });
+  log(postValidationMutationEvidence?.git?.worktreeChangedByPostValidation === true && postValidationMutationEvidence?.finalVerification?.postValidationMutation === true && postValidationMutationCommitCheck.stdout.trim() === '', 'bug-solver classifies post-change validation mutations and does not commit validation-generated files');
+
+  const postValidationSameFileRepo = join(tmp, 'post-validation-same-file-repo');
+  mkdirSync(postValidationSameFileRepo, { recursive: true });
+  expectExit('bug-solver post-validation same-file repo git init', ['git', 'init', '-q'], 0, { cwd: postValidationSameFileRepo });
+  expectExit('bug-solver post-validation same-file repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: postValidationSameFileRepo });
+  expectExit('bug-solver post-validation same-file repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: postValidationSameFileRepo });
+  writeFileSync(join(postValidationSameFileRepo, 'README.md'), 'same file before solve\n');
+  expectExit('bug-solver post-validation same-file repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: postValidationSameFileRepo });
+  const postValidationSameFileScript = join(postValidationSameFileRepo, 'repro.js');
+  writeFileSync(postValidationSameFileScript, `const fs=require('fs');\nconst s=fs.readFileSync('README.md','utf8');\nif (!s.includes('solved')) process.exit(1);\nfs.appendFileSync('README.md','validation-mutated-same-file\\n');\nprocess.exit(0);\n`);
+  expectExit('bug-solver post-validation same-file script commit', ['sh', '-c', 'git add repro.js && git commit -q -m repro'], 0, { cwd: postValidationSameFileRepo });
+  const postValidationSameFilePrecheck = expectExit('bug-solver workflow precheck for same-file post-validation mutation guard succeeds', ['node', bugSolverCli, 'precheck', '--cwd', postValidationSameFileRepo, '--bug', 'Fix same-file post validation mutation bug', '--user-test-command', 'node repro.js', '--max-repairs', '0', '--json'], 0);
+  let postValidationSameFilePrecheckDetails;
+  try { postValidationSameFilePrecheckDetails = JSON.parse(postValidationSameFilePrecheck.stdout); } catch { postValidationSameFilePrecheckDetails = undefined; }
+  expectExit('bug-solver workflow refuses same-file post-validation mutations before commit', ['node', bugSolverCli, 'solve', '--cwd', postValidationSameFileRepo, '--plan-path', postValidationSameFilePrecheckDetails?.planPath || join(tmp, 'missing-post-validation-same-file-plan.json'), '--approved', '--implementation-command', 'printf "solved\\n" >> README.md', '--json'], 1);
+  const postValidationSameFilePlan = postValidationSameFilePrecheckDetails?.planPath ? JSON.parse(readFileSync(postValidationSameFilePrecheckDetails.planPath, 'utf8')) : undefined;
+  const postValidationSameFileEvidence = postValidationSameFilePlan?.evidencePaths?.postValidation ? JSON.parse(readFileSync(postValidationSameFilePlan.evidencePaths.postValidation, 'utf8')) : undefined;
+  const postValidationSameFileCommitCheck = run('bug-solver post-validation same-file commit content check', ['git', 'log', '--all', '-S', 'validation-mutated-same-file', '--oneline', '--', 'README.md'], { cwd: postValidationSameFileRepo });
+  log(postValidationSameFileEvidence?.git?.worktreeChangedByPostValidation === true && postValidationSameFileEvidence?.finalVerification?.postValidationMutation === true && postValidationSameFileCommitCheck.stdout.trim() === '', 'bug-solver detects same-status same-file post-validation content mutations and does not commit them');
+
+  const interruptedCommitRepo = join(tmp, 'interrupted-commit-repo');
+  mkdirSync(interruptedCommitRepo, { recursive: true });
+  expectExit('bug-solver interrupted commit repo git init', ['git', 'init', '-q'], 0, { cwd: interruptedCommitRepo });
+  expectExit('bug-solver interrupted commit repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: interruptedCommitRepo });
+  expectExit('bug-solver interrupted commit repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: interruptedCommitRepo });
+  writeFileSync(join(interruptedCommitRepo, 'README.md'), 'interrupted before solve\n');
+  expectExit('bug-solver interrupted commit repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: interruptedCommitRepo });
+  const interruptedCommitPrecheck = expectExit('bug-solver workflow precheck for interrupted transaction commit recovery succeeds', ['node', bugSolverCli, 'precheck', '--cwd', interruptedCommitRepo, '--bug', 'Fix interrupted commit recovery bug', '--user-test-command', 'grep solved README.md', '--json'], 0);
+  let interruptedCommitPrecheckDetails;
+  try { interruptedCommitPrecheckDetails = JSON.parse(interruptedCommitPrecheck.stdout); } catch { interruptedCommitPrecheckDetails = undefined; }
+  expectExit('bug-solver injected interruption after transaction commit is recorded', ['node', bugSolverCli, 'solve', '--cwd', interruptedCommitRepo, '--plan-path', interruptedCommitPrecheckDetails?.planPath || join(tmp, 'missing-interrupted-commit-plan.json'), '--approved', '--implementation-command', 'printf "solved\\n" >> README.md', '--json'], 1, { env: { PI_BUG_SOLVER_INTERRUPT_SOLVE_AFTER: 'transaction_commit' } });
+  const interruptedCommitRecovery = expectExit('bug-solver repeated solve recovers after interrupted transaction commit', ['node', bugSolverCli, 'solve', '--cwd', interruptedCommitRepo, '--plan-path', interruptedCommitPrecheckDetails?.planPath || join(tmp, 'missing-interrupted-commit-plan.json'), '--approved', '--implementation-command', 'printf "solved-again\\n" >> README.md', '--json'], 0);
+  let interruptedCommitRecoveryDetails;
+  try { interruptedCommitRecoveryDetails = JSON.parse(interruptedCommitRecovery.stdout); } catch { interruptedCommitRecoveryDetails = undefined; }
+  log((interruptedCommitRecoveryDetails?.status === 'completed_recovered' || interruptedCommitRecoveryDetails?.status === 'already_completed') && interruptedCommitRecoveryDetails?.outcome?.transactionCommit, 'bug-solver repeated solve recovers durable final report after interruption following transaction commit');
   const allowlistExpansionRecords = allowlistExpansionSolveDetails?.implementationEvidencePath ? readFileSync(allowlistExpansionSolveDetails.implementationEvidencePath, 'utf8').trim().split(/\n+/).filter(Boolean).map((line) => JSON.parse(line)) : [];
   const allowlistExpansionRecord = allowlistExpansionRecords.find((record) => record.phase === 'implementation' && record.runnerOwnedImplementationMetadata === true);
   const allowlistExpansionReport = allowlistExpansionSolveDetails?.postValidationPath ? JSON.parse(readFileSync(allowlistExpansionSolveDetails.postValidationPath, 'utf8')) : undefined;

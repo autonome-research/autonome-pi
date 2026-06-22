@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, linkSync, lstatSync, mkdirSync, readlinkSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative as importPathRelative, resolve } from "node:path";
@@ -1446,6 +1446,7 @@ function finalVerificationProvesBugFixed(finalVerification) {
 }
 
 function postValidationNeedsRepair(postValidation) {
+  if (postValidation?.finalVerification?.postValidationMutation === true) return false;
   return (postValidation?.comparison?.newlyRegressed?.length || 0) > 0 || postValidation?.finalVerification?.status === "failed";
 }
 
@@ -1647,23 +1648,81 @@ function recordRepairCapReached({ transactionId, artifactPaths, statePath, final
   return record;
 }
 
+function sha256File(file) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(file);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(hash.digest("hex")));
+  });
+}
+
+async function worktreeContentFingerprint(cwd) {
+  const head = await runGit(cwd, ["rev-parse", "HEAD"]);
+  const diff = await runGit(cwd, ["diff", "--binary", "HEAD"]);
+  const untracked = await runGit(cwd, ["ls-files", "--others", "--exclude-standard", "-z"]);
+  if (head.status !== 0 || diff.status !== 0 || untracked.status !== 0) throw new Error(`Unable to fingerprint transaction worktree content: ${(head.stderr || diff.stderr || untracked.stderr || head.stdout || diff.stdout || untracked.stdout).trim()}`);
+  const untrackedFiles = untracked.stdout.split("\0").map((s) => normalizeChangedFilePath(s.trim())).filter(Boolean).sort();
+  const untrackedHashes = [];
+  for (const file of untrackedFiles) {
+    const absolute = resolve(cwd, file);
+    const stat = lstatSync(absolute);
+    if (stat.isFile()) untrackedHashes.push({ file, type: "file", size: stat.size, sha256: await sha256File(absolute) });
+    else if (stat.isSymbolicLink()) untrackedHashes.push({ file, type: "symlink", target: readlinkSync(absolute), sha256: createHash("sha256").update(readlinkSync(absolute)).digest("hex") });
+    else untrackedHashes.push({ file, type: stat.isDirectory() ? "directory" : stat.isFIFO() ? "fifo" : stat.isSocket() ? "socket" : stat.isBlockDevice() ? "block-device" : stat.isCharacterDevice() ? "character-device" : "special", mode: stat.mode, size: stat.size });
+  }
+  const payload = { head: head.stdout.trim(), diff: { sha256: createHash("sha256").update(diff.stdout).digest("hex"), bytes: Buffer.byteLength(diff.stdout, "utf8") }, untracked: untrackedHashes };
+  return { ...payload, hash: createHash("sha256").update(stableJson(payload)).digest("hex") };
+}
+
 async function runPostChangeValidation({ transactionId, planArtifact, artifactPaths, worktreePath, baseline }) {
   const startedAt = new Date().toISOString();
   const commands = baselineCommandList(planArtifact);
   const before = await gitInfo(worktreePath);
+  const beforeFingerprint = await worktreeContentFingerprint(worktreePath);
   const results = [];
   for (const entry of commands) {
     const result = await runShellCommand(entry.command, worktreePath);
     results.push({ ...entry, ...result });
   }
-  const after = await gitInfo(worktreePath);
+  const afterCommand = await gitInfo(worktreePath);
+  const afterFingerprint = await worktreeContentFingerprint(worktreePath);
+  const postValidationMutatedWorktree = beforeFingerprint.hash !== afterFingerprint.hash;
+  const after = afterCommand;
   const comparison = compareValidationResults({ baselineResults: baseline?.commandResults || [], postResults: results });
   const implementationEvidence = await implementationBackedEvidence({ baseline, postBefore: before, postAfter: after, artifactPaths, commands });
-  const finalVerification = buildFinalVerification({ commands, baselineResults: baseline?.commandResults || [], postResults: results, comparison, implementationEvidence });
-  const classifications = classifyPostValidationFailures(comparison, results, artifactPaths, finalVerification);
-  const status = commands.length === 0
-    ? "skipped_no_commands"
-    : (comparison.newlyRegressed.length ? "completed_with_regressions" : (finalVerification.status === "failed" ? "completed_with_unfixed_targeted_failures" : (finalVerification.status === "inconclusive" ? (finalVerification.notImplemented ? "inconclusive_not_implemented" : "inconclusive_not_reproduced") : "passed_without_new_regressions")));
+  let finalVerification = buildFinalVerification({ commands, baselineResults: baseline?.commandResults || [], postResults: results, comparison, implementationEvidence });
+  const postValidationMutationClassification = postValidationMutatedWorktree ? withFailureCategory({
+    type: "post_change_validation_mutated_worktree",
+    phase: "post-change-validation",
+    status: "failed_post_validation_integrity",
+    category: FAILURE_CATEGORIES.GIT_WORKTREE.id,
+    categoryLabel: FAILURE_CATEGORIES.GIT_WORKTREE.label,
+    commandCount: commands.length,
+    before: { head: before.head || null, statusShort: before.statusShort || "" },
+    afterCommand: { head: afterCommand.head || null, statusShort: afterCommand.statusShort || "" },
+    fingerprintBefore: { hash: beforeFingerprint.hash, untracked: beforeFingerprint.untracked.map((entry) => entry.file) },
+    fingerprintAfter: { hash: afterFingerprint.hash, untracked: afterFingerprint.untracked.map((entry) => entry.file) },
+    neutralization: { attempted: false, status: "not_attempted_terminal_integrity_failure", reason: "Validation-produced content is preserved for inspection but is never trusted or committed as implementation evidence." },
+    evidencePaths: { postValidation: artifactPaths.postValidation, failureClassifications: artifactPaths.failureClassifications },
+  }, FAILURE_CATEGORIES.GIT_WORKTREE, { postValidation: artifactPaths.postValidation, failureClassifications: artifactPaths.failureClassifications }) : null;
+  if (postValidationMutatedWorktree) {
+    finalVerification = {
+      ...finalVerification,
+      status: "failed",
+      bugFixed: false,
+      postValidationMutation: true,
+      reason: "post_change_validation_mutated_worktree",
+      message: "Post-change validation mutated the isolated transaction worktree; validation-produced files are untrusted and cannot be committed as implementation evidence.",
+    };
+  }
+  const classifications = [...classifyPostValidationFailures(comparison, results, artifactPaths, finalVerification), ...(postValidationMutationClassification ? [postValidationMutationClassification] : [])];
+  const status = postValidationMutatedWorktree
+    ? "failed_post_validation_integrity"
+    : (commands.length === 0
+      ? "skipped_no_commands"
+      : (comparison.newlyRegressed.length ? "completed_with_regressions" : (finalVerification.status === "failed" ? "completed_with_unfixed_targeted_failures" : (finalVerification.status === "inconclusive" ? (finalVerification.notImplemented ? "inconclusive_not_implemented" : "inconclusive_not_reproduced") : "passed_without_new_regressions"))));
   const record = {
     schema: "pi-bug-solver-workflow/post-change-validation/v1",
     transactionId,
@@ -1682,13 +1741,13 @@ async function runPostChangeValidation({ transactionId, planArtifact, artifactPa
     finalVerification,
     failures: { classifications, fixed: comparison.fixed, unchangedPreExisting: comparison.unchangedPreExisting, regressions: comparison.newlyRegressed, status: classifications.length ? "classified" : "none" },
     implementationEvidence,
-    git: { before, after, worktreeChangedByPostValidation: (before.statusShort || "") !== (after.statusShort || "") },
+    git: { before, afterCommand, after, worktreeChangedByPostValidation: postValidationMutatedWorktree, postValidationMutationTrusted: false, fingerprintBefore: beforeFingerprint, fingerprintAfter: afterFingerprint, neutralization: { attempted: false, status: "not_attempted_terminal_integrity_failure" } },
     boundedOutput: { maxStdoutBytes: MAX_COMMAND_OUTPUT_BYTES, maxStderrBytes: MAX_COMMAND_OUTPUT_BYTES },
     evidencePaths: { baseline: artifactPaths.baseline, postValidation: artifactPaths.postValidation, failureClassifications: artifactPaths.failureClassifications, finalReport: artifactPaths.finalReport, state: artifactPaths.state },
   };
   writeJson(artifactPaths.postValidation, record);
   for (const classification of classifications) appendJsonl(artifactPaths.failureClassifications, { ...classification, transactionId, createdAt: record.completedAt, postValidationEvidencePath: artifactPaths.postValidation });
-  appendJsonl(artifactPaths.implementationEvidence, { type: "post_change_validation", transactionId, createdAt: record.completedAt, commands: record.commands, outcome: record.finalVerification, comparison: record.outcomeComparison, evidencePath: artifactPaths.postValidation });
+  appendJsonl(artifactPaths.implementationEvidence, { type: "post_change_validation", transactionId, createdAt: record.completedAt, commands: record.commands, outcome: record.finalVerification, comparison: record.outcomeComparison, worktreeChangedByPostValidation: postValidationMutatedWorktree, validationProducedMutationTrustedForCommit: false, evidencePath: artifactPaths.postValidation });
   return record;
 }
 
@@ -2743,11 +2802,29 @@ function completedSolveResult({ run, transactionId, artifactPaths, state, finalR
   };
 }
 
+function acceptedChangedFilesForCommit({ implementation, repairRecords = [] }) {
+  return uniqueStrings([
+    ...(implementation?.allowlist?.accepted === true && implementation?.status !== "blocked_out_of_scope_changes" ? (implementation?.changedFiles || []) : []),
+    ...repairRecords.filter((record) => record?.status === "implementation_recorded" && record?.allowlistAccepted === true).flatMap((record) => record?.changedFiles || []),
+  ].map(normalizeChangedFilePath).filter(Boolean));
+}
+
 async function createTransactionCommit({ transactionId, planArtifact, artifactPaths, worktreePath, callerCwd, baseCommit, branchName, postValidation, implementation, repairRecords }) {
   const startedAt = new Date().toISOString();
   const before = await gitInfo(worktreePath);
   const callerBefore = callerCwd ? await gitInfo(callerCwd) : null;
+  if (postValidation?.git?.worktreeChangedByPostValidation === true) throw new Error(`Refusing to commit after post-change validation mutated the transaction worktree; evidence: ${artifactPaths.postValidation}`);
+  if (before.head && before.head !== baseCommit) {
+    const committedAhead = await runGit(worktreePath, ["diff", "--name-only", `${baseCommit}..HEAD`]);
+    const committedFiles = committedAhead.status === 0 ? committedAhead.stdout.split(/\n/).map((s) => normalizeChangedFilePath(s.trim())).filter(Boolean) : [];
+    throw new Error(`Refusing to create final report from a transaction worktree whose HEAD is already ahead of the recorded base before runner-owned commit creation; head=${before.head}; base=${baseCommit}; committedFiles=${committedFiles.join(",") || "<unknown>"}. Implementation commands must leave commit creation to bug-solver-workflow, or recover from a verified final report.`);
+  }
   const changedFilesBeforeCommit = await gitChangedFilesSince(worktreePath, baseCommit);
+  const rawAcceptedChangedFiles = acceptedChangedFilesForCommit({ implementation, repairRecords });
+  const changedFilesBeforeCommitSet = new Set(changedFilesBeforeCommit.map(normalizeChangedFilePath));
+  const acceptedChangedFiles = rawAcceptedChangedFiles.filter((file) => changedFilesBeforeCommitSet.has(normalizeChangedFilePath(file)));
+  const staleAcceptedChangedFiles = rawAcceptedChangedFiles.filter((file) => !changedFilesBeforeCommitSet.has(normalizeChangedFilePath(file)));
+  const unacceptedChangedFiles = changedFilesBeforeCommit.filter((file) => !acceptedChangedFiles.includes(normalizeChangedFilePath(file)));
   const record = {
     schema: "pi-bug-solver-workflow/transaction-commit/v1",
     transactionId,
@@ -2759,6 +2836,10 @@ async function createTransactionCommit({ transactionId, planArtifact, artifactPa
     baseCommit,
     commit: null,
     changedFiles: changedFilesBeforeCommit,
+    acceptedChangedFiles,
+    rawAcceptedChangedFiles,
+    staleAcceptedChangedFiles,
+    unacceptedChangedFiles,
     git: { before, after: null, callerBefore, callerAfter: null },
     validationEvidence: {
       baseline: artifactPaths.baseline,
@@ -2773,12 +2854,25 @@ async function createTransactionCommit({ transactionId, planArtifact, artifactPa
     manualNextSteps: [],
     commands: [],
   };
-  const add = await runGit(worktreePath, ["add", "--all"]);
-  record.commands.push({ command: "git add --all", status: add.status, stderr: add.stderr.trim(), stdout: add.stdout.trim() });
-  if (add.status !== 0) throw new Error(`Unable to stage accepted transaction work: ${(add.stderr || add.stdout).trim()}`);
+  const resetIndex = await runGit(worktreePath, ["reset", "--"]);
+  record.commands.push({ command: "git reset --", status: resetIndex.status, stderr: resetIndex.stderr.trim(), stdout: resetIndex.stdout.trim() });
+  if (resetIndex.status !== 0) throw new Error(`Unable to clear pre-staged transaction index before selective staging: ${(resetIndex.stderr || resetIndex.stdout).trim()}`);
+  if (acceptedChangedFiles.length > 0) {
+    const add = await runGit(worktreePath, ["add", "--", ...acceptedChangedFiles]);
+    record.commands.push({ command: `git add -- ${acceptedChangedFiles.join(" ")}`, status: add.status, stderr: add.stderr.trim(), stdout: add.stdout.trim() });
+    if (add.status !== 0) throw new Error(`Unable to stage accepted transaction work: ${(add.stderr || add.stdout).trim()}`);
+  } else {
+    record.commands.push({ command: "git add -- <accepted implementation/repair files>", status: 0, stderr: "", stdout: "", skipped: true, reason: "No accepted implementation/repair changed files were recorded." });
+  }
 
-  const changedFilesAfterStage = await gitChangedFilesSince(worktreePath, baseCommit);
+  const staged = await runGit(worktreePath, ["diff", "--cached", "--name-only"]);
+  if (staged.status !== 0) throw new Error(`Unable to inspect staged transaction work: ${(staged.stderr || staged.stdout).trim()}`);
+  const changedFilesAfterStage = staged.stdout.split(/\n/).map((s) => normalizeChangedFilePath(s.trim())).filter(Boolean);
+  const stagedOutsideAccepted = changedFilesAfterStage.filter((file) => !acceptedChangedFiles.includes(file));
+  if (stagedOutsideAccepted.length) throw new Error(`Selective staging safety check failed; staged files outside accepted implementation/repair set: ${stagedOutsideAccepted.join(", ")}`);
   record.changedFiles = changedFilesAfterStage;
+  record.unacceptedChangedFiles = unacceptedChangedFiles;
+  record.staleAcceptedChangedFiles = staleAcceptedChangedFiles;
   if (changedFilesAfterStage.length === 0) {
     record.status = "no_changes_to_commit";
     record.completedAt = new Date().toISOString();
@@ -2809,7 +2903,7 @@ async function createTransactionCommit({ transactionId, planArtifact, artifactPa
   if (commit.status !== 0) throw new Error(`Unable to create transaction commit on ${branchName}: ${(commit.stderr || commit.stdout).trim()}`);
   const head = await runGit(worktreePath, ["rev-parse", "HEAD"]);
   if (head.status !== 0) throw new Error(`Unable to read transaction commit hash: ${(head.stderr || head.stdout).trim()}`);
-  const committedFiles = await gitChangedFilesSince(worktreePath, baseCommit);
+  const committedFiles = changedFilesAfterStage;
   record.completedAt = new Date().toISOString();
   record.status = "committed_for_review";
   record.commit = head.stdout.trim();
@@ -3192,7 +3286,6 @@ async function solve(args, json) {
     currentPhase = "transaction-commit-and-report";
     phaseStart(run, "transaction-commit-and-report", { transactionId, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name, finalReportPath: artifactPaths.finalReport });
     const transactionCommit = await createTransactionCommit({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, callerCwd: cwd, baseCommit: integrity.baseCommit, branchName: worktreeRecord.branch.name, postValidation, implementation, repairRecords });
-    if (process.env.PI_BUG_SOLVER_INTERRUPT_SOLVE_AFTER === "transaction_commit") throw new Error("Injected interruption after transaction commit creation before cleanup/final report/state completion");
     const outcome = {
       status: transactionCommit.status === "committed_for_review" ? "accepted_for_manual_review" : "accepted_without_commit",
       finalStatus: transactionCommit.status,
@@ -3240,6 +3333,7 @@ async function solve(args, json) {
       const reportIntegrity = completionEvidenceIntegrity({ transactionId, state: null, finalReport: reportBeforeCompletedState, artifactPaths });
       if (!reportIntegrity.ok) throw new Error(`Completion protocol refused to mark state completed because final-report evidence was not verified: ${reportIntegrity.problems.join("; ")}`);
       writeJson(artifactPaths.finalReport, { ...reportBeforeCompletedState, completionProtocol: { ...(reportBeforeCompletedState.completionProtocol || {}), verifiedBeforeStateCompletion: true, evidenceVerifiedAt: new Date().toISOString(), integrity: reportIntegrity } });
+      if (process.env.PI_BUG_SOLVER_INTERRUPT_SOLVE_AFTER === "transaction_commit") throw new Error("Injected interruption after transaction commit creation and verified final-report write before cleanup/state completion");
     } else {
       throw new Error(`Completion protocol refused to mark state completed because final report is missing: ${artifactPaths.finalReport}`);
     }
@@ -3271,7 +3365,7 @@ async function solve(args, json) {
     if (json) console.log(JSON.stringify(result, null, 2));
     else console.log(`transaction ${transactionId} completed on ${worktreeRecord.branch.name}; final report: ${artifactPaths.finalReport}`);
   } catch (error) {
-    if (!/Repair cap reached|partial completion|Injected interruption after completed state write/i.test(error?.message || String(error)) && currentPhase !== "final-verification-gate") recordSolveFailureClassification({ transactionId: plan.transactionId, planArtifact, plan, planPath, phase: currentPhase, error });
+    if (!/Repair cap reached|partial completion|Injected interruption after transaction commit|Injected interruption after completed state write/i.test(error?.message || String(error)) && currentPhase !== "final-verification-gate") recordSolveFailureClassification({ transactionId: plan.transactionId, planArtifact, plan, planPath, phase: currentPhase, error });
     failRun(run, error, { transactionId: plan.transactionId, failurePhase: currentPhase });
     die(error.message || String(error), 1, json);
   }
