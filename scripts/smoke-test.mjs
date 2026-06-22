@@ -212,6 +212,17 @@ try {
   try { gatedRepeatSolveDetails = JSON.parse(gatedRepeatSolve.stdout); } catch { gatedRepeatSolveDetails = undefined; }
   const gatedRepeatMetadata = gatedRepeatSolveDetails?.worktreeMetadataPath ? JSON.parse(readFileSync(gatedRepeatSolveDetails.worktreeMetadataPath, 'utf8')) : undefined;
   log(gatedRepeatMetadata?.worktree?.action === 'reused' && gatedRepeatMetadata?.branch?.action === 'reused' && gatedRepeatMetadata?.cleanup?.durableReuse === true, 'bug-solver repeated solve records durable worktree/branch reuse and cleanup metadata');
+  const copiedRegisteredPlan = join(tmp, 'copied-registered-transaction-plan.json');
+  writeFileSync(copiedRegisteredPlan, JSON.stringify(gatedPlan, null, 2));
+  expectExit('bug-solver workflow solve gate rejects copied transaction plans not at the registered durable path', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', copiedRegisteredPlan, '--approved', '--json'], 1);
+  const tamperedRegistryPath = gatedPrecheckDetails?.artifactRegistryPath;
+  if (tamperedRegistryPath) {
+    const originalRegistry = JSON.parse(readFileSync(tamperedRegistryPath, 'utf8'));
+    const tamperedContract = join(tmp, 'tampered-validation-contract.json');
+    writeFileSync(tamperedContract, JSON.stringify(bugContract || {}, null, 2));
+    writeFileSync(tamperedRegistryPath, JSON.stringify({ ...originalRegistry, entries: originalRegistry.entries.map((entry) => entry.kind === 'validationContract' ? { ...entry, path: tamperedContract } : entry) }, null, 2));
+    expectExit('bug-solver workflow solve gate rejects artifact-registry validation contract mismatches before edits', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', gatedPrecheckDetails?.planPath || join(tmp, 'missing-gated-plan.json'), '--approved', '--json'], 1);
+  }
   const forgedInRepoContractPlan = join(tmp, 'forged-in-repo-contract-plan.json');
   writeFileSync(forgedInRepoContractPlan, JSON.stringify({ ...gatedPlan, validation: { ...(gatedPlan?.validation || {}), contractPath: join(gatedSolveRepo, 'contract.json') }, validationContractPath: join(gatedSolveRepo, 'contract.json') }, null, 2));
   expectExit('bug-solver workflow solve gate rejects validation contract paths inside target repo before edits', ['node', bugSolverCli, 'solve', '--cwd', gatedSolveRepo, '--plan-path', forgedInRepoContractPlan, '--approved', '--json'], 1);

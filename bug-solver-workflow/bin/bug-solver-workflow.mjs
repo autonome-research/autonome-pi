@@ -1187,7 +1187,7 @@ async function solve(args, json) {
     const integrity = assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd });
     phaseEnd(run, "confirmation-gate", STATUSES.SUCCESS, { integrity: "passed", validationAssertions: integrity.contract.assertions.length, artifactCount: integrity.registry.entries.length });
     phaseStart(run, "gated-activation", { transactionId });
-    const artifactPaths = buildArtifactPaths(transactionDir(transactionId));
+    const artifactPaths = integrity.artifactPaths;
     const worktreeRecord = await createOrReuseTransactionWorktree({ cwd, transactionId, baseCommit: integrity.baseCommit, state: integrity.state, artifactPaths });
     const activation = {
       schema: "pi-bug-solver-workflow/gated-activation/v1",
@@ -1331,6 +1331,21 @@ function assertExistingExternalFile(file, label, context) {
   return absolute;
 }
 
+function canonicalArtifactPath(file) {
+  return resolve(expandHomePath(file));
+}
+
+function assertSameArtifactPath(actual, expected, label) {
+  if (!actual || !expected || canonicalArtifactPath(actual) !== canonicalArtifactPath(expected)) {
+    throw new Error(`${label} mismatch: expected durable registered artifact ${expected || "<missing>"}, got ${actual || "<missing>"}`);
+  }
+  return canonicalArtifactPath(actual);
+}
+
+function registryEntryByKind(registry) {
+  return new Map((registry?.entries || []).map((entry) => [entry.kind, entry]));
+}
+
 function assertImmutableBaseMetadata({ planArtifact, state, git }) {
   const repo = planArtifact?.repo || planArtifact?.immutableTransactionIdentity?.repo || planArtifact?.git || {};
   const baseCommit = repo.baseCommit || repo.head;
@@ -1364,7 +1379,7 @@ function assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd }) {
   const targetCwd = resolve(cwd);
   const context = { targetRoot, targetCwd };
   if (plan.sourceKind !== "transaction-plan" && plan.sourceKind !== "precheck") throw new Error(`Refusing unsafe plan schema before edit-capable phases: ${planArtifact?.schema || "missing"}`);
-  assertExistingExternalFile(planPath, "planPath", context);
+  const submittedPlanPath = assertExistingExternalFile(planPath, "planPath", context);
   const statePath = planArtifact.statePath || plan.artifacts?.state || plan.evidencePaths?.state;
   const artifactRegistryPath = planArtifact.artifactRegistryPath || plan.artifacts?.artifactRegistry || plan.evidencePaths?.artifactRegistry;
   const stateFile = assertExistingExternalFile(statePath, "state", context);
@@ -1375,16 +1390,61 @@ function assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd }) {
   const registryFile = assertExistingExternalFile(artifactRegistryPath, "artifactRegistry", context);
   const registry = readJson(registryFile);
   if (registry?.schema !== "pi-bug-solver-workflow/artifact-registry/v1" || registry.materializationComplete !== true || !Array.isArray(registry.entries) || registry.entries.length === 0) throw new Error("Artifact registry must be materialized before solve activation.");
+  if (registry.transactionId !== plan.transactionId) throw new Error("Artifact registry transaction id does not match solve plan id.");
+  if (registry.recoverableByTransactionId !== true) throw new Error("Artifact registry must be recoverable by transaction id before solve activation.");
+  const entriesByKind = registryEntryByKind(registry);
+  for (const requiredKind of ["precheck", "transactionPlan", "validationContract", "state", "artifactRegistry"]) {
+    if (!entriesByKind.has(requiredKind)) throw new Error(`Artifact registry is missing required authoritative ${requiredKind} entry.`);
+  }
   for (const entry of registry.entries) {
     assertExistingExternalFile(entry.path, `artifactRegistry.entries.${entry.kind || "artifact"}`, context);
     if (entry.externalToTargetRepo !== true || entry.durableAtPrecheck !== true || entry.lifecycleStatus !== "materialized_at_precheck") throw new Error(`Artifact registry entry is not a durable external precheck artifact: ${entry.kind || entry.path}`);
   }
+  assertSameArtifactPath(stateFile, entriesByKind.get("state")?.path, "state path");
+  assertSameArtifactPath(registryFile, entriesByKind.get("artifactRegistry")?.path, "artifact registry path");
+  assertSameArtifactPath(plan.validationContractPath, entriesByKind.get("validationContract")?.path, "validation contract path");
+  const authoritativeTransactionPlanPath = assertSameArtifactPath(planArtifact.transactionPlanPath || plan.artifacts?.transactionPlan || submittedPlanPath, entriesByKind.get("transactionPlan")?.path, "transaction plan path");
+  if (plan.sourceKind === "transaction-plan") assertSameArtifactPath(submittedPlanPath, authoritativeTransactionPlanPath, "submitted transaction plan path");
+  if (plan.sourceKind === "precheck") assertSameArtifactPath(submittedPlanPath, entriesByKind.get("precheck")?.path, "submitted precheck path");
+
+  const expectedDir = canonicalArtifactPath(state.artifacts?.root || registry.transactionDir || dirname(registryFile));
+  if (registry.transactionDir) assertSameArtifactPath(registry.transactionDir, expectedDir, "registry transaction directory");
+  if (registry.artifactRoot) assertSameArtifactPath(registry.artifactRoot, ARTIFACT_ROOT, "artifact root");
+  const expectedArtifactPaths = buildArtifactPaths(expectedDir);
+  for (const [kind, expectedPath] of Object.entries({ precheck: expectedArtifactPaths.precheck, transactionPlan: expectedArtifactPaths.transactionPlan, validationContract: expectedArtifactPaths.validationContract, state: expectedArtifactPaths.state, artifactRegistry: expectedArtifactPaths.artifactRegistry })) {
+    assertSameArtifactPath(entriesByKind.get(kind)?.path, expectedPath, `registered ${kind} path`);
+  }
+
+  const lifecycle = state.lifecycle || {};
+  const allowedLifecycleStatuses = new Set(["awaiting_confirmation", "isolated_worktree_ready"]);
+  if (!allowedLifecycleStatuses.has(String(lifecycle.status || "")) || lifecycle.terminal === true) throw new Error(`Transaction state lifecycle is not eligible for solve activation: ${lifecycle.status || "missing"}`);
+  if (lifecycle.readOnlyPrecheckComplete !== true || lifecycle.materializationComplete !== true || lifecycle.editingAllowed !== false || lifecycle.confirmationRequired !== true) throw new Error("Transaction state lifecycle does not preserve the durable read-only precheck approval gate.");
+  if (state.transaction?.exactlyOneBug !== true || state.transaction?.multiplicity?.likelyMultiple !== false) throw new Error("Transaction state does not authorize exactly one bug for solve activation.");
+  if (state.transaction?.bugDescription !== plan.transaction?.bugDescription) throw new Error("Transaction state bug description does not match solve plan bug description.");
+  if (plan.transaction?.multiplicity?.likelyMultiple !== false || plan.transaction?.splitRequired === true || plan.transaction?.exactlyOneBug !== true) throw new Error("Transaction plan multiplicity does not authorize exactly one bug for solve activation.");
+  if (state.validation?.contractPath) assertSameArtifactPath(state.validation.contractPath, entriesByKind.get("validationContract")?.path, "state validation contract path");
+  if (state.artifactRegistryPath) assertSameArtifactPath(state.artifactRegistryPath, registryFile, "state artifact registry path");
+
+  const globalRegistry = existsSync(registryIndexPath()) ? readJson(registryIndexPath()) : undefined;
+  const indexed = globalRegistry?.transactions?.[plan.transactionId];
+  if (globalRegistry?.schema !== "pi-bug-solver-workflow/transaction-index/v1" || !indexed) throw new Error("Global transaction registry is missing this transaction id before solve activation.");
+  assertSameArtifactPath(indexed.statePath, stateFile, "global registry state path");
+  assertSameArtifactPath(indexed.artifactDir, expectedDir, "global registry artifact directory");
+  assertSameArtifactPath(indexed.planPath, entriesByKind.get("transactionPlan")?.path, "global registry transaction plan path");
+  if (indexed.baseCommit !== baseCommit) throw new Error(`Global transaction registry base commit ${indexed.baseCommit || "<missing>"} does not match plan base ${baseCommit}.`);
+
   const contract = assertValidationContractIntegrity(plan.validationContractPath, context);
-  const expectedTransactionPlan = planArtifact.transactionPlanPath || plan.artifacts?.transactionPlan;
-  if (plan.sourceKind === "precheck" && expectedTransactionPlan) {
-    const transactionPlanFile = assertExistingExternalFile(expectedTransactionPlan, "transactionPlan", context);
-    const transactionPlan = readJson(transactionPlanFile);
-    if (transactionPlan?.schema !== "pi-bug-solver-workflow/transaction-plan/v1" || transactionPlan.transactionId !== plan.transactionId) throw new Error("Precheck artifact does not point to a matching durable transaction plan.");
+  if (contract.transactionId !== plan.transactionId) throw new Error("Validation contract transaction id does not match solve plan id.");
+  if (contract.repoPath && canonicalArtifactPath(contract.repoPath) !== targetCwd && canonicalArtifactPath(contract.repoPath) !== targetRoot) throw new Error("Validation contract repository path does not match solve target repository.");
+  const transactionPlan = readJson(authoritativeTransactionPlanPath);
+  if (transactionPlan?.schema !== "pi-bug-solver-workflow/transaction-plan/v1" || transactionPlan.transactionId !== plan.transactionId) throw new Error("Durable registered transaction plan does not match solve transaction id.");
+  if (transactionPlan.status !== plan.status || transactionPlan.transaction?.bugDescription !== plan.transaction?.bugDescription) throw new Error("Submitted solve artifact does not match the durable registered transaction plan.");
+  if (transactionPlan.validation?.contractPath) assertSameArtifactPath(transactionPlan.validation.contractPath, entriesByKind.get("validationContract")?.path, "registered transaction plan contract path");
+  if (transactionPlan.statePath) assertSameArtifactPath(transactionPlan.statePath, stateFile, "registered transaction plan state path");
+  if (transactionPlan.artifactRegistryPath) assertSameArtifactPath(transactionPlan.artifactRegistryPath, registryFile, "registered transaction plan artifact registry path");
+  if (plan.sourceKind === "precheck") {
+    const transactionPlanFile = assertExistingExternalFile(planArtifact.transactionPlanPath || plan.artifacts?.transactionPlan, "transactionPlan", context);
+    assertSameArtifactPath(transactionPlanFile, authoritativeTransactionPlanPath, "precheck referenced transaction plan path");
   }
   for (const [index, artifactPath] of [...collectStringPaths(planArtifact.artifacts), ...collectStringPaths(planArtifact.evidencePaths)].entries()) {
     if ([".precheck-incomplete.json", ".precheck.lock"].some((suffix) => artifactPath.endsWith(suffix))) {
@@ -1393,7 +1453,7 @@ function assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd }) {
     }
     assertExistingExternalFile(artifactPath, `plan.artifactPath.${index}`, context);
   }
-  return { state, registry, contract, baseCommit };
+  return { state, registry, contract, baseCommit, artifactPaths: expectedArtifactPaths };
 }
 
 function deriveTerminalOutcome({ state, finalReport, activation }) {
