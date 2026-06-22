@@ -1175,11 +1175,16 @@ function repairBudgetFrom(planArtifact, args = {}) {
 }
 
 function implementationNeedsRepair(implementation) {
-  // Allowlist rejections are intentional safety outcomes, not auto-repairable
-  // implementation failures. Preserve the durable rejection evidence and allow
-  // final verification/reporting to complete so callers receive a JSON result
-  // instead of an unexpected repair-cap CLI failure.
-  return Boolean(implementation?.commandResult && implementation.commandResult.status !== 0);
+  return Boolean(
+    (implementation?.commandResult && implementation.commandResult.status !== 0)
+    || implementation?.allowlist?.accepted === false
+    || implementation?.status === "blocked_out_of_scope_changes"
+    || implementation?.outcome === "rejected_out_of_scope"
+  );
+}
+
+function repairFailureCategoryForImplementation(implementation) {
+  return implementation?.allowlist?.accepted === false ? FAILURE_CATEGORIES.ALLOWLIST : FAILURE_CATEGORIES.IMPLEMENTATION;
 }
 
 function postValidationNeedsRepair(postValidation) {
@@ -1187,7 +1192,14 @@ function postValidationNeedsRepair(postValidation) {
 }
 
 function repairTriggerSummary({ implementation, postValidation }) {
-  if (implementationNeedsRepair(implementation)) return { phase: "implementation", status: implementation?.status || "failed", commandStatus: implementation?.commandResult?.status ?? null, allowlistAccepted: implementation?.allowlist?.accepted === true };
+  if (implementationNeedsRepair(implementation)) return {
+    phase: "implementation",
+    status: implementation?.status || "failed",
+    failureKind: implementation?.allowlist?.accepted === false ? "allowlist_rejection" : "implementation_failure",
+    commandStatus: implementation?.commandResult?.status ?? null,
+    allowlistAccepted: implementation?.allowlist?.accepted === true,
+    outOfScopeFiles: implementation?.allowlist?.outOfScopeFiles || [],
+  };
   if (postValidationNeedsRepair(postValidation)) return { phase: "post-change-validation", status: postValidation?.status || "failed", finalVerificationStatus: postValidation?.finalVerification?.status || null, newlyRegressed: postValidation?.comparison?.newlyRegressed?.length || 0 };
   return { phase: "none", status: "no_repair_needed" };
 }
@@ -1253,8 +1265,10 @@ async function runRepairAttempt({ transactionId, planArtifact, artifactPaths, wo
       status: record.status,
       trigger,
       evidencePath: artifactPaths.repairAttempts,
-      rationale: "A bounded repair attempt completed but the implementation failure condition remained actionable.",
-    }, FAILURE_CATEGORIES.IMPLEMENTATION, { repairAttempts: artifactPaths.repairAttempts, implementationEvidence: artifactPaths.implementationEvidence, failureClassifications: artifactPaths.failureClassifications }));
+      rationale: implementation.allowlist?.accepted === false
+        ? "A bounded repair attempt completed but the out-of-scope allowlist rejection remained actionable as an implementation failure."
+        : "A bounded repair attempt completed but the implementation failure condition remained actionable.",
+    }, repairFailureCategoryForImplementation(implementation), { repairAttempts: artifactPaths.repairAttempts, implementationEvidence: artifactPaths.implementationEvidence, failureClassifications: artifactPaths.failureClassifications }));
   }
   return { repair: record, implementation };
 }
@@ -1272,7 +1286,7 @@ function recordRepairCapReached({ transactionId, artifactPaths, statePath, final
     trigger,
     evidencePath: artifactPaths.repairAttempts,
     rationale: "The workflow exhausted maxRepairIterations and refused unbounded implementation/validation retries.",
-  }, FAILURE_CATEGORIES.IMPLEMENTATION, { repairAttempts: artifactPaths.repairAttempts, failureClassifications: artifactPaths.failureClassifications, finalReport: finalReportPath, state: statePath });
+  }, trigger?.failureKind === "allowlist_rejection" ? FAILURE_CATEGORIES.ALLOWLIST : FAILURE_CATEGORIES.IMPLEMENTATION, { repairAttempts: artifactPaths.repairAttempts, failureClassifications: artifactPaths.failureClassifications, finalReport: finalReportPath, state: statePath });
   appendJsonl(artifactPaths.repairAttempts, record);
   appendJsonl(artifactPaths.failureClassifications, record);
   if (existsSync(statePath)) {
