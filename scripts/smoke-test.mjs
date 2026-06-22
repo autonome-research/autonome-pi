@@ -303,6 +303,25 @@ try {
   const reproBaseline = reproPlan?.evidencePaths?.baseline ? JSON.parse(readFileSync(reproPlan.evidencePaths.baseline, 'utf8')) : undefined;
   log(reproBaseline?.failures?.preExisting?.[0]?.category === 'targeted_reproduction' && reproPostValidation?.failures?.classifications?.some((failure) => failure.category === 'final_verification'), 'bug-solver distinguishes targeted reproduction failures from final-verification failures');
 
+  const baselineMutationRepo = join(tmp, 'baseline-mutation-solve-repo');
+  mkdirSync(baselineMutationRepo, { recursive: true });
+  expectExit('bug-solver baseline-mutation repo git init', ['git', 'init', '-q'], 0, { cwd: baselineMutationRepo });
+  expectExit('bug-solver baseline-mutation repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: baselineMutationRepo });
+  expectExit('bug-solver baseline-mutation repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: baselineMutationRepo });
+  writeFileSync(join(baselineMutationRepo, 'README.md'), 'baseline mutation solve\n');
+  expectExit('bug-solver baseline-mutation repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: baselineMutationRepo });
+  const baselineMutationCommand = 'sh -c \'printf "solved\\n" >> README.md; exit 1\'';
+  const baselineMutationPrecheck = expectExit('bug-solver workflow precheck for baseline mutation neutralization succeeds', ['node', bugSolverCli, 'precheck', '--cwd', baselineMutationRepo, '--bug', 'Fix baseline mutation neutralization bug', '--user-test-command', baselineMutationCommand, '--max-repairs', '0', '--json'], 0);
+  let baselineMutationPrecheckDetails;
+  try { baselineMutationPrecheckDetails = JSON.parse(baselineMutationPrecheck.stdout); } catch { baselineMutationPrecheckDetails = undefined; }
+  const baselineMutationPlan = baselineMutationPrecheckDetails?.planPath ? JSON.parse(readFileSync(baselineMutationPrecheckDetails.planPath, 'utf8')) : undefined;
+  const baselineMutationSolve = expectExit('bug-solver workflow neutralizes baseline validation worktree mutations before implementation evidence', ['node', bugSolverCli, 'solve', '--cwd', baselineMutationRepo, '--plan-path', baselineMutationPrecheckDetails?.planPath || join(tmp, 'missing-baseline-mutation-plan.json'), '--approved', '--json'], 1);
+  let baselineMutationSolveDetails;
+  try { baselineMutationSolveDetails = JSON.parse(baselineMutationSolve.stdout); } catch { baselineMutationSolveDetails = undefined; }
+  const baselineMutationBaseline = baselineMutationPlan?.evidencePaths?.baseline ? JSON.parse(readFileSync(baselineMutationPlan.evidencePaths.baseline, 'utf8')) : undefined;
+  const baselineMutationPost = baselineMutationPlan?.evidencePaths?.postValidation ? JSON.parse(readFileSync(baselineMutationPlan.evidencePaths.postValidation, 'utf8')) : undefined;
+  log(baselineMutationSolveDetails?.ok === false && baselineMutationBaseline?.status === 'completed_with_baseline_mutations_neutralized' && baselineMutationBaseline?.baselineIntegrity?.status === 'neutralized' && baselineMutationBaseline?.baselineIntegrity?.classifications?.some((record) => record.type === 'baseline_validation_worktree_mutation_neutralized' && record.category === 'command_validation') && baselineMutationBaseline?.git?.worktreeChangedByBaseline === true && baselineMutationBaseline?.git?.worktreeChangedAfterNeutralization === false && baselineMutationPost?.finalVerification?.implementationBacked === false && baselineMutationPost?.finalVerification?.implementationEvidence?.baselineAfter?.statusShort === '', 'bug-solver classifies and neutralizes baseline validation worktree mutations before implementationBackedEvidence can count them');
+
   const fakeEvidenceRepo = join(tmp, 'fake-evidence-solve-repo');
   mkdirSync(fakeEvidenceRepo, { recursive: true });
   expectExit('bug-solver fake-evidence repo git init', ['git', 'init', '-q'], 0, { cwd: fakeEvidenceRepo });

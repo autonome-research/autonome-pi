@@ -550,6 +550,55 @@ function classifyBaselineFailures(results) {
   }, commandFailureCategory(result, "baseline-validation")));
 }
 
+function baselineMutationClassification({ transactionId, artifactPaths, before, afterCommand, afterNeutralization, neutralization, callerBefore, callerAfter }) {
+  const callerChanged = gitSnapshotChanged(callerBefore, callerAfter);
+  const worktreeChanged = gitSnapshotChanged(before, afterCommand);
+  const neutralized = Boolean(neutralization?.succeeded);
+  return withFailureCategory({
+    type: callerChanged ? "baseline_validation_caller_mutation_refused" : (neutralized ? "baseline_validation_worktree_mutation_neutralized" : "baseline_validation_worktree_mutation_refused"),
+    phase: "baseline-validation",
+    transactionId,
+    createdAt: new Date().toISOString(),
+    status: callerChanged || !neutralized ? "failed_baseline_integrity" : "neutralized_before_implementation",
+    baselineIntegrity: true,
+    validationCommandMutation: true,
+    worktreeChangedByBaseline: worktreeChanged,
+    callerWorktreeChangedByBaseline: callerChanged,
+    changedFiles: uniqueStrings([...(afterCommand?.statusShort ? changedFilesFromStatusShort(afterCommand.statusShort) : []), ...(afterCommand?.root ? [] : [])]),
+    before: before ? { head: before.head || null, statusShort: before.statusShort || "" } : null,
+    afterCommand: afterCommand ? { head: afterCommand.head || null, statusShort: afterCommand.statusShort || "" } : null,
+    afterNeutralization: afterNeutralization ? { head: afterNeutralization.head || null, statusShort: afterNeutralization.statusShort || "" } : null,
+    neutralization,
+    rationale: callerChanged
+      ? "A baseline validation command mutated the caller repository, so solve fails before implementation evidence can be accepted."
+      : (neutralized
+        ? "A baseline validation command mutated the isolated transaction worktree; the workflow reset/cleaned it back to the recorded base before implementation so later implementationBackedEvidence only counts post-implementation changes."
+        : "A baseline validation command mutated the isolated transaction worktree and the workflow could not restore the recorded base, so solve fails before implementation."),
+  }, callerChanged ? FAILURE_CATEGORIES.GIT_WORKTREE : FAILURE_CATEGORIES.COMMAND_VALIDATION, { baseline: artifactPaths.baseline, failureClassifications: artifactPaths.failureClassifications, state: artifactPaths.state, finalReport: artifactPaths.finalReport });
+}
+
+async function neutralizeBaselineWorktreeMutations({ transactionId, artifactPaths, worktreePath, baseCommit, before, afterCommand, callerBefore, callerAfter }) {
+  const worktreeChanged = gitSnapshotChanged(before, afterCommand);
+  const callerChanged = gitSnapshotChanged(callerBefore, callerAfter);
+  if (!worktreeChanged && !callerChanged) return { after: afterCommand, classification: null, neutralization: null };
+  if (callerChanged) {
+    const classification = baselineMutationClassification({ transactionId, artifactPaths, before, afterCommand, afterNeutralization: afterCommand, neutralization: { attempted: false, succeeded: false, reason: "caller_worktree_mutated" }, callerBefore, callerAfter });
+    return { after: afterCommand, classification, neutralization: classification.neutralization };
+  }
+  const reset = await runGit(worktreePath, ["reset", "--hard", baseCommit]);
+  const clean = await runGit(worktreePath, ["clean", "-fd"]);
+  const afterNeutralization = await gitInfo(worktreePath);
+  const succeeded = reset.status === 0 && clean.status === 0 && (afterNeutralization.head || null) === (baseCommit || null) && !(afterNeutralization.dirty || parseGitStatusSignals(afterNeutralization.statusShort)).hasDirtyWorktree;
+  const neutralization = {
+    attempted: true,
+    succeeded,
+    reset: { status: reset.status, stdout: outputTruncationMetadata(reset.stdout || "", Buffer.byteLength(reset.stdout || "", "utf8")), stderr: outputTruncationMetadata(reset.stderr || "", Buffer.byteLength(reset.stderr || "", "utf8")) },
+    clean: { status: clean.status, stdout: outputTruncationMetadata(clean.stdout || "", Buffer.byteLength(clean.stdout || "", "utf8")), stderr: outputTruncationMetadata(clean.stderr || "", Buffer.byteLength(clean.stderr || "", "utf8")) },
+  };
+  const classification = baselineMutationClassification({ transactionId, artifactPaths, before, afterCommand, afterNeutralization, neutralization, callerBefore, callerAfter });
+  return { after: succeeded ? afterNeutralization : afterCommand, classification, neutralization };
+}
+
 function baselineWorktreeIntegrityStatus({ worktreeGit, expectedBranch, baseCommit }) {
   const dirty = worktreeGit?.dirty || parseGitStatusSignals(worktreeGit?.statusShort);
   const checks = {
@@ -761,6 +810,15 @@ async function gitChangedFilesSince(cwd, baseCommit) {
   ]);
 }
 
+async function gitChangedFilesAtSnapshot(cwd, baseCommit, snapshot) {
+  if (!cwd || !baseCommit || !snapshot) return [];
+  const committed = snapshot.head && snapshot.head !== baseCommit ? await runGit(cwd, ["diff", "--name-only", `${baseCommit}..${snapshot.head}`]) : { status: 0, stdout: "" };
+  return uniqueStrings([
+    ...(committed.status === 0 ? committed.stdout.split(/\n+/) : []),
+    ...changedFilesFromStatusShort(snapshot.statusShort),
+  ]);
+}
+
 function normalizeAllowlistEntry(entry) {
   return normalizeChangedFilePath(String(entry || "").replace(/^\.\//, "").replace(/\/$/, ""));
 }
@@ -947,7 +1005,7 @@ function causallyRelevantImplementationChange({ records, commands = [], baseline
 async function implementationBackedEvidence({ baseline, postBefore, postAfter, artifactPaths, commands = [] }) {
   const records = readJsonlRecords(artifactPaths.implementationEvidence);
   const baselineAfter = baseline?.git?.after;
-  const actualChangedFiles = await gitChangedFilesSince(postBefore?.root || baseline?.worktreePath, baselineAfter?.head);
+  const actualChangedFiles = await gitChangedFilesAtSnapshot(postBefore?.root || baseline?.worktreePath, baselineAfter?.head, postBefore);
   const assessedExplicitRecords = records.filter(explicitResolutionCandidate).map((record) => ({ record, assessment: trustedExplicitResolutionRecord(record, { baseline, baselineAfter, postBefore, actualChangedFiles }) }));
   const explicitResolution = assessedExplicitRecords.find((entry) => entry.assessment.trusted)?.record;
   const ignoredExplicitResolutionRecords = assessedExplicitRecords.filter((entry) => !entry.assessment.trusted).map((entry) => ({ type: entry.record?.type || null, status: entry.record?.status || entry.record?.outcome || null, createdAt: entry.record?.createdAt || entry.record?.completedAt || null, reason: entry.assessment.reason }));
@@ -1542,10 +1600,16 @@ async function runBaselineValidation({ transactionId, planArtifact, artifactPath
     const result = await runShellCommand(entry.command, worktreePath);
     results.push({ ...entry, ...result });
   }
-  const after = await gitInfo(worktreePath);
+  const afterCommand = await gitInfo(worktreePath);
   const callerAfter = await gitInfo(callerCwd);
-  const failureClassifications = classifyBaselineFailures(results);
-  const status = commands.length === 0 ? "skipped_no_commands" : (results.some((result) => result.status !== 0) ? "completed_with_pre_existing_failures" : "passed");
+  const baselineIntegrity = await neutralizeBaselineWorktreeMutations({ transactionId, artifactPaths, worktreePath, baseCommit, before, afterCommand, callerBefore, callerAfter });
+  const after = baselineIntegrity.after;
+  const baselineIntegrityClassifications = baselineIntegrity.classification ? [baselineIntegrity.classification] : [];
+  const failureClassifications = [...classifyBaselineFailures(results), ...baselineIntegrityClassifications];
+  const baselineIntegrityFailed = baselineIntegrityClassifications.some((record) => record.status === "failed_baseline_integrity");
+  const status = baselineIntegrityFailed
+    ? "failed_baseline_integrity"
+    : (baselineIntegrityClassifications.length ? "completed_with_baseline_mutations_neutralized" : (commands.length === 0 ? "skipped_no_commands" : (results.some((result) => result.status !== 0) ? "completed_with_pre_existing_failures" : "passed")));
   const record = {
     schema: "pi-bug-solver-workflow/baseline-validation/v1",
     transactionId,
@@ -1564,12 +1628,19 @@ async function runBaselineValidation({ transactionId, planArtifact, artifactPath
     commands: { targeted: commands.filter((entry) => entry.kind === "targeted_user_test").map((entry) => entry.command), broadValidation: commands.filter((entry) => entry.kind === "broad_validation").map((entry) => entry.command), executionOrder: commands.map((entry) => entry.kind), executed: results.map((result) => ({ kind: result.kind, command: result.command, status: result.status, timedOut: result.timedOut, durationMs: result.durationMs })) },
     commandResults: results,
     failures: { preExisting: failureClassifications, regressions: [], status: failureClassifications.length ? "pre_existing_failures_detected" : "none" },
-    git: { before, after, callerBefore, callerAfter, worktreeChangedByBaseline: (before.statusShort || "") !== (after.statusShort || ""), callerWorktreeChangedByBaseline: (callerBefore.statusShort || "") !== (callerAfter.statusShort || "") || (callerBefore.head || null) !== (callerAfter.head || null) },
+    baselineIntegrity: {
+      status: baselineIntegrityFailed ? "failed" : (baselineIntegrityClassifications.length ? "neutralized" : "clean"),
+      classifications: baselineIntegrityClassifications,
+      neutralization: baselineIntegrity.neutralization,
+      implementationEvidenceStartsAfter: after ? { head: after.head || null, statusShort: after.statusShort || "" } : null,
+    },
+    git: { before, afterCommand, after, callerBefore, callerAfter, worktreeChangedByBaseline: gitSnapshotChanged(before, afterCommand), worktreeChangedAfterNeutralization: gitSnapshotChanged(before, after), callerWorktreeChangedByBaseline: gitSnapshotChanged(callerBefore, callerAfter) },
     boundedOutput: { maxStdoutBytes: MAX_COMMAND_OUTPUT_BYTES, maxStderrBytes: MAX_COMMAND_OUTPUT_BYTES },
     evidencePaths: { baseline: artifactPaths.baseline, failureClassifications: artifactPaths.failureClassifications, finalReport: artifactPaths.finalReport, state: artifactPaths.state },
   };
   writeJson(artifactPaths.baseline, record);
-  for (const classification of failureClassifications) appendJsonl(artifactPaths.failureClassifications, { ...classification, transactionId, createdAt: record.completedAt, baselineEvidencePath: artifactPaths.baseline });
+  for (const classification of failureClassifications) appendJsonl(artifactPaths.failureClassifications, { ...classification, transactionId, createdAt: classification.createdAt || record.completedAt, baselineEvidencePath: artifactPaths.baseline });
+  if (baselineIntegrityFailed) throw new Error(`Baseline validation mutated protected worktree state and could not safely continue before implementation; evidence: ${artifactPaths.baseline}`);
   return record;
 }
 
@@ -2903,7 +2974,7 @@ async function solve(args, json) {
     if (updatedStateForRegistry) updateGlobalRegistry(updatedStateForRegistry);
     emitArtifact(run, { kind: "file", title: "bug-solver baseline validation", path: artifactPaths.baseline });
     emitArtifact(run, { kind: "file", title: "bug-solver failure classifications", path: artifactPaths.failureClassifications });
-    phaseEnd(run, "baseline-validation", baseline.status === "passed" || baseline.status === "skipped_no_commands" || baseline.status === "completed_with_pre_existing_failures" ? STATUSES.SUCCESS : STATUSES.FAILED, { status: baseline.status, commands: baseline.commandResults.length, preExistingFailures: baseline.failures.preExisting.length, targetedBeforeBroad: baseline.targetedBeforeBroad });
+    phaseEnd(run, "baseline-validation", baseline.status === "passed" || baseline.status === "skipped_no_commands" || baseline.status === "completed_with_pre_existing_failures" || baseline.status === "completed_with_baseline_mutations_neutralized" ? STATUSES.SUCCESS : STATUSES.FAILED, { status: baseline.status, commands: baseline.commandResults.length, preExistingFailures: baseline.failures.preExisting.length, targetedBeforeBroad: baseline.targetedBeforeBroad, baselineIntegrity: baseline.baselineIntegrity?.status });
 
     currentPhase = "implementation";
     phaseStart(run, "implementation", { transactionId, worktreePath: worktreeRecord.worktree.path, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence });
