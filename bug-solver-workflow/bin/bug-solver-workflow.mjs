@@ -2356,6 +2356,93 @@ async function createOrReuseTransactionWorktree({ cwd, transactionId, baseCommit
   return record;
 }
 
+async function createTransactionCommit({ transactionId, planArtifact, artifactPaths, worktreePath, callerCwd, baseCommit, branchName, postValidation, implementation, repairRecords }) {
+  const startedAt = new Date().toISOString();
+  const before = await gitInfo(worktreePath);
+  const callerBefore = callerCwd ? await gitInfo(callerCwd) : null;
+  const changedFilesBeforeCommit = await gitChangedFilesSince(worktreePath, baseCommit);
+  const record = {
+    schema: "pi-bug-solver-workflow/transaction-commit/v1",
+    transactionId,
+    startedAt,
+    completedAt: null,
+    status: "pending",
+    branch: branchName,
+    worktreePath,
+    baseCommit,
+    commit: null,
+    changedFiles: changedFilesBeforeCommit,
+    git: { before, after: null, callerBefore, callerAfter: null },
+    validationEvidence: {
+      baseline: artifactPaths.baseline,
+      postValidation: artifactPaths.postValidation,
+      finalVerification: postValidation?.finalVerification || null,
+      outcomeComparison: postValidation?.outcomeComparison || postValidation?.comparison || null,
+    },
+    allowlistDecisionEvidence: artifactPaths.allowlistDecisions,
+    repairHistoryEvidence: artifactPaths.repairAttempts,
+    implementationEvidence: artifactPaths.implementationEvidence,
+    failureClassificationEvidence: artifactPaths.failureClassifications,
+    manualNextSteps: [],
+    commands: [],
+  };
+  const add = await runGit(worktreePath, ["add", "--all"]);
+  record.commands.push({ command: "git add --all", status: add.status, stderr: add.stderr.trim(), stdout: add.stdout.trim() });
+  if (add.status !== 0) throw new Error(`Unable to stage accepted transaction work: ${(add.stderr || add.stdout).trim()}`);
+
+  const changedFilesAfterStage = await gitChangedFilesSince(worktreePath, baseCommit);
+  record.changedFiles = changedFilesAfterStage;
+  if (changedFilesAfterStage.length === 0) {
+    record.status = "no_changes_to_commit";
+    record.completedAt = new Date().toISOString();
+    record.git.after = await gitInfo(worktreePath);
+    record.git.callerAfter = callerCwd ? await gitInfo(callerCwd) : null;
+    record.manualNextSteps = [
+      "No transaction commit was created because the isolated transaction worktree has no changes relative to the recorded base commit.",
+      `Review the preserved transaction branch ${branchName} and durable evidence before deciding whether to rerun implementation.`,
+    ];
+    return record;
+  }
+
+  const bug = String(planArtifact?.transaction?.bugDescription || planArtifact?.bugDescription || "bug solver transaction").trim();
+  const message = [
+    `bug-solver: ${bug.slice(0, 72) || transactionId}`,
+    "",
+    `Transaction-Id: ${transactionId}`,
+    `Base-Commit: ${baseCommit}`,
+    `Validation-Evidence: ${artifactPaths.postValidation}`,
+    `Implementation-Evidence: ${artifactPaths.implementationEvidence}`,
+    `Repair-Attempts: ${repairRecords?.length || 0}`,
+    `Final-Verification: ${postValidation?.finalVerification?.status || "unknown"}`,
+    "",
+    "Created by pi bug-solver-workflow in an isolated transaction worktree.",
+  ].join("\n");
+  const commit = await runGit(worktreePath, ["-c", "user.name=Pi Bug Solver", "-c", "user.email=pi-bug-solver@localhost", "commit", "-m", message]);
+  record.commands.push({ command: "git -c user.name=Pi Bug Solver -c user.email=pi-bug-solver@localhost commit -m <transaction metadata>", status: commit.status, stderr: commit.stderr.trim(), stdout: commit.stdout.trim() });
+  if (commit.status !== 0) throw new Error(`Unable to create transaction commit on ${branchName}: ${(commit.stderr || commit.stdout).trim()}`);
+  const head = await runGit(worktreePath, ["rev-parse", "HEAD"]);
+  if (head.status !== 0) throw new Error(`Unable to read transaction commit hash: ${(head.stderr || head.stdout).trim()}`);
+  const committedFiles = await gitChangedFilesSince(worktreePath, baseCommit);
+  record.completedAt = new Date().toISOString();
+  record.status = "committed_for_review";
+  record.commit = head.stdout.trim();
+  record.changedFiles = committedFiles;
+  record.git.after = await gitInfo(worktreePath);
+  record.git.callerAfter = callerCwd ? await gitInfo(callerCwd) : null;
+  record.manualNextSteps = [
+    `Review transaction branch ${branchName} at commit ${record.commit}.`,
+    "Inspect the final report, baseline/post-change validation evidence, allowlist decisions, repair attempts, and failure classifications before merging manually.",
+    "Merge or cherry-pick the transaction commit only after human review; the workflow intentionally did not merge into the caller branch.",
+  ];
+  record.acceptedWork = {
+    validationStatus: postValidation?.status || null,
+    finalVerification: postValidation?.finalVerification || null,
+    implementationStatus: implementation?.status || null,
+    repairAttempts: repairRecords?.length || 0,
+  };
+  return record;
+}
+
 function categoryForSolveError(error, phase) {
   const message = String(error?.message || error || "").toLowerCase();
   if (phase === "confirmation-gate" || /precheck|plan|multi|split|approval|approved|editingallowed|contract|artifact path|dirty caller|dirty worktree|base head|unsafe/.test(message)) return FAILURE_CATEGORIES.PRECHECK_PLAN;
@@ -2643,10 +2730,66 @@ async function solve(args, json) {
     phaseEnd(run, "post-change-validation", repairCapReached ? STATUSES.FAILED : (postValidation.failures.regressions.length === 0 && postValidation.finalVerification.status === "passed" ? STATUSES.SUCCESS : STATUSES.FAILED), { status: postValidation.status, commands: postValidation.commandResults.length, fixed: postValidation.comparison.fixed.length, unchangedPreExisting: postValidation.comparison.unchangedPreExisting.length, newlyRegressed: postValidation.comparison.newlyRegressed.length, targetedBeforeBroad: postValidation.targetedBeforeBroad, finalVerification: postValidation.finalVerification.status, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, repairCapReached });
     if (repairCapReached) throw new Error(`Repair cap reached after ${repairRecords.length}/${repairMax} attempts; terminal failure recorded in ${artifactPaths.repairAttempts}`);
 
-    completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence, repairAttemptsPath: artifactPaths.repairAttempts, postValidationPath: artifactPaths.postValidation, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name });
-    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence, repairAttemptsPath: artifactPaths.repairAttempts, postValidationPath: artifactPaths.postValidation, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, preExistingFailureCount: baseline.failures.preExisting.length, newlyRegressedCount: postValidation.comparison.newlyRegressed.length, fixedCount: postValidation.comparison.fixed.length, unchangedPreExistingCount: postValidation.comparison.unchangedPreExisting.length, finalVerification: postValidation.finalVerification, status: "post_change_validation_recorded", editCapableResourcesCreated: true, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name };
+    currentPhase = "transaction-commit-and-report";
+    phaseStart(run, "transaction-commit-and-report", { transactionId, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name, finalReportPath: artifactPaths.finalReport });
+    const transactionCommit = await createTransactionCommit({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, callerCwd: cwd, baseCommit: integrity.baseCommit, branchName: worktreeRecord.branch.name, postValidation, implementation, repairRecords });
+    const outcome = {
+      status: transactionCommit.status === "committed_for_review" ? "accepted_for_manual_review" : "accepted_without_commit",
+      finalStatus: transactionCommit.status,
+      manualReviewRequired: true,
+      mergedIntoCallerBranch: false,
+      transactionBranch: worktreeRecord.branch.name,
+      transactionCommit: transactionCommit.commit,
+      transactionWorktree: worktreeRecord.worktree.path,
+      changedFiles: transactionCommit.changedFiles,
+      finalVerification: postValidation.finalVerification,
+      guidance: transactionCommit.manualNextSteps,
+    };
+    if (existsSync(statePath)) {
+      const state = readJson(statePath);
+      const updatedState = {
+        ...state,
+        updatedAt: transactionCommit.completedAt,
+        revision: Number.isInteger(state.revision) ? state.revision + 1 : 1,
+        lifecycle: { ...(state.lifecycle || {}), status: "completed", phase: "transaction-commit-and-report", terminal: true, outcome },
+        branch: { ...(state.branch || {}), head: transactionCommit.commit || state.branch?.head || integrity.baseCommit, status: transactionCommit.status === "committed_for_review" ? "committed_for_review" : "ready_for_review" },
+        implementation: { ...(state.implementation || {}), changedFiles: transactionCommit.changedFiles, transactionCommit: transactionCommit.commit },
+        validation: { ...(state.validation || {}), finalVerification: { ...(state.validation?.finalVerification || {}), ...postValidation.finalVerification, path: artifactPaths.finalReport, evidencePath: artifactPaths.postValidation } },
+        reports: { ...(state.reports || {}), finalReportPath: artifactPaths.finalReport },
+      };
+      writeJson(statePath, updatedState);
+      updatedStateForRegistry = updatedState;
+    }
+    if (existsSync(artifactPaths.finalReport)) {
+      const finalReport = readJson(artifactPaths.finalReport);
+      writeJson(artifactPaths.finalReport, {
+        ...finalReport,
+        updatedAt: transactionCommit.completedAt,
+        status: "completed",
+        terminal: true,
+        outcome,
+        finalOutcome: outcome,
+        summary: { ...(finalReport.summary || {}), status: "completed", phase: "transaction-commit-and-report", changedFiles: transactionCommit.changedFiles, finalStatus: outcome.status, manualReviewRequired: true },
+        commands: postValidation.commands,
+        decisions: [
+          ...(finalReport.decisions || []),
+          { decision: transactionCommit.status === "committed_for_review" ? "accepted_work_committed_to_transaction_branch" : "reviewable_transaction_branch_preserved_without_commit", createdAt: transactionCommit.completedAt, justification: transactionCommit.status === "committed_for_review" ? "Outcome-based final verification passed with no new regressions; accepted work was committed on the isolated transaction branch for manual review, not merged into the caller branch." : "No changed files were present to commit; the isolated transaction branch, final verification result, validation evidence, and manual review guidance were preserved without merging into the caller branch.", branch: worktreeRecord.branch.name, commit: transactionCommit.commit, changedFiles: transactionCommit.changedFiles },
+        ],
+        commits: { transactionBranch: worktreeRecord.branch.name, transactionWorktree: worktreeRecord.worktree.path, commits: transactionCommit.commit ? [transactionCommit.commit] : [], status: transactionCommit.status, records: [transactionCommit], changedFiles: transactionCommit.changedFiles, baseCommit: integrity.baseCommit, metadata: { transactionId, validationEvidence: transactionCommit.validationEvidence, allowlistDecisionEvidence: artifactPaths.allowlistDecisions, repairHistoryEvidence: artifactPaths.repairAttempts } },
+        changedFiles: transactionCommit.changedFiles,
+        manualNextSteps: transactionCommit.manualNextSteps,
+        finalVerification: postValidation.finalVerification,
+        evidencePaths: { ...(finalReport.evidencePaths || {}), baseline: artifactPaths.baseline, postValidation: artifactPaths.postValidation, implementation: artifactPaths.implementationEvidence, allowlistDecisions: artifactPaths.allowlistDecisions, repairAttempts: artifactPaths.repairAttempts, failureClassifications: artifactPaths.failureClassifications, finalReport: artifactPaths.finalReport, worktreeMetadata: artifactPaths.worktreeMetadata, state: statePath },
+      });
+    }
+    if (updatedStateForRegistry) updateGlobalRegistry(updatedStateForRegistry);
+    emitArtifact(run, { kind: "file", title: "bug-solver final report", path: artifactPaths.finalReport });
+    phaseEnd(run, "transaction-commit-and-report", transactionCommit.status === "committed_for_review" ? STATUSES.SUCCESS : STATUSES.FAILED, { status: transactionCommit.status, commit: transactionCommit.commit, changedFiles: transactionCommit.changedFiles.length, branch: worktreeRecord.branch.name, finalReportPath: artifactPaths.finalReport, manualReviewRequired: true });
+
+    completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence, repairAttemptsPath: artifactPaths.repairAttempts, postValidationPath: artifactPaths.postValidation, finalReportPath: artifactPaths.finalReport, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name, transactionCommit: transactionCommit.commit, finalStatus: outcome.status });
+    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence, repairAttemptsPath: artifactPaths.repairAttempts, postValidationPath: artifactPaths.postValidation, finalReportPath: artifactPaths.finalReport, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, preExistingFailureCount: baseline.failures.preExisting.length, newlyRegressedCount: postValidation.comparison.newlyRegressed.length, fixedCount: postValidation.comparison.fixed.length, unchangedPreExistingCount: postValidation.comparison.unchangedPreExisting.length, finalVerification: postValidation.finalVerification, status: "completed", outcome, editCapableResourcesCreated: true, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name, transactionCommit: transactionCommit.commit };
     if (json) console.log(JSON.stringify(result, null, 2));
-    else console.log(`gated activation recorded: ${file}`);
+    else console.log(`transaction ${transactionId} completed on ${worktreeRecord.branch.name}; final report: ${artifactPaths.finalReport}`);
   } catch (error) {
     if (!/Repair cap reached/i.test(error?.message || String(error))) recordSolveFailureClassification({ transactionId: plan.transactionId, planArtifact, plan, planPath, phase: currentPhase, error });
     failRun(run, error, { transactionId: plan.transactionId, failurePhase: currentPhase });
@@ -2812,8 +2955,8 @@ function assertSolvePlanIntegrity({ planArtifact, planPath, plan, git, cwd }) {
   }
 
   const lifecycle = state.lifecycle || {};
-  const allowedLifecycleStatuses = new Set(["awaiting_confirmation", "isolated_worktree_ready", "baseline_validation_recorded", "post_change_validation_recorded"]);
-  if (!allowedLifecycleStatuses.has(String(lifecycle.status || "")) || lifecycle.terminal === true) throw new Error(`Transaction state lifecycle is not eligible for solve activation: ${lifecycle.status || "missing"}`);
+  const allowedLifecycleStatuses = new Set(["awaiting_confirmation", "isolated_worktree_ready", "baseline_validation_recorded", "post_change_validation_recorded", "completed"]);
+  if (!allowedLifecycleStatuses.has(String(lifecycle.status || "")) || (lifecycle.terminal === true && lifecycle.status !== "completed")) throw new Error(`Transaction state lifecycle is not eligible for solve activation: ${lifecycle.status || "missing"}`);
   if (lifecycle.readOnlyPrecheckComplete !== true || lifecycle.materializationComplete !== true || lifecycle.editingAllowed !== false || lifecycle.confirmationRequired !== true) throw new Error("Transaction state lifecycle does not preserve the durable read-only precheck approval gate.");
   if (state.transaction?.exactlyOneBug !== true || state.transaction?.multiplicity?.likelyMultiple !== false) throw new Error("Transaction state does not authorize exactly one bug for solve activation.");
   if (state.transaction?.bugDescription !== plan.transaction?.bugDescription) throw new Error("Transaction state bug description does not match solve plan bug description.");
