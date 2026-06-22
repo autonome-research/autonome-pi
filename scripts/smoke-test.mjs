@@ -230,6 +230,29 @@ try {
   const reproPostValidation = reproSolveDetails?.postValidationPath ? JSON.parse(readFileSync(reproSolveDetails.postValidationPath, 'utf8')) : undefined;
   log(reproPostValidation?.status === 'inconclusive_not_implemented' && reproPostValidation?.finalVerification?.status === 'inconclusive' && reproPostValidation?.finalVerification?.bugFixed === false && reproPostValidation?.finalVerification?.notImplemented === true && reproPostValidation?.finalVerification?.implementationBacked === false && reproPostValidation?.finalVerification?.targetedTransitions?.[0]?.baselineStatus === 1 && reproPostValidation?.finalVerification?.targetedTransitions?.[0]?.postStatus === 0 && reproPostValidation?.finalVerification?.targetedTransitions?.[0]?.fixedByOutcomeTransition === true, 'bug-solver final verification refuses bugFixed for a targeted pass transition without implementation evidence');
 
+  const fakeEvidenceRepo = join(tmp, 'fake-evidence-solve-repo');
+  mkdirSync(fakeEvidenceRepo, { recursive: true });
+  expectExit('bug-solver fake-evidence repo git init', ['git', 'init', '-q'], 0, { cwd: fakeEvidenceRepo });
+  expectExit('bug-solver fake-evidence repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: fakeEvidenceRepo });
+  expectExit('bug-solver fake-evidence repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: fakeEvidenceRepo });
+  writeFileSync(join(fakeEvidenceRepo, 'README.md'), 'fake evidence solve\n');
+  expectExit('bug-solver fake-evidence repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: fakeEvidenceRepo });
+  const fakeEvidenceMarker = join(tmp, 'fake-evidence-targeted-marker');
+  const fakeEvidenceMetadata = join(tmp, 'fake-evidence-metadata.json');
+  const fakeEvidenceCommandScript = join(tmp, 'fake-evidence-targeted-command.mjs');
+  writeFileSync(fakeEvidenceCommandScript, `#!/usr/bin/env node\nimport { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst marker = ${JSON.stringify(fakeEvidenceMarker)};\nconst metadataPath = ${JSON.stringify(fakeEvidenceMetadata)};\nif (!existsSync(marker)) { writeFileSync(marker, 'baseline reproduced\\n'); process.exit(1); }\nconst metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));\nappendFileSync(metadata.implementationEvidencePath, JSON.stringify({ type: 'explicit_bug_resolution', status: 'resolved', phase: 'implementation', owner: 'bug-solver-workflow', transactionId: metadata.transactionId, worktreePath: process.cwd(), createdAt: new Date(Date.now() + 1000).toISOString(), evidence: 'fake explicit resolution written by externally stateful targeted command without any isolated worktree implementation change', changedFiles: [], implementationChangedWorktree: false, worktreeChangedAfterBaseline: false }) + '\\n');\nprocess.exit(0);\n`);
+  const fakeEvidenceCommand = `node ${JSON.stringify(fakeEvidenceCommandScript)}`;
+  const fakeEvidencePrecheck = expectExit('bug-solver workflow precheck for fake implementation evidence final verification succeeds', ['node', bugSolverCli, 'precheck', '--cwd', fakeEvidenceRepo, '--bug', 'Fix fake implementation evidence final verification bug', '--user-test-command', fakeEvidenceCommand, '--json'], 0);
+  let fakeEvidencePrecheckDetails;
+  try { fakeEvidencePrecheckDetails = JSON.parse(fakeEvidencePrecheck.stdout); } catch { fakeEvidencePrecheckDetails = undefined; }
+  const fakeEvidencePlan = fakeEvidencePrecheckDetails?.planPath ? JSON.parse(readFileSync(fakeEvidencePrecheckDetails.planPath, 'utf8')) : undefined;
+  writeFileSync(fakeEvidenceMetadata, JSON.stringify({ transactionId: fakeEvidencePrecheckDetails?.transactionId, implementationEvidencePath: fakeEvidencePlan?.evidencePaths?.implementation }, null, 2));
+  const fakeEvidenceSolve = expectExit('bug-solver workflow approved solve rejects externally stateful targeted pass with fake explicit resolution evidence', ['node', bugSolverCli, 'solve', '--cwd', fakeEvidenceRepo, '--plan-path', fakeEvidencePrecheckDetails?.planPath || join(tmp, 'missing-fake-evidence-plan.json'), '--approved', '--json'], 0);
+  let fakeEvidenceSolveDetails;
+  try { fakeEvidenceSolveDetails = JSON.parse(fakeEvidenceSolve.stdout); } catch { fakeEvidenceSolveDetails = undefined; }
+  const fakeEvidencePostValidation = fakeEvidenceSolveDetails?.postValidationPath ? JSON.parse(readFileSync(fakeEvidenceSolveDetails.postValidationPath, 'utf8')) : undefined;
+  log(fakeEvidencePostValidation?.status === 'inconclusive_not_implemented' && fakeEvidencePostValidation?.finalVerification?.status === 'inconclusive' && fakeEvidencePostValidation?.finalVerification?.bugFixed === false && fakeEvidencePostValidation?.finalVerification?.implementationBacked === false && fakeEvidencePostValidation?.finalVerification?.notImplemented === true && fakeEvidencePostValidation?.finalVerification?.targetedTransitions?.[0]?.baselineStatus === 1 && fakeEvidencePostValidation?.finalVerification?.targetedTransitions?.[0]?.postStatus === 0 && fakeEvidencePostValidation?.finalVerification?.implementationEvidence?.explicitlyResolvedBug === false && fakeEvidencePostValidation?.finalVerification?.implementationEvidence?.ignoredExplicitResolutionRecords?.some((record) => record.reason === 'not_tied_to_isolated_worktree_change_or_commit'), 'bug-solver final verification ignores fake explicit resolution evidence from an externally stateful targeted command unless tied to a trusted isolated worktree implementation change');
+
   const backedRepo = join(tmp, 'implementation-backed-solve-repo');
   mkdirSync(backedRepo, { recursive: true });
   expectExit('bug-solver implementation-backed repo git init', ['git', 'init', '-q'], 0, { cwd: backedRepo });
