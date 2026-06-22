@@ -765,12 +765,16 @@ function evaluateAllowlist({ changedFiles, planArtifact, artifactPaths }) {
 }
 
 function explicitResolutionCandidate(record) {
-  const explicitResolutionTypes = new Set(["implementation_change", "repair_change", "bug_resolution", "explicit_bug_resolution", "repair_attempt"]);
+  const explicitResolutionTypes = new Set(["bug_resolution", "explicit_bug_resolution", "repair_resolution", "explicit_repair_resolution"]);
+  const explicitResolutionStatusTypes = new Set(["repair_change", "repair_attempt"]);
+  const status = String(record?.status || record?.outcome || "").toLowerCase();
   return record?.explicitlyResolvedBug === true
     || record?.bugResolved === true
     || record?.resolvedBug === true
-    || record?.implementationChangedWorktree === true
-    || (explicitResolutionTypes.has(String(record?.type || "")) && ["resolved", "fixed", "changed", "implemented", "success", "passed"].includes(String(record?.status || record?.outcome || "").toLowerCase()));
+    || typeof record?.bugResolution === "string"
+    || typeof record?.resolutionSummary === "string"
+    || explicitResolutionTypes.has(String(record?.type || ""))
+    || (explicitResolutionStatusTypes.has(String(record?.type || "")) && ["resolved", "fixed", "implemented", "success", "passed"].includes(status));
 }
 
 function parseRecordTime(value) {
@@ -827,18 +831,59 @@ function trustedExplicitResolutionRecord(record, { baseline, baselineAfter, post
   return { trusted: true, reason: "trusted_post_baseline_resolution_corroborated_by_isolated_worktree_git_evidence" };
 }
 
-async function implementationBackedEvidence({ baseline, postBefore, postAfter, artifactPaths }) {
+function commandReferencedPaths(command) {
+  const tokens = String(command || "").match(/(?:\.\/|\.\.\/|[A-Za-z0-9_.-]+\/)[A-Za-z0-9_./-]+|[A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+/g) || [];
+  return uniqueStrings(tokens.map((token) => token.replace(/^['"]|['"]$/g, "").replace(/^\.\//, "")).filter((token) => token && !token.startsWith("/")));
+}
+
+function commandPathOverlapsChangedFile(commandPath, changedFile) {
+  const commandValue = String(commandPath || "").replace(/^\.\//, "").replace(/\/$/, "");
+  const changedValue = String(changedFile || "").replace(/^\.\//, "");
+  return commandValue === changedValue || changedValue.startsWith(`${commandValue}/`) || commandValue.startsWith(`${changedValue}/`);
+}
+
+function causallyRelevantImplementationChange({ records, commands = [], baseline, baselineAfter, postBefore, actualChangedFiles }) {
+  const targetedPathRefs = uniqueStrings(commands.filter((entry) => entry.kind === "targeted_user_test").flatMap((entry) => commandReferencedPaths(entry.command)));
+  const trustedRunnerRecords = records.filter((record) => {
+    const phase = String(record?.phase || record?.workflowPhase || record?.producedByPhase || "");
+    const recordWorktreePath = record?.worktreePath || record?.isolatedWorktreePath || record?.worktree?.path;
+    const createdAt = parseRecordTime(record?.createdAt || record?.completedAt);
+    const baselineCompletedAt = parseRecordTime(baseline?.completedAt);
+    return record?.runnerOwnedImplementationMetadata === true
+      && record?.validationCommandProduced !== true
+      && record?.transactionId === baseline?.transactionId
+      && baselineCompletedAt && createdAt && createdAt > baselineCompletedAt
+      && ["implementation", "repair", "repair-attempt", "implementation-repair", "bounded-repair-loop"].includes(phase)
+      && recordWorktreePath && baseline?.worktreePath && resolve(String(recordWorktreePath)) === resolve(String(baseline.worktreePath));
+  });
+  const runnerChangedFiles = uniqueStrings([...actualChangedFiles, ...trustedRunnerRecords.flatMap((record) => Array.isArray(record.changedFiles) ? record.changedFiles : [])]);
+  const matchingChangedFiles = runnerChangedFiles.filter((file) => targetedPathRefs.some((ref) => commandPathOverlapsChangedFile(ref, file)));
+  const actualWorktreeChanged = gitSnapshotChanged(baselineAfter, postBefore) || actualChangedFiles.length > 0;
+  return {
+    found: actualWorktreeChanged && trustedRunnerRecords.length > 0 && matchingChangedFiles.length > 0,
+    required: true,
+    targetedCommandPathReferences: targetedPathRefs,
+    matchingChangedFiles,
+    reason: matchingChangedFiles.length > 0
+      ? "trusted runner-owned implementation metadata changed file paths referenced by the targeted bug reproduction command"
+      : "post-baseline worktree changes were not causally tied to the targeted bug reproduction command or an explicit trusted bug-resolution record",
+  };
+}
+
+async function implementationBackedEvidence({ baseline, postBefore, postAfter, artifactPaths, commands = [] }) {
   const records = readJsonlRecords(artifactPaths.implementationEvidence);
   const baselineAfter = baseline?.git?.after;
   const actualChangedFiles = await gitChangedFilesSince(postBefore?.root || baseline?.worktreePath, baselineAfter?.head);
   const assessedExplicitRecords = records.filter(explicitResolutionCandidate).map((record) => ({ record, assessment: trustedExplicitResolutionRecord(record, { baseline, baselineAfter, postBefore, actualChangedFiles }) }));
   const explicitResolution = assessedExplicitRecords.find((entry) => entry.assessment.trusted)?.record;
   const ignoredExplicitResolutionRecords = assessedExplicitRecords.filter((entry) => !entry.assessment.trusted).map((entry) => ({ type: entry.record?.type || null, status: entry.record?.status || entry.record?.outcome || null, createdAt: entry.record?.createdAt || entry.record?.completedAt || null, reason: entry.assessment.reason }));
+  const causalImplementation = causallyRelevantImplementationChange({ records, commands, baseline, baselineAfter, postBefore, actualChangedFiles });
   const worktreeChangedAfterBaseline = gitSnapshotChanged(baselineAfter, postBefore);
   const worktreeChangedByPostValidation = gitSnapshotChanged(postBefore, postAfter);
   const allowlistDecisions = readJsonlRecords(artifactPaths.allowlistDecisions);
   const rejectedOutOfScope = allowlistDecisions.filter((record) => record?.type === "out_of_scope_change_rejected");
   const allowlistAccepted = rejectedOutOfScope.length === 0;
+  const implementationBacked = Boolean(explicitResolution) || causalImplementation.found;
   const implementationEvidence = {
     required: true,
     evidencePath: artifactPaths.implementationEvidence,
@@ -848,15 +893,17 @@ async function implementationBackedEvidence({ baseline, postBefore, postAfter, a
     explicitlyResolvedBug: Boolean(explicitResolution),
     trustedExplicitResolutionRequired: true,
     explicitResolutionCorroborationRequired: true,
+    causalImplementationEvidenceRequired: true,
+    causalImplementation,
     ignoredExplicitResolutionRecords,
     allowlistAccepted,
     rejectedOutOfScope,
-    durableEvidenceFound: allowlistAccepted && (worktreeChangedAfterBaseline || Boolean(explicitResolution)),
+    durableEvidenceFound: allowlistAccepted && implementationBacked,
     baselineAfter: baselineAfter ? { head: baselineAfter.head || null, statusShort: baselineAfter.statusShort || "" } : null,
     postValidationBefore: postBefore ? { head: postBefore.head || null, statusShort: postBefore.statusShort || "" } : null,
     postValidationAfter: postAfter ? { head: postAfter.head || null, statusShort: postAfter.statusShort || "" } : null,
     explicitResolutionRecord: explicitResolution ? { type: explicitResolution.type || null, status: explicitResolution.status || explicitResolution.outcome || null, createdAt: explicitResolution.createdAt || explicitResolution.completedAt || null, phase: explicitResolution.phase || explicitResolution.workflowPhase || null } : null,
-    basis: !allowlistAccepted ? "implementation changed files outside the adaptive allowlist without a prior durable justification, so the workflow refuses to count the change as accepted implementation evidence" : (worktreeChangedAfterBaseline ? "isolated transaction worktree changed after baseline and before final verification" : (explicitResolution ? "trusted post-baseline implementation/repair evidence records bug resolution tied to the isolated transaction worktree change or commit" : "no trusted post-baseline implementation or repair evidence changed/resolved the isolated transaction worktree before final verification")),
+    basis: !allowlistAccepted ? "implementation changed files outside the adaptive allowlist without a prior durable justification, so the workflow refuses to count the change as accepted implementation evidence" : (explicitResolution ? "trusted post-baseline implementation/repair evidence explicitly records bug resolution tied to isolated worktree git evidence" : (causalImplementation.found ? causalImplementation.reason : "no trusted post-baseline implementation or repair evidence explicitly or causally ties the isolated worktree change to the bug resolution")),
   };
   return implementationEvidence;
 }
@@ -1252,7 +1299,7 @@ async function runPostChangeValidation({ transactionId, planArtifact, artifactPa
   }
   const after = await gitInfo(worktreePath);
   const comparison = compareValidationResults({ baselineResults: baseline?.commandResults || [], postResults: results });
-  const implementationEvidence = await implementationBackedEvidence({ baseline, postBefore: before, postAfter: after, artifactPaths });
+  const implementationEvidence = await implementationBackedEvidence({ baseline, postBefore: before, postAfter: after, artifactPaths, commands });
   const finalVerification = buildFinalVerification({ commands, baselineResults: baseline?.commandResults || [], postResults: results, comparison, implementationEvidence });
   const classifications = classifyPostValidationFailures(comparison, results, artifactPaths, finalVerification);
   const status = commands.length === 0

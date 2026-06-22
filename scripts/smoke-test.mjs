@@ -356,6 +356,24 @@ try {
   const implementationPhasePostValidation = implementationPhaseSolveDetails?.postValidationPath ? JSON.parse(readFileSync(implementationPhaseSolveDetails.postValidationPath, 'utf8')) : undefined;
   log(implementationPhaseRecord?.editCapable === true && implementationPhaseRecord?.commandProvided === true && implementationPhaseRecord?.worktreeChangedAfterBaseline === true && implementationPhaseRecord?.changedFiles?.includes('README.md') && implementationPhaseContext?.status === 'ready_for_implementation' && implementationPhaseContext?.isolatedWorktreePath === implementationPhaseSolveDetails?.worktreePath && implementationPhaseContext?.baselineSummary?.status === 'completed_with_pre_existing_failures' && implementationPhaseContext?.allowlistPolicy?.justificationRequiredForExpansion === true && implementationPhaseRecord?.workerContext?.requiredEvidencePaths?.implementationContext === implementationPhaseSolveDetails?.implementationContextPath && implementationPhasePostValidation?.finalVerification?.targetedTransitions?.[0]?.baselineStatus === 1 && implementationPhasePostValidation?.finalVerification?.targetedTransitions?.[0]?.postStatus === 0 && implementationPhasePostValidation?.finalVerification?.targetedTransitions?.[0]?.fixedByOutcomeTransition === true && implementationPhasePostValidation?.finalVerification?.bugFixed === true && implementationPhasePostValidation?.finalVerification?.implementationBacked === true, 'bug-solver solve supplies durable implementation context to the isolated worker, captures changed files/evidence, and proves outcome-based bug fix');
 
+  const unrelatedEditRepo = join(tmp, 'external-stateful-targeted-unrelated-edit-repo');
+  mkdirSync(unrelatedEditRepo, { recursive: true });
+  expectExit('bug-solver unrelated-edit repo git init', ['git', 'init', '-q'], 0, { cwd: unrelatedEditRepo });
+  expectExit('bug-solver unrelated-edit repo git config email', ['git', 'config', 'user.email', 'test@example.com'], 0, { cwd: unrelatedEditRepo });
+  expectExit('bug-solver unrelated-edit repo git config name', ['git', 'config', 'user.name', 'Test'], 0, { cwd: unrelatedEditRepo });
+  writeFileSync(join(unrelatedEditRepo, 'README.md'), 'external stateful targeted before solve\n');
+  expectExit('bug-solver unrelated-edit repo initial commit', ['sh', '-c', 'git add README.md && git commit -q -m init'], 0, { cwd: unrelatedEditRepo });
+  const unrelatedMarker = join(tmp, 'external-stateful-targeted-unrelated-marker');
+  const unrelatedCommand = `sh -c 'test -f ${JSON.stringify(unrelatedMarker)} && exit 0; touch ${JSON.stringify(unrelatedMarker)}; exit 1'`;
+  const unrelatedPrecheck = expectExit('bug-solver workflow precheck for external stateful targeted command succeeds', ['node', bugSolverCli, 'precheck', '--cwd', unrelatedEditRepo, '--bug', 'Fix external stateful targeted command bug', '--user-test-command', unrelatedCommand, '--json'], 0);
+  let unrelatedPrecheckDetails;
+  try { unrelatedPrecheckDetails = JSON.parse(unrelatedPrecheck.stdout); } catch { unrelatedPrecheckDetails = undefined; }
+  const unrelatedSolve = expectExit('bug-solver workflow approved solve refuses bugFixed for external stateful targeted pass plus unrelated edit', ['node', bugSolverCli, 'solve', '--cwd', unrelatedEditRepo, '--plan-path', unrelatedPrecheckDetails?.planPath || join(tmp, 'missing-unrelated-edit-plan.json'), '--approved', '--implementation-command', 'printf unrelated > UNRELATED.md', '--json'], 0);
+  let unrelatedSolveDetails;
+  try { unrelatedSolveDetails = JSON.parse(unrelatedSolve.stdout); } catch { unrelatedSolveDetails = undefined; }
+  const unrelatedPostValidation = unrelatedSolveDetails?.postValidationPath ? JSON.parse(readFileSync(unrelatedSolveDetails.postValidationPath, 'utf8')) : undefined;
+  log(unrelatedPostValidation?.status === 'inconclusive_not_implemented' && unrelatedPostValidation?.finalVerification?.status === 'inconclusive' && unrelatedPostValidation?.finalVerification?.bugFixed === false && unrelatedPostValidation?.finalVerification?.implementationBacked === false && unrelatedPostValidation?.finalVerification?.notImplemented === true && unrelatedPostValidation?.finalVerification?.targetedTransitions?.[0]?.baselineStatus === 1 && unrelatedPostValidation?.finalVerification?.targetedTransitions?.[0]?.postStatus === 0 && unrelatedPostValidation?.finalVerification?.implementationEvidence?.worktreeChangedAfterBaseline === true && unrelatedPostValidation?.finalVerification?.implementationEvidence?.causalImplementation?.matchingChangedFiles?.length === 0, 'bug-solver final verification requires causally trusted implementation evidence and rejects external targeted state plus unrelated implementation edits');
+
   const allowlistBlockedRepo = join(tmp, 'allowlist-blocked-repo');
   mkdirSync(allowlistBlockedRepo, { recursive: true });
   expectExit('bug-solver allowlist-blocked repo git init', ['git', 'init', '-q'], 0, { cwd: allowlistBlockedRepo });
