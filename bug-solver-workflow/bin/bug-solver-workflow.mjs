@@ -1112,6 +1112,121 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
   return record;
 }
 
+function repairBudgetFrom(planArtifact, args = {}) {
+  const raw = args["max-repairs"] ?? args.maxRepairIterations ?? planArtifact?.repairPolicy?.maxRepairIterations ?? planArtifact?.maxRepairIterations ?? planArtifact?.repair?.maxRepairIterations;
+  try { return parseMaxRepairs(raw); } catch { return 8; }
+}
+
+function implementationNeedsRepair(implementation) {
+  return !implementation?.allowlist?.accepted || (implementation?.commandResult && implementation.commandResult.status !== 0);
+}
+
+function postValidationNeedsRepair(postValidation) {
+  return (postValidation?.comparison?.newlyRegressed?.length || 0) > 0 || postValidation?.finalVerification?.status === "failed";
+}
+
+function repairTriggerSummary({ implementation, postValidation }) {
+  if (implementationNeedsRepair(implementation)) return { phase: "implementation", status: implementation?.status || "failed", commandStatus: implementation?.commandResult?.status ?? null, allowlistAccepted: implementation?.allowlist?.accepted === true };
+  if (postValidationNeedsRepair(postValidation)) return { phase: "post-change-validation", status: postValidation?.status || "failed", finalVerificationStatus: postValidation?.finalVerification?.status || null, newlyRegressed: postValidation?.comparison?.newlyRegressed?.length || 0 };
+  return { phase: "none", status: "no_repair_needed" };
+}
+
+async function runRepairAttempt({ transactionId, planArtifact, artifactPaths, worktreePath, baseline, implementationCommand, attempt, maxRepairIterations, trigger }) {
+  const startedAt = new Date().toISOString();
+  const before = await gitInfo(worktreePath);
+  const startRecord = {
+    schema: "pi-bug-solver-workflow/repair-attempt/v1",
+    type: "repair_attempt_started",
+    transactionId,
+    attempt,
+    maxRepairIterations,
+    remainingAfterStart: Math.max(maxRepairIterations - attempt, 0),
+    createdAt: startedAt,
+    phase: "repair-attempt",
+    trigger,
+    bounded: true,
+    worktreePath,
+    evidencePaths: { repairAttempts: artifactPaths.repairAttempts, implementationEvidence: artifactPaths.implementationEvidence, postValidation: artifactPaths.postValidation, failureClassifications: artifactPaths.failureClassifications },
+  };
+  appendJsonl(artifactPaths.repairAttempts, startRecord);
+  const implementation = await runImplementationPhase({ transactionId, planArtifact, artifactPaths, worktreePath, baseline, implementationCommand });
+  const after = await gitInfo(worktreePath);
+  const completedAt = new Date().toISOString();
+  const record = {
+    ...startRecord,
+    type: "repair_attempt_completed",
+    completedAt,
+    status: implementationNeedsRepair(implementation) ? "implementation_still_failing" : "implementation_recorded",
+    implementationStatus: implementation.status,
+    commandStatus: implementation.commandResult?.status ?? null,
+    allowlistAccepted: implementation.allowlist?.accepted === true,
+    changedFiles: implementation.changedFiles || [],
+    git: { before, after },
+  };
+  appendJsonl(artifactPaths.repairAttempts, record);
+  appendJsonl(artifactPaths.implementationEvidence, {
+    type: "repair_attempt",
+    transactionId,
+    createdAt: completedAt,
+    phase: "repair-attempt",
+    workflow: WORKFLOW,
+    producer: { workflow: WORKFLOW, name: WORKFLOW, phase: "repair-attempt" },
+    runnerOwnedImplementationMetadata: true,
+    runnerProcessPid: process.pid,
+    validationCommandProduced: false,
+    attempt,
+    maxRepairIterations,
+    status: record.status,
+    changedFiles: record.changedFiles,
+    worktreePath,
+    evidencePath: artifactPaths.repairAttempts,
+  });
+  if (record.status !== "implementation_recorded") {
+    appendJsonl(artifactPaths.failureClassifications, withFailureCategory({
+      type: "repair_attempt_failed",
+      phase: "repair-attempt",
+      transactionId,
+      createdAt: completedAt,
+      attempt,
+      maxRepairIterations,
+      status: record.status,
+      trigger,
+      evidencePath: artifactPaths.repairAttempts,
+      rationale: "A bounded repair attempt completed but the implementation failure condition remained actionable.",
+    }, FAILURE_CATEGORIES.IMPLEMENTATION, { repairAttempts: artifactPaths.repairAttempts, implementationEvidence: artifactPaths.implementationEvidence, failureClassifications: artifactPaths.failureClassifications }));
+  }
+  return { repair: record, implementation };
+}
+
+function recordRepairCapReached({ transactionId, artifactPaths, statePath, finalReportPath, maxRepairIterations, attempts, trigger }) {
+  const now = new Date().toISOString();
+  const record = withFailureCategory({
+    type: "repair_cap_reached",
+    phase: "bounded-repair-loop",
+    transactionId,
+    createdAt: now,
+    status: "terminal_failure_repair_cap_reached",
+    attempts,
+    maxRepairIterations,
+    trigger,
+    evidencePath: artifactPaths.repairAttempts,
+    rationale: "The workflow exhausted maxRepairIterations and refused unbounded implementation/validation retries.",
+  }, FAILURE_CATEGORIES.IMPLEMENTATION, { repairAttempts: artifactPaths.repairAttempts, failureClassifications: artifactPaths.failureClassifications, finalReport: finalReportPath, state: statePath });
+  appendJsonl(artifactPaths.repairAttempts, record);
+  appendJsonl(artifactPaths.failureClassifications, record);
+  if (existsSync(statePath)) {
+    const state = readJson(statePath);
+    const updatedState = { ...state, updatedAt: now, revision: Number.isInteger(state.revision) ? state.revision + 1 : 1, lifecycle: { ...(state.lifecycle || {}), status: record.status, phase: "bounded-repair-loop", terminal: true, lastError: record.rationale }, repair: { ...(state.repair || {}), attempts, maxRepairIterations, remaining: 0, capReached: true, attemptsPath: artifactPaths.repairAttempts }, failureClassification: { ...(state.failureClassification || {}), current: record, status: "failed_classified", classificationsPath: artifactPaths.failureClassifications } };
+    writeJson(statePath, updatedState);
+    updateGlobalRegistry(updatedState);
+  }
+  if (existsSync(finalReportPath)) {
+    const finalReport = readJson(finalReportPath);
+    writeJson(finalReportPath, { ...finalReport, updatedAt: now, status: record.status, terminal: true, repairs: { ...(finalReport.repairs || {}), attempts, maxRepairIterations, capReached: true, terminalFailure: record, evidencePath: artifactPaths.repairAttempts }, failures: { ...(finalReport.failures || {}), classifications: [...(finalReport.failures?.classifications || []), record], status: "failed_classified" }, evidencePaths: { ...(finalReport.evidencePaths || {}), repairAttempts: artifactPaths.repairAttempts, failureClassifications: artifactPaths.failureClassifications } });
+  }
+  return record;
+}
+
 async function runPostChangeValidation({ transactionId, planArtifact, artifactPaths, worktreePath, baseline }) {
   const startedAt = new Date().toISOString();
   const commands = baselineCommandList(planArtifact);
@@ -2155,7 +2270,7 @@ async function solve(args, json) {
 
     currentPhase = "implementation";
     phaseStart(run, "implementation", { transactionId, worktreePath: worktreeRecord.worktree.path, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence });
-    const implementation = await runImplementationPhase({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, baseline, implementationCommand: implementationCommandFrom({ args, planArtifact }) });
+    let implementation = await runImplementationPhase({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, baseline, implementationCommand: implementationCommandFrom({ args, planArtifact }) });
     if (existsSync(statePath)) {
       const state = readJson(statePath);
       const updatedState = {
@@ -2191,14 +2306,31 @@ async function solve(args, json) {
 
     currentPhase = "post-change-validation";
     phaseStart(run, "post-change-validation", { transactionId, worktreePath: worktreeRecord.worktree.path, baselinePath: artifactPaths.baseline, postValidationPath: artifactPaths.postValidation, implementationEvidencePath: artifactPaths.implementationEvidence });
-    const postValidation = await runPostChangeValidation({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, baseline });
+    let postValidation = await runPostChangeValidation({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, baseline });
+    const repairMax = repairBudgetFrom(planArtifact, args);
+    const repairRecords = [];
+    while ((implementationNeedsRepair(implementation) || postValidationNeedsRepair(postValidation)) && repairRecords.length < repairMax) {
+      const attempt = repairRecords.length + 1;
+      const trigger = repairTriggerSummary({ implementation, postValidation });
+      phaseEvent(run, "post-change-validation", { type: "repair_attempt_scheduled", attempt, maxRepairIterations: repairMax, trigger, repairAttemptsPath: artifactPaths.repairAttempts });
+      const repairResult = await runRepairAttempt({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, baseline, implementationCommand: implementationCommandFrom({ args, planArtifact }), attempt, maxRepairIterations: repairMax, trigger });
+      repairRecords.push(repairResult.repair);
+      implementation = repairResult.implementation;
+      postValidation = await runPostChangeValidation({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, baseline });
+      phaseEvent(run, "post-change-validation", { type: "repair_attempt_validated", attempt, maxRepairIterations: repairMax, implementationStatus: implementation.status, postValidationStatus: postValidation.status, finalVerification: postValidation.finalVerification?.status, newlyRegressed: postValidation.comparison?.newlyRegressed?.length || 0, repairAttemptsPath: artifactPaths.repairAttempts });
+    }
+    const repairCapReached = (implementationNeedsRepair(implementation) || postValidationNeedsRepair(postValidation)) && repairRecords.length >= repairMax;
+    if (repairCapReached) {
+      recordRepairCapReached({ transactionId, artifactPaths, statePath, finalReportPath: artifactPaths.finalReport, maxRepairIterations: repairMax, attempts: repairRecords.length, trigger: repairTriggerSummary({ implementation, postValidation }) });
+    }
     if (existsSync(statePath)) {
       const state = readJson(statePath);
       const updatedState = {
         ...state,
         updatedAt: postValidation.completedAt,
         revision: Number.isInteger(state.revision) ? state.revision + 1 : 1,
-        lifecycle: { ...(state.lifecycle || {}), status: "post_change_validation_recorded", phase: "post-change-validation", terminal: false },
+        lifecycle: { ...(state.lifecycle || {}), status: repairCapReached ? "terminal_failure_repair_cap_reached" : "post_change_validation_recorded", phase: repairCapReached ? "bounded-repair-loop" : "post-change-validation", terminal: repairCapReached, lastError: repairCapReached ? `Repair cap reached after ${repairRecords.length}/${repairMax} attempts` : state.lifecycle?.lastError },
+        repair: { ...(state.repair || {}), attempts: repairRecords.length, maxRepairIterations: repairMax, remaining: Math.max(repairMax - repairRecords.length, 0), capReached: repairCapReached, attemptsPath: artifactPaths.repairAttempts, latestAttempt: repairRecords.at(-1) || state.repair?.latestAttempt || null },
         validation: {
           ...(state.validation || {}),
           postValidation: { status: postValidation.status, path: artifactPaths.postValidation, completedAt: postValidation.completedAt, targetedBeforeBroad: postValidation.targetedBeforeBroad, outcomeComparison: postValidation.outcomeComparison },
@@ -2214,8 +2346,10 @@ async function solve(args, json) {
       writeJson(artifactPaths.finalReport, {
         ...finalReport,
         updatedAt: postValidation.completedAt,
-        status: "post_change_validation_recorded",
+        status: repairCapReached ? "terminal_failure_repair_cap_reached" : "post_change_validation_recorded",
+        terminal: repairCapReached,
         commands: postValidation.commands,
+        repairs: { ...(finalReport.repairs || {}), attempts: repairRecords.length, maxRepairIterations: repairMax, capReached: repairCapReached, records: repairRecords, evidencePath: artifactPaths.repairAttempts },
         failures: {
           ...(finalReport.failures || {}),
           preExisting: baseline.failures.preExisting,
@@ -2232,14 +2366,15 @@ async function solve(args, json) {
     if (updatedStateForRegistry) updateGlobalRegistry(updatedStateForRegistry);
     emitArtifact(run, { kind: "file", title: "bug-solver post-change validation", path: artifactPaths.postValidation });
     emitArtifact(run, { kind: "file", title: "bug-solver implementation evidence", path: artifactPaths.implementationEvidence });
-    phaseEnd(run, "post-change-validation", postValidation.failures.regressions.length === 0 && postValidation.finalVerification.status === "passed" ? STATUSES.SUCCESS : STATUSES.FAILED, { status: postValidation.status, commands: postValidation.commandResults.length, fixed: postValidation.comparison.fixed.length, unchangedPreExisting: postValidation.comparison.unchangedPreExisting.length, newlyRegressed: postValidation.comparison.newlyRegressed.length, targetedBeforeBroad: postValidation.targetedBeforeBroad, finalVerification: postValidation.finalVerification.status });
+    phaseEnd(run, "post-change-validation", repairCapReached ? STATUSES.FAILED : (postValidation.failures.regressions.length === 0 && postValidation.finalVerification.status === "passed" ? STATUSES.SUCCESS : STATUSES.FAILED), { status: postValidation.status, commands: postValidation.commandResults.length, fixed: postValidation.comparison.fixed.length, unchangedPreExisting: postValidation.comparison.unchangedPreExisting.length, newlyRegressed: postValidation.comparison.newlyRegressed.length, targetedBeforeBroad: postValidation.targetedBeforeBroad, finalVerification: postValidation.finalVerification.status, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, repairCapReached });
+    if (repairCapReached) throw new Error(`Repair cap reached after ${repairRecords.length}/${repairMax} attempts; terminal failure recorded in ${artifactPaths.repairAttempts}`);
 
-    completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence, postValidationPath: artifactPaths.postValidation, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name });
-    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence, postValidationPath: artifactPaths.postValidation, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, preExistingFailureCount: baseline.failures.preExisting.length, newlyRegressedCount: postValidation.comparison.newlyRegressed.length, fixedCount: postValidation.comparison.fixed.length, unchangedPreExistingCount: postValidation.comparison.unchangedPreExisting.length, finalVerification: postValidation.finalVerification, status: "post_change_validation_recorded", editCapableResourcesCreated: true, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name };
+    completeRun(run, STATUSES.SUCCESS, { transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence, repairAttemptsPath: artifactPaths.repairAttempts, postValidationPath: artifactPaths.postValidation, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name });
+    const result = { ok: true, action: "solve", runId: run.runId, transactionId, activationPath: file, worktreeMetadataPath: artifactPaths.worktreeMetadata, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence, repairAttemptsPath: artifactPaths.repairAttempts, postValidationPath: artifactPaths.postValidation, baselineStatus: baseline.status, implementationStatus: implementation.status, postValidationStatus: postValidation.status, repairAttempts: repairRecords.length, maxRepairIterations: repairMax, preExistingFailureCount: baseline.failures.preExisting.length, newlyRegressedCount: postValidation.comparison.newlyRegressed.length, fixedCount: postValidation.comparison.fixed.length, unchangedPreExistingCount: postValidation.comparison.unchangedPreExisting.length, finalVerification: postValidation.finalVerification, status: "post_change_validation_recorded", editCapableResourcesCreated: true, worktreePath: worktreeRecord.worktree.path, branch: worktreeRecord.branch.name };
     if (json) console.log(JSON.stringify(result, null, 2));
     else console.log(`gated activation recorded: ${file}`);
   } catch (error) {
-    recordSolveFailureClassification({ transactionId: plan.transactionId, planArtifact, plan, planPath, phase: currentPhase, error });
+    if (!/Repair cap reached/i.test(error?.message || String(error))) recordSolveFailureClassification({ transactionId: plan.transactionId, planArtifact, plan, planPath, phase: currentPhase, error });
     failRun(run, error, { transactionId: plan.transactionId, failurePhase: currentPhase });
     die(error.message || String(error), 1, json);
   }
