@@ -678,6 +678,59 @@ function gitSnapshotChanged(before, after) {
   return (before.head || null) !== (after.head || null) || (before.statusShort || "") !== (after.statusShort || "");
 }
 
+function classifyCallerWorktreeMutation({ transactionId, phase, callerCwd, before, after, artifactPaths, extra = {} }) {
+  const headChanged = (before?.head || null) !== (after?.head || null);
+  const statusChanged = (before?.statusShort || "") !== (after?.statusShort || "");
+  const detected = Boolean(before && after && (headChanged || statusChanged));
+  const base = {
+    schema: "pi-bug-solver-workflow/caller-worktree-integrity/v1",
+    transactionId,
+    phase,
+    callerWorktreePath: callerCwd || null,
+    recordedBeforeEditCapablePhase: Boolean(before),
+    recordedAfterEditCapablePhase: Boolean(after),
+    headBefore: before?.head || null,
+    headAfter: after?.head || null,
+    statusBefore: before?.statusShort || "",
+    statusAfter: after?.statusShort || "",
+    headChanged,
+    statusChanged,
+    detected,
+    directMutationDetected: detected,
+    failSafe: detected,
+    evidencePaths: {
+      implementationEvidence: artifactPaths?.implementationEvidence,
+      repairAttempts: artifactPaths?.repairAttempts,
+      failureClassifications: artifactPaths?.failureClassifications,
+      finalReport: artifactPaths?.finalReport,
+      state: artifactPaths?.state,
+    },
+    ...extra,
+  };
+  if (!detected) return { ...base, status: "unchanged" };
+  return {
+    ...base,
+    status: "direct_caller_mutation_detected",
+    classification: withFailureCategory({
+      type: "direct_caller_worktree_mutation_detected",
+      phase,
+      transactionId,
+      createdAt: new Date().toISOString(),
+      status: "failed_safe_direct_caller_mutation",
+      callerWorktreePath: callerCwd || null,
+      headBefore: base.headBefore,
+      headAfter: base.headAfter,
+      statusBefore: base.statusBefore,
+      statusAfter: base.statusAfter,
+      headChanged,
+      statusChanged,
+      ...extra,
+      evidencePath: artifactPaths?.implementationEvidence,
+      rationale: "An edit-capable implementation or repair phase changed the caller repository HEAD/status instead of only mutating the isolated transaction worktree, so the workflow failed safely.",
+    }, FAILURE_CATEGORIES.GIT_WORKTREE, { implementationEvidence: artifactPaths?.implementationEvidence, repairAttempts: artifactPaths?.repairAttempts, failureClassifications: artifactPaths?.failureClassifications, finalReport: artifactPaths?.finalReport, state: artifactPaths?.state }),
+  };
+}
+
 function normalizeChangedFilePath(file) {
   return String(file || "").trim().replace(/^\"|\"$/g, "").replace(/\\/g, "/");
 }
@@ -1081,9 +1134,10 @@ function buildImplementationContext({ transactionId, planArtifact, artifactPaths
   };
 }
 
-async function runImplementationPhase({ transactionId, planArtifact, artifactPaths, worktreePath, baseline, implementationCommand }) {
+async function runImplementationPhase({ transactionId, planArtifact, artifactPaths, worktreePath, callerCwd, baseline, implementationCommand, callerIntegrityPhase = "implementation", callerIntegrityExtra = {}, failOnCallerMutation = true }) {
   const startedAt = new Date().toISOString();
   const before = await gitInfo(worktreePath);
+  const callerBefore = callerCwd ? await gitInfo(callerCwd) : null;
   const command = String(implementationCommand || "").trim();
   const implementationContext = buildImplementationContext({ transactionId, planArtifact, artifactPaths, worktreePath, baseline, implementationCommand: command });
   writeJson(artifactPaths.implementationContext, implementationContext);
@@ -1101,6 +1155,8 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
     PI_BUG_SOLVER_REQUIRED_EVIDENCE_PATHS: JSON.stringify(implementationContext.requiredEvidencePaths),
   }) : null;
   const after = await gitInfo(worktreePath);
+  const callerAfter = callerCwd ? await gitInfo(callerCwd) : null;
+  const callerMutation = classifyCallerWorktreeMutation({ transactionId, phase: callerIntegrityPhase, callerCwd, before: callerBefore, after: callerAfter, artifactPaths, extra: callerIntegrityExtra });
   const changedFiles = await gitChangedFilesSince(worktreePath, baseline?.git?.after?.head || baseline?.baseCommit || planArtifact?.repo?.baseCommit);
   const allowlist = evaluateAllowlist({ changedFiles, planArtifact, artifactPaths, decisionPrefixBytes: allowlistDecisionPrefixBytes, acceptanceWindowStartedAt: startedAt });
   const worktreeChangedAfterBaseline = gitSnapshotChanged(baseline?.git?.after, after) || changedFiles.length > 0;
@@ -1169,7 +1225,8 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
     worktreeChangedAfterBaseline,
     changedFiles,
     allowlist: finalAllowlist,
-    git: { before, after },
+    git: { before, after, callerBefore, callerAfter, callerWorktreeChangedByImplementation: callerMutation.detected },
+    callerWorktree: callerMutation,
     evidencePath: artifactPaths.implementationEvidence,
     evidenceTiedToWorktreeGitState: true,
     workerContext: {
@@ -1184,6 +1241,10 @@ async function runImplementationPhase({ transactionId, planArtifact, artifactPat
     note: command ? "Implementation command ran in the isolated transaction worktree after baseline validation and before post-change validation with durable bug/contract/baseline/allowlist/evidence context supplied via PI_BUG_SOLVER_IMPLEMENTATION_CONTEXT." : "No implementation command was supplied; the edit-capable implementation phase still recorded isolated-worktree git state between baseline and post-change validation.",
   };
   appendJsonl(artifactPaths.implementationEvidence, record);
+  if (callerMutation.detected && failOnCallerMutation) {
+    appendJsonl(artifactPaths.failureClassifications, callerMutation.classification);
+    throw new Error(`Direct caller worktree mutation detected during implementation; headChanged=${callerMutation.headChanged}; statusChanged=${callerMutation.statusChanged}; evidence=${artifactPaths.implementationEvidence}`);
+  }
   if (commandResult && commandResult.status !== 0) {
     appendJsonl(artifactPaths.failureClassifications, withFailureCategory({
       type: "implementation_command_failed",
@@ -1236,9 +1297,10 @@ function repairTriggerSummary({ implementation, postValidation }) {
   return { phase: "none", status: "no_repair_needed" };
 }
 
-async function runRepairAttempt({ transactionId, planArtifact, artifactPaths, worktreePath, baseline, implementationCommand, attempt, maxRepairIterations, trigger }) {
+async function runRepairAttempt({ transactionId, planArtifact, artifactPaths, worktreePath, callerCwd, baseline, implementationCommand, attempt, maxRepairIterations, trigger }) {
   const startedAt = new Date().toISOString();
   const before = await gitInfo(worktreePath);
+  const callerBefore = callerCwd ? await gitInfo(callerCwd) : null;
   const startRecord = {
     schema: "pi-bug-solver-workflow/repair-attempt/v1",
     type: "repair_attempt_started",
@@ -1254,8 +1316,10 @@ async function runRepairAttempt({ transactionId, planArtifact, artifactPaths, wo
     evidencePaths: { repairAttempts: artifactPaths.repairAttempts, implementationEvidence: artifactPaths.implementationEvidence, postValidation: artifactPaths.postValidation, failureClassifications: artifactPaths.failureClassifications },
   };
   appendJsonl(artifactPaths.repairAttempts, startRecord);
-  const implementation = await runImplementationPhase({ transactionId, planArtifact, artifactPaths, worktreePath, baseline, implementationCommand });
+  const implementation = await runImplementationPhase({ transactionId, planArtifact, artifactPaths, worktreePath, callerCwd, baseline, implementationCommand, callerIntegrityPhase: "repair-attempt", callerIntegrityExtra: { attempt, maxRepairIterations }, failOnCallerMutation: false });
   const after = await gitInfo(worktreePath);
+  const callerAfter = callerCwd ? await gitInfo(callerCwd) : null;
+  const callerMutation = classifyCallerWorktreeMutation({ transactionId, phase: "repair-attempt", callerCwd, before: callerBefore, after: callerAfter, artifactPaths, extra: { attempt, maxRepairIterations } });
   const completedAt = new Date().toISOString();
   const record = {
     ...startRecord,
@@ -1266,9 +1330,14 @@ async function runRepairAttempt({ transactionId, planArtifact, artifactPaths, wo
     commandStatus: implementation.commandResult?.status ?? null,
     allowlistAccepted: implementation.allowlist?.accepted === true,
     changedFiles: implementation.changedFiles || [],
-    git: { before, after },
+    git: { before, after, callerBefore, callerAfter, callerWorktreeChangedByRepairAttempt: callerMutation.detected },
+    callerWorktree: callerMutation,
   };
   appendJsonl(artifactPaths.repairAttempts, record);
+  if (callerMutation.detected) {
+    appendJsonl(artifactPaths.failureClassifications, callerMutation.classification);
+    throw new Error(`Direct caller worktree mutation detected during repair attempt ${attempt}; headChanged=${callerMutation.headChanged}; statusChanged=${callerMutation.statusChanged}; evidence=${artifactPaths.repairAttempts}`);
+  }
   appendJsonl(artifactPaths.implementationEvidence, {
     type: "repair_attempt",
     transactionId,
@@ -2475,7 +2544,7 @@ async function solve(args, json) {
 
     currentPhase = "implementation";
     phaseStart(run, "implementation", { transactionId, worktreePath: worktreeRecord.worktree.path, baselinePath: artifactPaths.baseline, implementationContextPath: artifactPaths.implementationContext, implementationEvidencePath: artifactPaths.implementationEvidence });
-    let implementation = await runImplementationPhase({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, baseline, implementationCommand: implementationCommandFrom({ args, planArtifact }) });
+    let implementation = await runImplementationPhase({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, callerCwd: cwd, baseline, implementationCommand: implementationCommandFrom({ args, planArtifact }) });
     if (existsSync(statePath)) {
       const state = readJson(statePath);
       const updatedState = {
@@ -2518,7 +2587,7 @@ async function solve(args, json) {
       const attempt = repairRecords.length + 1;
       const trigger = repairTriggerSummary({ implementation, postValidation });
       phaseEvent(run, "post-change-validation", { type: "repair_attempt_scheduled", attempt, maxRepairIterations: repairMax, trigger, repairAttemptsPath: artifactPaths.repairAttempts });
-      const repairResult = await runRepairAttempt({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, baseline, implementationCommand: implementationCommandFrom({ args, planArtifact }), attempt, maxRepairIterations: repairMax, trigger });
+      const repairResult = await runRepairAttempt({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, callerCwd: cwd, baseline, implementationCommand: implementationCommandFrom({ args, planArtifact }), attempt, maxRepairIterations: repairMax, trigger });
       repairRecords.push(repairResult.repair);
       implementation = repairResult.implementation;
       postValidation = await runPostChangeValidation({ transactionId, planArtifact, artifactPaths, worktreePath: worktreeRecord.worktree.path, baseline });
