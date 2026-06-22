@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -123,6 +123,15 @@ try {
   rmSync(relativeInRepoArtifactPath, { recursive: true, force: true });
   const relativeArtifactResult = expectExit('bug-solver workflow rejects relative in-repo artifact root', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix accidental relative artifact root bug', '--json'], 1, { env: { PI_BUG_SOLVER_ARTIFACT_DIR: relativeInRepoArtifactDir } });
   log(!existsSync(relativeInRepoArtifactPath) && /outside the repository/i.test(relativeArtifactResult.stdout || relativeArtifactResult.stderr || ''), 'bug-solver refuses accidental relative in-repo PI_BUG_SOLVER_ARTIFACT_DIR before writing artifacts');
+  const symlinkToRepo = join(tmp, 'lexically-external-link-to-repo');
+  rmSync(symlinkToRepo, { recursive: true, force: true });
+  symlinkSync(root, symlinkToRepo, 'dir');
+  const symlinkArtifactDir = join(symlinkToRepo, '.bug-solver-symlink-artifacts-smoke');
+  rmSync(join(root, '.bug-solver-symlink-artifacts-smoke'), { recursive: true, force: true });
+  const symlinkPrecheckResult = expectExit('bug-solver workflow rejects symlink artifact root resolving inside repo during precheck', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix symlink artifact root bug', '--json'], 1, { env: { PI_BUG_SOLVER_ARTIFACT_DIR: symlinkArtifactDir } });
+  log(!existsSync(join(root, '.bug-solver-symlink-artifacts-smoke')) && /physicalArtifactRoot=.*\.bug-solver-symlink-artifacts-smoke/i.test(symlinkPrecheckResult.stdout || symlinkPrecheckResult.stderr || ''), 'bug-solver refuses lexically external symlink artifact root before precheck writes artifacts');
+  const symlinkStatusResult = expectExit('bug-solver workflow rejects symlink artifact root resolving inside repo during status', ['node', bugSolverCli, 'status', '--cwd', root, '--transaction-id', 'missing-symlink-status', '--json'], 1, { env: { PI_BUG_SOLVER_ARTIFACT_DIR: symlinkArtifactDir } });
+  log(/physicalArtifactRoot=.*\.bug-solver-symlink-artifacts-smoke/i.test(symlinkStatusResult.stdout || symlinkStatusResult.stderr || ''), 'bug-solver status uses realpath containment checks for artifact root safety');
   const bugPrecheck = expectExit('bug-solver workflow precheck writes durable artifact', ['node', bugSolverCli, 'precheck', '--cwd', root, '--bug', 'Fix smoke-test bug transaction', '--json'], 0);
   let bugPrecheckDetails;
   try { bugPrecheckDetails = JSON.parse(bugPrecheck.stdout); } catch { bugPrecheckDetails = undefined; }

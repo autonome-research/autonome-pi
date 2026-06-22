@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative as importPathRelative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative as importPathRelative, resolve } from "node:path";
 import {
   STATUSES,
   artifact as emitArtifact,
@@ -82,6 +82,23 @@ function sameOrInsidePath(candidate, parent) {
   const base = resolve(parent);
   const relative = pathRelative(base, child);
   return relative === "" || (!relative.startsWith("..") && !isAbsolute(relative));
+}
+
+function physicalPathForContainment(input) {
+  const absolute = resolve(input);
+  let current = absolute;
+  const missingTail = [];
+  while (!existsSync(current)) {
+    const parent = dirname(current);
+    if (parent === current) return absolute;
+    missingTail.unshift(basename(current));
+    current = parent;
+  }
+  try {
+    return resolve(realpathSync(current), ...missingTail);
+  } catch (error) {
+    throw new Error(`Unable to verify physical realpath for artifact-root safety: ${current}: ${error.message}`);
+  }
 }
 
 function pathRelative(from, to) {
@@ -330,13 +347,16 @@ function validateArtifactRootExternal({ cwd, git }) {
   const artifactRoot = resolveArtifactRoot();
   const targetRoot = resolve(git?.root || cwd);
   const targetCwd = resolve(cwd);
-  const inTargetRoot = sameOrInsidePath(artifactRoot, targetRoot);
-  const inTargetCwd = sameOrInsidePath(artifactRoot, targetCwd);
+  const physicalArtifactRoot = physicalPathForContainment(artifactRoot);
+  const physicalTargetRoot = physicalPathForContainment(targetRoot);
+  const physicalTargetCwd = physicalPathForContainment(targetCwd);
+  const inTargetRoot = sameOrInsidePath(artifactRoot, targetRoot) || sameOrInsidePath(physicalArtifactRoot, physicalTargetRoot);
+  const inTargetCwd = sameOrInsidePath(artifactRoot, targetCwd) || sameOrInsidePath(physicalArtifactRoot, physicalTargetCwd);
   if (inTargetRoot || inTargetCwd) {
-    throw new Error(`Refusing PI_BUG_SOLVER_ARTIFACT_DIR inside the target repository/cwd. artifactRoot=${artifactRoot}; targetRoot=${targetRoot}; cwd=${targetCwd}. Choose an external durable directory outside the repository.`);
+    throw new Error(`Refusing PI_BUG_SOLVER_ARTIFACT_DIR inside the target repository/cwd. artifactRoot=${artifactRoot}; physicalArtifactRoot=${physicalArtifactRoot}; targetRoot=${targetRoot}; physicalTargetRoot=${physicalTargetRoot}; cwd=${targetCwd}; physicalCwd=${physicalTargetCwd}. Choose an external durable directory outside the repository.`);
   }
   ARTIFACT_ROOT = artifactRoot;
-  return { artifactRoot, targetRoot, targetCwd, externalToTargetRepo: true };
+  return { artifactRoot, physicalArtifactRoot, targetRoot, physicalTargetRoot, targetCwd, physicalTargetCwd, externalToTargetRepo: true };
 }
 
 function atomicWriteJson(file, value) {
