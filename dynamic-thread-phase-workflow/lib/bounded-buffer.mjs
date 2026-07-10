@@ -19,16 +19,31 @@ export class BoundedTextBuffer {
 
   append(value) {
     const chunk = String(value ?? "");
-    this.observedBytes += Buffer.byteLength(chunk, "utf8");
+    const chunkBytes = Buffer.byteLength(chunk, "utf8");
+    this.observedBytes += chunkBytes;
     if (!chunk || (this.keep === "head" && this.truncated)) return;
 
-    this.text += chunk;
-    if (Buffer.byteLength(this.text, "utf8") <= this.maxBytes) return;
+    const currentBytes = Buffer.byteLength(this.text, "utf8");
+    if (this.keep === "head") {
+      const remainingBytes = this.maxBytes - currentBytes;
+      if (chunkBytes <= remainingBytes) this.text += chunk;
+      else {
+        // Trim the incoming chunk before concatenation so even one giant chunk
+        // cannot create a temporary allocation above the configured bound.
+        if (remainingBytes > 0) this.text += takeUtf8Prefix(chunk, remainingBytes);
+        this.truncated = true;
+      }
+      return;
+    }
 
-    this.truncated = true;
-    this.text = this.keep === "tail"
-      ? takeUtf8Suffix(this.text, this.maxBytes)
-      : takeUtf8Prefix(this.text, this.maxBytes);
+    if (chunkBytes >= this.maxBytes) {
+      this.text = takeUtf8Suffix(chunk, this.maxBytes);
+      this.truncated = this.truncated || currentBytes > 0 || chunkBytes > this.maxBytes;
+      return;
+    }
+    const oldBytesToKeep = this.maxBytes - chunkBytes;
+    if (currentBytes > oldBytesToKeep) this.truncated = true;
+    this.text = `${takeUtf8Suffix(this.text, oldBytesToKeep)}${chunk}`;
   }
 
   value({ marker = true } = {}) {

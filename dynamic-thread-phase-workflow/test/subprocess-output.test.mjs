@@ -30,6 +30,16 @@ test("bounded truncation preserves a legitimate replacement character at boundar
   assert.match(tail.value(), /�b$/u);
 });
 
+test("BoundedTextBuffer trims a single giant chunk before retention", () => {
+  for (const keep of ["head", "tail"]) {
+    const buffer = new BoundedTextBuffer(1_024, { keep });
+    buffer.append(`prefix-${"x".repeat(1_000_000)}-suffix`);
+    assert.equal(buffer.truncated, true);
+    assert.ok(Buffer.byteLength(buffer.text, "utf8") <= 1_024);
+    assert.ok(buffer.observedBytes > 1_000_000);
+  }
+});
+
 test("runBoundedProcess caps stdout and stderr during ingestion", async () => {
   const script = [
     "process.stdout.write('o'.repeat(200_000));",

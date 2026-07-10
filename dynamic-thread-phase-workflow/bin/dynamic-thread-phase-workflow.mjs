@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, rmdirSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -193,7 +193,14 @@ function generatedInputDirectory(inputFile) {
 }
 
 function cleanupGeneratedInput(inputFile) {
-  rmSync(generatedInputDirectory(inputFile), { recursive: true, force: true });
+  const file = resolve(String(inputFile));
+  const directory = generatedInputDirectory(file);
+  // Delete only the owned input file. Removing the whole directory recursively
+  // would let a caller erase unrelated files by choosing a matching temp name.
+  rmSync(file, { force: true });
+  try { rmdirSync(directory); } catch (error) {
+    if (error?.code !== "ENOTEMPTY" && error?.code !== "EEXIST" && error?.code !== "ENOENT") throw error;
+  }
 }
 
 function isTruthyFlag(value) {
@@ -618,6 +625,9 @@ async function main() {
   activeRun = visualizerRun;
   const controller = new AbortController();
   activeAbortController = controller;
+  // Close the startup gap between the pre-background check and controller
+  // registration. A signal in that interval sets the global flag first.
+  if (cancellationRequested) controller.abort("cancelled during workflow startup");
   const stopWatchingCancellation = watchCancellation(visualizerRun, controller);
 
   const artifactsDir = join(ARTIFACTS_DIR, visualizerRun.runId);

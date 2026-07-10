@@ -38,6 +38,25 @@ test("generated foreground harness is copied to durable artifacts before cleanup
   }
 });
 
+test("cleanup removes only the generated input and preserves unrelated temp files", () => {
+  const generatedDir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflow-"));
+  const testDir = mkdtempSync(join(tmpdir(), "dynamic-input-neighbor-"));
+  const harnessFile = join(generatedDir, "workflow-harness.mjs");
+  const unrelatedFile = join(generatedDir, "unrelated.txt");
+  writeFileSync(harnessFile, "export default async function workflow() {}\n");
+  writeFileSync(unrelatedFile, "keep me\n");
+  try {
+    const result = runHarness(harnessFile, join(testDir, "store"), ["--cleanup-input"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(existsSync(harnessFile), false);
+    assert.equal(existsSync(unrelatedFile), true);
+    assert.equal(readFileSync(unrelatedFile, "utf8"), "keep me\n");
+  } finally {
+    rmSync(generatedDir, { recursive: true, force: true });
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
 test("user-supplied harness is never deleted without the cleanup handshake", () => {
   const testDir = mkdtempSync(join(tmpdir(), "dynamic-user-harness-"));
   const harnessFile = join(testDir, "user-harness.mjs");
