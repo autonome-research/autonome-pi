@@ -68,6 +68,7 @@ export function runBoundedProcess(command, args, options = {}) {
     let settled = false;
     let requestedSignal;
     let killTimer;
+    let streamCallbackError;
 
     const terminate = (signal = "SIGTERM") => {
       requestedSignal ||= signal;
@@ -120,11 +121,12 @@ export function runBoundedProcess(command, args, options = {}) {
             ? { kind: "signal", observedSignal: signal }
             : undefined;
       const error = spawnError?.message
+        || streamCallbackError?.message
         || (timedOut ? `${command} timed out after ${timeoutMs} ms; terminated with ${signal || requestedSignal || "SIGTERM"}` : undefined)
         || (aborted ? String(options.signal?.reason || "cancelled") : undefined)
         || (code === 0 ? undefined : stderr || (signal ? `${command} terminated with ${signal}` : `${command} exited ${code}`));
       resolve({
-        ok: code === 0 && !timedOut && !aborted,
+        ok: code === 0 && !timedOut && !aborted && !streamCallbackError,
         code,
         signal,
         stdout,
@@ -143,12 +145,23 @@ export function runBoundedProcess(command, args, options = {}) {
     // calling Buffer#toString independently would corrupt split code points.
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
+    const observeChunk = (callback, chunk) => {
+      if (!callback || streamCallbackError) return;
+      try {
+        callback(chunk);
+      } catch (error) {
+        streamCallbackError = error instanceof Error ? error : new Error(String(error));
+        // Do not settle until the child exits: the normal escalation timer must
+        // remain armed in case the child ignores SIGTERM.
+        terminate("SIGTERM");
+      }
+    };
     child.stdout.on("data", (chunk) => {
-      options.onStdout?.(chunk);
+      observeChunk(options.onStdout, chunk);
       if (options.captureStdout !== false) stdoutBuffer.append(chunk);
     });
     child.stderr.on("data", (chunk) => {
-      options.onStderr?.(chunk);
+      observeChunk(options.onStderr, chunk);
       if (options.captureStderr !== false) stderrBuffer.append(chunk);
     });
     child.on("error", (error) => finish({ code: 1, signal: null, spawnError: error }));

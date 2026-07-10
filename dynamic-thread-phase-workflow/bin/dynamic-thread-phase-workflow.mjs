@@ -588,6 +588,11 @@ async function main() {
     : validateSpec(loadSpec(args));
   const cleanupInputFile = args["js-file"] || args["harness-file"] || args["spec-file"];
   if (isTruthyFlag(args["cleanup-input"]) && cleanupInputFile) generatedInputDirectory(cleanupInputFile);
+  // Yield once so a SIGTERM delivered during startup is observed before the
+  // launcher can detach a background child. The wrapper also guards signals
+  // that were already aborted before spawn.
+  await new Promise((resolveTick) => setImmediate(resolveTick));
+  if (cancellationRequested) throw abortError("cancelled before background launch");
   if (maybeBackground(rawArgv, args)) return;
   const cwd = resolve(String(args.cwd || spec.cwd || process.cwd()));
   const workflow = spec.name || "dynamic-workflow";

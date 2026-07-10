@@ -87,7 +87,7 @@ test("runBoundedProcess reports timeout separately from process exit", async () 
   assert.ok(result.durationMs >= 30);
 });
 
-test("runBoundedProcess escalates an ignored SIGTERM and records SIGKILL", async () => {
+test("runBoundedProcess escalates an ignored SIGTERM and records SIGKILL", { skip: process.platform === "win32" && "POSIX signal assertion" }, async () => {
   const script = "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000)";
   const result = await runBoundedProcess(process.execPath, ["-e", script], {
     timeoutMs: 500,
@@ -98,6 +98,17 @@ test("runBoundedProcess escalates an ignored SIGTERM and records SIGKILL", async
   assert.equal(result.signal, "SIGKILL");
   assert.equal(result.termination.observedSignal, "SIGKILL");
   assert.match(result.error, /terminated with SIGKILL/);
+});
+
+test("runBoundedProcess terminates the child when a stream observer throws", async () => {
+  const result = await runBoundedProcess(process.execPath, ["-e", "process.stdout.write('trigger'); setInterval(()=>{},1000)"], {
+    timeoutMs: 5_000,
+    killGraceMs: 100,
+    onStdout: () => { throw new Error("collector failed"); },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "collector failed");
+  assert.ok(result.signal === "SIGTERM" || result.signal === "SIGKILL");
 });
 
 test("runBoundedProcess returns immediately for a pre-aborted workflow", async () => {

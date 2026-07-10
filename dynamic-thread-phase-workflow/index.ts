@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { BoundedTextBuffer } from "./lib/bounded-buffer.mjs";
+import { MAX_TIMEOUT_MS, normalizeTimeoutMs } from "./lib/subprocess.mjs";
 
 const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(EXT_DIR, "bin", "dynamic-thread-phase-workflow.mjs");
@@ -24,6 +25,9 @@ function truncate(text: string, max = MAX_TOOL_TEXT): string {
 }
 
 function runScript(args: string[], cwd: string, signal?: AbortSignal): Promise<{ code: number; signal: NodeJS.Signals | null; stdout: string; stderr: string; aborted: boolean }> {
+	if (signal?.aborted) {
+		return Promise.resolve({ code: 130, signal: null, stdout: "", stderr: String(signal.reason || "cancelled"), aborted: true });
+	}
 	return new Promise((resolve) => {
 		const proc = spawn(process.execPath, [SCRIPT, ...args], { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env });
 		// The runner normally emits one small JSON result, but bound both streams
@@ -110,7 +114,7 @@ function parametersSchema() {
 		model: Type.Optional(Type.String({ description: "Optional default Pi model pattern for pi/fanout_pi phases." })),
 		background: Type.Optional(Type.Boolean({ description: "Start the workflow in the background and return immediately." })),
 		autoContinue: Type.Optional(Type.Boolean({ description: "Queue a follow-up assistant continuation when the workflow completes successfully. Default false for dynamic workflows." })),
-		timeout: Type.Optional(Type.Number({ description: "Default phase timeout in milliseconds." })),
+		timeout: Type.Optional(Type.Number({ minimum: 1, maximum: MAX_TIMEOUT_MS, multipleOf: 1, description: "Default phase timeout in milliseconds (positive integer)." })),
 	});
 }
 
@@ -136,7 +140,7 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 	}
 	if (generatedInputFile) args.push("--cleanup-input");
 	if (params.model) args.push("--model", params.model);
-	if (params.timeout !== undefined) args.push("--timeout", String(params.timeout));
+	if (params.timeout !== undefined) args.push("--timeout", String(normalizeTimeoutMs(params.timeout, "timeout")));
 	if (params.background) args.push("--background");
 	if (params.autoContinue) args.push("--auto-continue");
 	addSessionArgs(args, ctx);

@@ -10,7 +10,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../..");
 const cli = join(root, "dynamic-thread-phase-workflow/bin/dynamic-thread-phase-workflow.mjs");
 
-test("dynamic runner reports a phase timeout instead of generic exit 143", () => {
+test("dynamic runner reports a phase timeout instead of generic exit 143", { skip: process.platform === "win32" && "requires POSIX shell process groups" }, () => {
   const temp = mkdtempSync(join(tmpdir(), "dynamic-timeout-test-"));
   try {
     const specPath = join(temp, "spec.json");
