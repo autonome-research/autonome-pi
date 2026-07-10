@@ -5,7 +5,8 @@
   "description": "Thread-phase workflow visualizer and workflow examples for Pi.",
   "scripts": {
     "smoke": "node scripts/smoke-test.mjs",
-    "test": "node scripts/smoke-test.mjs"
+    "test:dynamic": "node --test dynamic-thread-phase-workflow/test/*.test.mjs",
+    "test": "npm run test:dynamic && node scripts/smoke-test.mjs"
   },
   "keywords": [
     "pi-package",

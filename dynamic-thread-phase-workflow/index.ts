@@ -5,10 +5,12 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { BoundedTextBuffer } from "./lib/bounded-buffer.mjs";
 
 const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(EXT_DIR, "bin", "dynamic-thread-phase-workflow.mjs");
 const MAX_TOOL_TEXT = 30_000;
+const MAX_RUNNER_CAPTURE_BYTES = 1_000_000;
 
 function truncate(text: string, max = MAX_TOOL_TEXT): string {
 	if (Buffer.byteLength(text, "utf8") <= max) return text;
@@ -20,12 +22,14 @@ function truncate(text: string, max = MAX_TOOL_TEXT): string {
 function runScript(args: string[], cwd: string, signal?: AbortSignal): Promise<{ code: number; stdout: string; stderr: string }> {
 	return new Promise((resolve) => {
 		const proc = spawn(process.execPath, [SCRIPT, ...args], { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env });
-		let stdout = "";
-		let stderr = "";
-		proc.stdout.on("data", (d) => (stdout += d.toString()));
-		proc.stderr.on("data", (d) => (stderr += d.toString()));
-		proc.on("error", (error) => resolve({ code: 1, stdout, stderr: error.message }));
-		proc.on("close", (code) => resolve({ code: code ?? 0, stdout, stderr }));
+		// The runner normally emits one small JSON result, but bound both streams
+		// while reading so a noisy/crashing child cannot exhaust the Pi process.
+		const stdout = new BoundedTextBuffer(MAX_RUNNER_CAPTURE_BYTES, { keep: "tail" });
+		const stderr = new BoundedTextBuffer(MAX_RUNNER_CAPTURE_BYTES, { keep: "tail" });
+		proc.stdout.on("data", (d) => stdout.append(d.toString()));
+		proc.stderr.on("data", (d) => stderr.append(d.toString()));
+		proc.on("error", (error) => resolve({ code: 1, stdout: stdout.value(), stderr: error.message }));
+		proc.on("close", (code) => resolve({ code: code ?? 0, stdout: stdout.value(), stderr: stderr.value() }));
 		if (signal) {
 			const abort = () => {
 				proc.kill("SIGTERM");

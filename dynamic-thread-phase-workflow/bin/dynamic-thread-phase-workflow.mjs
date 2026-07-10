@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { runBoundedProcess, terminateChild } from "../lib/subprocess.mjs";
 import {
   ARTIFACTS_DIR,
   STATUSES,
@@ -66,15 +67,6 @@ function abortError(reason = "cancelled") {
 
 function isAbortError(error) {
   return error?.name === "AbortError" || /aborted|cancelled/i.test(String(error?.message || error));
-}
-
-function terminateChild(child, signal = "SIGTERM") {
-  try {
-    if (process.platform !== "win32" && child.pid) process.kill(-child.pid, signal);
-    else child.kill(signal);
-  } catch {
-    try { child.kill(signal); } catch { /* ignore */ }
-  }
 }
 
 function requestCancel(signalName = "SIGTERM") {
@@ -301,51 +293,11 @@ function normalizePiTools(tools, permissions, label) {
 }
 
 async function runProcess(command, args, options) {
-  return await new Promise((resolve) => {
-    if (options.signal?.aborted) {
-      resolve({ ok: false, code: null, stdout: "", stderr: "", aborted: true, error: String(options.signal.reason || "cancelled") });
-      return;
-    }
-    const proc = spawn(command, args, {
-      cwd: options.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: options.env || process.env,
-      shell: Boolean(options.shell),
-      detached: process.platform !== "win32",
-    });
-    activeChildren.add(proc);
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let aborted = false;
-    const terminate = (signal = "SIGTERM") => {
-      terminateChild(proc, signal);
-      setTimeout(() => terminateChild(proc, "SIGKILL"), 5000).unref();
-    };
-    const onAbort = () => {
-      aborted = true;
-      terminate("SIGTERM");
-    };
-    const timer = setTimeout(() => {
-      timedOut = true;
-      terminate("SIGTERM");
-    }, options.timeoutMs || DEFAULT_TIMEOUT_MS);
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-    if (options.signal?.aborted) onAbort();
-    proc.stdout.on("data", (data) => stdout += data.toString());
-    proc.stderr.on("data", (data) => stderr += data.toString());
-    proc.on("error", (error) => {
-      activeChildren.delete(proc);
-      clearTimeout(timer);
-      options.signal?.removeEventListener("abort", onAbort);
-      resolve({ ok: false, code: 1, stdout, stderr, timedOut, aborted, error: error.message });
-    });
-    proc.on("close", (code) => {
-      activeChildren.delete(proc);
-      clearTimeout(timer);
-      options.signal?.removeEventListener("abort", onAbort);
-      resolve({ ok: code === 0 && !aborted, code, stdout, stderr, timedOut, aborted, error: aborted ? String(options.signal?.reason || "cancelled") : code === 0 ? undefined : stderr || `${command} exited ${code}` });
-    });
+  return await runBoundedProcess(command, args, {
+    ...options,
+    timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS,
+    onChildStart: (child) => activeChildren.add(child),
+    onChildEnd: (child) => activeChildren.delete(child),
   });
 }
 
