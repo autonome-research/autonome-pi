@@ -118,6 +118,7 @@ test("runBoundedProcess terminates the child when a stream observer throws", asy
   });
   assert.equal(result.ok, false);
   assert.equal(result.error, "collector failed");
+  assert.equal(result.termination.kind, "callback_error");
   assert.ok(result.signal === "SIGTERM" || result.signal === "SIGKILL");
 });
 
@@ -129,6 +130,7 @@ test("runBoundedProcess reaps the child when onChildStart throws", async () => {
   });
   assert.equal(result.ok, false);
   assert.equal(result.error, "start hook failed");
+  assert.equal(result.termination.kind, "callback_error");
   assert.ok(result.signal === "SIGTERM" || result.signal === "SIGKILL");
 });
 

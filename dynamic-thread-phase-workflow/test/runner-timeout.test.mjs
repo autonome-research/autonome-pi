@@ -35,6 +35,23 @@ test("dynamic runner reports a phase timeout instead of generic exit 143", { ski
   }
 });
 
+test("background spawn failure does not emit a success acknowledgement", () => {
+  const temp = mkdtempSync(join(tmpdir(), "dynamic-background-spawn-test-"));
+  try {
+    const specPath = join(temp, "spec.json");
+    writeFileSync(specPath, JSON.stringify({ name: "bad-background-cwd", permissions: "r", phases: [{ type: "artifact", name: "result", content: "x" }] }));
+    const missingCwd = join(temp, "does-not-exist");
+    const result = spawnSync(process.execPath, [cli, "--spec-file", specPath, "--cwd", missingCwd, "--background"], {
+      cwd: root, env: { ...process.env, PI_THREAD_PHASE_STORE_DIR: join(temp, "store") }, encoding: "utf8", timeout: 5_000,
+    });
+    assert.notEqual(result.status, 0);
+    assert.doesNotMatch(result.stdout, /"background"\s*:\s*true/);
+    assert.match(result.stderr, /ENOENT/);
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
 test("invalid CLI timeout is rejected before creating a visualizer run", () => {
   const temp = mkdtempSync(join(tmpdir(), "dynamic-cli-timeout-validation-test-"));
   try {

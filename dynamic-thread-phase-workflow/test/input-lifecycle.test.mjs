@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -135,6 +135,38 @@ test("detached runner cleans generated input when validation fails before create
   }
 });
 
+test("cleanup handshake refuses a symlinked generated directory", { skip: process.platform === "win32" && "POSIX symlink semantics" }, () => {
+  const targetDir = mkdtempSync(join(tmpdir(), "dynamic-symlink-target-"));
+  const testDir = mkdtempSync(join(tmpdir(), "dynamic-symlink-test-"));
+  const linkDir = join(tmpdir(), `pi-dynamic-workflow-symlink-${process.pid}-${Date.now()}`);
+  const harnessFile = join(targetDir, "workflow-harness.mjs");
+  writeFileSync(harnessFile, "export default async function workflow() {}\n");
+  symlinkSync(targetDir, linkDir, "dir");
+  try {
+    const result = runHarness(join(linkDir, "workflow-harness.mjs"), join(testDir, "store"), ["--cleanup-input"]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /refusing to clean non-generated workflow input/);
+    assert.equal(existsSync(harnessFile), true);
+  } finally {
+    try { unlinkSync(linkDir); } catch { /* already removed */ }
+    rmSync(targetDir, { recursive: true, force: true });
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
+test("harness fanout rejects non-array items", () => {
+  const testDir = mkdtempSync(join(tmpdir(), "dynamic-harness-fanout-type-"));
+  const harnessFile = join(testDir, "harness.mjs");
+  writeFileSync(harnessFile, "export default async function workflow(ctx) { await ctx.fanout('not-an-array', { run: async () => 'x' }); }\n");
+  try {
+    const result = runHarness(harnessFile, join(testDir, "store"));
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(JSON.parse(result.stdout).error, /items must be an array/);
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
 test("cleanup handshake refuses non-generated directories", () => {
   const testDir = mkdtempSync(join(tmpdir(), "dynamic-refuse-cleanup-"));
   const harnessFile = join(testDir, "user-harness.mjs");
@@ -142,7 +174,7 @@ test("cleanup handshake refuses non-generated directories", () => {
   try {
     const result = runHarness(harnessFile, join(testDir, "store"), ["--cleanup-input"]);
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /refusing to clean non-generated workflow input directory/);
+    assert.match(result.stderr, /refusing to clean non-generated workflow input/);
     assert.equal(existsSync(harnessFile), true);
   } finally {
     rmSync(testDir, { recursive: true, force: true });

@@ -132,9 +132,11 @@ export function runBoundedProcess(command, args, options = {}) {
         ? { kind: "timeout", timeoutMs, requestedSignal, observedSignal: signal }
         : aborted
           ? { kind: "cancelled", reason: String(options.signal?.reason || "cancelled"), requestedSignal, observedSignal: signal }
-          : signal
-            ? { kind: "signal", observedSignal: signal }
-            : undefined;
+          : streamCallbackError
+            ? { kind: "callback_error", reason: streamCallbackError.message, requestedSignal, observedSignal: signal }
+            : signal
+              ? { kind: "signal", observedSignal: signal }
+              : undefined;
       const error = spawnError?.message
         || streamCallbackError?.message
         || (timedOut ? `${command} timed out after ${timeoutMs} ms; terminated with ${signal || requestedSignal || "SIGTERM"}` : undefined)

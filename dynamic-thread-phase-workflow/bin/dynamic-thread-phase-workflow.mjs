@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { accessSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants as fsConstants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -139,7 +139,8 @@ function validateName(name, label) {
 }
 
 function normalizeFanoutItems(value, label = "fanout items") {
-  const items = asArray(value);
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  const items = value;
   if (items.length > MAX_FANOUT_ITEMS) throw new Error(`${label} is capped at ${MAX_FANOUT_ITEMS} items`);
   return items;
 }
@@ -191,11 +192,19 @@ function loadSpec(args) {
 }
 
 function generatedInputDirectory(inputFile) {
-  const directory = dirname(resolve(String(inputFile)));
-  // --cleanup-input is an internal handshake with the Pi extension. Never let
-  // a manually supplied path turn recursive cleanup into an arbitrary delete.
-  if (dirname(directory) !== resolve(tmpdir()) || !basename(directory).startsWith("pi-dynamic-workflow-")) {
-    throw new Error(`refusing to clean non-generated workflow input directory: ${directory}`);
+  const file = resolve(String(inputFile));
+  const directory = dirname(file);
+  const tempRoot = realpathSync(tmpdir());
+  const directoryStats = lstatSync(directory);
+  const allowedFiles = new Set(["workflow-spec.json", "workflow-harness.mjs"]);
+  // --cleanup-input is an internal handshake with the Pi extension. Validate
+  // the real filesystem objects, not only a lexical /tmp prefix: a symlinked
+  // matching directory must never redirect deletion into unrelated data.
+  if (directoryStats.isSymbolicLink() || !directoryStats.isDirectory()
+      || dirname(realpathSync(directory)) !== tempRoot
+      || !basename(directory).startsWith("pi-dynamic-workflow-")
+      || !allowedFiles.has(basename(file))) {
+    throw new Error(`refusing to clean non-generated workflow input: ${file}`);
   }
   return directory;
 }
@@ -211,6 +220,8 @@ function preflightHarnessFile(inputFile) {
 function cleanupGeneratedInput(inputFile) {
   const file = resolve(String(inputFile));
   const directory = generatedInputDirectory(file);
+  const fileStats = lstatSync(file);
+  if (fileStats.isSymbolicLink() || !fileStats.isFile()) throw new Error(`refusing to clean non-regular workflow input: ${file}`);
   // Delete only the owned input file. Removing the whole directory recursively
   // would let a caller erase unrelated files by choosing a matching temp name.
   rmSync(file, { force: true });
@@ -244,7 +255,7 @@ function stripBackgroundArgs(argv) {
   return next;
 }
 
-function maybeBackground(rawArgv, opts) {
+async function maybeBackground(rawArgv, opts) {
   if (process.env.PI_DYNAMIC_WORKFLOW_BACKGROUND || process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND) return false;
   if (!isTruthyFlag(opts.background)) return false;
   const nextArgs = stripBackgroundArgs(rawArgv);
@@ -253,6 +264,10 @@ function maybeBackground(rawArgv, opts) {
     detached: true,
     stdio: "ignore",
     env: { ...process.env, PI_DYNAMIC_WORKFLOW_BACKGROUND: "1", PI_DYNAMIC_THREAD_PHASE_BACKGROUND: "1" },
+  });
+  await new Promise((resolveSpawn, rejectSpawn) => {
+    child.once("spawn", resolveSpawn);
+    child.once("error", rejectSpawn);
   });
   child.unref();
   console.log(JSON.stringify({ ok: true, background: true, pid: child.pid }, null, 2));
@@ -492,15 +507,22 @@ async function* runFanoutPiPhase(ctx, phase) {
       throw error;
     }
   });
+  const workerSettled = worker.then(() => true, () => true);
   while (true) {
     while (queue.length) yield queue.shift();
-    const done = await Promise.race([worker.then(() => true), sleep(100).then(() => false)]);
+    const done = await Promise.race([workerSettled, sleep(100).then(() => false)]);
     if (done) break;
   }
-  const results = await worker;
+  let results;
+  try {
+    results = await worker;
+  } finally {
+    // Drain terminal/progress events produced by every active worker before a
+    // worker rejection propagates out of the phase.
+    while (queue.length) yield queue.shift();
+  }
   ctx.outputs[phase.name] = results.map((result) => result.text).join("\n\n---\n\n");
   ctx.results[phase.name] = results;
-  while (queue.length) yield queue.shift();
   if (failed > 0 && phase.failOnItemFailure !== false) throw new Error(`${failed}/${items.length} fanout items failed`);
 }
 
@@ -636,7 +658,7 @@ async function main() {
   // that were already aborted before spawn.
   await new Promise((resolveTick) => setImmediate(resolveTick));
   if (cancellationRequested) throw abortError("cancelled before background launch");
-  if (maybeBackground(rawArgv, args)) return;
+  if (await maybeBackground(rawArgv, args)) return;
   const cwd = resolve(String(args.cwd || spec.cwd || process.cwd()));
   const workflow = spec.name || "dynamic-workflow";
   const visualizerRun = createRun({
