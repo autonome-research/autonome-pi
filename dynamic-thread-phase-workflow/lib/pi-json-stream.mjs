@@ -1,4 +1,5 @@
 const DEFAULT_MAX_LINE_BYTES = 4_000_000;
+const MAX_UNTYPED_LINE_BYTES = 64_000;
 
 /**
  * Incremental collector for `pi --mode json` NDJSON.
@@ -36,9 +37,19 @@ export class PiJsonEventCollector {
 
       const newline = input.indexOf("\n");
       if (newline !== -1) {
-        const line = `${this.pending}${input.slice(0, newline)}`;
-        this.pending = "";
+        const segment = input.slice(0, newline);
         input = input.slice(newline + 1);
+        // Check each side before concatenation. Without this guard, one giant
+        // complete record can briefly allocate pending + segment even though
+        // consumeLine would immediately reject the oversized result.
+        const lineBytes = Buffer.byteLength(this.pending, "utf8") + Buffer.byteLength(segment, "utf8");
+        if (lineBytes > this.maxLineBytes) {
+          this.pending = "";
+          this.oversizedEvents++;
+          continue;
+        }
+        const line = `${this.pending}${segment}`;
+        this.pending = "";
         this.consumeLine(line.replace(/\r$/, ""));
         continue;
       }
@@ -89,6 +100,13 @@ export class PiJsonEventCollector {
     const type = eventTypeFromPrefix(line);
     if (type && type !== "message_end") {
       this.droppedEvents++;
+      return;
+    }
+    // Pi currently serializes the top-level event discriminator first. Small
+    // untyped records (such as a session header) remain parseable, but refuse
+    // to materialize a large untyped record if that protocol invariant changes.
+    if (!type && Buffer.byteLength(line, "utf8") > MAX_UNTYPED_LINE_BYTES) {
+      this.malformedEvents++;
       return;
     }
 

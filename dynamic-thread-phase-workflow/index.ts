@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -85,6 +85,16 @@ function parseJsonObject(stdout: string): any {
 	return JSON.parse(trimmed);
 }
 
+function runnerFailure(result: { code: number; signal: NodeJS.Signals | null; stdout: string; stderr: string; aborted: boolean }): string {
+	const status = result.aborted
+		? `dynamic workflow runner cancelled${result.signal ? ` with ${result.signal}` : ""}`
+		: result.signal
+			? `dynamic workflow runner terminated with ${result.signal}`
+			: `dynamic workflow runner exited ${result.code}`;
+	const output = result.stderr || result.stdout;
+	return output ? `${status}\n${output}` : status;
+}
+
 function parametersSchema() {
 	return Type.Object({
 		spec: Type.Optional(Type.Any({ description: "Structured workflow spec object. Required for spec mode. Supported phase types: shell, pi, fanout_pi, artifact." })),
@@ -104,9 +114,11 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 	if (!params.spec && !params.harness && !params.harnessFile) throw new Error("Provide either spec, harness, or harnessFile.");
 	const cwd = path.resolve(ctx.cwd, params.cwd || params.spec?.cwd || ".");
 	const args = ["--cwd", cwd];
+	let generatedInputFile: string | undefined;
+	let retainGeneratedInput = false;
 	if (params.harness || params.harnessFile) {
 		if (params.permissions !== "rwx") throw new Error("JavaScript harness mode requires explicit permissions: \"rwx\".");
-		const harnessFile = params.harnessFile ? path.resolve(ctx.cwd, params.harnessFile) : writeHarnessFile(params.harness);
+		const harnessFile = params.harnessFile ? path.resolve(ctx.cwd, params.harnessFile) : (generatedInputFile = writeHarnessFile(params.harness));
 		args.push("--js-file", harnessFile, "--permissions", params.permissions);
 		if (params.name) args.push("--name", params.name);
 	} else {
@@ -115,7 +127,8 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 			if (spec.permissions && spec.permissions !== params.permissions) throw new Error("Top-level permissions conflict with spec.permissions.");
 			spec.permissions = params.permissions;
 		}
-		args.push("--spec-file", writeJsonFile(spec));
+		generatedInputFile = writeJsonFile(spec);
+		args.push("--spec-file", generatedInputFile);
 	}
 	if (params.model) args.push("--model", params.model);
 	if (params.timeout !== undefined) args.push("--timeout", String(params.timeout));
@@ -123,15 +136,23 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 	if (params.autoContinue) args.push("--auto-continue");
 	addSessionArgs(args, ctx);
 	onUpdate?.({ content: [{ type: "text", text: `Starting ${legacyName ? "dynamic thread-phase" : "dynamic"} workflow in ${cwd}...` }] });
-	const result = await runScript(args, cwd, signal);
-	let details: any;
-	try { details = parseJsonObject(result.stdout); } catch { details = { stdout: result.stdout, stderr: result.stderr }; }
-	if (params.background && !(result.code === 0 && details?.ok === true && details?.background === true && details?.pid)) throw new Error(result.stderr || result.stdout || "dynamic workflow background launch failed");
-	if (result.code !== 0 && !params.background) throw new Error(result.stderr || result.stdout || `dynamic workflow exited ${result.code}`);
-	const text = details?.background
-		? `Started dynamic workflow in background (pid ${details.pid}). Open ctrl+shift+t to monitor it.`
-		: result.stdout || "Dynamic workflow started.";
-	return { content: [{ type: "text", text: truncate(text) }], details };
+	try {
+		const result = await runScript(args, cwd, signal);
+		let details: any;
+		try { details = parseJsonObject(result.stdout); } catch { details = { stdout: result.stdout, stderr: result.stderr }; }
+		if (params.background && !(result.code === 0 && details?.ok === true && details?.background === true && details?.pid)) throw new Error(runnerFailure(result));
+		if (result.code !== 0 && !params.background) throw new Error(runnerFailure(result));
+		retainGeneratedInput = Boolean(params.background && details?.background);
+		const text = details?.background
+			? `Started dynamic workflow in background (pid ${details.pid}). Open ctrl+shift+t to monitor it.`
+			: result.stdout || "Dynamic workflow started.";
+		return { content: [{ type: "text", text: truncate(text) }], details };
+	} finally {
+		// Detached runs may not have opened their input yet when the launcher
+		// acknowledges them, so retain background inputs. Foreground inputs are
+		// private implementation details and can be removed immediately.
+		if (generatedInputFile && !retainGeneratedInput) rmSync(path.dirname(generatedInputFile), { recursive: true, force: true });
+	}
 }
 
 export default function dynamicWorkflows(pi: ExtensionAPI) {

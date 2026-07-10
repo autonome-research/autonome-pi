@@ -100,6 +100,25 @@ test("runBoundedProcess escalates an ignored SIGTERM and records SIGKILL", async
   assert.match(result.error, /terminated with SIGKILL/);
 });
 
+test("runBoundedProcess returns immediately for a pre-aborted workflow", async () => {
+  const controller = new AbortController();
+  controller.abort("already cancelled");
+  const result = await runBoundedProcess(process.execPath, ["-e", "process.exit(99)"], {
+    timeoutMs: 5_000,
+    signal: controller.signal,
+  });
+  assert.equal(result.aborted, true);
+  assert.equal(result.code, null);
+  assert.equal(result.error, "already cancelled");
+});
+
+test("runBoundedProcess reports spawn failures without hanging", async () => {
+  const result = await runBoundedProcess("definitely-not-a-real-dynamic-workflow-command", [], { timeoutMs: 5_000 });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 1);
+  assert.match(result.error, /ENOENT/);
+});
+
 test("runBoundedProcess preserves workflow cancellation separately from timeout", async () => {
   const controller = new AbortController();
   setTimeout(() => controller.abort("operator cancelled"), 30);

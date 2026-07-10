@@ -57,6 +57,14 @@ test("collector bounds and skips an oversized unterminated record", () => {
   assert.equal(result.piJson.bufferedBytes, 0);
 });
 
+test("collector rejects a complete oversized line before concatenation and recovers in the same chunk", () => {
+  const collector = new PiJsonEventCollector({ maxLineBytes: 1_024 });
+  collector.push(`${JSON.stringify({ type: "message_update", payload: "x".repeat(5_000) })}\n${eventLine(finalMessage("same-chunk-recovery"))}`);
+  const result = collector.finish();
+  assert.equal(result.text, "same-chunk-recovery");
+  assert.equal(result.piJson.oversizedEvents, 1);
+});
+
 test("collector counts malformed records without failing the run", () => {
   const collector = new PiJsonEventCollector();
   collector.push("not-json\n");
@@ -64,6 +72,16 @@ test("collector counts malformed records without failing the run", () => {
   const result = collector.finish();
   assert.equal(result.text, "done");
   assert.equal(result.piJson.malformedEvents, 1);
+});
+
+test("collector joins multiple text parts and keeps the latest assistant message", () => {
+  const collector = new PiJsonEventCollector();
+  collector.push(eventLine(finalMessage("first")));
+  collector.push(eventLine({
+    ...finalMessage(),
+    message: { ...finalMessage().message, content: [{ type: "text", text: "second " }, { type: "text", text: "message" }] },
+  }));
+  assert.equal(collector.finish().text, "second message");
 });
 
 test("collector validates its maximum NDJSON record size", () => {
