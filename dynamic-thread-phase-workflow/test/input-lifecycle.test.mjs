@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -150,6 +150,34 @@ test("cleanup handshake refuses a symlinked generated directory", { skip: proces
   } finally {
     try { unlinkSync(linkDir); } catch { /* already removed */ }
     rmSync(targetDir, { recursive: true, force: true });
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
+test("harness fanout joins sibling workers before the workflow fails", () => {
+  const testDir = mkdtempSync(join(tmpdir(), "dynamic-harness-fanout-join-"));
+  const harnessFile = join(testDir, "harness.mjs");
+  const store = join(testDir, "store");
+  writeFileSync(harnessFile, `export default async function workflow(ctx) {
+    await ctx.fanout(['fail', 'slow'], {
+      concurrency: 2,
+      run: async (item) => {
+        if (item === 'fail') throw new Error('intentional fast failure');
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        return 'slow complete';
+      }
+    });
+  }\n`);
+  try {
+    const result = runHarness(harnessFile, store);
+    assert.equal(result.status, 1, result.stderr);
+    const runFile = join(store, "runs", readdirSync(join(store, "runs"))[0]);
+    const events = readFileSync(runFile, "utf8").trim().split("\n").map(JSON.parse);
+    const workflowEndIndex = events.findIndex((event) => event.type === "workflow_end");
+    const itemEnds = events.map((event, index) => ({ event, index })).filter(({ event }) => event.data?.kind === "fanout_item_end");
+    assert.equal(itemEnds.length, 2);
+    assert.ok(itemEnds.every(({ index }) => index < workflowEndIndex));
+  } finally {
     rmSync(testDir, { recursive: true, force: true });
   }
 });

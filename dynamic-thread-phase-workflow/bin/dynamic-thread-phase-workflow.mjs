@@ -408,7 +408,12 @@ async function mapWithConcurrency(items, concurrency, fn) {
       results[index] = await fn(boundedItems[index], index);
     }
   });
-  await Promise.all(workers);
+  // Promise.all would reject on the first failed worker and let siblings keep
+  // running after the phase had emitted its terminal state. Join every worker,
+  // then rethrow the first failure only after all subprocesses/events settle.
+  const settlements = await Promise.allSettled(workers);
+  const failedWorker = settlements.find((result) => result.status === "rejected");
+  if (failedWorker) throw failedWorker.reason;
   return results;
 }
 
