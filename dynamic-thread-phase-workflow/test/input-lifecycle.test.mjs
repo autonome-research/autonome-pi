@@ -159,7 +159,7 @@ test("harness fanout joins sibling workers before the workflow fails", () => {
   const harnessFile = join(testDir, "harness.mjs");
   const store = join(testDir, "store");
   writeFileSync(harnessFile, `export default async function workflow(ctx) {
-    await ctx.fanout(['fail', 'slow'], {
+    await ctx.fanout(['fail', 'slow', 'queued-1', 'queued-2'], {
       concurrency: 2,
       run: async (item) => {
         if (item === 'fail') throw new Error('intentional fast failure');
@@ -174,7 +174,9 @@ test("harness fanout joins sibling workers before the workflow fails", () => {
     const runFile = join(store, "runs", readdirSync(join(store, "runs"))[0]);
     const events = readFileSync(runFile, "utf8").trim().split("\n").map(JSON.parse);
     const workflowEndIndex = events.findIndex((event) => event.type === "workflow_end");
+    const itemStarts = events.filter((event) => event.data?.kind === "fanout_item_start");
     const itemEnds = events.map((event, index) => ({ event, index })).filter(({ event }) => event.data?.kind === "fanout_item_end");
+    assert.equal(itemStarts.length, 2);
     assert.equal(itemEnds.length, 2);
     assert.ok(itemEnds.every(({ index }) => index < workflowEndIndex));
   } finally {

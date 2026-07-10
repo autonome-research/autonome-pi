@@ -120,6 +120,9 @@ export class PiJsonEventCollector {
 
     const message = event.message;
     if (message.usage) {
+      // Pi emits per-assistant-message (per-turn) usage, matching the former
+      // array-of-events behavior; summing preserves run totals without retaining
+      // an unbounded event list.
       mergeNumericUsage(this.usageTotals, message.usage);
       this.usageEvents++;
     }

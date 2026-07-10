@@ -401,19 +401,23 @@ async function mapWithConcurrency(items, concurrency, fn) {
   const limit = Math.min(normalizeConcurrency(concurrency), boundedItems.length || 1);
   const results = new Array(boundedItems.length);
   let next = 0;
+  let firstError;
   const workers = new Array(limit).fill(null).map(async () => {
-    while (true) {
+    while (!firstError) {
       const index = next++;
       if (index >= boundedItems.length) return;
-      results[index] = await fn(boundedItems[index], index);
+      try {
+        results[index] = await fn(boundedItems[index], index);
+      } catch (error) {
+        firstError ||= error;
+        return;
+      }
     }
   });
-  // Promise.all would reject on the first failed worker and let siblings keep
-  // running after the phase had emitted its terminal state. Join every worker,
-  // then rethrow the first failure only after all subprocesses/events settle.
-  const settlements = await Promise.allSettled(workers);
-  const failedWorker = settlements.find((result) => result.status === "rejected");
-  if (failedWorker) throw failedWorker.reason;
+  // Join active workers but stop claiming queued items after the first fatal
+  // error. This avoids both post-terminal activity and unnecessary new work.
+  await Promise.all(workers);
+  if (firstError) throw firstError;
   return results;
 }
 
@@ -641,8 +645,12 @@ async function main() {
     return;
   }
 
-  if (args["js-file"] && args["harness-file"]) throw new Error("Provide only one of --js-file or --harness-file");
-  let harnessFile = args["js-file"] || args["harness-file"] ? preflightHarnessFile(args["js-file"] || args["harness-file"]) : undefined;
+  const hasJsFile = args["js-file"] !== undefined;
+  const hasHarnessFile = args["harness-file"] !== undefined;
+  if (hasJsFile && hasHarnessFile) throw new Error("Provide only one of --js-file or --harness-file");
+  const harnessInput = hasJsFile ? args["js-file"] : hasHarnessFile ? args["harness-file"] : undefined;
+  if (harnessInput !== undefined && !String(harnessInput).trim()) throw new Error("workflow harness path must be non-empty");
+  let harnessFile = harnessInput !== undefined ? preflightHarnessFile(harnessInput) : undefined;
   if (harnessFile && (args.spec || args["spec-file"])) throw new Error("Provide either spec input or --js-file, not both");
   const spec = harnessFile
     ? (() => {

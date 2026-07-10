@@ -119,16 +119,22 @@ function parametersSchema() {
 }
 
 async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any, legacyName: string) {
-	const inputModes = [params.spec !== undefined, params.harness !== undefined, params.harnessFile !== undefined].filter(Boolean).length;
+	const hasSpec = params.spec !== undefined;
+	const hasHarness = params.harness !== undefined;
+	const hasHarnessFile = params.harnessFile !== undefined;
+	const inputModes = [hasSpec, hasHarness, hasHarnessFile].filter(Boolean).length;
 	if (inputModes !== 1) throw new Error("Provide exactly one of spec, harness, or harnessFile.");
+	if (hasSpec && (!params.spec || typeof params.spec !== "object" || Array.isArray(params.spec))) throw new Error("spec must be a non-null object.");
+	if (hasHarness && (typeof params.harness !== "string" || !params.harness.trim())) throw new Error("harness must be a non-empty string.");
+	if (hasHarnessFile && (typeof params.harnessFile !== "string" || !params.harnessFile.trim())) throw new Error("harnessFile must be a non-empty path.");
 	const cwd = path.resolve(ctx.cwd, params.cwd || params.spec?.cwd || ".");
 	let generatedInputFile: string | undefined;
 	let retainGeneratedInput = false;
 	try {
 		const args = ["--cwd", cwd];
-		if (params.harness || params.harnessFile) {
+		if (hasHarness || hasHarnessFile) {
 			if (params.permissions !== "rwx") throw new Error("JavaScript harness mode requires explicit permissions: \"rwx\".");
-			const harnessFile = params.harnessFile ? path.resolve(ctx.cwd, params.harnessFile) : (generatedInputFile = writeHarnessFile(params.harness));
+			const harnessFile = hasHarnessFile ? path.resolve(ctx.cwd, params.harnessFile) : (generatedInputFile = writeHarnessFile(params.harness));
 			args.push("--js-file", harnessFile, "--permissions", params.permissions);
 			if (params.name) args.push("--name", params.name);
 		} else {

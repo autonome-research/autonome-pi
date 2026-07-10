@@ -74,6 +74,18 @@ test("extension rejects ambiguous workflow input modes", async () => {
   }
 });
 
+test("extension rejects empty harness inputs and malformed specs", async () => {
+  const tools = new Map();
+  registerDynamicWorkflows({ registerTool: (definition) => tools.set(definition.name, definition) });
+  const execute = tools.get("dynamic_workflow").execute;
+  const ctx = { cwd: root, sessionManager: {} };
+  await assert.rejects(execute("test", { harness: "", permissions: "rwx" }, undefined, undefined, ctx), /harness must be a non-empty string/);
+  await assert.rejects(execute("test", { harness: "   ", permissions: "rwx" }, undefined, undefined, ctx), /harness must be a non-empty string/);
+  await assert.rejects(execute("test", { harnessFile: "", permissions: "rwx" }, undefined, undefined, ctx), /harnessFile must be a non-empty path/);
+  await assert.rejects(execute("test", { spec: null }, undefined, undefined, ctx), /spec must be a non-null object/);
+  await assert.rejects(execute("test", { spec: [] }, undefined, undefined, ctx), /spec must be a non-null object/);
+});
+
 test("tool-level timeout validation rejects invalid values and cleans generated input", async () => {
   const tools = new Map();
   registerDynamicWorkflows({ registerTool: (definition) => tools.set(definition.name, definition) });
