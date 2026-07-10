@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { PiJsonEventCollector } from "../lib/pi-json-stream.mjs";
 import { runBoundedProcess, terminateChild } from "../lib/subprocess.mjs";
 import {
   ARTIFACTS_DIR,
@@ -223,29 +224,6 @@ function renderTemplate(input, ctx, extra = {}) {
   });
 }
 
-function parsePiJsonLines(stdout) {
-  const messages = [];
-  const usage = [];
-  let text = "";
-  let model;
-  let stopReason;
-  for (const line of stdout.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    let event;
-    try { event = JSON.parse(line); } catch { continue; }
-    if (event.type !== "message_end" || !event.message) continue;
-    messages.push(event.message);
-    if (event.message.usage) usage.push(event.message.usage);
-    const msg = event.message;
-    if (msg.role === "assistant") {
-      model = msg.model || model;
-      stopReason = msg.stopReason || stopReason;
-      for (const part of msg.content || []) if (part.type === "text") text = part.text;
-    }
-  }
-  return { text, messages, usage, model, stopReason };
-}
-
 function normalizePermissions(value, label = "permissions") {
   if (value === undefined || value === null || value === "") return "";
   if (typeof value !== "string") throw new Error(`${label} must be a string containing any of r, w, x`);
@@ -307,8 +285,19 @@ async function runPi({ cwd, prompt, model, tools, timeoutMs, signal }) {
     "--no-prompt-templates", "--no-context-files", "--tools", tools.join(","), "-p", prompt,
   ];
   if (model) args.unshift("--model", model);
-  const result = await runProcess(DEFAULT_PI, args, { cwd, timeoutMs, signal });
-  const parsed = parsePiJsonLines(result.stdout || "");
+
+  // Parse Pi's NDJSON incrementally and do not retain raw message_update
+  // records. Those records contain cumulative tool-call arguments and can make
+  // a large generated file produce quadratic stdout volume in memory.
+  const collector = new PiJsonEventCollector();
+  const result = await runProcess(DEFAULT_PI, args, {
+    cwd,
+    timeoutMs,
+    signal,
+    captureStdout: false,
+    onStdout: (chunk) => collector.push(chunk),
+  });
+  const parsed = collector.finish();
   return { ...result, ...parsed, ok: result.ok && Boolean(parsed.text), error: result.ok && parsed.text ? undefined : result.error || "pi produced no assistant text" };
 }
 
@@ -398,7 +387,7 @@ async function* runPiPhase(ctx, phase) {
   const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: ctx.signal });
   if (result.aborted) throw abortError(result.error || "cancelled");
   ctx.outputs[phase.name] = compactText(result.text || "");
-  ctx.results[phase.name] = { ok: result.ok, model: result.model, stopReason: result.stopReason, code: result.code, error: result.error };
+  ctx.results[phase.name] = { ok: result.ok, model: result.model, stopReason: result.stopReason, code: result.code, error: result.error, piJson: result.piJson };
   if (result.usage?.length) phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage: result.usage, model: result.model });
   emitTextArtifact(ctx, phase, ctx.outputs[phase.name], { title: `Pi output: ${phase.name}`, fileName: `${phase.name}.md` });
   yield { type: "data", kind: "data", key: "model", value: result.model, message: result.ok ? "Pi agent complete" : "Pi agent failed" };
@@ -441,7 +430,7 @@ async function* runFanoutPiPhase(ctx, phase) {
       if (result.ok) completed++; else failed++;
       push({ type: "fanout", kind: "fanout_item_end", itemId: item, label: item, index, status: result.ok ? STATUSES.SUCCESS : STATUSES.FAILED, message: result.ok ? `Complete ${item}` : `Failed ${item}`, error: result.error });
       push({ type: "progress", kind: "progress", completed, total: items.length, message: `${completed}/${items.length} complete` });
-      return { item, index, ok: result.ok, text, model: result.model, stopReason: result.stopReason, error: result.error };
+      return { item, index, ok: result.ok, text, model: result.model, stopReason: result.stopReason, error: result.error, piJson: result.piJson };
     } catch (error) {
       failed++;
       const cancelled = isAbortError(error) || ctx.signal?.aborted;
