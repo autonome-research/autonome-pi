@@ -84,6 +84,30 @@ Defaults are controlled by environment:
 
 Legacy `PI_DYNAMIC_THREAD_PHASE_*` environment variables remain supported as fallbacks.
 
+## Subprocess output and timeout behavior
+
+Subprocess output is bounded while it is being read, rather than truncated only after process exit:
+
+- Generic shell stdout/stderr capture retains at most 1 MB per stream and marks truncated output.
+- The Pi tool wrapper also bounds the dynamic runner's stdout/stderr to 1 MB per stream.
+- `pi --mode json` output is parsed incrementally. Cumulative `message_update` events are discarded instead of being retained for the lifetime of the phase.
+- A single Pi NDJSON record is capped at 4 MB. Oversized or malformed records are counted in the phase result under `piJson`; a later valid final message can still complete the phase.
+
+The workflow-level `timeoutMs` is the default for shell and Pi phases. A phase can override it with its own positive integer `timeoutMs`:
+
+```json
+{
+  "name": "bounded-example",
+  "permissions": "rwx",
+  "timeoutMs": 600000,
+  "phases": [
+    { "type": "shell", "name": "quick-check", "timeoutMs": 30000, "command": "npm test" }
+  ]
+}
+```
+
+Timeouts use a phase-local abort controller composed with the workflow cancellation signal. The child receives `SIGTERM`, followed by `SIGKILL` after the grace period if needed. Results distinguish `timedOut` from operator cancellation and preserve `code`, `signal`, `durationMs`, and structured `termination` metadata. A timeout is reported directly—for example, `pi timed out after 300000 ms; terminated with SIGTERM`—rather than as generic exit 143.
+
 ## Recent stabilization notes
 
 - Harness mode requires explicit `permissions: "rwx"`; omission fails before import.
@@ -92,6 +116,8 @@ Legacy `PI_DYNAMIC_THREAD_PHASE_*` environment variables remain supported as fal
 - `phase.tools` must be an array of supported tool names.
 - Background launches validate before detaching and require a valid `{ ok: true, background: true, pid }` acknowledgement.
 - Dynamic workflows do not auto-continue by default; use `autoContinue: true`.
+- Subprocess capture is byte-bounded at ingestion, and Pi NDJSON is parsed incrementally to avoid cumulative-event memory growth.
+- Timeout, cancellation, exit-code, and terminating-signal outcomes are recorded separately.
 
 ## Remaining work
 
