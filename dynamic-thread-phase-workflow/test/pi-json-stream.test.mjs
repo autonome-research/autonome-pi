@@ -57,6 +57,14 @@ test("collector bounds and skips an oversized unterminated record", () => {
   assert.equal(result.piJson.bufferedBytes, 0);
 });
 
+test("collector rejects a giant unterminated chunk before appending it", () => {
+  const collector = new PiJsonEventCollector({ maxLineBytes: 1_024 });
+  collector.push(`{"type":"message_update","payload":"${"x".repeat(1_000_000)}`);
+  const interim = collector.result();
+  assert.equal(interim.piJson.bufferedBytes, 0);
+  assert.equal(interim.piJson.oversizedEvents, 1);
+});
+
 test("collector rejects a complete oversized line before concatenation and recovers in the same chunk", () => {
   const collector = new PiJsonEventCollector({ maxLineBytes: 1_024 });
   collector.push(`${JSON.stringify({ type: "message_update", payload: "x".repeat(5_000) })}\n${eventLine(finalMessage("same-chunk-recovery"))}`);
@@ -72,6 +80,13 @@ test("collector counts malformed records without failing the run", () => {
   const result = collector.finish();
   assert.equal(result.text, "done");
   assert.equal(result.piJson.malformedEvents, 1);
+});
+
+test("escaped type-like text in an earlier field is not treated as the discriminator", () => {
+  const collector = new PiJsonEventCollector();
+  const event = { note: 'quoted text: "type":"message_update"', ...finalMessage("not-confused") };
+  collector.push(eventLine(event));
+  assert.equal(collector.finish().text, "not-confused");
 });
 
 test("collector joins multiple text parts and keeps the latest assistant message", () => {

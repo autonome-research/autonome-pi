@@ -37,6 +37,7 @@ const PI_TOOL_REQUIREMENTS = Object.freeze({
 });
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_FANOUT_CONCURRENCY = 3;
+const MAX_FANOUT_CONCURRENCY = 64;
 const MAX_OUTPUT_BYTES = 250_000;
 const DEFAULT_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_WORKFLOW_DEFAULT_PERMISSIONS || process.env.PI_DYNAMIC_THREAD_PHASE_DEFAULT_PERMISSIONS || "r", "PI_DYNAMIC_WORKFLOW_DEFAULT_PERMISSIONS");
 const MAX_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_PERMISSIONS || "rwx", "PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS");
@@ -136,6 +137,13 @@ function validateName(name, label) {
   if (!/^[a-zA-Z0-9_.:-]+$/.test(name)) throw new Error(`${label}.name may only contain letters, numbers, _, ., :, and -`);
 }
 
+function normalizeConcurrency(value, label = "concurrency") {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_FANOUT_CONCURRENCY) {
+    throw new Error(`${label} must be an integer between 1 and ${MAX_FANOUT_CONCURRENCY}`);
+  }
+  return value;
+}
+
 function validateSpec(spec) {
   if (!spec || typeof spec !== "object" || Array.isArray(spec)) throw new Error("spec must be an object");
   if (spec.name !== undefined) validateName(spec.name, "spec");
@@ -158,10 +166,12 @@ function validateSpec(spec) {
     if (phase.type === "artifact" && typeof phase.content !== "string" && typeof phase.from !== "string") throw new Error(`${phase.name} must provide content or from`);
     if (phase.permissions !== undefined) normalizePermissions(phase.permissions, `${phase.name}.permissions`);
     if (phase.timeoutMs !== undefined) normalizeTimeoutMs(phase.timeoutMs, `${phase.name}.timeoutMs`);
+    if (phase.concurrency !== undefined) normalizeConcurrency(phase.concurrency, `${phase.name}.concurrency`);
     if (phase.tools !== undefined && (!Array.isArray(phase.tools) || !phase.tools.every((tool) => typeof tool === "string"))) throw new Error(`${phase.name}.tools must be an array of strings`);
   }
   if (spec.permissions !== undefined) normalizePermissions(spec.permissions, "spec.permissions");
   if (spec.timeoutMs !== undefined) normalizeTimeoutMs(spec.timeoutMs, "spec.timeoutMs");
+  if (spec.concurrency !== undefined) normalizeConcurrency(spec.concurrency, "spec.concurrency");
   if (spec.permissionMode !== undefined) throw new Error("permissionMode is not part of the dynamic workflow spec; declare rwx capabilities with permissions instead");
   return spec;
 }
@@ -349,7 +359,7 @@ function outputToItems(value) {
 }
 
 async function mapWithConcurrency(items, concurrency, fn) {
-  const limit = Math.max(1, Math.min(concurrency, items.length || 1));
+  const limit = Math.min(normalizeConcurrency(concurrency), items.length || 1);
   const results = new Array(items.length);
   let next = 0;
   const workers = new Array(limit).fill(null).map(async () => {
@@ -415,7 +425,7 @@ async function* runFanoutPiPhase(ctx, phase) {
   if (!items.length) throw new Error(`${phase.name} has no fanout items`);
   const permissions = permissionsForPhase(ctx, phase);
   const tools = normalizePiTools(phase.tools, permissions, phase.name);
-  const concurrency = Number(phase.concurrency || ctx.spec.concurrency || DEFAULT_FANOUT_CONCURRENCY);
+  const concurrency = normalizeConcurrency(phase.concurrency ?? ctx.spec.concurrency ?? DEFAULT_FANOUT_CONCURRENCY, `${phase.name}.concurrency`);
   yield { type: "data", kind: "data", key: "permissions", value: permissions, message: `Running fanout with ${permissions} permissions` };
   yield { type: "fanout", kind: "fanout_start", total: items.length, label: phase.label || "items" };
   let completed = 0;
@@ -537,7 +547,8 @@ async function runHarness(ctx, harnessFile) {
         const values = asArray(items);
         phaseEvent(ctx.visualizerRun, name, { kind: "fanout_start", total: values.length, label: options.label || "items" });
         let completed = 0;
-        const results = await mapWithConcurrency(values, Number(options.concurrency || DEFAULT_FANOUT_CONCURRENCY), async (item, index) => {
+        const concurrency = normalizeConcurrency(options.concurrency ?? DEFAULT_FANOUT_CONCURRENCY, `${name}.concurrency`);
+        const results = await mapWithConcurrency(values, concurrency, async (item, index) => {
           phaseEvent(ctx.visualizerRun, name, { kind: "fanout_item_start", itemId: String(item), label: String(item), index, total: values.length });
           try {
             const result = options.run ? await options.run(item, index, harnessCtx) : await harnessCtx.pi(String(options.promptTemplate || options.prompt || "").replace(/\{\{\s*item\s*\}\}/g, String(item)), { ...(options.pi || {}), name: `${name}-${safeName(item)}` });

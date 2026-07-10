@@ -54,14 +54,17 @@ export class PiJsonEventCollector {
         continue;
       }
 
-      this.pending += input;
-      if (Buffer.byteLength(this.pending, "utf8") > this.maxLineBytes) {
-        // Never let a malformed or unexpectedly giant unterminated record turn
-        // back into an unbounded process-lifetime buffer.
+      const pendingBytes = Buffer.byteLength(this.pending, "utf8");
+      const inputBytes = Buffer.byteLength(input, "utf8");
+      if (pendingBytes + inputBytes > this.maxLineBytes) {
+        // Check before concatenating so the configured line cap is also an
+        // allocation cap, not merely a post-allocation retention cap.
         this.pending = "";
         this.droppingLine = true;
         this.oversizedEvents++;
+        return;
       }
+      this.pending += input;
       return;
     }
   }
@@ -135,8 +138,8 @@ export class PiJsonEventCollector {
 }
 
 function eventTypeFromPrefix(line) {
-  // `type` is emitted near the beginning by Pi. Restrict the scan so a giant
-  // tool argument containing a coincidental `type` key cannot be mistaken for
-  // the event discriminator.
-  return line.slice(0, 512).match(/"type"\s*:\s*"([^"]+)"/)?.[1];
+  // Pi constructs protocol events with `type` as the first top-level field.
+  // Anchor at the object start: a regex searching arbitrary raw JSON could
+  // mistake escaped `"type"` text inside an earlier string for a discriminator.
+  return line.slice(0, 512).match(/^\s*\{\s*"type"\s*:\s*"([^"]+)"/)?.[1];
 }
