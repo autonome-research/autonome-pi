@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,26 @@ test("dynamic runner reports a phase timeout instead of generic exit 143", { ski
     const details = JSON.parse(result.stdout);
     assert.match(details.error, /timed out after 40 ms; terminated with SIGTERM/);
     assert.doesNotMatch(details.error, /exited 143/);
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("invalid CLI timeout is rejected before creating a visualizer run", () => {
+  const temp = mkdtempSync(join(tmpdir(), "dynamic-cli-timeout-validation-test-"));
+  try {
+    const specPath = join(temp, "spec.json");
+    const store = join(temp, "store");
+    writeFileSync(specPath, JSON.stringify({ name: "bad-cli-timeout", permissions: "rwx", phases: [{ type: "shell", name: "never-runs", command: "exit 99" }] }));
+    const result = spawnSync(process.execPath, [cli, "--spec-file", specPath, "--cwd", temp, "--timeout", "0"], {
+      cwd: root,
+      env: { ...process.env, PI_THREAD_PHASE_STORE_DIR: store },
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--timeout must be an integer/);
+    assert.equal(existsSync(join(store, "runs")), false);
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }

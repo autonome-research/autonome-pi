@@ -140,6 +140,16 @@ test("runBoundedProcess reports spawn failures without hanging", async () => {
   assert.match(result.error, /ENOENT/);
 });
 
+test("runBoundedProcess resolves synchronous or emitted spawn setup failures consistently", async () => {
+  const result = await runBoundedProcess(process.execPath, ["-e", "process.exit(0)"], {
+    cwd: "/definitely/not/a/real/dynamic-workflow-directory",
+    timeoutMs: 5_000,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 1);
+  assert.match(result.error, /ENOENT/);
+});
+
 test("runBoundedProcess preserves workflow cancellation separately from timeout", async () => {
   const controller = new AbortController();
   setTimeout(() => controller.abort("operator cancelled"), 30);

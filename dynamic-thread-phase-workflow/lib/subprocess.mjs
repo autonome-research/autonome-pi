@@ -53,14 +53,30 @@ export function runBoundedProcess(command, args, options = {}) {
       return;
     }
 
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: options.env || process.env,
-      shell: Boolean(options.shell),
-      detached: process.platform !== "win32",
-    });
-    options.onChildStart?.(child);
+    let child;
+    try {
+      child = spawn(command, args, {
+        cwd: options.cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: options.env || process.env,
+        shell: Boolean(options.shell),
+        detached: process.platform !== "win32",
+      });
+      options.onChildStart?.(child);
+    } catch (error) {
+      resolve({
+        ok: false,
+        code: 1,
+        signal: null,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        aborted: false,
+        durationMs: Date.now() - startedAt,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
 
     const timeoutController = new AbortController();
     let timedOut = false;

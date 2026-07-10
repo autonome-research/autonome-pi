@@ -606,6 +606,9 @@ async function main() {
     : validateSpec(loadSpec(args));
   const cleanupInputFile = args["js-file"] || args["harness-file"] || args["spec-file"];
   if (isTruthyFlag(args["cleanup-input"]) && cleanupInputFile) generatedInputDirectory(cleanupInputFile);
+  // Validate CLI timeout before creating a visualizer run so bad input cannot
+  // leave a setup-stage run that needs terminal-state repair.
+  const timeoutMs = normalizeTimeoutMs(args.timeout ?? spec.timeoutMs ?? DEFAULT_TIMEOUT_MS, args.timeout !== undefined ? "--timeout" : "workflow timeoutMs");
   // Yield once so a SIGTERM delivered during startup is observed before the
   // launcher can detach a background child. The wrapper also guards signals
   // that were already aborted before spawn.
@@ -628,39 +631,39 @@ async function main() {
   // Close the startup gap between the pre-background check and controller
   // registration. A signal in that interval sets the global flag first.
   if (cancellationRequested) controller.abort("cancelled during workflow startup");
-  const stopWatchingCancellation = watchCancellation(visualizerRun, controller);
+  let stopWatchingCancellation = () => {};
 
-  const artifactsDir = join(ARTIFACTS_DIR, visualizerRun.runId);
-  mkdirSync(artifactsDir, { recursive: true });
-  const specPath = join(artifactsDir, harnessFile ? "workflow-harness-manifest.json" : "workflow-spec.json");
-  writeFileSync(specPath, JSON.stringify(spec, null, 2), "utf8");
-  artifact(visualizerRun, { kind: "json", title: harnessFile ? "Workflow harness manifest" : "Compiled workflow spec", path: specPath });
-  if (harnessFile) {
-    // Artifacts must be durable copies, not references to temporary/user files.
-    // Execute the copy as well so generated input can be securely removed once
-    // this detached or foreground runner has taken ownership of it.
-    const harnessArtifactPath = join(artifactsDir, "workflow-harness.mjs");
-    copyFileSync(harnessFile, harnessArtifactPath);
-    artifact(visualizerRun, { kind: "file", title: "Workflow harness source", path: harnessArtifactPath });
-    harnessFile = harnessArtifactPath;
-  }
-  if (isTruthyFlag(args["cleanup-input"])) {
-    if (cleanupInputFile) cleanupGeneratedInput(cleanupInputFile);
-  }
-
-  const ctx = {
-    cache: new PipelineCache(),
-    visualizerRun,
-    spec,
-    cwd,
-    model: args.model ? String(args.model) : spec.model,
-    timeoutMs: normalizeTimeoutMs(args.timeout ?? spec.timeoutMs ?? DEFAULT_TIMEOUT_MS, args.timeout !== undefined ? "--timeout" : "workflow timeoutMs"),
-    outputs: {},
-    results: {},
-    signal: controller.signal,
-  };
-
+  // Everything after createRun is protected so setup failures receive a
+  // terminal visualizer event and cancellation polling/global state is cleaned.
   try {
+    stopWatchingCancellation = watchCancellation(visualizerRun, controller);
+    const artifactsDir = join(ARTIFACTS_DIR, visualizerRun.runId);
+    mkdirSync(artifactsDir, { recursive: true });
+    const specPath = join(artifactsDir, harnessFile ? "workflow-harness-manifest.json" : "workflow-spec.json");
+    writeFileSync(specPath, JSON.stringify(spec, null, 2), "utf8");
+    artifact(visualizerRun, { kind: "json", title: harnessFile ? "Workflow harness manifest" : "Compiled workflow spec", path: specPath });
+    if (harnessFile) {
+      // Artifacts must be durable copies, not references to temporary/user files.
+      // Execute the copy as well so generated input can be securely removed once
+      // this detached or foreground runner has taken ownership of it.
+      const harnessArtifactPath = join(artifactsDir, "workflow-harness.mjs");
+      copyFileSync(harnessFile, harnessArtifactPath);
+      artifact(visualizerRun, { kind: "file", title: "Workflow harness source", path: harnessArtifactPath });
+      harnessFile = harnessArtifactPath;
+    }
+    if (isTruthyFlag(args["cleanup-input"]) && cleanupInputFile) cleanupGeneratedInput(cleanupInputFile);
+
+    const ctx = {
+      cache: new PipelineCache(),
+      visualizerRun,
+      spec,
+      cwd,
+      model: args.model ? String(args.model) : spec.model,
+      timeoutMs,
+      outputs: {},
+      results: {},
+      signal: controller.signal,
+    };
     if (harnessFile) {
       const phases = [{ name: "run-harness", async *run(runCtx) { await runHarness(runCtx, harnessFile); yield { type: "data", kind: "data", key: "mode", value: "harness", message: "Harness complete" }; } }];
       for await (const _event of runPipeline(wrapPhases(phases, visualizerRun), ctx, { signal: controller.signal })) {
@@ -692,6 +695,7 @@ async function main() {
     activeRun = undefined;
   } finally {
     stopWatchingCancellation();
+    if (activeRun === visualizerRun) activeRun = undefined;
     if (activeAbortController === controller) activeAbortController = undefined;
   }
 }
