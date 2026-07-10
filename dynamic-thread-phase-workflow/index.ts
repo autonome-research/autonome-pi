@@ -19,25 +19,38 @@ function truncate(text: string, max = MAX_TOOL_TEXT): string {
 	return `${out}\n\n[Tool output truncated. Full run is available through thread_phase_runs.]`;
 }
 
-function runScript(args: string[], cwd: string, signal?: AbortSignal): Promise<{ code: number; stdout: string; stderr: string }> {
+function runScript(args: string[], cwd: string, signal?: AbortSignal): Promise<{ code: number; signal: NodeJS.Signals | null; stdout: string; stderr: string; aborted: boolean }> {
 	return new Promise((resolve) => {
 		const proc = spawn(process.execPath, [SCRIPT, ...args], { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env });
 		// The runner normally emits one small JSON result, but bound both streams
 		// while reading so a noisy/crashing child cannot exhaust the Pi process.
 		const stdout = new BoundedTextBuffer(MAX_RUNNER_CAPTURE_BYTES, { keep: "tail" });
 		const stderr = new BoundedTextBuffer(MAX_RUNNER_CAPTURE_BYTES, { keep: "tail" });
+		let aborted = false;
+		let settled = false;
+		let killTimer: NodeJS.Timeout | undefined;
+		const cleanup = () => {
+			if (killTimer) clearTimeout(killTimer);
+			signal?.removeEventListener("abort", abort);
+		};
+		const finish = (code: number, observedSignal: NodeJS.Signals | null, error?: Error) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			resolve({ code, signal: observedSignal, stdout: stdout.value(), stderr: error?.message || stderr.value(), aborted });
+		};
+		const abort = () => {
+			aborted = true;
+			proc.kill("SIGTERM");
+			killTimer = setTimeout(() => proc.kill("SIGKILL"), 5000);
+			killTimer.unref();
+		};
 		proc.stdout.on("data", (d) => stdout.append(d.toString()));
 		proc.stderr.on("data", (d) => stderr.append(d.toString()));
-		proc.on("error", (error) => resolve({ code: 1, stdout: stdout.value(), stderr: error.message }));
-		proc.on("close", (code) => resolve({ code: code ?? 0, stdout: stdout.value(), stderr: stderr.value() }));
-		if (signal) {
-			const abort = () => {
-				proc.kill("SIGTERM");
-				setTimeout(() => proc.kill("SIGKILL"), 5000).unref();
-			};
-			if (signal.aborted) abort();
-			else signal.addEventListener("abort", abort, { once: true });
-		}
+		proc.on("error", (error) => finish(1, null, error));
+		proc.on("close", (code, observedSignal) => finish(code ?? (aborted ? 130 : 1), observedSignal));
+		if (signal?.aborted) abort();
+		else signal?.addEventListener("abort", abort, { once: true });
 	});
 }
 

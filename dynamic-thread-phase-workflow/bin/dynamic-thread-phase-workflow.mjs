@@ -5,7 +5,7 @@ import { tmpdir, homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { PiJsonEventCollector } from "../lib/pi-json-stream.mjs";
-import { runBoundedProcess, terminateChild } from "../lib/subprocess.mjs";
+import { normalizeTimeoutMs, runBoundedProcess, terminateChild } from "../lib/subprocess.mjs";
 import {
   ARTIFACTS_DIR,
   STATUSES,
@@ -157,9 +157,11 @@ function validateSpec(spec) {
     }
     if (phase.type === "artifact" && typeof phase.content !== "string" && typeof phase.from !== "string") throw new Error(`${phase.name} must provide content or from`);
     if (phase.permissions !== undefined) normalizePermissions(phase.permissions, `${phase.name}.permissions`);
+    if (phase.timeoutMs !== undefined) normalizeTimeoutMs(phase.timeoutMs, `${phase.name}.timeoutMs`);
     if (phase.tools !== undefined && (!Array.isArray(phase.tools) || !phase.tools.every((tool) => typeof tool === "string"))) throw new Error(`${phase.name}.tools must be an array of strings`);
   }
   if (spec.permissions !== undefined) normalizePermissions(spec.permissions, "spec.permissions");
+  if (spec.timeoutMs !== undefined) normalizeTimeoutMs(spec.timeoutMs, "spec.timeoutMs");
   if (spec.permissionMode !== undefined) throw new Error("permissionMode is not part of the dynamic workflow spec; declare rwx capabilities with permissions instead");
   return spec;
 }
@@ -273,7 +275,7 @@ function normalizePiTools(tools, permissions, label) {
 async function runProcess(command, args, options) {
   return await runBoundedProcess(command, args, {
     ...options,
-    timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS,
+    timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     onChildStart: (child) => activeChildren.add(child),
     onChildEnd: (child) => activeChildren.delete(child),
   });
@@ -367,7 +369,7 @@ async function* runShellPhase(ctx, phase) {
   yield { type: "data", kind: "data", key: "permissions", value: permissions, message: `Running shell command with ${permissions} permissions` };
   yield { type: "data", kind: "data", key: "command", value: command, message: `Running shell command` };
   if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
-  const result = await runProcess(command, [], { cwd: ctx.cwd, shell: true, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: ctx.signal });
+  const result = await runProcess(command, [], { cwd: ctx.cwd, shell: true, timeoutMs: phase.timeoutMs ?? ctx.timeoutMs, signal: ctx.signal });
   if (result.aborted) throw abortError(result.error || "cancelled");
   const output = compactText(result.stdout || "");
   ctx.outputs[phase.name] = output;
@@ -384,10 +386,10 @@ async function* runPiPhase(ctx, phase) {
   yield { type: "data", kind: "data", key: "permissions", value: permissions, message: `Running pi agent with ${permissions} permissions` };
   yield { type: "data", kind: "data", key: "tools", value: tools, message: `Running pi agent` };
   if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
-  const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: ctx.signal });
+  const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs ?? ctx.timeoutMs, signal: ctx.signal });
   if (result.aborted) throw abortError(result.error || "cancelled");
   ctx.outputs[phase.name] = compactText(result.text || "");
-  ctx.results[phase.name] = { ok: result.ok, model: result.model, stopReason: result.stopReason, code: result.code, error: result.error, piJson: result.piJson };
+  ctx.results[phase.name] = { ok: result.ok, model: result.model, stopReason: result.stopReason, code: result.code, signal: result.signal, timedOut: result.timedOut, durationMs: result.durationMs, termination: result.termination, error: result.error, piJson: result.piJson };
   if (result.usage?.length) phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage: result.usage, model: result.model });
   emitTextArtifact(ctx, phase, ctx.outputs[phase.name], { title: `Pi output: ${phase.name}`, fileName: `${phase.name}.md` });
   yield { type: "data", kind: "data", key: "model", value: result.model, message: result.ok ? "Pi agent complete" : "Pi agent failed" };
@@ -411,7 +413,7 @@ async function* runFanoutPiPhase(ctx, phase) {
     try {
       if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
       const prompt = renderTemplate(phase.promptTemplate, ctx, { item, index });
-      const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: ctx.signal });
+      const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs ?? ctx.timeoutMs, signal: ctx.signal });
       if (result.aborted) throw abortError(result.error || "cancelled");
       const text = compactText(result.text || "");
       const fileNameTemplate = phase.artifact && typeof phase.artifact === "object" ? phase.artifact.fileNameTemplate : undefined;
@@ -430,7 +432,7 @@ async function* runFanoutPiPhase(ctx, phase) {
       if (result.ok) completed++; else failed++;
       push({ type: "fanout", kind: "fanout_item_end", itemId: item, label: item, index, status: result.ok ? STATUSES.SUCCESS : STATUSES.FAILED, message: result.ok ? `Complete ${item}` : `Failed ${item}`, error: result.error });
       push({ type: "progress", kind: "progress", completed, total: items.length, message: `${completed}/${items.length} complete` });
-      return { item, index, ok: result.ok, text, model: result.model, stopReason: result.stopReason, error: result.error, piJson: result.piJson };
+      return { item, index, ok: result.ok, text, model: result.model, stopReason: result.stopReason, signal: result.signal, timedOut: result.timedOut, durationMs: result.durationMs, termination: result.termination, error: result.error, piJson: result.piJson };
     } catch (error) {
       failed++;
       const cancelled = isAbortError(error) || ctx.signal?.aborted;
@@ -497,7 +499,7 @@ async function runHarness(ctx, harnessFile) {
         const permissions = permissionsForPhase(ctx, phase);
         if (!permissionIncludesAll(permissions, "rwx")) throw new Error(`shell helper requires rwx permissions because command execution is not sandboxed`);
         phaseEvent(ctx.visualizerRun, phase.name, { kind: "data", key: "command", value: command, message: "Running shell command" });
-        const result = await runProcess(command, [], { cwd: options.cwd || ctx.cwd, shell: true, timeoutMs: options.timeoutMs || ctx.timeoutMs, signal: ctx.signal });
+        const result = await runProcess(command, [], { cwd: options.cwd || ctx.cwd, shell: true, timeoutMs: options.timeoutMs ?? ctx.timeoutMs, signal: ctx.signal });
         if (result.aborted) throw abortError(result.error || "cancelled");
         if (!result.ok && options.reject !== false) throw new Error(result.error || `shell command exited ${result.code}`);
         return compactText(result.stdout || "");
@@ -508,7 +510,7 @@ async function runHarness(ctx, harnessFile) {
         const phase = { name: options.name || `pi-${autoPhase}`, permissions: options.permissions || ctx.spec.permissions || DEFAULT_PERMISSIONS };
         const permissions = permissionsForPhase(ctx, phase);
         const tools = normalizePiTools(options.tools, permissions, phase.name);
-        const result = await runPi({ cwd: options.cwd || ctx.cwd, prompt, model: options.model || ctx.model, tools, timeoutMs: options.timeoutMs || ctx.timeoutMs, signal: ctx.signal });
+        const result = await runPi({ cwd: options.cwd || ctx.cwd, prompt, model: options.model || ctx.model, tools, timeoutMs: options.timeoutMs ?? ctx.timeoutMs, signal: ctx.signal });
         if (result.aborted) throw abortError(result.error || "cancelled");
         if (result.usage?.length) phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage: result.usage, model: result.model });
         if (!result.ok && options.reject !== false) throw new Error(result.error || "pi helper failed");
@@ -599,7 +601,7 @@ async function main() {
     spec,
     cwd,
     model: args.model ? String(args.model) : spec.model,
-    timeoutMs: args.timeout ? Number(args.timeout) : spec.timeoutMs || DEFAULT_TIMEOUT_MS,
+    timeoutMs: normalizeTimeoutMs(args.timeout ?? spec.timeoutMs ?? DEFAULT_TIMEOUT_MS, args.timeout !== undefined ? "--timeout" : "workflow timeoutMs"),
     outputs: {},
     results: {},
     signal: controller.signal,

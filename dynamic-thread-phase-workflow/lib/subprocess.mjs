@@ -3,6 +3,15 @@ import { BoundedTextBuffer } from "./bounded-buffer.mjs";
 
 export const DEFAULT_CAPTURE_BYTES = 1_000_000;
 export const DEFAULT_KILL_GRACE_MS = 5_000;
+export const MAX_TIMEOUT_MS = 2_147_483_647;
+
+export function normalizeTimeoutMs(value, label = "timeoutMs") {
+  const timeout = Number(value);
+  if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > MAX_TIMEOUT_MS) {
+    throw new Error(`${label} must be an integer between 1 and ${MAX_TIMEOUT_MS} milliseconds`);
+  }
+  return timeout;
+}
 
 /** Terminate the whole subprocess group where supported. */
 export function terminateChild(child, signal = "SIGTERM") {
@@ -15,19 +24,32 @@ export function terminateChild(child, signal = "SIGTERM") {
 }
 
 /**
- * Spawn a command while bounding captured output as bytes arrive.
+ * Spawn a command with bounded output and cooperative cancellation.
  *
- * onStdout/onStderr allow protocol consumers to parse streams incrementally;
- * captureStdout/captureStderr can be disabled when those consumers do not need
- * a raw copy. This helper intentionally preserves the runner's existing
- * timeout/error semantics; timeout classification is handled separately.
+ * A local AbortController owns the per-process timeout and is composed with
+ * the workflow's AbortSignal. Timeout and user cancellation remain distinct in
+ * the result so callers can report an actionable failure instead of exit 143.
  */
 export function runBoundedProcess(command, args, options = {}) {
   return new Promise((resolve) => {
+    const timeoutMs = normalizeTimeoutMs(options.timeoutMs, "process timeoutMs");
+    const killGraceMs = normalizeTimeoutMs(options.killGraceMs ?? DEFAULT_KILL_GRACE_MS, "process killGraceMs");
+    const startedAt = Date.now();
     const stdoutBuffer = new BoundedTextBuffer(options.maxStdoutBytes ?? DEFAULT_CAPTURE_BYTES, { keep: options.stdoutKeep ?? "head" });
     const stderrBuffer = new BoundedTextBuffer(options.maxStderrBytes ?? DEFAULT_CAPTURE_BYTES, { keep: options.stderrKeep ?? "tail" });
     if (options.signal?.aborted) {
-      resolve({ ok: false, code: null, signal: null, stdout: "", stderr: "", timedOut: false, aborted: true, error: String(options.signal.reason || "cancelled") });
+      resolve({
+        ok: false,
+        code: null,
+        signal: null,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        aborted: true,
+        durationMs: 0,
+        termination: { kind: "cancelled", reason: String(options.signal.reason || "cancelled") },
+        error: String(options.signal.reason || "cancelled"),
+      });
       return;
     }
 
@@ -40,41 +62,74 @@ export function runBoundedProcess(command, args, options = {}) {
     });
     options.onChildStart?.(child);
 
+    const timeoutController = new AbortController();
+    const combinedSignal = options.signal
+      ? AbortSignal.any([options.signal, timeoutController.signal])
+      : timeoutController.signal;
     let timedOut = false;
     let aborted = false;
     let settled = false;
+    let requestedSignal;
     let killTimer;
+
     const terminate = (signal = "SIGTERM") => {
+      requestedSignal ||= signal;
       terminateChild(child, signal);
       if (!killTimer) {
-        killTimer = setTimeout(() => terminateChild(child, "SIGKILL"), options.killGraceMs ?? DEFAULT_KILL_GRACE_MS);
+        killTimer = setTimeout(() => terminateChild(child, "SIGKILL"), killGraceMs);
         killTimer.unref?.();
       }
     };
     const onAbort = () => {
-      aborted = true;
+      timedOut = timeoutController.signal.aborted;
+      aborted = !timedOut && Boolean(options.signal?.aborted);
       terminate("SIGTERM");
     };
-    const timeoutMs = options.timeoutMs;
+    combinedSignal.addEventListener("abort", onAbort, { once: true });
+    if (combinedSignal.aborted) onAbort();
     const timeoutTimer = setTimeout(() => {
-      timedOut = true;
-      terminate("SIGTERM");
+      timeoutController.abort(new Error(`${command} timed out after ${timeoutMs} ms`));
     }, timeoutMs);
     timeoutTimer.unref?.();
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-    if (options.signal?.aborted) onAbort();
 
     const cleanup = () => {
       clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
-      options.signal?.removeEventListener("abort", onAbort);
+      combinedSignal.removeEventListener("abort", onAbort);
       options.onChildEnd?.(child);
     };
-    const finish = (result) => {
+    const finish = ({ code, signal, spawnError }) => {
       if (settled) return;
       settled = true;
       cleanup();
-      resolve(result);
+      const stdout = stdoutBuffer.value();
+      const stderr = stderrBuffer.value();
+      const durationMs = Date.now() - startedAt;
+      const termination = timedOut
+        ? { kind: "timeout", timeoutMs, requestedSignal, observedSignal: signal }
+        : aborted
+          ? { kind: "cancelled", reason: String(options.signal?.reason || "cancelled"), requestedSignal, observedSignal: signal }
+          : signal
+            ? { kind: "signal", observedSignal: signal }
+            : undefined;
+      const error = spawnError?.message
+        || (timedOut ? `${command} timed out after ${timeoutMs} ms; terminated with ${signal || requestedSignal || "SIGTERM"}` : undefined)
+        || (aborted ? String(options.signal?.reason || "cancelled") : undefined)
+        || (code === 0 ? undefined : stderr || (signal ? `${command} terminated with ${signal}` : `${command} exited ${code}`));
+      resolve({
+        ok: code === 0 && !timedOut && !aborted,
+        code,
+        signal,
+        stdout,
+        stderr,
+        stdoutTruncated: stdoutBuffer.truncated,
+        stderrTruncated: stderrBuffer.truncated,
+        timedOut,
+        aborted,
+        durationMs,
+        termination,
+        error,
+      });
     };
 
     child.stdout.on("data", (data) => {
@@ -87,35 +142,7 @@ export function runBoundedProcess(command, args, options = {}) {
       options.onStderr?.(chunk);
       if (options.captureStderr !== false) stderrBuffer.append(chunk);
     });
-    child.on("error", (error) => {
-      finish({
-        ok: false,
-        code: 1,
-        signal: null,
-        stdout: stdoutBuffer.value(),
-        stderr: stderrBuffer.value(),
-        stdoutTruncated: stdoutBuffer.truncated,
-        stderrTruncated: stderrBuffer.truncated,
-        timedOut,
-        aborted,
-        error: error.message,
-      });
-    });
-    child.on("close", (code, signal) => {
-      const stdout = stdoutBuffer.value();
-      const stderr = stderrBuffer.value();
-      finish({
-        ok: code === 0 && !aborted,
-        code,
-        signal,
-        stdout,
-        stderr,
-        stdoutTruncated: stdoutBuffer.truncated,
-        stderrTruncated: stderrBuffer.truncated,
-        timedOut,
-        aborted,
-        error: aborted ? String(options.signal?.reason || "cancelled") : code === 0 ? undefined : stderr || `${command} exited ${code}`,
-      });
-    });
+    child.on("error", (error) => finish({ code: 1, signal: null, spawnError: error }));
+    child.on("close", (code, signal) => finish({ code, signal }));
   });
 }

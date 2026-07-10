@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { BoundedTextBuffer } from "../lib/bounded-buffer.mjs";
-import { runBoundedProcess } from "../lib/subprocess.mjs";
+import { normalizeTimeoutMs, runBoundedProcess } from "../lib/subprocess.mjs";
 
 test("BoundedTextBuffer retains a byte-safe head", () => {
   const buffer = new BoundedTextBuffer(7, { keep: "head" });
@@ -50,4 +50,42 @@ test("runBoundedProcess can stream stdout without retaining a raw copy", async (
   assert.equal(result.ok, true);
   assert.equal(observed, 50_000);
   assert.equal(result.stdout, "");
+});
+
+test("runBoundedProcess reports timeout separately from process exit", async () => {
+  const result = await runBoundedProcess(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], {
+    timeoutMs: 40,
+    killGraceMs: 100,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, true);
+  assert.equal(result.aborted, false);
+  assert.equal(result.termination.kind, "timeout");
+  assert.equal(result.termination.timeoutMs, 40);
+  assert.match(result.error, /timed out after 40 ms; terminated with SIGTERM/);
+  assert.ok(result.durationMs >= 30);
+});
+
+test("runBoundedProcess preserves workflow cancellation separately from timeout", async () => {
+  const controller = new AbortController();
+  setTimeout(() => controller.abort("operator cancelled"), 30);
+  const result = await runBoundedProcess(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], {
+    timeoutMs: 5_000,
+    killGraceMs: 100,
+    signal: controller.signal,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.aborted, true);
+  assert.equal(result.termination.kind, "cancelled");
+  assert.equal(result.error, "operator cancelled");
+});
+
+test("timeout validation rejects values that Node timers cannot represent", () => {
+  assert.equal(normalizeTimeoutMs(1), 1);
+  assert.throws(() => normalizeTimeoutMs(0), /must be an integer/);
+  assert.throws(() => normalizeTimeoutMs(Number.NaN), /must be an integer/);
+  assert.throws(() => normalizeTimeoutMs(2_147_483_648), /must be an integer/);
 });
