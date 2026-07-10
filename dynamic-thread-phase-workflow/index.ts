@@ -121,31 +121,31 @@ function parametersSchema() {
 async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any, legacyName: string) {
 	if (!params.spec && !params.harness && !params.harnessFile) throw new Error("Provide either spec, harness, or harnessFile.");
 	const cwd = path.resolve(ctx.cwd, params.cwd || params.spec?.cwd || ".");
-	const args = ["--cwd", cwd];
 	let generatedInputFile: string | undefined;
 	let retainGeneratedInput = false;
-	if (params.harness || params.harnessFile) {
-		if (params.permissions !== "rwx") throw new Error("JavaScript harness mode requires explicit permissions: \"rwx\".");
-		const harnessFile = params.harnessFile ? path.resolve(ctx.cwd, params.harnessFile) : (generatedInputFile = writeHarnessFile(params.harness));
-		args.push("--js-file", harnessFile, "--permissions", params.permissions);
-		if (params.name) args.push("--name", params.name);
-	} else {
-		const spec = { ...params.spec };
-		if (params.permissions) {
-			if (spec.permissions && spec.permissions !== params.permissions) throw new Error("Top-level permissions conflict with spec.permissions.");
-			spec.permissions = params.permissions;
-		}
-		generatedInputFile = writeJsonFile(spec);
-		args.push("--spec-file", generatedInputFile);
-	}
-	if (generatedInputFile) args.push("--cleanup-input");
-	if (params.model) args.push("--model", params.model);
-	if (params.timeout !== undefined) args.push("--timeout", String(normalizeTimeoutMs(params.timeout, "timeout")));
-	if (params.background) args.push("--background");
-	if (params.autoContinue) args.push("--auto-continue");
-	addSessionArgs(args, ctx);
-	onUpdate?.({ content: [{ type: "text", text: `Starting ${legacyName ? "dynamic thread-phase" : "dynamic"} workflow in ${cwd}...` }] });
 	try {
+		const args = ["--cwd", cwd];
+		if (params.harness || params.harnessFile) {
+			if (params.permissions !== "rwx") throw new Error("JavaScript harness mode requires explicit permissions: \"rwx\".");
+			const harnessFile = params.harnessFile ? path.resolve(ctx.cwd, params.harnessFile) : (generatedInputFile = writeHarnessFile(params.harness));
+			args.push("--js-file", harnessFile, "--permissions", params.permissions);
+			if (params.name) args.push("--name", params.name);
+		} else {
+			const spec = { ...params.spec };
+			if (params.permissions) {
+				if (spec.permissions && spec.permissions !== params.permissions) throw new Error("Top-level permissions conflict with spec.permissions.");
+				spec.permissions = params.permissions;
+			}
+			generatedInputFile = writeJsonFile(spec);
+			args.push("--spec-file", generatedInputFile);
+		}
+		if (generatedInputFile) args.push("--cleanup-input");
+		if (params.model) args.push("--model", params.model);
+		if (params.timeout !== undefined) args.push("--timeout", String(normalizeTimeoutMs(params.timeout, "timeout")));
+		if (params.background) args.push("--background");
+		if (params.autoContinue) args.push("--auto-continue");
+		addSessionArgs(args, ctx);
+		onUpdate?.({ content: [{ type: "text", text: `Starting ${legacyName ? "dynamic thread-phase" : "dynamic"} workflow in ${cwd}...` }] });
 		const result = await runScript(args, cwd, signal);
 		let details: any;
 		try { details = parseJsonObject(result.stdout); } catch { details = { stdout: result.stdout, stderr: result.stderr }; }

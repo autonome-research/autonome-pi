@@ -62,7 +62,6 @@ export function runBoundedProcess(command, args, options = {}) {
         shell: Boolean(options.shell),
         detached: process.platform !== "win32",
       });
-      options.onChildStart?.(child);
     } catch (error) {
       resolve({
         ok: false,
@@ -120,7 +119,7 @@ export function runBoundedProcess(command, args, options = {}) {
       if (killTimer) clearTimeout(killTimer);
       options.signal?.removeEventListener("abort", onWorkflowAbort);
       timeoutController.signal.removeEventListener("abort", onTimeoutAbort);
-      options.onChildEnd?.(child);
+      try { options.onChildEnd?.(child); } catch { /* lifecycle cleanup must not mask the process result */ }
     };
     const finish = ({ code, signal, spawnError }) => {
       if (settled) return;
@@ -182,5 +181,11 @@ export function runBoundedProcess(command, args, options = {}) {
     });
     child.on("error", (error) => finish({ code: 1, signal: null, spawnError: error }));
     child.on("close", (code, signal) => finish({ code, signal }));
+    try {
+      options.onChildStart?.(child);
+    } catch (error) {
+      streamCallbackError = error instanceof Error ? error : new Error(String(error));
+      terminate("SIGTERM");
+    }
   });
 }

@@ -18,7 +18,8 @@ export class PiJsonEventCollector {
     this.droppedEvents = 0;
     this.malformedEvents = 0;
     this.oversizedEvents = 0;
-    this.usage = [];
+    this.usageTotals = {};
+    this.usageEvents = 0;
     this.text = "";
     this.model = undefined;
     this.stopReason = undefined;
@@ -78,13 +79,14 @@ export class PiJsonEventCollector {
   result() {
     return {
       text: this.text,
-      usage: this.usage,
+      usage: this.usageEvents ? [this.usageTotals] : [],
       model: this.model,
       stopReason: this.stopReason,
       piJson: {
         droppedEvents: this.droppedEvents,
         malformedEvents: this.malformedEvents,
         oversizedEvents: this.oversizedEvents,
+        usageEvents: this.usageEvents,
         bufferedBytes: Buffer.byteLength(this.pending, "utf8"),
       },
     };
@@ -126,7 +128,10 @@ export class PiJsonEventCollector {
     }
 
     const message = event.message;
-    if (message.usage) this.usage.push(message.usage);
+    if (message.usage) {
+      mergeNumericUsage(this.usageTotals, message.usage);
+      this.usageEvents++;
+    }
     if (message.role !== "assistant") return;
     this.model = message.model || this.model;
     this.stopReason = message.stopReason || this.stopReason;
@@ -134,6 +139,31 @@ export class PiJsonEventCollector {
       .filter((part) => part?.type === "text" && typeof part.text === "string")
       .map((part) => part.text);
     if (textParts.length) this.text = textParts.join("");
+  }
+}
+
+const NUMERIC_USAGE_KEYS = new Set([
+  "input", "output", "totalTokens", "reasoning", "cacheRead", "cacheWrite",
+  "input_tokens", "output_tokens", "total_tokens", "reasoning_tokens",
+  "cached_input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+  "promptTokens", "completionTokens", "cachedInputTokens", "cacheCreationInputTokens", "reasoningTokens",
+]);
+const NUMERIC_COST_KEYS = new Set(["input", "output", "cacheRead", "cacheWrite", "total"]);
+
+function mergeNumericUsage(target, source) {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return;
+  // Provider usage schemas vary, but retaining arbitrary keys would allow many
+  // small events to grow this aggregate forever. Keep a fixed numeric schema.
+  for (const key of NUMERIC_USAGE_KEYS) {
+    const value = source[key];
+    if (typeof value === "number" && Number.isFinite(value)) target[key] = (target[key] || 0) + value;
+  }
+  if (source.cost && typeof source.cost === "object" && !Array.isArray(source.cost)) {
+    target.cost ||= {};
+    for (const key of NUMERIC_COST_KEYS) {
+      const value = source.cost[key];
+      if (typeof value === "number" && Number.isFinite(value)) target.cost[key] = (target.cost[key] || 0) + value;
+    }
   }
 }
 

@@ -121,6 +121,17 @@ test("runBoundedProcess terminates the child when a stream observer throws", asy
   assert.ok(result.signal === "SIGTERM" || result.signal === "SIGKILL");
 });
 
+test("runBoundedProcess reaps the child when onChildStart throws", async () => {
+  const result = await runBoundedProcess(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
+    timeoutMs: 5_000,
+    killGraceMs: 100,
+    onChildStart: () => { throw new Error("start hook failed"); },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "start hook failed");
+  assert.ok(result.signal === "SIGTERM" || result.signal === "SIGKILL");
+});
+
 test("runBoundedProcess returns immediately for a pre-aborted workflow", async () => {
   const controller = new AbortController();
   controller.abort("already cancelled");

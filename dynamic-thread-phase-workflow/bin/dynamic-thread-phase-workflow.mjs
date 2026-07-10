@@ -700,4 +700,15 @@ async function main() {
   }
 }
 
-await main();
+const exitArgs = parseArgs(process.argv.slice(2));
+try {
+  await main();
+} finally {
+  // Backup cleanup for detached/foreground failures that occur before createRun
+  // or before the normal setup block takes ownership of the generated input.
+  const cleanupInputFile = exitArgs["js-file"] || exitArgs["harness-file"] || exitArgs["spec-file"];
+  const ownsGeneratedInput = Boolean(process.env.PI_DYNAMIC_WORKFLOW_BACKGROUND || process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND) || !isTruthyFlag(exitArgs.background);
+  if (isTruthyFlag(exitArgs["cleanup-input"]) && cleanupInputFile && ownsGeneratedInput) {
+    try { cleanupGeneratedInput(cleanupInputFile); } catch { /* preserve the primary workflow error */ }
+  }
+}

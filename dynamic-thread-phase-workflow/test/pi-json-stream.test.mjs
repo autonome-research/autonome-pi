@@ -39,6 +39,18 @@ test("collector discards cumulative message updates and retains final metadata",
   assert.equal(result.piJson.bufferedBytes, 0);
 });
 
+test("collector aggregates arbitrarily many usage events into one bounded record", () => {
+  const collector = new PiJsonEventCollector();
+  const line = eventLine(finalMessage("usage"));
+  for (let index = 0; index < 20_000; index++) collector.push(line);
+  const result = collector.finish();
+  assert.equal(result.usage.length, 1);
+  assert.equal(result.usage[0].input, 200_000);
+  assert.equal(result.usage[0].output, 40_000);
+  assert.equal(result.piJson.usageEvents, 20_000);
+  assert.ok(JSON.stringify(result.usage).length < 1_000);
+});
+
 test("collector handles NDJSON records split across arbitrary chunks", () => {
   const collector = new PiJsonEventCollector();
   const stream = eventLine(finalMessage("chunked"));

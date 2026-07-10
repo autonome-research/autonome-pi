@@ -59,11 +59,21 @@ test("startup SIGTERM is observed before the CLI can detach a background run", a
   }
 });
 
-test("tool-level timeout validation rejects fractional and out-of-range values before spawn", async () => {
+test("tool-level timeout validation rejects invalid values and cleans generated input", async () => {
   const tools = new Map();
   registerDynamicWorkflows({ registerTool: (definition) => tools.set(definition.name, definition) });
   const execute = tools.get("dynamic_workflow").execute;
   const ctx = { cwd: root, sessionManager: {} };
-  await assert.rejects(execute("test", { spec: artifactSpec("fractional-timeout"), timeout: 1.5 }, undefined, undefined, ctx), /timeout must be an integer/);
-  await assert.rejects(execute("test", { spec: artifactSpec("large-timeout"), timeout: 2_147_483_648 }, undefined, undefined, ctx), /timeout must be an integer/);
+  const isolatedTmp = mkdtempSync(join(tmpdir(), "dynamic-wrapper-cleanup-"));
+  const previousTmpdir = process.env.TMPDIR;
+  process.env.TMPDIR = isolatedTmp;
+  try {
+    await assert.rejects(execute("test", { spec: artifactSpec("fractional-timeout"), timeout: 1.5 }, undefined, undefined, ctx), /timeout must be an integer/);
+    await assert.rejects(execute("test", { spec: artifactSpec("large-timeout"), timeout: 2_147_483_648 }, undefined, undefined, ctx), /timeout must be an integer/);
+    assert.deepEqual(readdirSync(isolatedTmp), []);
+  } finally {
+    if (previousTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previousTmpdir;
+    rmSync(isolatedTmp, { recursive: true, force: true });
+  }
 });

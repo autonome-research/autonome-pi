@@ -86,7 +86,7 @@ test("generated background harness is removed after detached runner takes owners
     assert.equal(existsSync(generatedDir), false);
   } finally {
     rmSync(generatedDir, { recursive: true, force: true });
-    rmSync(testDir, { recursive: true, force: true });
+    rmSync(testDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -104,6 +104,26 @@ test("harness copy setup failure finalizes the visualizer run", () => {
     assert.equal(terminal?.status, "failed");
   } finally {
     rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
+test("detached runner cleans generated input when validation fails before createRun", () => {
+  const generatedDir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflow-"));
+  const testDir = mkdtempSync(join(tmpdir(), "dynamic-detached-early-failure-"));
+  const specFile = join(generatedDir, "workflow-spec.json");
+  writeFileSync(specFile, JSON.stringify({ name: "early-failure", permissions: "r", phases: [{ type: "artifact", name: "result", content: "x" }] }));
+  try {
+    const result = spawnSync(process.execPath, [cli, "--spec-file", specFile, "--cleanup-input", "--timeout", "0", "--cwd", root], {
+      cwd: root,
+      env: { ...process.env, PI_DYNAMIC_WORKFLOW_BACKGROUND: "1", PI_THREAD_PHASE_STORE_DIR: join(testDir, "store") },
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    assert.notEqual(result.status, 0);
+    assert.equal(existsSync(generatedDir), false);
+  } finally {
+    rmSync(generatedDir, { recursive: true, force: true });
+    rmSync(testDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
