@@ -21,6 +21,15 @@ test("BoundedTextBuffer retains a byte-safe tail", () => {
   assert.doesNotMatch(value, /\uFFFD/u);
 });
 
+test("bounded truncation preserves a legitimate replacement character at boundaries", () => {
+  const head = new BoundedTextBuffer(4, { keep: "head" });
+  const tail = new BoundedTextBuffer(4, { keep: "tail" });
+  head.append("a�b");
+  tail.append("a�b");
+  assert.match(head.value(), /^a�\n/u);
+  assert.match(tail.value(), /�b$/u);
+});
+
 test("runBoundedProcess caps stdout and stderr during ingestion", async () => {
   const script = [
     "process.stdout.write('o'.repeat(200_000));",
@@ -37,6 +46,17 @@ test("runBoundedProcess caps stdout and stderr during ingestion", async () => {
   assert.equal(result.stderrTruncated, true);
   assert.ok(Buffer.byteLength(result.stdout, "utf8") < 1_200);
   assert.ok(Buffer.byteLength(result.stderr, "utf8") < 2_300);
+});
+
+test("runBoundedProcess decodes UTF-8 split across native stream chunks", async () => {
+  const script = [
+    "const value=Buffer.from('A😀B');",
+    "process.stdout.write(value.subarray(0,3));",
+    "setTimeout(()=>process.stdout.end(value.subarray(3)),10);",
+  ].join("");
+  const result = await runBoundedProcess(process.execPath, ["-e", script], { timeoutMs: 5_000 });
+  assert.equal(result.ok, true);
+  assert.equal(result.stdout, "A😀B");
 });
 
 test("runBoundedProcess can stream stdout without retaining a raw copy", async () => {
@@ -65,6 +85,19 @@ test("runBoundedProcess reports timeout separately from process exit", async () 
   assert.equal(result.termination.timeoutMs, 40);
   assert.match(result.error, /timed out after 40 ms; terminated with SIGTERM/);
   assert.ok(result.durationMs >= 30);
+});
+
+test("runBoundedProcess escalates an ignored SIGTERM and records SIGKILL", async () => {
+  const script = "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000)";
+  const result = await runBoundedProcess(process.execPath, ["-e", script], {
+    timeoutMs: 100,
+    killGraceMs: 50,
+  });
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.signal, "SIGKILL");
+  assert.equal(result.termination.observedSignal, "SIGKILL");
+  assert.match(result.error, /terminated with SIGKILL/);
 });
 
 test("runBoundedProcess preserves workflow cancellation separately from timeout", async () => {

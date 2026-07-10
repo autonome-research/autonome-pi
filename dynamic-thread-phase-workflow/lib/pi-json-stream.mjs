@@ -10,6 +10,7 @@ const DEFAULT_MAX_LINE_BYTES = 4_000_000;
  */
 export class PiJsonEventCollector {
   constructor({ maxLineBytes = DEFAULT_MAX_LINE_BYTES } = {}) {
+    if (!Number.isSafeInteger(maxLineBytes) || maxLineBytes <= 0) throw new Error("maxLineBytes must be a positive safe integer");
     this.maxLineBytes = maxLineBytes;
     this.pending = "";
     this.droppingLine = false;

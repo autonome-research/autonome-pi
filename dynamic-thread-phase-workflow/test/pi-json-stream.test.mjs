@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { PiJsonEventCollector } from "../lib/pi-json-stream.mjs";
+import { runBoundedProcess } from "../lib/subprocess.mjs";
 
 function eventLine(event) {
   return `${JSON.stringify(event)}\n`;
@@ -63,4 +64,28 @@ test("collector counts malformed records without failing the run", () => {
   const result = collector.finish();
   assert.equal(result.text, "done");
   assert.equal(result.piJson.malformedEvents, 1);
+});
+
+test("collector validates its maximum NDJSON record size", () => {
+  assert.throws(() => new PiJsonEventCollector({ maxLineBytes: 0 }), /positive safe integer/);
+  assert.throws(() => new PiJsonEventCollector({ maxLineBytes: 1.5 }), /positive safe integer/);
+});
+
+test("Pi NDJSON preserves raw Unicode split across byte chunks", async () => {
+  const collector = new PiJsonEventCollector();
+  const line = eventLine(finalMessage("café 😀"));
+  const emojiStart = Buffer.from(line).indexOf(Buffer.from("😀"));
+  const script = [
+    `const value=Buffer.from(${JSON.stringify(line)});`,
+    `process.stdout.write(value.subarray(0,${emojiStart + 2}));`,
+    `setTimeout(()=>process.stdout.end(value.subarray(${emojiStart + 2})),10);`,
+  ].join("");
+  const processResult = await runBoundedProcess(process.execPath, ["-e", script], {
+    timeoutMs: 5_000,
+    captureStdout: false,
+    onStdout: (chunk) => collector.push(chunk),
+  });
+
+  assert.equal(processResult.ok, true);
+  assert.equal(collector.finish().text, "café 😀");
 });

@@ -40,16 +40,24 @@ export class BoundedTextBuffer {
 
 export function takeUtf8Prefix(text, maxBytes) {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  const bytes = Buffer.from(text, "utf8").subarray(0, maxBytes);
-  return bytes.toString("utf8").replace(/\uFFFD$/, "");
+  const bytes = Buffer.from(text, "utf8");
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  // UTF-8 code points are at most four bytes, so at most three boundary bytes
+  // need to be removed. Fatal decoding distinguishes an incomplete boundary
+  // from a legitimate U+FFFD character in the original text.
+  for (let end = maxBytes; end >= Math.max(0, maxBytes - 3); end--) {
+    try { return decoder.decode(bytes.subarray(0, end)); } catch { /* try the previous code-point boundary */ }
+  }
+  return "";
 }
 
 export function takeUtf8Suffix(text, maxBytes) {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
   const bytes = Buffer.from(text, "utf8");
-  let suffix = bytes.subarray(bytes.length - maxBytes).toString("utf8");
-  // Starting in the middle of a multi-byte code point yields one replacement
-  // character. Remove only that boundary artifact, not legitimate content.
-  if (suffix.startsWith("\uFFFD")) suffix = suffix.slice(1);
-  return suffix;
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const first = bytes.length - maxBytes;
+  for (let start = first; start <= Math.min(bytes.length, first + 3); start++) {
+    try { return decoder.decode(bytes.subarray(start)); } catch { /* try the next code-point boundary */ }
+  }
+  return "";
 }

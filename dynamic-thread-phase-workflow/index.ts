@@ -45,8 +45,11 @@ function runScript(args: string[], cwd: string, signal?: AbortSignal): Promise<{
 			killTimer = setTimeout(() => proc.kill("SIGKILL"), 5000);
 			killTimer.unref();
 		};
-		proc.stdout.on("data", (d) => stdout.append(d.toString()));
-		proc.stderr.on("data", (d) => stderr.append(d.toString()));
+		// Preserve UTF-8 code points split across native Buffer boundaries.
+		proc.stdout.setEncoding("utf8");
+		proc.stderr.setEncoding("utf8");
+		proc.stdout.on("data", (chunk) => stdout.append(chunk));
+		proc.stderr.on("data", (chunk) => stderr.append(chunk));
 		proc.on("error", (error) => finish(1, null, error));
 		proc.on("close", (code, observedSignal) => finish(code ?? (aborted ? 130 : 1), observedSignal));
 		if (signal?.aborted) abort();

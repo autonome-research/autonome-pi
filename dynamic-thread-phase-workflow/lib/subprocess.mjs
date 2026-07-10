@@ -63,9 +63,6 @@ export function runBoundedProcess(command, args, options = {}) {
     options.onChildStart?.(child);
 
     const timeoutController = new AbortController();
-    const combinedSignal = options.signal
-      ? AbortSignal.any([options.signal, timeoutController.signal])
-      : timeoutController.signal;
     let timedOut = false;
     let aborted = false;
     let settled = false;
@@ -80,13 +77,22 @@ export function runBoundedProcess(command, args, options = {}) {
         killTimer.unref?.();
       }
     };
-    const onAbort = () => {
-      timedOut = timeoutController.signal.aborted;
-      aborted = !timedOut && Boolean(options.signal?.aborted);
+    // Manually compose the workflow and local timeout signals. This preserves
+    // Node 20.0 compatibility while giving both sources the same termination
+    // path and keeping their result classifications distinct.
+    const onWorkflowAbort = () => {
+      if (timedOut) return;
+      aborted = true;
       terminate("SIGTERM");
     };
-    combinedSignal.addEventListener("abort", onAbort, { once: true });
-    if (combinedSignal.aborted) onAbort();
+    const onTimeoutAbort = () => {
+      if (aborted) return;
+      timedOut = true;
+      terminate("SIGTERM");
+    };
+    options.signal?.addEventListener("abort", onWorkflowAbort, { once: true });
+    timeoutController.signal.addEventListener("abort", onTimeoutAbort, { once: true });
+    if (options.signal?.aborted) onWorkflowAbort();
     const timeoutTimer = setTimeout(() => {
       timeoutController.abort(new Error(`${command} timed out after ${timeoutMs} ms`));
     }, timeoutMs);
@@ -95,7 +101,8 @@ export function runBoundedProcess(command, args, options = {}) {
     const cleanup = () => {
       clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
-      combinedSignal.removeEventListener("abort", onAbort);
+      options.signal?.removeEventListener("abort", onWorkflowAbort);
+      timeoutController.signal.removeEventListener("abort", onTimeoutAbort);
       options.onChildEnd?.(child);
     };
     const finish = ({ code, signal, spawnError }) => {
@@ -132,13 +139,15 @@ export function runBoundedProcess(command, args, options = {}) {
       });
     };
 
-    child.stdout.on("data", (data) => {
-      const chunk = data.toString();
+    // Stream decoders carry incomplete UTF-8 sequences across Buffer chunks;
+    // calling Buffer#toString independently would corrupt split code points.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
       options.onStdout?.(chunk);
       if (options.captureStdout !== false) stdoutBuffer.append(chunk);
     });
-    child.stderr.on("data", (data) => {
-      const chunk = data.toString();
+    child.stderr.on("data", (chunk) => {
       options.onStderr?.(chunk);
       if (options.captureStderr !== false) stderrBuffer.append(chunk);
     });
