@@ -1,5 +1,4 @@
 const DEFAULT_MAX_LINE_BYTES = 4_000_000;
-const MAX_UNTYPED_LINE_BYTES = 64_000;
 
 /**
  * Incremental collector for `pi --mode json` NDJSON.
@@ -107,14 +106,6 @@ export class PiJsonEventCollector {
       this.droppedEvents++;
       return;
     }
-    // Pi currently serializes the top-level event discriminator first. Small
-    // untyped records (such as a session header) remain parseable, but refuse
-    // to materialize a large untyped record if that protocol invariant changes.
-    if (!type && Buffer.byteLength(line, "utf8") > MAX_UNTYPED_LINE_BYTES) {
-      this.malformedEvents++;
-      return;
-    }
-
     let event;
     try {
       event = JSON.parse(line);
@@ -168,8 +159,47 @@ function mergeNumericUsage(target, source) {
 }
 
 function eventTypeFromPrefix(line) {
-  // Pi constructs protocol events with `type` as the first top-level field.
-  // Anchor at the object start: a regex searching arbitrary raw JSON could
-  // mistake escaped `"type"` text inside an earlier string for a discriminator.
-  return line.slice(0, 512).match(/^\s*\{\s*"type"\s*:\s*"([^"]+)"/)?.[1];
+  // Scan the bounded record for a top-level string property named `type`.
+  // This avoids materializing cumulative update objects and does not depend on
+  // property order or mistake escaped type-like text inside another value.
+  let depth = 0;
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index];
+    if (char === "{") { depth++; continue; }
+    if (char === "}") { depth--; continue; }
+    if (char !== '"') continue;
+
+    const start = index;
+    index++;
+    let escaped = false;
+    while (index < line.length) {
+      const current = line[index];
+      if (escaped) escaped = false;
+      else if (current === "\\") escaped = true;
+      else if (current === '"') break;
+      index++;
+    }
+    if (depth !== 1) continue;
+    let cursor = index + 1;
+    while (/\s/.test(line[cursor] || "")) cursor++;
+    if (line[cursor] !== ":") continue;
+    let key;
+    try { key = JSON.parse(line.slice(start, index + 1)); } catch { continue; }
+    if (key !== "type") continue;
+    cursor++;
+    while (/\s/.test(line[cursor] || "")) cursor++;
+    if (line[cursor] !== '"') return undefined;
+    const valueStart = cursor;
+    cursor++;
+    escaped = false;
+    while (cursor < line.length) {
+      const current = line[cursor];
+      if (escaped) escaped = false;
+      else if (current === "\\") escaped = true;
+      else if (current === '"') break;
+      cursor++;
+    }
+    try { return JSON.parse(line.slice(valueStart, cursor + 1)); } catch { return undefined; }
+  }
+  return undefined;
 }

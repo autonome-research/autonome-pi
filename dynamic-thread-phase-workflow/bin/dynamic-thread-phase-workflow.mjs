@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, rmdirSync, writeFileSync } from "node:fs";
+import { accessSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -38,6 +38,7 @@ const PI_TOOL_REQUIREMENTS = Object.freeze({
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_FANOUT_CONCURRENCY = 3;
 const MAX_FANOUT_CONCURRENCY = 64;
+const MAX_FANOUT_ITEMS = 1_000;
 const MAX_OUTPUT_BYTES = 250_000;
 const DEFAULT_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_WORKFLOW_DEFAULT_PERMISSIONS || process.env.PI_DYNAMIC_THREAD_PHASE_DEFAULT_PERMISSIONS || "r", "PI_DYNAMIC_WORKFLOW_DEFAULT_PERMISSIONS");
 const MAX_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_PERMISSIONS || "rwx", "PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS");
@@ -137,6 +138,12 @@ function validateName(name, label) {
   if (!/^[a-zA-Z0-9_.:-]+$/.test(name)) throw new Error(`${label}.name may only contain letters, numbers, _, ., :, and -`);
 }
 
+function normalizeFanoutItems(value, label = "fanout items") {
+  const items = asArray(value);
+  if (items.length > MAX_FANOUT_ITEMS) throw new Error(`${label} is capped at ${MAX_FANOUT_ITEMS} items`);
+  return items;
+}
+
 function normalizeConcurrency(value, label = "concurrency") {
   if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_FANOUT_CONCURRENCY) {
     throw new Error(`${label} must be an integer between 1 and ${MAX_FANOUT_CONCURRENCY}`);
@@ -162,6 +169,7 @@ function validateSpec(spec) {
     if (phase.type === "fanout_pi") {
       if (typeof phase.promptTemplate !== "string") throw new Error(`${phase.name}.promptTemplate must be a string`);
       if (!Array.isArray(phase.items) && typeof phase.itemsFrom !== "string") throw new Error(`${phase.name} must provide items array or itemsFrom phase name`);
+      if (phase.items) normalizeFanoutItems(phase.items, `${phase.name}.items`);
     }
     if (phase.type === "artifact" && typeof phase.content !== "string" && typeof phase.from !== "string") throw new Error(`${phase.name} must provide content or from`);
     if (phase.permissions !== undefined) normalizePermissions(phase.permissions, `${phase.name}.permissions`);
@@ -190,6 +198,14 @@ function generatedInputDirectory(inputFile) {
     throw new Error(`refusing to clean non-generated workflow input directory: ${directory}`);
   }
   return directory;
+}
+
+function preflightHarnessFile(inputFile) {
+  const file = resolve(String(inputFile));
+  const stats = statSync(file);
+  if (!stats.isFile()) throw new Error(`workflow harness must be a regular file: ${file}`);
+  accessSync(file, fsConstants.R_OK);
+  return file;
 }
 
 function cleanupGeneratedInput(inputFile) {
@@ -366,14 +382,15 @@ function outputToItems(value) {
 }
 
 async function mapWithConcurrency(items, concurrency, fn) {
-  const limit = Math.min(normalizeConcurrency(concurrency), items.length || 1);
-  const results = new Array(items.length);
+  const boundedItems = normalizeFanoutItems(items);
+  const limit = Math.min(normalizeConcurrency(concurrency), boundedItems.length || 1);
+  const results = new Array(boundedItems.length);
   let next = 0;
   const workers = new Array(limit).fill(null).map(async () => {
     while (true) {
       const index = next++;
-      if (index >= items.length) return;
-      results[index] = await fn(items[index], index);
+      if (index >= boundedItems.length) return;
+      results[index] = await fn(boundedItems[index], index);
     }
   });
   await Promise.all(workers);
@@ -428,7 +445,7 @@ async function* runPiPhase(ctx, phase) {
 }
 
 async function* runFanoutPiPhase(ctx, phase) {
-  const items = phase.items ? asArray(phase.items).map(String) : outputToItems(ctx.outputs[phase.itemsFrom]);
+  const items = normalizeFanoutItems(phase.items ? asArray(phase.items).map(String) : outputToItems(ctx.outputs[phase.itemsFrom]), `${phase.name}.items`);
   if (!items.length) throw new Error(`${phase.name} has no fanout items`);
   const permissions = permissionsForPhase(ctx, phase);
   const tools = normalizePiTools(phase.tools, permissions, phase.name);
@@ -436,6 +453,7 @@ async function* runFanoutPiPhase(ctx, phase) {
   yield { type: "data", kind: "data", key: "permissions", value: permissions, message: `Running fanout with ${permissions} permissions` };
   yield { type: "fanout", kind: "fanout_start", total: items.length, label: phase.label || "items" };
   let completed = 0;
+  let terminal = 0;
   let failed = 0;
   const queue = [];
   const push = (event) => queue.push(event);
@@ -461,13 +479,16 @@ async function* runFanoutPiPhase(ctx, phase) {
       emitTextArtifact(ctx, artifactPhase, text, { title: `${phase.name}: ${item}` });
       if (result.usage?.length) phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", item, index, usage: result.usage, model: result.model });
       if (result.ok) completed++; else failed++;
+      terminal++;
       push({ type: "fanout", kind: "fanout_item_end", itemId: item, label: item, index, status: result.ok ? STATUSES.SUCCESS : STATUSES.FAILED, message: result.ok ? `Complete ${item}` : `Failed ${item}`, error: result.error });
-      push({ type: "progress", kind: "progress", completed, total: items.length, message: `${completed}/${items.length} complete` });
+      push({ type: "progress", kind: "progress", completed: terminal, total: items.length, message: `${terminal}/${items.length} finished (${completed} successful)` });
       return { item, index, ok: result.ok, text, model: result.model, stopReason: result.stopReason, signal: result.signal, timedOut: result.timedOut, durationMs: result.durationMs, termination: result.termination, error: result.error, piJson: result.piJson };
     } catch (error) {
       failed++;
+      terminal++;
       const cancelled = isAbortError(error) || ctx.signal?.aborted;
       push({ type: "fanout", kind: "fanout_item_end", itemId: item, label: item, index, status: cancelled ? STATUSES.CANCELLED : STATUSES.FAILED, message: cancelled ? `Cancelled ${item}` : `Failed ${item}`, error: error?.message || String(error) });
+      push({ type: "progress", kind: "progress", completed: terminal, total: items.length, message: `${terminal}/${items.length} finished (${completed} successful)` });
       throw error;
     }
   });
@@ -551,7 +572,7 @@ async function runHarness(ctx, harnessFile) {
     async fanout(items, options = {}) {
       const name = options.name || `fanout-${++autoPhase}`;
       return await harnessCtx.phase(name, async () => {
-        const values = asArray(items);
+        const values = normalizeFanoutItems(items, `${name}.items`);
         phaseEvent(ctx.visualizerRun, name, { kind: "fanout_start", total: values.length, label: options.label || "items" });
         let completed = 0;
         const concurrency = normalizeConcurrency(options.concurrency ?? DEFAULT_FANOUT_CONCURRENCY, `${name}.concurrency`);
@@ -593,7 +614,8 @@ async function main() {
     return;
   }
 
-  let harnessFile = args["js-file"] || args["harness-file"] ? resolve(String(args["js-file"] || args["harness-file"])) : undefined;
+  if (args["js-file"] && args["harness-file"]) throw new Error("Provide only one of --js-file or --harness-file");
+  let harnessFile = args["js-file"] || args["harness-file"] ? preflightHarnessFile(args["js-file"] || args["harness-file"]) : undefined;
   if (harnessFile && (args.spec || args["spec-file"])) throw new Error("Provide either spec input or --js-file, not both");
   const spec = harnessFile
     ? (() => {

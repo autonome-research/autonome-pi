@@ -163,7 +163,7 @@ test("runBoundedProcess resolves synchronous or emitted spawn setup failures con
 
 test("runBoundedProcess preserves workflow cancellation separately from timeout", async () => {
   const controller = new AbortController();
-  setTimeout(() => controller.abort("operator cancelled"), 30);
+  setTimeout(() => controller.abort("operator cancelled"), 100);
   const result = await runBoundedProcess(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], {
     timeoutMs: 5_000,
     killGraceMs: 100,

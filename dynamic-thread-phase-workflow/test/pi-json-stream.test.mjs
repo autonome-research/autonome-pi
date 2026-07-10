@@ -101,6 +101,15 @@ test("escaped type-like text in an earlier field is not treated as the discrimin
   assert.equal(collector.finish().text, "not-confused");
 });
 
+test("large reordered message_end records are recognized without first-field type", () => {
+  const collector = new PiJsonEventCollector();
+  const event = { note: "x".repeat(100_000), ...finalMessage("large-reordered") };
+  collector.push(eventLine(event));
+  const result = collector.finish();
+  assert.equal(result.text, "large-reordered");
+  assert.equal(result.piJson.malformedEvents, 0);
+});
+
 test("collector joins multiple text parts and keeps the latest assistant message", () => {
   const collector = new PiJsonEventCollector();
   collector.push(eventLine(finalMessage("first")));

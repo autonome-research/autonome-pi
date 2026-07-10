@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -90,18 +90,26 @@ test("generated background harness is removed after detached runner takes owners
   }
 });
 
-test("harness copy setup failure finalizes the visualizer run", () => {
+test("missing harness fails preflight without creating a visualizer run", () => {
   const testDir = mkdtempSync(join(tmpdir(), "dynamic-setup-failure-"));
   const store = join(testDir, "store");
   const missingHarness = join(testDir, "missing-harness.mjs");
   try {
-    const result = runHarness(missingHarness, store);
-    assert.equal(result.status, 1, result.stderr);
-    const runFiles = readdirSync(join(store, "runs"));
-    assert.equal(runFiles.length, 1);
-    const events = readFileSync(join(store, "runs", runFiles[0]), "utf8").trim().split("\n").map(JSON.parse);
-    const terminal = events.findLast((event) => event.type === "workflow_end");
-    assert.equal(terminal?.status, "failed");
+    const result = runHarness(missingHarness, store, ["--background"]);
+    assert.notEqual(result.status, 0);
+    assert.equal(existsSync(join(store, "runs")), false);
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
+test("directory-valued harness fails preflight before background acknowledgement", () => {
+  const testDir = mkdtempSync(join(tmpdir(), "dynamic-directory-harness-"));
+  try {
+    const result = runHarness(testDir, join(testDir, "store"), ["--background"]);
+    assert.notEqual(result.status, 0);
+    assert.doesNotMatch(result.stdout, /"background"\s*:\s*true/);
+    assert.match(result.stderr, /must be a regular file/);
   } finally {
     rmSync(testDir, { recursive: true, force: true });
   }

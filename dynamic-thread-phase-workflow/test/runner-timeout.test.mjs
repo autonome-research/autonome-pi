@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,6 +50,66 @@ test("invalid CLI timeout is rejected before creating a visualizer run", () => {
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /--timeout must be an integer/);
     assert.equal(existsSync(join(store, "runs")), false);
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("structured specs reject explicit and resolved fanouts above the item cap", () => {
+  const temp = mkdtempSync(join(tmpdir(), "dynamic-fanout-size-test-"));
+  try {
+    const explicitPath = join(temp, "explicit.json");
+    writeFileSync(explicitPath, JSON.stringify({
+      name: "large-explicit-fanout", permissions: "r",
+      phases: [{ type: "fanout_pi", name: "too-many", items: new Array(1_001).fill("x"), promptTemplate: "{{item}}" }],
+    }));
+    const explicit = spawnSync(process.execPath, [cli, "--spec-file", explicitPath, "--cwd", temp], {
+      cwd: root, env: { ...process.env, PI_THREAD_PHASE_STORE_DIR: join(temp, "explicit-store") }, encoding: "utf8", timeout: 5_000,
+    });
+    assert.notEqual(explicit.status, 0);
+    assert.match(explicit.stderr, /too-many\.items is capped at 1000 items/);
+
+    const resolvedPath = join(temp, "resolved.json");
+    const command = `${JSON.stringify(process.execPath)} -e "console.log(Array.from({length:1001},(_,i)=>i).join('\\\\n'))"`;
+    writeFileSync(resolvedPath, JSON.stringify({
+      name: "large-resolved-fanout", permissions: "rwx",
+      phases: [
+        { type: "shell", name: "items", command },
+        { type: "fanout_pi", name: "too-many-resolved", itemsFrom: "items", promptTemplate: "{{item}}" },
+      ],
+    }));
+    const resolved = spawnSync(process.execPath, [cli, "--spec-file", resolvedPath, "--cwd", temp], {
+      cwd: root, env: { ...process.env, PI_THREAD_PHASE_STORE_DIR: join(temp, "resolved-store") }, encoding: "utf8", timeout: 5_000,
+    });
+    assert.equal(resolved.status, 1, resolved.stderr);
+    assert.match(JSON.parse(resolved.stdout).error, /too-many-resolved\.items is capped at 1000 items/);
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("fanout progress reaches total when failures are allowed", () => {
+  const temp = mkdtempSync(join(tmpdir(), "dynamic-fanout-progress-test-"));
+  try {
+    const fakePi = join(temp, "fake-pi.mjs");
+    writeFileSync(fakePi, `#!/usr/bin/env node\nconsole.log(JSON.stringify({type:'message_end',message:{role:'assistant',model:'fake',content:[{type:'text',text:'failed item'}]}}));\nprocess.exitCode=1;\n`);
+    chmodSync(fakePi, 0o755);
+    const specPath = join(temp, "spec.json");
+    const store = join(temp, "store");
+    writeFileSync(specPath, JSON.stringify({
+      name: "fanout-progress", permissions: "r", phases: [{
+        type: "fanout_pi", name: "allowed-failures", items: ["a", "b"], promptTemplate: "{{item}}", failOnItemFailure: false,
+      }],
+    }));
+    const result = spawnSync(process.execPath, [cli, "--spec-file", specPath, "--cwd", temp], {
+      cwd: root, env: { ...process.env, PI_THREAD_PHASE_STORE_DIR: store, PI_DYNAMIC_WORKFLOW_PI_BIN: fakePi }, encoding: "utf8", timeout: 5_000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const runFile = join(store, "runs", readdirSync(join(store, "runs"))[0]);
+    const events = readFileSync(runFile, "utf8").trim().split("\n").map(JSON.parse);
+    const progress = events.filter((event) => event.data?.kind === "progress").at(-1)?.data;
+    assert.equal(progress?.completed, 2);
+    assert.equal(progress?.total, 2);
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }

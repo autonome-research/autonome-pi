@@ -92,6 +92,7 @@ Subprocess output is bounded while it is being read, rather than truncated only 
 - The Pi tool wrapper also bounds the dynamic runner's stdout/stderr to 1 MB per stream.
 - `pi --mode json` output is parsed incrementally. Cumulative `message_update` events are discarded instead of being retained for the lifetime of the phase.
 - A single Pi NDJSON record is capped at 4 MB. Oversized or malformed records are counted in the phase result under `piJson`; a later valid final message can still complete the phase.
+- Fanout concurrency is capped at 64 and each fanout is capped at 1,000 items, including lists resolved through `itemsFrom` and JavaScript harness fanouts.
 
 The workflow-level `timeoutMs` is the default for shell and Pi phases. A phase can override it with its own positive integer `timeoutMs`:
 
@@ -116,7 +117,7 @@ Generated specs and inline harnesses use an internal cleanup handshake. Foregrou
 - Harness permissions are checked against `PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS` before importing generated JavaScript, so denied harnesses do not run top-level module side effects.
 - Structured tool-level `permissions` are merged into the spec when absent and rejected on conflict.
 - `phase.tools` must be an array of supported tool names.
-- Background launches validate before detaching and require a valid `{ ok: true, background: true, pid }` acknowledgement.
+- Background launches validate before detaching, preflight harness paths as readable regular files, and require a valid `{ ok: true, background: true, pid }` acknowledgement.
 - Dynamic workflows do not auto-continue by default; use `autoContinue: true`.
 - Subprocess capture is byte-bounded at ingestion, and Pi NDJSON is parsed incrementally to avoid cumulative-event memory growth.
 - Timeout, cancellation, exit-code, and terminating-signal outcomes are recorded separately.

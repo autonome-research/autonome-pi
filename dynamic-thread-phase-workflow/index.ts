@@ -119,7 +119,8 @@ function parametersSchema() {
 }
 
 async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any, legacyName: string) {
-	if (!params.spec && !params.harness && !params.harnessFile) throw new Error("Provide either spec, harness, or harnessFile.");
+	const inputModes = [params.spec !== undefined, params.harness !== undefined, params.harnessFile !== undefined].filter(Boolean).length;
+	if (inputModes !== 1) throw new Error("Provide exactly one of spec, harness, or harnessFile.");
 	const cwd = path.resolve(ctx.cwd, params.cwd || params.spec?.cwd || ".");
 	let generatedInputFile: string | undefined;
 	let retainGeneratedInput = false;

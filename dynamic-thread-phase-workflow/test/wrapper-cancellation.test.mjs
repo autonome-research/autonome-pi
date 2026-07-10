@@ -59,6 +59,21 @@ test("startup SIGTERM is observed before the CLI can detach a background run", a
   }
 });
 
+test("extension rejects ambiguous workflow input modes", async () => {
+  const tools = new Map();
+  registerDynamicWorkflows({ registerTool: (definition) => tools.set(definition.name, definition) });
+  const execute = tools.get("dynamic_workflow").execute;
+  const ctx = { cwd: root, sessionManager: {} };
+  const spec = artifactSpec("ambiguous");
+  for (const params of [
+    { spec, harness: "export default async function workflow() {}" },
+    { spec, harnessFile: "/tmp/workflow.mjs" },
+    { harness: "export default async function workflow() {}", harnessFile: "/tmp/workflow.mjs", permissions: "rwx" },
+  ]) {
+    await assert.rejects(execute("test", params, undefined, undefined, ctx), /exactly one of spec, harness, or harnessFile/);
+  }
+});
+
 test("tool-level timeout validation rejects invalid values and cleans generated input", async () => {
   const tools = new Map();
   registerDynamicWorkflows({ registerTool: (definition) => tools.set(definition.name, definition) });
