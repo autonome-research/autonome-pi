@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { PiJsonEventCollector } from "../lib/pi-json-stream.mjs";
 import { normalizeTimeoutMs, runBoundedProcess, terminateChild } from "../lib/subprocess.mjs";
@@ -170,6 +170,20 @@ function loadSpec(args) {
   if (args["spec-file"]) return JSON.parse(readFileSync(String(args["spec-file"]), "utf8"));
   if (args.spec) return JSON.parse(String(args.spec));
   throw new Error("Provide --spec-file PATH or --spec JSON, or --harness-file PATH");
+}
+
+function generatedInputDirectory(inputFile) {
+  const directory = dirname(resolve(String(inputFile)));
+  // --cleanup-input is an internal handshake with the Pi extension. Never let
+  // a manually supplied path turn recursive cleanup into an arbitrary delete.
+  if (dirname(directory) !== resolve(tmpdir()) || !basename(directory).startsWith("pi-dynamic-workflow-")) {
+    throw new Error(`refusing to clean non-generated workflow input directory: ${directory}`);
+  }
+  return directory;
+}
+
+function cleanupGeneratedInput(inputFile) {
+  rmSync(generatedInputDirectory(inputFile), { recursive: true, force: true });
 }
 
 function isTruthyFlag(value) {
@@ -561,7 +575,7 @@ async function main() {
     return;
   }
 
-  const harnessFile = args["js-file"] || args["harness-file"] ? resolve(String(args["js-file"] || args["harness-file"])) : undefined;
+  let harnessFile = args["js-file"] || args["harness-file"] ? resolve(String(args["js-file"] || args["harness-file"])) : undefined;
   if (harnessFile && (args.spec || args["spec-file"])) throw new Error("Provide either spec input or --js-file, not both");
   const spec = harnessFile
     ? (() => {
@@ -572,6 +586,8 @@ async function main() {
         return { name: args.name ? String(args.name) : safeName(basename(harnessFile).replace(/\.[cm]?js$/, "")), mode: "harness", permissions, harnessFile };
       })()
     : validateSpec(loadSpec(args));
+  const cleanupInputFile = args["js-file"] || args["harness-file"] || args["spec-file"];
+  if (isTruthyFlag(args["cleanup-input"]) && cleanupInputFile) generatedInputDirectory(cleanupInputFile);
   if (maybeBackground(rawArgv, args)) return;
   const cwd = resolve(String(args.cwd || spec.cwd || process.cwd()));
   const workflow = spec.name || "dynamic-workflow";
@@ -593,7 +609,18 @@ async function main() {
   const specPath = join(artifactsDir, harnessFile ? "workflow-harness-manifest.json" : "workflow-spec.json");
   writeFileSync(specPath, JSON.stringify(spec, null, 2), "utf8");
   artifact(visualizerRun, { kind: "json", title: harnessFile ? "Workflow harness manifest" : "Compiled workflow spec", path: specPath });
-  if (harnessFile) artifact(visualizerRun, { kind: "file", title: "Workflow harness source", path: harnessFile });
+  if (harnessFile) {
+    // Artifacts must be durable copies, not references to temporary/user files.
+    // Execute the copy as well so generated input can be securely removed once
+    // this detached or foreground runner has taken ownership of it.
+    const harnessArtifactPath = join(artifactsDir, "workflow-harness.mjs");
+    copyFileSync(harnessFile, harnessArtifactPath);
+    artifact(visualizerRun, { kind: "file", title: "Workflow harness source", path: harnessArtifactPath });
+    harnessFile = harnessArtifactPath;
+  }
+  if (isTruthyFlag(args["cleanup-input"])) {
+    if (cleanupInputFile) cleanupGeneratedInput(cleanupInputFile);
+  }
 
   const ctx = {
     cache: new PipelineCache(),

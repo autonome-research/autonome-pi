@@ -11,6 +11,10 @@ const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(EXT_DIR, "bin", "dynamic-thread-phase-workflow.mjs");
 const MAX_TOOL_TEXT = 30_000;
 const MAX_RUNNER_CAPTURE_BYTES = 1_000_000;
+// The runner gives its own child process groups five seconds to escalate from
+// SIGTERM to SIGKILL. Keep the wrapper alive longer so that escalation cannot
+// be cut off and leave detached descendants behind.
+const RUNNER_KILL_GRACE_MS = 8_000;
 
 function truncate(text: string, max = MAX_TOOL_TEXT): string {
 	if (Buffer.byteLength(text, "utf8") <= max) return text;
@@ -42,7 +46,7 @@ function runScript(args: string[], cwd: string, signal?: AbortSignal): Promise<{
 		const abort = () => {
 			aborted = true;
 			proc.kill("SIGTERM");
-			killTimer = setTimeout(() => proc.kill("SIGKILL"), 5000);
+			killTimer = setTimeout(() => proc.kill("SIGKILL"), RUNNER_KILL_GRACE_MS);
 			killTimer.unref();
 		};
 		// Preserve UTF-8 code points split across native Buffer boundaries.
@@ -130,6 +134,7 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 		generatedInputFile = writeJsonFile(spec);
 		args.push("--spec-file", generatedInputFile);
 	}
+	if (generatedInputFile) args.push("--cleanup-input");
 	if (params.model) args.push("--model", params.model);
 	if (params.timeout !== undefined) args.push("--timeout", String(params.timeout));
 	if (params.background) args.push("--background");

@@ -106,7 +106,9 @@ The workflow-level `timeoutMs` is the default for shell and Pi phases. A phase c
 }
 ```
 
-Timeouts use a phase-local abort controller composed with the workflow cancellation signal. The child receives `SIGTERM`, followed by `SIGKILL` after the grace period if needed. Results distinguish `timedOut` from operator cancellation and preserve `code`, `signal`, `durationMs`, and structured `termination` metadata. A timeout is reported directly—for example, `pi timed out after 300000 ms; terminated with SIGTERM`—rather than as generic exit 143.
+Timeouts use a phase-local abort controller composed with the workflow cancellation signal. The child receives `SIGTERM`, followed by `SIGKILL` after the five-second grace period if needed. The Pi tool wrapper waits eight seconds before force-killing the workflow runner, leaving enough time for the runner to escalate and reap its detached child process groups. Results distinguish `timedOut` from operator cancellation and preserve `code`, `signal`, `durationMs`, and structured `termination` metadata. A timeout is reported directly—for example, `pi timed out after 300000 ms; terminated with SIGTERM`—rather than as generic exit 143.
+
+Generated specs and inline harnesses use an internal cleanup handshake. Foreground inputs are removed after execution; detached inputs are removed after the background runner has loaded them. Harness source is copied into the run artifact directory before cleanup, so the `Workflow harness source` artifact is durable. User-supplied harness files are copied for the audit artifact but are never deleted.
 
 ## Recent stabilization notes
 

@@ -90,7 +90,7 @@ test("runBoundedProcess reports timeout separately from process exit", async () 
 test("runBoundedProcess escalates an ignored SIGTERM and records SIGKILL", async () => {
   const script = "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000)";
   const result = await runBoundedProcess(process.execPath, ["-e", script], {
-    timeoutMs: 100,
+    timeoutMs: 500,
     killGraceMs: 50,
   });
 
