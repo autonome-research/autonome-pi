@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -148,10 +148,63 @@ try {
   writeFileSync(okHarness, `export default async function workflow(ctx) { await ctx.artifact('Harness result', 'ok'); }\n`);
   expectExit('harness requires explicit permissions', ['node', cli, '--js-file', okHarness, '--cwd', root, '--name', 'missing-permissions'], 1);
   expectExit('harness succeeds with explicit rwx', ['node', cli, '--js-file', okHarness, '--cwd', root, '--name', 'ok-harness', '--permissions', 'rwx'], 0);
+  const circularHarness = join(tmp, 'circular-harness.mjs');
+  writeFileSync(circularHarness, `export default async function workflow(ctx) { await ctx.phase('circular', async () => { const value = { big: 1n }; value.self = value; return value; }); }\n`);
+  expectExit('harness safely persists BigInt and circular partial results', ['node', cli, '--js-file', circularHarness, '--cwd', root, '--name', 'circular-harness', '--permissions', 'rwx'], 0);
 
   const shellSpec = join(tmp, 'shell-spec.json');
   writeFileSync(shellSpec, JSON.stringify({ name: 'shell-smoke', permissions: 'rwx', phases: [{ type: 'shell', name: 'hello', command: 'printf hello', artifact: true }] }, null, 2));
   expectExit('structured shell workflow succeeds', ['node', cli, '--spec-file', shellSpec, '--cwd', root], 0);
+  expectExit('dynamic CLI rejects timeout outside policy', ['node', cli, '--spec-file', shellSpec, '--cwd', root, '--timeout', '-1'], 1);
+  expectExit('dynamic CLI rejects malformed environment resource policy', ['node', cli, '--spec-file', shellSpec, '--cwd', root], 1, { env: { PI_DYNAMIC_WORKFLOW_MAX_CONCURRENCY: 'NaN' } });
+  const backgroundShell = expectExit('dynamic background launch waits for readiness and returns runId', ['node', cli, '--spec-file', shellSpec, '--cwd', root, '--background'], 0);
+  let backgroundShellDetails;
+  try { backgroundShellDetails = JSON.parse(backgroundShell.stdout); } catch { backgroundShellDetails = undefined; }
+  log(Boolean(backgroundShellDetails?.background && backgroundShellDetails?.runId && backgroundShellDetails?.pid), 'dynamic background readiness acknowledgement includes runId and pid', JSON.stringify(backgroundShellDetails));
+  if (backgroundShellDetails?.runId) {
+    const backgroundRunFile = join(store, 'runs', `${backgroundShellDetails.runId}.jsonl`);
+    for (let i = 0; i < 100; i++) {
+      if (existsSync(backgroundRunFile) && readFileSync(backgroundRunFile, 'utf8').includes('"type":"workflow_end"')) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    log(existsSync(backgroundRunFile) && readFileSync(backgroundRunFile, 'utf8').includes('"status":"success"'), 'dynamic ready background run reaches durable terminal state', backgroundRunFile);
+  }
+
+  const invalidReferenceSpec = join(tmp, 'invalid-reference-spec.json');
+  writeFileSync(invalidReferenceSpec, JSON.stringify({ name: 'invalid-reference', permissions: 'r', phases: [{ type: 'artifact', name: 'report', from: 'missing' }] }, null, 2));
+  expectExit('dynamic structured preflight rejects unresolved references', ['node', cli, '--spec-file', invalidReferenceSpec, '--cwd', root, '--background'], 1);
+
+  const invalidConcurrencySpec = join(tmp, 'invalid-concurrency-spec.json');
+  writeFileSync(invalidConcurrencySpec, JSON.stringify({ name: 'invalid-concurrency', permissions: 'r', phases: [{ type: 'fanout_pi', name: 'fan', items: ['a'], concurrency: 0, promptTemplate: '{{item}}' }] }, null, 2));
+  expectExit('dynamic structured preflight rejects unsafe concurrency before background launch', ['node', cli, '--spec-file', invalidConcurrencySpec, '--cwd', root, '--background'], 1);
+
+  const partialFailureSpec = join(tmp, 'partial-failure-spec.json');
+  writeFileSync(partialFailureSpec, JSON.stringify({ name: 'partial-failure', permissions: 'rwx', phases: [{ type: 'shell', name: 'first', command: 'printf first-output' }, { type: 'shell', name: 'fail', command: 'exit 7' }] }, null, 2));
+  const partialFailure = expectExit('failed dynamic workflow writes partial result artifact', ['node', cli, '--spec-file', partialFailureSpec, '--cwd', root], 1);
+  let partialFailureDetails;
+  try { partialFailureDetails = JSON.parse(partialFailure.stdout); } catch { partialFailureDetails = undefined; }
+  const partialResultPath = partialFailureDetails?.runId ? join(store, 'artifacts', partialFailureDetails.runId, 'workflow-result.json') : undefined;
+  const partialResult = partialResultPath && existsSync(partialResultPath) ? JSON.parse(readFileSync(partialResultPath, 'utf8')) : undefined;
+  log(partialResult?.status === 'failed' && partialResult?.outputs?.first === 'first-output', 'dynamic partial result preserves completed phase output after later failure', partialResultPath || 'missing result path');
+
+  const retryMarker = join(tmp, 'dynamic-retry-marker');
+  const retrySpec = join(tmp, 'retry-spec.json');
+  writeFileSync(retrySpec, JSON.stringify({ name: 'retry-smoke', permissions: 'rwx', phases: [{ type: 'shell', name: 'flaky', command: `if [ ! -f ${JSON.stringify(retryMarker)} ]; then touch ${JSON.stringify(retryMarker)}; exit 1; else printf recovered; fi`, retry: { maxAttempts: 2, baseDelayMs: 0 } }] }, null, 2));
+  expectExit('dynamic structured retry policy recovers an explicitly retryable phase', ['node', cli, '--spec-file', retrySpec, '--cwd', root], 0);
+
+  const fakePiMultipart = join(tmp, 'fake-pi-multipart.mjs');
+  writeFileSync(fakePiMultipart, `#!/usr/bin/env node\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-multipart', content: [{ type: 'text', text: 'intermediate-ignored' }] } }));\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-multipart', usage: { input: 2, output: 2, totalTokens: 4 }, content: [{ type: 'text', text: 'alpha' }, { type: 'text', text: 'beta' }] } }));\n`);
+  expectExit('fake multipart pi is executable', ['chmod', '+x', fakePiMultipart], 0);
+  const fanoutSpec = join(tmp, 'fanout-spec.json');
+  writeFileSync(fanoutSpec, JSON.stringify({ name: 'fanout-smoke', permissions: 'r', phases: [{ type: 'fanout_pi', name: 'fan', items: ['a/b', 'a-b'], concurrency: 2, promptTemplate: 'Process {{item}}' }] }, null, 2));
+  const fanoutRun = expectExit('dynamic structured fanout succeeds with deterministic bounded subagents', ['node', cli, '--spec-file', fanoutSpec, '--cwd', root], 0, { env: { PI_DYNAMIC_WORKFLOW_PI_BIN: fakePiMultipart } });
+  let fanoutDetails;
+  try { fanoutDetails = JSON.parse(fanoutRun.stdout); } catch { fanoutDetails = undefined; }
+  const fanoutResult = fanoutDetails?.resultPath && existsSync(fanoutDetails.resultPath) ? JSON.parse(readFileSync(fanoutDetails.resultPath, 'utf8')) : undefined;
+  const fanoutArtifactDir = fanoutDetails?.runId ? join(store, 'artifacts', fanoutDetails.runId) : undefined;
+  const fanoutArtifacts = fanoutArtifactDir && existsSync(fanoutArtifactDir) ? readdirSync(fanoutArtifactDir).filter((name) => name.startsWith('fan-') && name.endsWith('.md')) : [];
+  log(fanoutResult?.outputs?.fan === 'alphabeta\n\n---\n\nalphabeta', 'dynamic Pi parser preserves multipart assistant text in order', JSON.stringify(fanoutResult?.outputs));
+  log(fanoutArtifacts.length === 2 && new Set(fanoutArtifacts).size === 2, 'dynamic fanout artifact names remain distinct after safe-name collisions', JSON.stringify(fanoutArtifacts));
 
   const missionCli = join(root, 'mission-workflow/bin/mission-workflow.mjs');
   const missionPromptVersions = ['mission-planner-v3', 'mission-worker-v4', 'mission-validator-v4', 'mission-feature-review-v1', 'mission-repair-planner-v1'];
