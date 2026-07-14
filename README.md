@@ -14,7 +14,7 @@ Private Pi package for thread-phase workflow visualization and example workflows
 ## Install
 
 ```bash
-pi install git:git@github.com:Code4me2/pi-thread-phase-tools@v0.12.0
+pi install git:git@github.com:Code4me2/pi-thread-phase-tools@v0.13.0
 ```
 
 For active development:
@@ -36,22 +36,24 @@ pi install git:git@github.com:Code4me2/pi-thread-phase-tools@main
 
 ## Current status
 
-Latest release: `v0.12.0`.
+Next release: `v0.13.0` (coordinated with thread-phase v5).
 
 Recent changes:
 
 - Cooperative cancellation uses cancel request files under `~/.pi/agent/thread-phase/cancel/<runId>.json` instead of direct monitor PID killing.
 - `dynamic_workflow` is the preferred dynamic workflow tool; `dynamic_thread_phase_workflow` remains as a deprecated alias.
 - Dynamic workflows support two modes:
-  - structured spec mode for validated/auditable workflows,
-  - JavaScript harness mode for richer control flow. Harness mode requires explicit `permissions: "rwx"`.
+  - structured spec mode for validated/auditable deterministic subagent deployment,
+  - JavaScript harness mode for richer control flow. Harness mode requires explicit `permissions: "rwx"` and is unsandboxed.
+- Structured specs now have a strict phase schema, semantic reference/permission/resource preflight, bounded supervised fanout, explicit retries, collision-safe artifacts, multipart Pi output handling, partial failure results, and background readiness acknowledgements containing `runId` + `pid`.
+- Reusable or operationally important workflows should graduate into standalone TypeScript extensions using thread-phase directly.
 - Dynamic workflows do not auto-continue by default; pass `autoContinue: true` for successful-run follow-up.
 - Usage events are aggregated into run, phase, and fanout-item summaries and rendered in tools/monitor/completion cards.
 - `npm test` runs smoke coverage for extension load, permission denial before harness import, structured validation, JS harness mode, structured shell mode, usage projection, and mission registry/resume/strict-handoff checks.
 - The package now ships workflow skills so fresh Pi sessions get progressive-disclosure guidance for dynamic workflows and mission workflows.
 - Hardened `mission_workflow` with adversarial post-milestone validation, runner-owned handoff metadata, durable trusted checkpoints for resume, strict validation-cursor fingerprints/evidence checks, merge-blocking transient lockfile quarantine, stale `lastError` archival after successful resume/completion, cancellation-safe validation, contaminated-branch detection/reset, assertion coverage reports, generated-junk protection, transient `uv.lock` cleanup with audit artifacts, short content-addressed repair IDs, runner-provided handoff skeletons, compact result payloads, and capped repair loops.
 - The generic visualizer now deduplicates repeated artifact paths, closes phase-event-only phases when a workflow reaches a terminal status, and keeps compact run/monitor summaries focused on recent or active phases instead of dumping every historical phase/artifact.
-- Thread-phase dependency is `^4.1.0`; global `@autonome-research/thread-phase-cli` was updated to `4.1.0` for improved cancellation/error/fanout primitives.
+- Thread-phase dependency is `^5.0.0`, using authoritative lifecycle, supervised fanout, atomic terminal events, cancellation, ownership, and heartbeat primitives.
 - Mission continuation/failure-mode notes are in `docs/mission-workflow-continuation.md`; the DX/agent-X roadmap for making missions closer to a full software production pipeline is in `docs/mission-workflow-completeness-roadmap.md`. Read `/home/velvet/droid_flows.md` first for Droid/Missions design context.
 
 ## Remaining work
@@ -59,7 +61,7 @@ Recent changes:
 High-value follow-ups:
 
 - Bounded JSONL reads: replace full-file index/run reads with tail/offset reads for large stores.
-- Dynamic workflow hardening: add tests for harness cancellation, background invalid specs, broader permission matrices, and fanout terminal states.
+- Dynamic workflow hardening: add tests for harness cancellation, broader permission matrices, and additional fanout terminal races.
 - Usage budgets: optionally fail/stop workflows when projected token usage exceeds configured limits.
 - Saved workflow templates: support reusable specs/harnesses under a Pi workflow directory.
 - Resume support: allow structured/dynamic workflows to resume/reuse completed phase artifacts after interruption.

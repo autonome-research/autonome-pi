@@ -11,7 +11,7 @@ Use this skill when a user asks to create, run, debug, or reason about Pi dynami
 
 Prefer the `dynamic_workflow` tool. `dynamic_thread_phase_workflow` is a deprecated compatibility alias and should only be used if the canonical tool is unavailable.
 
-Dynamic workflows are backed by the package's generic workflow event store, so they can be monitored with `ctrl+shift+t`, inspected with `thread_phase_runs`, and cancelled cooperatively from the monitor.
+Dynamic workflows are the first-line mechanism for deploying bounded deterministic subagents from chat. Deterministic means topology and policy, not model output. Runs are backed by the package's generic workflow event store, so they can be monitored with `ctrl+shift+t`, inspected with `thread_phase_runs`, and cancelled cooperatively from the monitor. When workflow logic becomes reusable or operationally important, implement it as a standalone TypeScript extension using thread-phase directly.
 
 ## Choose the workflow mode
 
@@ -25,6 +25,8 @@ Supported phase types:
 - `pi`
 - `fanout_pi`
 - `artifact`
+
+Specs use ordered dependencies: `from`, `itemsFrom`, and output templates may only reference earlier phases. Fanout must provide exactly one of `items` or `itemsFrom`; artifact phases exactly one of `content` or `from`. Unknown fields are rejected. Per-phase `retry: { maxAttempts, baseDelayMs }` is explicit and bounded; never retry side-effecting work without considering idempotence.
 
 Example:
 
@@ -53,7 +55,7 @@ Example:
 
 Use JS harness mode only when the workflow needs rich control flow that structured specs cannot express, such as loops, branching, tournaments, custom scoring, or dynamic fanout generation.
 
-Harness mode executes generated Node.js code and is **not sandboxed**. It requires explicit `permissions: "rwx"` and is checked against `PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS` before import.
+Harness mode executes generated Node.js code and is **not sandboxed**. `rwx` is an acknowledgement, not confinement. It requires explicit `permissions: "rwx"` and is checked against `PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS` before import.
 
 Example:
 
@@ -98,7 +100,7 @@ Important:
 
 ## Runtime behavior
 
-- Use `background: true` for long workflows so normal chat remains usable.
+- Use `background: true` for long workflows so normal chat remains usable. A successful launch acknowledgement includes both `runId` and `pid` only after the child creates its durable run.
 - Dynamic workflows do **not** auto-continue by default. Set `autoContinue: true` only when a successful background run should queue a follow-up.
 - Workflow visibility is session-scoped. The monitor should show workflows launched by the current Pi session.
 - Execution cwd may differ from the session cwd; set `cwd` explicitly when needed.
@@ -149,12 +151,14 @@ await thread_phase_runs({ runId: "..." });
 6. Use `background: true` for long workflows.
 7. Use `autoContinue: true` only when follow-up is desired.
 8. Include an artifact/report phase when the user expects a durable result.
+9. Keep fanout item count and concurrency minimal; runtime limits are intentionally bounded.
+10. Prefer a standalone extension for reusable workflows, domain-specific state, complex recovery, or operational deployment.
 
 ## Current known remaining work
 
 Treat these as implementation caveats, not usage blockers:
 
 - Store scalability still needs bounded JSONL tail/offset reads for very large stores.
-- Automated tests should be expanded for background invalid specs, harness cancellation, broader permission matrices, alias registration introspection, and fanout terminal states.
+- Automated tests should still be expanded for harness cancellation, broader permission matrices, alias registration introspection, and more fanout terminal races.
 - Usage is projected and rendered, but usage budgets/threshold enforcement are not implemented yet.
 - Saved workflow templates, resume/reuse semantics, and worktree isolation are planned but not yet implemented.
