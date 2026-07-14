@@ -62,7 +62,13 @@ async function loadThreadPhaseCore() {
   }
 }
 
-const { PipelineCache, boundedFanout, runPipeline, withRetry } = await loadThreadPhaseCore();
+const threadPhaseCore = await loadThreadPhaseCore();
+for (const name of ["PipelineCache", "boundedFanout", "runPipeline", "withRetry"]) {
+  if (typeof threadPhaseCore[name] !== "function") {
+    throw new Error(`thread-phase v5 compatibility error: missing callable export ${name}`);
+  }
+}
+const { PipelineCache, boundedFanout, runPipeline, withRetry } = threadPhaseCore;
 
 const activeChildren = new Set();
 let activeRun;
@@ -656,13 +662,15 @@ async function* runFanoutPiPhase(ctx, phase) {
   let settled = false;
   let workerError;
   let results;
-  void worker.then(
+  const settlement = worker.then(
     (value) => { results = value; settled = true; },
     (error) => { workerError = error; settled = true; },
   );
   while (!settled) {
     while (queue.length) yield queue.shift();
-    await sleep(100);
+    // Core boundedFanout guarantees settlement after draining started workers;
+    // racing it avoids an unnecessary polling delay at terminal transition.
+    await Promise.race([settlement, sleep(100)]);
   }
   while (queue.length) yield queue.shift();
   if (workerError) throw workerError;
@@ -882,7 +890,11 @@ async function main() {
   } catch (error) {
     const cancelled = cancellationRequested || isAbortError(error) || controller.signal.aborted;
     try { writeWorkflowResult(ctx, cancelled ? STATUSES.CANCELLED : STATUSES.FAILED, error); }
-    catch (artifactError) { phaseEvent(visualizerRun, "workflow-result", { kind: "result_artifact_error", message: artifactError?.message || String(artifactError) }); }
+    catch (artifactError) {
+      const message = artifactError?.message || String(artifactError);
+      console.error(`failed to persist workflow result artifact: ${message}`);
+      phaseEvent(visualizerRun, "workflow-result", { kind: "result_artifact_error", message });
+    }
     if (cancelled) {
       if (activeRun === visualizerRun) completeRun(visualizerRun, STATUSES.CANCELLED, { cancelled: true, reason: controller.signal.reason || error?.message });
       console.log(JSON.stringify({ ok: false, cancelled: true, runId: visualizerRun.runId, workflow, cwd }, null, 2));
