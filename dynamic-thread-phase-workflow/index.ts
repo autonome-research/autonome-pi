@@ -103,9 +103,79 @@ function runnerFailure(result: { code: number; signal: NodeJS.Signals | null; st
 	return output ? `${status}\n${output}` : status;
 }
 
+function structuredSpecSchema() {
+	const permissions = Type.Optional(Type.String({ pattern: "^[rwx]+$", description: "Capabilities: r, rw, or rwx." }));
+	const retry = Type.Optional(Type.Object({
+		maxAttempts: Type.Optional(Type.Integer({ minimum: 1, maximum: 5 })),
+		baseDelayMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 60_000 })),
+	}, { additionalProperties: false }));
+	const artifactConfig = Type.Union([
+		Type.Boolean(),
+		Type.Object({
+			kind: Type.Optional(Type.String()),
+			title: Type.Optional(Type.String()),
+			fileName: Type.Optional(Type.String()),
+			titleTemplate: Type.Optional(Type.String()),
+			fileNameTemplate: Type.Optional(Type.String()),
+		}, { additionalProperties: false }),
+	]);
+	const common = {
+		name: Type.String({ pattern: "^[a-zA-Z0-9_.:-]+$" }),
+		description: Type.Optional(Type.String()),
+		permissions,
+		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 3_600_000 })),
+		artifact: Type.Optional(artifactConfig),
+		retry,
+	};
+	const phases = Type.Union([
+		Type.Object({ ...common, type: Type.Literal("shell"), command: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+		Type.Object({
+			...common,
+			type: Type.Literal("pi"),
+			prompt: Type.String({ minLength: 1 }),
+			tools: Type.Optional(Type.Array(Type.String())),
+			model: Type.Optional(Type.String()),
+		}, { additionalProperties: false }),
+		Type.Object({
+			...common,
+			type: Type.Literal("fanout_pi"),
+			promptTemplate: Type.String({ minLength: 1 }),
+			items: Type.Optional(Type.Array(Type.Union([Type.String(), Type.Number(), Type.Boolean()]), { minItems: 1, maxItems: 1_000 })),
+			itemsFrom: Type.Optional(Type.String()),
+			concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
+			label: Type.Optional(Type.String()),
+			tools: Type.Optional(Type.Array(Type.String())),
+			model: Type.Optional(Type.String()),
+			failOnItemFailure: Type.Optional(Type.Boolean()),
+		}, { additionalProperties: false }),
+		Type.Object({
+			...common,
+			type: Type.Literal("artifact"),
+			content: Type.Optional(Type.String()),
+			from: Type.Optional(Type.String()),
+			title: Type.Optional(Type.String()),
+			fileName: Type.Optional(Type.String()),
+			kind: Type.Optional(Type.String()),
+		}, { additionalProperties: false }),
+	]);
+	return Type.Object({
+		schema: Type.Optional(Type.Literal("pi-dynamic-workflow/v1")),
+		name: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9_.:-]+$" })),
+		description: Type.Optional(Type.String()),
+		permissions,
+		cwd: Type.Optional(Type.String()),
+		model: Type.Optional(Type.String()),
+		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 3_600_000 })),
+		concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
+		autoContinue: Type.Optional(Type.Boolean()),
+		metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
+		phases: Type.Array(phases, { minItems: 1, maxItems: 30 }),
+	}, { additionalProperties: false });
+}
+
 function parametersSchema() {
 	return Type.Object({
-		spec: Type.Optional(Type.Any({ description: "Structured workflow spec object. Required for spec mode. Supported phase types: shell, pi, fanout_pi, artifact." })),
+		spec: Type.Optional(structuredSpecSchema()),
 		harness: Type.Optional(Type.String({ description: "Advanced JavaScript harness source. Must export default async function(ctx). Requires rwx permissions." })),
 		harnessFile: Type.Optional(Type.String({ description: "Path to an advanced JavaScript harness module. Requires rwx permissions." })),
 		name: Type.Optional(Type.String({ description: "Optional workflow name for harness mode." })),
@@ -156,11 +226,11 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 		const result = await runScript(args, cwd, signal);
 		let details: any;
 		try { details = parseJsonObject(result.stdout); } catch { details = { stdout: result.stdout, stderr: result.stderr }; }
-		if (params.background && !(result.code === 0 && details?.ok === true && details?.background === true && details?.pid)) throw new Error(runnerFailure(result));
+		if (params.background && !(result.code === 0 && details?.ok === true && details?.ready === true && details?.background === true && details?.runId && details?.pid)) throw new Error(runnerFailure(result));
 		if (result.code !== 0 && !params.background) throw new Error(runnerFailure(result));
 		retainGeneratedInput = Boolean(params.background && details?.background);
 		const text = details?.background
-			? `Started dynamic workflow in background (pid ${details.pid}). Open ctrl+shift+t to monitor it.`
+			? `Started dynamic workflow ${details.runId} in background (pid ${details.pid}). Open ctrl+shift+t to monitor it.`
 			: result.stdout || "Dynamic workflow started.";
 		return { content: [{ type: "text", text: truncate(text) }], details };
 	} finally {
@@ -177,8 +247,10 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 		"Default to structured spec mode for auditability. Use JavaScript harness mode only when loops, branching, tournaments, custom scoring, or other rich control flow are needed.",
 		"Build a concrete spec or harness first and declare compact rwx permissions at the workflow or phase level.",
 		"Permissions are capabilities, not tool names: r enables read/grep/find/ls, w enables edit/write, and shell or bash execution requires rwx because command execution is not sandboxed.",
-		"Structured phase types are shell, pi, fanout_pi, and artifact. Harness mode receives ctx.phase, ctx.shell, ctx.pi, ctx.fanout, and ctx.artifact helpers.",
-		"Use background: true for long workflows so normal Pi chat remains usable.",
+		"Structured phase types are shell, pi, fanout_pi, and artifact. References may only target earlier phases; retries are explicit and bounded.",
+		"Harness mode receives ctx.phase, ctx.shell, ctx.pi, ctx.fanout, and ctx.artifact helpers. It is arbitrary unsandboxed Node.js; rwx is an acknowledgement, not confinement.",
+		"Use background: true for long workflows so normal Pi chat remains usable. Readiness acknowledgement includes runId and pid.",
+		"When logic becomes reusable, domain-specific, or operationally important, graduate it into a standalone TypeScript extension using thread-phase directly.",
 	];
 
 	pi.registerTool({

@@ -1,6 +1,6 @@
 {
   "name": "pi-thread-phase-tools",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "private": true,
   "description": "Thread-phase workflow visualizer and workflow examples for Pi.",
   "scripts": {
@@ -27,12 +27,15 @@
     ]
   },
   "dependencies": {
-    "@autonome-research/thread-phase": "^4.1.0"
+    "@autonome-research/thread-phase": "^5.0.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
+  },
+  "overrides": {
+    "better-sqlite3": "^12.11.1"
   }
 }

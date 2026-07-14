@@ -1,8 +1,8 @@
 # dynamic-workflows
 
-Status: experimental-but-usable as of `pi-thread-phase-tools@v0.8.0`.
+Status: experimental but usable.
 
-Executes dynamic workflows built live in chat. The implementation uses thread-phase internally for structured execution, cancellation, events, and artifacts, but the user-facing concept is a Pi dynamic workflow.
+Executes deterministic subagent workflows built live in chat. “Deterministic” describes the encoded topology—phase order, references, concurrency, retries, permissions, and terminal behavior—not model output. Structured workflows are validated and compiled into thread-phase phases; complex reusable workflows should graduate into standalone TypeScript extensions rather than indefinitely growing a chat-authored spec.
 
 ## Tools
 
@@ -24,7 +24,7 @@ Use `background: true` for long workflows. Runs emit generic `thread-phase-ui/v1
 
 ### Structured spec mode
 
-Default mode. The agent supplies a constrained JSON spec with phases. This is best for auditability, replay, permissions, and monitor visualization.
+Default mode. The agent supplies a constrained `pi-dynamic-workflow/v1` JSON spec with phases. This is the preferred way to deploy bounded Pi subagents reliably: the full schema and cross-phase references are validated before execution or background detachment.
 
 Supported phase types:
 
@@ -37,7 +37,7 @@ Supported phase types:
 
 Advanced mode. The agent supplies a JavaScript module for richer control flow: loops, branches, tournaments, custom scoring, or unusual orchestration.
 
-Harness mode requires workflow `permissions: "rwx"` because generated JavaScript executes as Node code. The harness should use the provided helpers so the monitor still sees phases, artifacts, cancellation, and fanout progress.
+Harness mode requires workflow `permissions: "rwx"` because generated JavaScript executes as arbitrary Node code. `rwx` is an acknowledgement, not a sandbox. Cancellation is cooperative for harness code itself; helper-launched subprocesses receive the workflow signal. Prefer a standalone extension when logic is important, reusable, or long-lived.
 
 ```js
 export default async function workflow(ctx) {
@@ -117,7 +117,10 @@ Generated specs and inline harnesses use an internal cleanup handshake. Foregrou
 - Harness permissions are checked against `PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS` before importing generated JavaScript, so denied harnesses do not run top-level module side effects.
 - Structured tool-level `permissions` are merged into the spec when absent and rejected on conflict.
 - `phase.tools` must be an array of supported tool names.
-- Background launches validate before detaching, preflight harness paths as readable regular files, and require a valid `{ ok: true, background: true, pid }` acknowledgement.
+- Background launches validate before detaching, preflight harness paths as readable regular files, and wait for the child to create a durable run. The acknowledgement contains `{ ok: true, ready: true, background: true, runId, pid }`.
+- Structured references must point to earlier phases; unknown fields and conflicting `items`/`itemsFrom` or `content`/`from` sources are rejected.
+- Fanout concurrency is bounded, sibling workers settle before terminal failure, and default artifact names include index/hash collision protection.
+- Successful, failed, and cancelled runs write `workflow-result.json`; non-success results are labeled partial.
 - Dynamic workflows do not auto-continue by default; use `autoContinue: true`.
 - Subprocess capture is byte-bounded at ingestion, and Pi NDJSON is parsed incrementally to avoid cumulative-event memory growth.
 - Timeout, cancellation, exit-code, and terminating-signal outcomes are recorded separately.
@@ -130,6 +133,26 @@ Generated specs and inline harnesses use an internal cleanup handshake. Foregrou
 - Add worktree isolation helpers for patch/eval workflows.
 - Add usage budgets using visualizer-projected usage summaries.
 - Consider moving implementation files/folder to `dynamic-workflows` after a compatibility window; current folder and legacy tool remain for backwards compatibility.
+
+## Structured workflow contract
+
+Top-level fields:
+
+- `schema`: optional literal `pi-dynamic-workflow/v1`
+- `name`: workflow/run name
+- `permissions`: default capabilities inherited by phases
+- `model`, `timeoutMs`, `concurrency`: workflow defaults
+- `phases`: 1–30 ordered phases
+
+Every phase has a unique `name` and may declare `permissions`, `timeoutMs`, `artifact`, and an explicit retry policy:
+
+```json
+{ "retry": { "maxAttempts": 3, "baseDelayMs": 1000 } }
+```
+
+Retries are opt-in because shell and harness work may have side effects. Structured fanout is capped at 1,000 items and concurrency 64 by default; operators may lower runtime maxima with environment policy.
+
+References (`from`, `itemsFrom`, `{{output:name}}`, and `{{outputs.name}}`) must identify an earlier phase. Fanout uses exactly one of `items` or `itemsFrom`; artifact phases use exactly one of `content` or `from`.
 
 ## Structured phase examples
 
