@@ -1,10 +1,11 @@
-# pi-thread-phase-tools
+# autonome-pi
 
-Private Pi package for thread-phase workflow visualization and example workflows.
+Autonome's Pi package for shared extensions, workflow tooling, and skills.
 
 ## Contents
 
 - `thread-phase-visualizer` — generic TUI monitor and event store for `thread-phase-ui/v1` workflow events.
+- `detach` — `/detach` and `/detach-status` commands for handing an interactive Pi session off to tmux so it can survive an SSH logout.
 - `codebase-exploration-workflow` — fanout codebase exploration workflow using Pi subagents.
 - `code-review-workflow` — git diff/commit code review workflow using Pi subagents.
 - `dynamic-workflows` — validated ad-hoc workflow runner for dynamic workflows planned in chat, with structured spec mode and advanced JavaScript harness mode.
@@ -14,17 +15,27 @@ Private Pi package for thread-phase workflow visualization and example workflows
 ## Install
 
 ```bash
-pi install git:git@github.com:Code4me2/pi-thread-phase-tools@v0.13.0
+pi install git:git@github.com:Code4me2/autonome-pi@v0.14.0
 ```
 
 For active development:
 
 ```bash
-pi install git:git@github.com:Code4me2/pi-thread-phase-tools@main
+pi install git:git@github.com:Code4me2/autonome-pi@main
 ```
+
+To migrate an installation that still uses the old repository identity:
+
+```bash
+pi remove git:git@github.com:Code4me2/pi-thread-phase-tools@v0.12.0
+pi install git:git@github.com:Code4me2/autonome-pi@v0.14.0
+```
+
+Pi identifies git packages by repository URL, so remove the old source before installing the renamed one to avoid loading both copies.
 
 ## Usage
 
+- `/detach [--name <tmux-name>] [--now|--wait] [prompt]` hands the current session off to tmux; `/detach-status` reports the latest handoff. See [`detach/README.md`](detach/README.md).
 - `ctrl+shift+t` opens the thread-phase monitor for workflows launched by the current Pi session, including cooperative cancellation via `x`.
 - Background/session-launched workflows can queue a session follow-up after successful completion. Dynamic workflows are opt-in via `autoContinue: true` to avoid noisy autonomous callbacks.
 - `/codebase-explore` starts codebase exploration in the background by default.
@@ -36,10 +47,12 @@ pi install git:git@github.com:Code4me2/pi-thread-phase-tools@main
 
 ## Current status
 
-Next release: `v0.13.0` (coordinated with thread-phase v5).
+Latest release: `v0.14.0`.
 
 Recent changes:
 
+- Renamed the package and repository from `pi-thread-phase-tools` to `autonome-pi`.
+- Added the tmux-backed `/detach` extension and `/detach-status` command.
 - Cooperative cancellation uses cancel request files under `~/.pi/agent/thread-phase/cancel/<runId>.json` instead of direct monitor PID killing.
 - `dynamic_workflow` is the preferred dynamic workflow tool; `dynamic_thread_phase_workflow` remains as a deprecated alias.
 - Dynamic workflows support two modes:

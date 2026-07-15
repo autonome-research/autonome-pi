@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
 const root = resolve(new URL('..', import.meta.url).pathname);
-const tmp = mkdtempSync(join(tmpdir(), 'pi-thread-phase-tools-test-'));
+const tmp = mkdtempSync(join(tmpdir(), 'autonome-pi-test-'));
 const store = join(tmp, 'store');
 const testHome = join(tmp, 'home');
 mkdirSync(testHome, { recursive: true });
@@ -16,12 +16,42 @@ const realThreadPhaseCorePath = process.env.THREAD_PHASE_CORE_PATH || join(realH
 const env = { ...process.env, HOME: testHome, PI_THREAD_PHASE_STORE_DIR: store, ...(existsSync(realThreadPhaseCorePath) ? { THREAD_PHASE_CORE_PATH: realThreadPhaseCorePath } : {}) };
 process.env.PI_THREAD_PHASE_STORE_DIR = store;
 const visualizerStore = await import(pathToFileURL(join(root, 'thread-phase-visualizer/lib/store.mjs')).href);
+const detachHelpers = await import(pathToFileURL(join(root, 'detach/index.ts')).href);
 let failures = 0;
 
 function log(ok, name, detail = '') {
   const mark = ok ? '✓' : '✗';
   console.log(`${mark} ${name}${detail ? ` — ${detail}` : ''}`);
   if (!ok) failures++;
+}
+
+const parsedDetach = detachHelpers.parseArgs('--name work --wait "continue the task"');
+log(parsedDetach.name === 'work' && parsedDetach.wait === true && parsedDetach.now === false && parsedDetach.prompt === 'continue the task', 'detach parser handles name, wait mode, and quoted prompts');
+log(detachHelpers.parseArgs('-- --prompt-like-text').prompt === '--prompt-like-text' && detachHelpers.sanitizeTmuxName(' bad/name ') === 'bad-name' && detachHelpers.sanitizeTmuxName('project.js') === 'project-js', 'detach parser supports option-like prompts and safe tmux names');
+log(detachHelpers.shellCommand('mise exec -- pi') === "'mise' 'exec' '--' 'pi'", 'detach command override is shell-quoted token by token');
+const resumedLaunchArgs = detachHelpers.preservedLaunchArgs(['--model', 'stale/model', '--thinking', 'low', '--no-context-files', '-e', './guard.ts', '--session', '/old.jsonl', '--tools', 'read', 'initial prompt'], ['read', 'grep'], '/launch', { model: 'current/model', thinking: 'high', trusted: true });
+log(resumedLaunchArgs.includes('--no-context-files') && resumedLaunchArgs.includes('/launch/guard.ts') && !resumedLaunchArgs.includes('/old.jsonl') && !resumedLaunchArgs.includes('stale/model') && resumedLaunchArgs.includes('current/model') && resumedLaunchArgs.includes('high') && resumedLaunchArgs.includes('--approve') && resumedLaunchArgs.at(-1) === 'read,grep', 'detach preserves absolute runtime resources, current model/thinking/trust, and the exact effective tool allowlist');
+for (const unsafeArgs of [['--api-key', 'secret'], ['--custom-security-flag']]) {
+  let rejected = false;
+  try { detachHelpers.preservedLaunchArgs(unsafeArgs, ['read']); } catch { rejected = true; }
+  log(rejected, `detach rejects launch configuration it cannot safely preserve: ${unsafeArgs[0]}`);
+}
+const maxName = 'x'.repeat(80);
+const suffixedName = detachHelpers.tmuxNameWithSuffix(maxName, 2);
+log(suffixedName.length === 80 && suffixedName.endsWith('-2') && suffixedName !== maxName, 'detach collision names reserve room for a unique suffix');
+const longDefaultName = detachHelpers.defaultTmuxName(`/tmp/${'project'.repeat(20)}`, '/tmp/session.jsonl');
+const expectedSessionHash = createHash('sha1').update('/tmp/session.jsonl').digest('hex').slice(0, 7);
+log(longDefaultName.length <= 80 && longDefaultName.endsWith(`-${expectedSessionHash}`), 'detach default names preserve the session hash when truncated');
+log(['--flag', '-x', '@secret.txt'].every((prompt) => !detachHelpers.safeInitialPrompt(prompt).startsWith(prompt[0])), 'detach resume prompts cannot be parsed as flags or file attachments');
+log(detachHelpers.choosePrompt('', false)?.includes('may have been interrupted') && detachHelpers.choosePrompt('', true) === undefined, 'detach prompt selection resumes interrupted work only');
+const preservedDetachEnv = detachHelpers.preservedEnvironmentExports({ TERM: 'xterm-old', GPG_TTY: '/dev/pts/old', PATH: '/bin', OPENAI_API_KEY: 'secret', NVIDIA_API_KEY: 'nvidia', CUSTOM_PROVIDER_KEY: 'custom', PI_DETACH_PRESERVE_ENV: 'CUSTOM_PROVIDER_KEY', DATABASE_PASSWORD: 'unrelated' });
+log(!preservedDetachEnv.includes('TERM=') && !preservedDetachEnv.includes('GPG_TTY=') && !preservedDetachEnv.includes('DATABASE_PASSWORD=') && preservedDetachEnv.includes('OPENAI_API_KEY=') && preservedDetachEnv.includes('NVIDIA_API_KEY=') && preservedDetachEnv.includes('CUSTOM_PROVIDER_KEY='), 'detach handoff preserves built-in and configured provider credentials without stale terminal or unrelated secret variables');
+log(detachHelpers.shellQuote('/home/user name/wrapper.sh') === "'/home/user name/wrapper.sh'", 'detach wrapper paths with spaces are shell-quoted');
+log(detachHelpers.isLastDetach({ name: 'work', cwd: '/tmp', sessionFile: '/tmp/session.jsonl', createdAt: 1 }) && !detachHelpers.isLastDetach({ name: 'work' }), 'detach status restore rejects malformed persisted state');
+for (const [name, input] of [['conflicting modes', '--now --wait'], ['missing name', '--name'], ['unterminated quote', '"prompt']]) {
+  let rejected = false;
+  try { detachHelpers.parseArgs(input); } catch { rejected = true; }
+  log(rejected, `detach parser rejects ${name}`);
 }
 
 function run(name, args, options = {}) {
@@ -1667,7 +1697,9 @@ Mission-Feature-Fingerprint: ${registryDriftOldFingerprint}' && git branch missi
 
   if (missionPlanDetails?.plan?.worktreeBaseDir) rmSync(missionPlanDetails.plan.worktreeBaseDir, { recursive: true, force: true });
 } finally {
-  if (process.env.KEEP_PI_THREAD_PHASE_TEST_TMP !== '1') rmSync(tmp, { recursive: true, force: true });
+  if (process.env.KEEP_AUTONOME_PI_TEST_TMP !== '1' && process.env.KEEP_PI_THREAD_PHASE_TEST_TMP !== '1') {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 if (failures > 0) {

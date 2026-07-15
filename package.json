@@ -1,8 +1,8 @@
 {
-  "name": "pi-thread-phase-tools",
-  "version": "0.13.0",
+  "name": "autonome-pi",
+  "version": "0.14.0",
   "private": true,
-  "description": "Thread-phase workflow visualizer and workflow examples for Pi.",
+  "description": "Autonome's extensions, workflow tools, and skills for Pi.",
   "scripts": {
     "smoke": "node scripts/smoke-test.mjs",
     "test:dynamic": "node --test dynamic-thread-phase-workflow/test/*.test.mjs",
@@ -11,12 +11,18 @@
   "keywords": [
     "pi-package",
     "pi-extension",
-    "thread-phase"
+    "thread-phase",
+    "tmux",
+    "detach"
   ],
   "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "pi": {
     "extensions": [
       "thread-phase-visualizer/index.ts",
+      "detach/index.ts",
       "codebase-exploration-workflow/index.ts",
       "code-review-workflow/index.ts",
       "dynamic-thread-phase-workflow/index.ts",
