@@ -1,6 +1,7 @@
 import { keyHint, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { STATUSES, formatUsageSummary } from "../lib/store.mjs";
+import { formatOwnerMetadata, formatStaleIndicator } from "../lib/run-display.mjs";
 import { artifactSummaryText, renderArtifactList } from "./artifact-view.ts";
 import { phaseSummaryText, renderPhaseTimeline, statusColor, statusIcon } from "./phase-timeline.ts";
 
@@ -16,11 +17,12 @@ function compactRunLine(run: RunSummary, theme: any): string {
 	const status = run.normalizedStatus || run.status;
 	const icon = theme.fg(statusColor(status), statusIcon(status));
 	const workflow = theme.fg("accent", run.workflow || "workflow");
-	const statusText = run.stale ? `stale (${run.stale.reason})` : status === STATUSES.RUNNING ? "running" : status === STATUSES.FAILED ? "failed" : "completed";
+	const statusText = status === STATUSES.RUNNING ? "running" : status === STATUSES.FAILED ? "failed" : "completed";
+	const stale = run.stale ? ` ${theme.fg("warning", formatStaleIndicator(run))}` : "";
 	const usage = run.usage?.entries ? ` · ${formatUsageSummary(run.usage)}` : "";
 	const counts = theme.fg("muted", `${phaseSummaryText(run)} · ${artifactSummaryText(run)}${usage}`);
 	const id = theme.fg("dim", shortRunId(run.runId));
-	return `${icon} phased workflow ${statusText}: ${workflow} ${theme.fg("dim", "[")}${id}${theme.fg("dim", "]")} ${counts}`;
+	return `${icon} phased workflow ${statusText}: ${workflow}${stale} ${theme.fg("dim", "[")}${id}${theme.fg("dim", "]")} ${counts}`;
 }
 
 function runFromMessage(message: any): RunSummary | undefined {
@@ -46,12 +48,13 @@ function renderRunMessage(message: any, expanded: boolean, theme: any) {
 
 	container.addChild(new Spacer(1));
 	container.addChild(new Text(theme.fg("muted", `Run: ${run.runId || "unknown"}`), 0, 0));
-	if (run.cwd) container.addChild(new Text(theme.fg("muted", `CWD: ${run.cwd}`), 0, 0));
+	const owner = formatOwnerMetadata(run);
+	if (owner) container.addChild(new Text(theme.fg("muted", owner), 0, 0));
 	if (run.startedAt || run.updatedAt) {
 		container.addChild(new Text(theme.fg("dim", `Started: ${run.startedAt || "?"}  Updated: ${run.updatedAt || "?"}`), 0, 0));
 	}
 	if (run.heartbeat?.timestamp) container.addChild(new Text(theme.fg("dim", `Heartbeat: ${run.heartbeat.timestamp}${run.heartbeat.featureId ? ` feature=${run.heartbeat.featureId}` : ""}`), 0, 0));
-	if (run.stale) container.addChild(new Text(theme.fg("warning", `Stale: ${run.stale.reason}${run.stale.pid ? ` pid=${run.stale.pid}` : ""}`), 0, 0));
+	if (run.stale) container.addChild(new Text(theme.fg("warning", formatStaleIndicator(run)), 0, 0));
 	if (run.usage?.entries) container.addChild(new Text(theme.fg("muted", `Usage: ${formatUsageSummary(run.usage)}`), 0, 0));
 
 	container.addChild(new Spacer(1));

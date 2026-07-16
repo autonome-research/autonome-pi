@@ -1,4 +1,5 @@
 import { STATUSES } from "../lib/store.mjs";
+import { formatOwnerMetadata, formatStaleIndicator } from "../lib/run-display.mjs";
 
 type RunSummary = Record<string, any>;
 
@@ -16,7 +17,7 @@ function progressText(phase: Record<string, any> | undefined): string {
 }
 
 export function activeRunWidgetLines(runs: RunSummary[], options: { maxRuns?: number } = {}): string[] {
-	const active = runs.filter((run) => run.normalizedStatus === STATUSES.RUNNING && !run.stale);
+	const active = runs.filter((run) => run.normalizedStatus === STATUSES.RUNNING);
 	if (active.length === 0) return [];
 
 	const maxRuns = options.maxRuns ?? 3;
@@ -24,7 +25,9 @@ export function activeRunWidgetLines(runs: RunSummary[], options: { maxRuns?: nu
 	for (const run of active.slice(0, maxRuns)) {
 		const phase = latestActivePhase(run);
 		const phasePart = phase?.phase ? `: ${phase.phase}${progressText(phase)}` : "";
-		lines.push(`… ${run.workflow || "workflow"}${phasePart}`);
+		const stale = run.stale ? ` ${formatStaleIndicator(run)}` : "";
+		const owner = formatOwnerMetadata(run);
+		lines.push(`… ${run.workflow || "workflow"}${stale}${phasePart}${owner ? ` · ${owner}` : ""}`);
 	}
 	if (active.length > maxRuns) lines.push(`… +${active.length - maxRuns} more`);
 	return lines;

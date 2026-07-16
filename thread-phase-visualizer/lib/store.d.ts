@@ -11,13 +11,22 @@ export type ThreadPhaseArtifact = {
   metadata?: Record<string, unknown>;
 };
 
+export type ThreadPhaseOwnerMetadata = {
+  sessionId?: string;
+  sessionFile?: string;
+  launchSource?: string;
+  cwdAtLaunch?: string;
+  [key: string]: unknown;
+};
+
 export type ThreadPhaseRunContext = {
   runId: string;
   workflow: string;
   cwd?: string;
   trigger?: unknown;
-  metadata?: unknown;
-  runFile?: string;
+  metadata?: ThreadPhaseOwnerMetadata;
+  /** Canonical path returned by createRun; caller-provided overrides are rejected. */
+  readonly runFile?: string;
 };
 
 export type ThreadPhaseUiEvent = {
@@ -45,7 +54,7 @@ export type ThreadPhaseUiEvent = {
   data?: unknown;
   artifact?: ThreadPhaseArtifact;
   error?: { name?: string; message: string; stack?: string; code?: string };
-  metadata?: unknown;
+  metadata?: ThreadPhaseOwnerMetadata;
 };
 
 export type ThreadPhaseUsageSummary = {
@@ -148,7 +157,11 @@ export type ThreadPhaseRunSummary = {
   workflow?: string;
   cwd?: string;
   trigger?: unknown;
-  metadata?: unknown;
+  metadata?: ThreadPhaseOwnerMetadata;
+  /** Whether workflow_start was present or verified by a bounded store lookup. */
+  workflowStartResolved: boolean;
+  /** Whether the authoritative workflow_start record contained its own cwd field. */
+  workflowStartCwdPresent?: boolean;
   startedAt?: string;
   updatedAt?: string;
   status: ThreadPhaseUiStatus;
@@ -204,7 +217,7 @@ export function createRun(options?: {
   cwd?: string;
   trigger?: unknown;
   input?: unknown;
-  metadata?: unknown;
+  metadata?: ThreadPhaseOwnerMetadata;
   runId?: string;
   message?: string;
 }): ThreadPhaseRunContext;
@@ -229,13 +242,64 @@ export function wrapPhases<TPhase extends { name?: string; run(ctx: any, ...args
   run: ThreadPhaseRunContext,
   options?: Record<string, { name?: string; input?: (ctx: any) => unknown; output?: (ctx: any) => unknown }>,
 ): TPhase[];
-export function readRun(runId: string): ThreadPhaseUiEvent[];
-export function readIndex(options?: { limit?: number; workflow?: string; cwd?: string }): ThreadPhaseUiEvent[];
-export function projectRun(events?: ThreadPhaseUiEvent[]): ThreadPhaseRunSummary;
-export function projectRuns(events?: ThreadPhaseUiEvent[]): ThreadPhaseRunSummary[];
+export type ThreadPhaseBoundedReadOptions = {
+  /** Read forward from this byte offset; omitted reads from the file tail. */
+  fromByte?: number;
+  /** Maximum events returned. */
+  limit?: number;
+  /** Maximum JSONL lines inspected. */
+  readLimit?: number;
+  /** Maximum file bytes retained and decoded by one read. */
+  maxBytes?: number;
+};
+
+export type ThreadPhaseJsonlParseError = {
+  kind: "invalid_json" | "partial_final_line" | "oversized_record";
+  file: string;
+  /** Zero-based position within the bounded read window. */
+  lineIndex: number;
+  message: string;
+  preview: string;
+};
+
+export type ThreadPhaseJsonlReadResult = ThreadPhaseUiEvent[] & {
+  /** Invalid and incomplete lines skipped while producing this result. */
+  readonly parseErrors: ThreadPhaseJsonlParseError[];
+};
+
+export function readJsonl(file: string, options?: ThreadPhaseBoundedReadOptions): ThreadPhaseJsonlReadResult;
+export function readRunBounded(runId: string, options?: ThreadPhaseBoundedReadOptions): ThreadPhaseJsonlReadResult;
+export function readIndexBounded(options?: ThreadPhaseBoundedReadOptions & { workflow?: string; cwd?: string }): ThreadPhaseJsonlReadResult;
+export function readRun(runId: string, options?: ThreadPhaseBoundedReadOptions): ThreadPhaseJsonlReadResult;
+export function readIndex(options?: ThreadPhaseBoundedReadOptions & { workflow?: string; cwd?: string }): ThreadPhaseJsonlReadResult;
+export type ThreadPhaseProjectionOptions = {
+  /** Shared clock used for stale age and checkedAt calculations. */
+  referenceTime?: number | string | Date;
+};
+
+export function projectRun(events?: ThreadPhaseUiEvent[], options?: ThreadPhaseProjectionOptions): ThreadPhaseRunSummary;
+export function projectRuns(events?: ThreadPhaseUiEvent[], options?: ThreadPhaseProjectionOptions): ThreadPhaseRunSummary[];
 export function getRunSummary(runId: string): ThreadPhaseRunSummary;
-export function latestRunSummaries(options?: { limit?: number; workflow?: string; cwd?: string; readLimit?: number }): ThreadPhaseRunSummary[];
-export function latestRuns(options?: { limit?: number; workflow?: string; cwd?: string; readLimit?: number }): ThreadPhaseRunSummary[];
+export type ThreadPhaseRunSummaryReadOptions = {
+  limit?: number;
+  workflow?: string;
+  cwd?: string;
+  readLimit?: number;
+  /** Aggregate bytes allowed for authoritative run-prefix verification, including sidecar cross-checks. Default 8 MiB. */
+  ownershipReadBudgetBytes?: number;
+  /** Maximum authoritative run-prefix scans per query, including sidecar cross-checks. Default 256. */
+  ownershipFallbackScanLimit?: number;
+  /** Aggregate bytes allowed for sidecar fallback when a catalog record is unavailable. Default 4 MiB. */
+  ownershipSidecarReadBudgetBytes?: number;
+  /** Maximum sidecar fallback reads per query. Catalog hits do not consume this budget. Default 256. */
+  ownershipSidecarScanLimit?: number;
+  /** Applied exactly once to each fully restored public summary and before limit. */
+  filter?: (run: ThreadPhaseRunSummary) => boolean;
+  /** Internal security prefilter over compact ownership data; may be rechecked after sidecar verification. */
+  ownershipFilter?: (run: ThreadPhaseRunSummary) => boolean;
+};
+export function latestRunSummaries(options?: ThreadPhaseRunSummaryReadOptions): ThreadPhaseRunSummary[];
+export function latestRuns(options?: ThreadPhaseRunSummaryReadOptions): ThreadPhaseRunSummary[];
 export function formatUsageSummary(usage: ThreadPhaseUsageSummary | undefined): string;
 export function readArtifactContent(artifact: ThreadPhaseArtifact, options?: { maxBytes?: number }): { content: string; truncated: boolean; bytes?: number } | undefined;
 export function normalizeStatus(status?: unknown): ThreadPhaseNormalizedStatus;

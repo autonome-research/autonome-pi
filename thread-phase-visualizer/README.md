@@ -11,8 +11,13 @@ Default store:
 ```text
 ~/.pi/agent/thread-phase/
 ├── index.jsonl          # global append-only event stream
+├── run-starts.jsonl     # compact append-only ownership lookup catalog
+├── index-pending/       # transient durable index-reconciliation markers
+├── index-quarantine/    # malformed/unsupported recovery markers
+├── run-start-quarantine/# dead orphan start reservations
 ├── runs/
-│   └── <runId>.jsonl    # per-run event stream
+│   ├── <runId>.jsonl       # per-run event stream
+│   └── <runId>.start.json  # immutable workflow-start ownership sidecar for new runs
 └── artifacts/           # optional workflow-owned artifact location
 ```
 
@@ -175,6 +180,8 @@ for await (const event of runPipeline(visualizedPhases, ctx)) {
 
 ## Projection/read APIs
 
+> **v0.13 migration:** caller-supplied `runFile` overrides are rejected. All events use `runFileFor(runId)` so ownership verification and crash recovery share one authoritative path. Remove custom `runFile` fields and migrate external logs into the canonical store layout before upgrading.
+
 UI code should consume projected summaries rather than reconstructing state itself:
 
 ```ts
@@ -194,6 +201,8 @@ const detail = getRunSummary(runs[0].runId);
 The projected run shape includes:
 
 - `normalizedStatus` for icon/color decisions
+- `workflowStartResolved` for store-backed ownership confidence. New runs atomically reserve an immutable compact start sidecar (dead pre-publication reservations are quarantined on a safe retry) (strictly capped at 16 KiB) and publish the run log with no-replace semantics before appending the same ownership envelope to `run-starts.jsonl`. Every serialized event is capped at 512 KiB, so the complete start fits the 512 KiB verification prefix and pending index markers remain safely recoverable. The compact envelope contains only security/UI ownership fields; fully returned summaries verify it against the authoritative run prefix and preserve full public metadata and trigger values. Legacy runs fall back to per-run prefix verification within fixed per-run and aggregate byte/scan budgets. If lookup cannot prove the start, owner metadata and launch cwd remain unknown and session scoping fails closed; later tail events cannot supply ownership.
+- `workflowStartCwdPresent` preserves whether that authoritative start contained `cwd`. Only an omitted `cwd` (including the JavaScript compatibility form `cwd: undefined`) may fall back to absolute legacy owner metadata. Explicit `null`, empty, whitespace-only, relative-without-a-known-base, or malformed primary values remain authoritative and fail closed. Synthetic in-memory events that retain an own `cwd: undefined` property (which JSON cannot persist) are treated as malformed and fail closed.
 - ordered `phases[]`; if a workflow reaches a terminal status without explicit `phase_end` events for every phase, projection closes still-running phase-event-only phases with the workflow's terminal status so completed runs do not appear to have live historical phases
 - deduplicated `artifacts[]` for stable external targets (`path`/`url`), keeping the latest event for repeated artifact paths or URLs; inline/preview-only artifacts remain distinct to avoid collapsing large or truncated content
 - `errors[]`
@@ -232,7 +241,7 @@ The first UI layer is implemented as generic custom message renderers:
 - `thread-phase-run`: collapsed one-line workflow status; expand with Pi's tool/message expansion key to show phases, errors, and summary artifact content.
 - live monitor overlay: session-scoped keyboard-driven progress view with animated live workflow glyphs, compact recent/active phase summaries, arrow/enter navigation across phases and artifacts in one detail view, cancellation (`x` for running workflows), markdown-rendered artifact content, and separate phase glyphs (`◆`, `◈`, `◇`) for quick visual scanning.
 - session continuations: successful background/session-launched workflows can emit a normal follow-up user message for the current Pi session; if the main agent is still generating, the continuation is queued with Pi's follow-up delivery instead of interrupting the stream. Dynamic workflows opt in with `autoContinue: true`.
-- `thread_phase_runs` is session-scoped by default; unscoped historical/direct-CLI runs are only inspectable through an explicit matching cwd.
+- `thread_phase_runs` is session-scoped by default; session-owned history stays private to its owner, while unscoped running/direct-CLI runs are visible only from a canonically matching active or explicitly requested cwd.
 
 Component files:
 

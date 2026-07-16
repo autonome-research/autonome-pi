@@ -1,5 +1,4 @@
 import * as fs from "node:fs";
-import { homedir } from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -17,6 +16,9 @@ import {
 	readIndex,
 	readRun,
 } from "./lib/store.mjs";
+import { belongsToSession, formatOwnerMetadata, formatStaleIndicator, runSessionId } from "./lib/run-display.mjs";
+import { canonicalCwd, canInspectRun, createCwdState, matchesRunCwd, mergeMonitorRuns as mergeScopedMonitorRuns, trackCwdCommand } from "./lib/session-scope.mjs";
+import { loadContinuedRuns, persistContinuationClaim, releaseContinuationClaim, shouldAutoContinue } from "./lib/continuation-store.mjs";
 
 const MAX_MESSAGE_BYTES = 20_000;
 
@@ -59,12 +61,13 @@ function compactArtifactSummary(run: AnyEvent): string[] {
 	return artifacts.length > visible.length ? [...visible, `+${artifacts.length - visible.length} older artifact(s)`] : visible;
 }
 
-function formatRunSummary(run: AnyEvent): string {
+export function formatRunSummary(run: AnyEvent): string {
 	const phases = compactPhaseSummary(run);
 	const artifacts = compactArtifactSummary(run);
 	return [
-		`- ${statusIcon(run.normalizedStatus)} ${run.workflow} (${run.runId})${run.stale ? ` [STALE: ${run.stale.reason}]` : ""}`,
+		`- ${statusIcon(run.normalizedStatus)} ${run.workflow} (${run.runId})${run.stale ? ` ${formatStaleIndicator(run)}` : ""}`,
 		`  updated: ${run.updatedAt}`,
+		formatOwnerMetadata(run) ? `  ${formatOwnerMetadata(run)}` : undefined,
 		run.heartbeat?.timestamp ? `  heartbeat: ${run.heartbeat.timestamp}${run.heartbeat.featureId ? ` feature=${run.heartbeat.featureId}` : ""}` : undefined,
 		run.usage?.entries ? `  usage: ${formatUsageSummary(run.usage)}` : undefined,
 		phases ? `  phases: ${phases}` : undefined,
@@ -76,9 +79,9 @@ function formatRunSummary(run: AnyEvent): string {
 function formatRunDetail(run: AnyEvent): string {
 	const artifacts = run.artifacts || [];
 	return truncate([
-		`${statusIcon(run.normalizedStatus)} Thread-phase workflow ${run.status}: ${run.workflow}${run.stale ? ` [STALE: ${run.stale.reason}]` : ""}`,
+		`${statusIcon(run.normalizedStatus)} Thread-phase workflow ${run.status}: ${run.workflow}${run.stale ? ` ${formatStaleIndicator(run)}` : ""}`,
 		`Run: ${run.runId}`,
-		run.cwd ? `CWD: ${run.cwd}` : undefined,
+		formatOwnerMetadata(run) || undefined,
 		run.heartbeat?.timestamp ? `Heartbeat: ${run.heartbeat.timestamp}${run.heartbeat.featureId ? ` feature=${run.heartbeat.featureId}` : ""}` : undefined,
 		run.usage?.entries ? `Usage: ${formatUsageSummary(run.usage)}` : undefined,
 		run.phases?.length ? `\nPhases:\n${run.phases.map((p: AnyEvent) => `- ${statusIcon(p.normalizedStatus)} ${p.phase}${p.usage?.entries ? ` · ${formatUsageSummary(p.usage)}` : ""}${p.lastMessage ? ` — ${p.lastMessage}` : ""}`).join("\n")}` : undefined,
@@ -118,68 +121,22 @@ function formatContinuationPrompt(run: AnyEvent): string {
 	].filter(Boolean).join("\n").slice(0, 12000);
 }
 
-function shellUnquote(value: string): string {
-	const trimmed = value.trim();
-	if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) return trimmed.slice(1, -1);
-	return trimmed.replace(/\\ /g, " ");
-}
-
-function expandHome(input: string): string {
-	if (input === "~") return homedir();
-	if (input.startsWith("~/")) return path.join(homedir(), input.slice(2));
-	return input;
-}
-
-function parseSimpleCd(command: string): string | undefined {
-	const trimmed = command.trim().replace(/;\s*$/, "");
-	const match = trimmed.match(/^cd(?:\s+(.+))?$/);
-	if (!match) return undefined;
-	return shellUnquote(match[1] || "~");
-}
-
-function directoryExists(candidate: string): boolean {
-	try { return fs.existsSync(candidate) && fs.statSync(candidate).isDirectory(); }
-	catch { return false; }
-}
-
-function runSessionId(run: AnyEvent | undefined): string | undefined {
-	const sessionId = run?.metadata?.sessionId;
-	return typeof sessionId === "string" && sessionId ? sessionId : undefined;
-}
-
-function belongsToSession(run: AnyEvent, sessionId?: string, cwd?: string): boolean {
-	if (sessionId) return runSessionId(run) === sessionId;
-	return !cwd || run.cwd === cwd;
-}
-
-function canInspectRun(run: AnyEvent, sessionId?: string, fallbackCwd?: string): boolean {
-	const ownerSessionId = runSessionId(run);
-	if (ownerSessionId) return Boolean(sessionId && ownerSessionId === sessionId);
-	return Boolean(fallbackCwd && run.cwd === fallbackCwd);
-}
-
-function shouldAutoContinue(run: AnyEvent): boolean {
-	if (run.normalizedStatus !== STATUSES.SUCCESS) return false;
-	return run.metadata?.autoContinue === true || run.metadata?.autoContinue === "always";
-}
-
 function mergeMonitorRuns(cwd: string, sessionId?: string): AnyEvent[] {
-	const allRecent = latestRunSummaries({ limit: 150, readLimit: 8000 });
-	const scopedRuns = allRecent.filter((run: AnyEvent) => belongsToSession(run, sessionId, cwd));
-	const localUnscopedRunning = allRecent.filter((run: AnyEvent) => !runSessionId(run) && run.normalizedStatus === STATUSES.RUNNING);
-	const byRun = new Map<string, AnyEvent>();
-	for (const run of [...scopedRuns, ...localUnscopedRunning]) if (run.runId) byRun.set(run.runId, run);
-	return Array.from(byRun.values()).sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+	const runs = latestRunSummaries({
+		limit: 150,
+		readLimit: 8000,
+		ownershipFilter: (run: AnyEvent) => canInspectRun(run, sessionId, cwd, STATUSES.RUNNING),
+	});
+	return mergeScopedMonitorRuns(runs, cwd, sessionId, STATUSES.RUNNING);
 }
 
 export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	registerThreadPhaseMessageRenderers(pi);
 
 	let watcher: fs.FSWatcher | undefined;
-	let activeCwd = process.cwd();
-	let previousCwd = activeCwd;
+	let cwdState = createCwdState(process.cwd());
+	let continuedRuns = new Set<string>();
 	const seen = new Set<string>();
-	const continuedRuns = new Set<string>();
 
 	pi.registerTool({
 		name: "thread_phase_runs",
@@ -196,23 +153,30 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			ensureStore();
 			const sessionId = ctx.sessionManager.getSessionId();
-			const cwd = params.cwd ? path.resolve(ctx.cwd, params.cwd) : undefined;
-			const fallbackCwd = cwd || path.resolve(ctx.cwd);
+			const cwd = params.cwd ? canonicalCwd(params.cwd, ctx.cwd) : undefined;
+			const fallbackCwd = cwd || canonicalCwd(ctx.cwd) || path.resolve(ctx.cwd);
 			if (params.runId) {
 				const summary = getRunSummary(params.runId);
 				if (!canInspectRun(summary, sessionId, fallbackCwd)) {
 					return { content: [{ type: "text", text: "No thread-phase run found for this session." }], details: { summary: undefined, events: [] } };
 				}
-				const events = readRun(params.runId).slice(-(params.limit || 80));
+				const events = readRun(params.runId, { limit: params.limit || 80, readLimit: params.limit || 80 });
 				return {
 					content: [{ type: "text", text: truncate(params.rawEvents ? JSON.stringify(events, null, 2) : formatRunDetail(summary)) }],
-					details: { summary, events },
+					details: { summary, events, ...(runSessionId(summary) ? { sessionId: runSessionId(summary) } : {}) },
 				};
 			}
 			const max = Math.max(1, Math.min(Number(params.limit || 20), 100));
-			const runs = latestRunSummaries({ limit: 200, workflow: params.workflow, readLimit: 8000 })
-				.filter((run: AnyEvent) => canInspectRun(run, sessionId, cwd))
-				.slice(0, max);
+			const recentRuns = latestRunSummaries({
+				limit: max,
+				workflow: params.workflow,
+				readLimit: 8000,
+				ownershipFilter: (run: AnyEvent) => canInspectRun(run, sessionId, cwd || fallbackCwd, STATUSES.RUNNING)
+					&& (!cwd || matchesRunCwd(run, cwd)),
+			});
+			const runs = cwd
+				? recentRuns
+				: mergeScopedMonitorRuns(recentRuns, fallbackCwd, sessionId, STATUSES.RUNNING);
 			return {
 				content: [{ type: "text", text: runs.length ? runs.map(formatRunSummary).join("\n\n") : "No thread-phase runs found for this session." }],
 				details: { runs },
@@ -224,35 +188,66 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		description: "Open live thread-phase monitor",
 		handler: async (ctx) => {
 			ensureStore();
-			await showThreadPhaseMonitor(ctx, path.resolve(activeCwd || ctx.cwd));
+			await showThreadPhaseMonitor(ctx, cwdState.activeCwd || canonicalCwd(ctx.cwd) || path.resolve(ctx.cwd));
 		},
 	});
 
 	pi.on("user_bash", (event, ctx) => {
-		const target = parseSimpleCd(event.command);
-		if (target === undefined) return;
-		const base = activeCwd || event.cwd || ctx.cwd;
-		const next = target === "-" ? previousCwd : path.resolve(base, expandHome(target));
-		if (!directoryExists(next)) return;
-		previousCwd = base;
-		activeCwd = next;
+		cwdState = trackCwdCommand(cwdState, event.command, event.cwd || ctx.cwd);
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		ensureStore();
-		activeCwd = path.resolve(ctx.cwd);
-		previousCwd = activeCwd;
+		cwdState = createCwdState(ctx.cwd);
 		const updateStatus = () => {
 			if (!ctx.hasUI) return;
-			const runs = mergeMonitorRuns(activeCwd, currentSessionId);
+			const runs = mergeMonitorRuns(cwdState.activeCwd, currentSessionId);
 			const running = runs.filter((run: AnyEvent) => run.normalizedStatus === STATUSES.RUNNING).length;
 			ctx.ui.setStatus("thread-phase", running > 0 ? `${running} workflow(s) running` : undefined);
 			const widgetLines = activeRunWidgetLines(runs);
 			ctx.ui.setWidget("thread-phase", widgetLines.length > 0 ? widgetLines : undefined, { placement: "belowEditor" });
 		};
 		const currentSessionId = ctx.sessionManager.getSessionId();
-		// Prime the seen set so reloading Pi does not replay old completed workflow messages.
-		for (const event of readIndex({ limit: 5000 })) seen.add(eventKey(event));
+		// Normalize/prune persisted history at startup. This set mirrors the durable
+		// state for diagnostics only; live delivery decisions never use it as a
+		// precondition because entries can expire while this session remains open.
+		continuedRuns = loadContinuedRuns({ storeDir: path.dirname(INDEX_FILE) });
+		const attemptAutoContinuation = (summary: AnyEvent, runId: string) => {
+			let claim;
+			try {
+				claim = persistContinuationClaim(runId, { storeDir: path.dirname(INDEX_FILE) });
+				continuedRuns = claim.runs;
+			} catch (error) {
+				if (ctx.hasUI) ctx.ui.notify(`Could not persist thread-phase continuation claim: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				return;
+			}
+			if (!claim.claimed) return;
+			try {
+				const prompt = formatContinuationPrompt(summary);
+				if (ctx.isIdle()) pi.sendUserMessage(prompt);
+				else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+			} catch (error) {
+				try {
+					continuedRuns = releaseContinuationClaim(runId, { storeDir: path.dirname(INDEX_FILE) }).runs;
+				} catch (releaseError) {
+					if (ctx.hasUI) ctx.ui.notify(`Continuation delivery failed and its claim could not be released: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`, "warning");
+					return;
+				}
+				if (ctx.hasUI) ctx.ui.notify(`Could not deliver thread-phase continuation; it remains retryable: ${error instanceof Error ? error.message : String(error)}`, "warning");
+			}
+		};
+
+		// Prime completion rendering while retrying explicitly opted-in runs whose
+		// prior synchronous continuation enqueue failed and released its claim.
+		const startupEvents = readIndex({ limit: 5000 });
+		for (const event of startupEvents) seen.add(eventKey(event));
+		const startupRuns = new Set<string>();
+		for (const event of startupEvents) {
+			if (event.type !== EVENT_TYPES.WORKFLOW_END || !event.runId || startupRuns.has(event.runId)) continue;
+			startupRuns.add(event.runId);
+			const summary = getRunSummary(event.runId);
+			if (belongsToSession(summary, currentSessionId, cwdState.activeCwd) && shouldAutoContinue(summary)) attemptAutoContinuation(summary, event.runId);
+		}
 		updateStatus();
 
 		const processNewEvents = () => {
@@ -263,19 +258,14 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				seen.add(key);
 				if (event.type === EVENT_TYPES.WORKFLOW_END) {
 					const summary = getRunSummary(event.runId);
-					if (!belongsToSession(summary, currentSessionId, activeCwd)) continue;
+					if (!belongsToSession(summary, currentSessionId, cwdState.activeCwd)) continue;
 					pi.sendMessage({
 						customType: "thread-phase-run",
 						content: formatCompletion(event),
 						display: true,
-						details: { event, summary, events: readRun(event.runId) },
+						details: { event, summary, events: readRun(event.runId, { readLimit: 50_000 }) },
 					});
-					if (event.runId && shouldAutoContinue(summary) && !continuedRuns.has(event.runId)) {
-						continuedRuns.add(event.runId);
-						const prompt = formatContinuationPrompt(summary);
-						if (ctx.isIdle()) pi.sendUserMessage(prompt);
-						else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-					}
+					if (event.runId && shouldAutoContinue(summary)) attemptAutoContinuation(summary, event.runId);
 					if (ctx.hasUI) ctx.ui.notify(`thread-phase ${event.workflow}: ${event.status || "done"}`, summary.normalizedStatus === STATUSES.FAILED ? "warning" : "info");
 				}
 			}
