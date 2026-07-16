@@ -73,7 +73,6 @@ Recent changes:
 
 High-value follow-ups:
 
-- Bounded JSONL reads: replace full-file index/run reads with tail/offset reads for large stores.
 - Dynamic workflow hardening: add tests for harness cancellation, broader permission matrices, and additional fanout terminal races.
 - Usage budgets: optionally fail/stop workflows when projected token usage exceeds configured limits.
 - Saved workflow templates: support reusable specs/harnesses under a Pi workflow directory.

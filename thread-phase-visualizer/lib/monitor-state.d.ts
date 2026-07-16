@@ -7,6 +7,6 @@ export const MONITOR_SORTS: readonly MonitorSort[];
 export function runMatchesSearch(run: Record<string, unknown>, query: string): boolean;
 export function filterAndSortMonitorRuns<T extends Record<string, any>>(
   runs: T[],
-  options?: { query?: string; status?: MonitorStatusFilter | string; sort?: MonitorSort | string },
+  options?: { query?: string; status?: MonitorStatusFilter | string; sort?: MonitorSort | string; hideStale?: boolean },
 ): T[];
 export function cycleMonitorOption<T>(current: T, options: readonly T[]): T;

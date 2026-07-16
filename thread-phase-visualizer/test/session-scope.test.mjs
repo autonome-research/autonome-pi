@@ -204,3 +204,43 @@ test("cwd tracking handles nested and chained cd commands and swaps for cd -", (
   assert.equal(state.activeCwd, paths.repo);
   assert.equal(state.previousCwd, paths.sibling);
 });
+
+test("cwd parser accepts trailing semicolons but rejects incomplete conditional chains", (t) => {
+  const paths = fixture();
+  t.after(() => rmSync(paths.root, { recursive: true, force: true }));
+
+  assert.deepEqual(parseCdTargets("cd nested;"), ["nested"]);
+  assert.deepEqual(parseCdTargets("cd nested;   "), ["nested"]);
+  assert.deepEqual(parseCdTargets("cd nested &&"), []);
+  assert.deepEqual(parseCdTargets("cd nested; && cd path"), []);
+
+  const state = trackCwdCommand(createCwdState(paths.repo), "cd nested;", paths.repo);
+  assert.equal(state.activeCwd, path.join(paths.repo, "nested"));
+});
+
+test("cwd tracking preserves semicolon and conditional-chain failure semantics", (t) => {
+  const paths = fixture();
+  t.after(() => rmSync(paths.root, { recursive: true, force: true }));
+
+  const missing = "definitely-missing-directory";
+  const semicolon = trackCwdCommand(
+    createCwdState(paths.repo),
+    `cd ${missing}; cd ${paths.sibling}`,
+    paths.repo,
+  );
+  assert.equal(semicolon.activeCwd, paths.sibling, "semicolon must continue after a failed cd");
+
+  const conditional = trackCwdCommand(
+    createCwdState(paths.repo),
+    `cd ${missing} && cd ${paths.sibling}`,
+    paths.repo,
+  );
+  assert.equal(conditional.activeCwd, paths.repo, "&& must stop its chain after a failed cd");
+
+  const mixed = trackCwdCommand(
+    createCwdState(paths.repo),
+    `cd ${missing} && cd ${paths.sibling}; cd nested && cd path; cd ${missing} && cd ${paths.sibling}; cd ${paths.repo}`,
+    paths.repo,
+  );
+  assert.equal(mixed.activeCwd, paths.repo, "semicolon-delimited lists must resume after failed && chains");
+});

@@ -6,12 +6,19 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import {
+  CONTINUATION_STATE_FILENAME,
   CONTINUATION_TIMESTAMPS_FILENAME,
   continuedRunsFile,
+  createContinuationClaimantId,
+  currentProcessStartIdentity,
   loadContinuedRuns,
+  loadPendingContinuationRecords,
+  loadPendingContinuations,
+  markContinuationDelivered,
   persistContinuationClaim,
   persistContinuedRuns,
   releaseContinuationClaim,
+  relinquishContinuationClaims,
   pruneContinuedRuns,
   shouldAutoContinue,
 } from "../lib/continuation-store.mjs";
@@ -39,6 +46,52 @@ test("loadContinuedRuns handles a missing persistence file", (t) => {
 
   assert.deepEqual(Array.from(loadContinuedRuns({ storeDir })), []);
   assert.equal(existsSync(continuedRunsFile(storeDir)), false);
+});
+
+test("malformed authoritative state never falls back to lossy legacy mirrors", (t) => {
+  const storeDir = temporaryStore(t);
+  writeFileSync(continuedRunsFile(storeDir), `${JSON.stringify(["mirrored-pending"])}\n`);
+  writeFileSync(join(storeDir, CONTINUATION_STATE_FILENAME), "{not-json");
+  assert.throws(() => loadPendingContinuationRecords({ storeDir }), /Invalid authoritative continuation state JSON/);
+
+  writeFileSync(join(storeDir, CONTINUATION_STATE_FILENAME), `${JSON.stringify({ schema: "thread-phase-continuations/v999", records: [] })}\n`);
+  assert.throws(() => loadContinuedRuns({ storeDir }), /Unsupported authoritative continuation state schema or shape/);
+
+  const malformedPending = `${JSON.stringify({
+    schema: "thread-phase-continuations/v3",
+    records: [{ runId: "must-not-disappear", deliveryId: "delivery", state: "pending", updatedAt: "not-a-date" }],
+  })}\n`;
+  writeFileSync(join(storeDir, CONTINUATION_STATE_FILENAME), malformedPending);
+  assert.throws(() => loadPendingContinuationRecords({ storeDir }), /updatedAt is required/);
+  assert.equal(readFileSync(join(storeDir, CONTINUATION_STATE_FILENAME), "utf8"), malformedPending);
+});
+
+test("pending continuation claims enforce an independent hard bound", (t) => {
+  const storeDir = temporaryStore(t);
+  assert.equal(persistContinuationClaim("pending-one", { storeDir, maxPendingEntries: 1 }).claimed, true);
+  assert.throws(
+    () => persistContinuationClaim("pending-two", { storeDir, maxPendingEntries: 1 }),
+    /Pending continuation limit reached \(1\)/,
+  );
+  assert.deepEqual(loadPendingContinuationRecords({ storeDir }).map((record) => record.runId), ["pending-one"]);
+});
+
+test("expired claimant leases permit retry despite a still-live PID", (t) => {
+  const storeDir = temporaryStore(t);
+  const first = persistContinuationClaim("lease-retry", {
+    storeDir,
+    claimantId: "old-runtime",
+    claimantProcessStart: null,
+    claimLeaseMs: 1,
+    now: "2000-01-01T00:00:00.000Z",
+  });
+  const retried = persistContinuationClaim("lease-retry", {
+    storeDir,
+    retryPending: true,
+    claimantId: "replacement-runtime",
+  });
+  assert.equal(retried.claimed, true);
+  assert.equal(retried.deliveryId, first.deliveryId);
 });
 
 test("persisted continuation ids load after a simulated extension restart", (t) => {
@@ -76,7 +129,7 @@ test("persistContinuedRuns atomically merges the latest JSON with new run ids", 
   assert.deepEqual(Array.from(requested), persisted);
   assert.ok(persisted.every((runId) => typeof runId === "string"));
   assert.ok(Object.values(persistedTimestamps(storeDir)).every((timestamp) => Number.isFinite(Date.parse(timestamp))));
-  assert.deepEqual(readdirSync(storeDir), ["continued-runs.json", "continued-runs.timestamps.json"]);
+  assert.deepEqual(readdirSync(storeDir).sort(), ["continuations.json", "continued-runs.json", "continued-runs.timestamps.json"]);
 });
 
 test("competing stale writers preserve on-disk order at continuation capacity", async (t) => {
@@ -161,13 +214,94 @@ test("single-run claims persist before success and deduplicate after reload", (t
   assert.deepEqual(Array.from(restartedClaim.runs), ["claimed-run"]);
 });
 
-test("failed delivery claims can be released and retried", (t) => {
+test("pending claim survives a pre-enqueue crash and startup marks the retry delivered", (t) => {
   const storeDir = temporaryStore(t);
-  assert.equal(persistContinuationClaim("retryable-run", { storeDir }).claimed, true);
-  const released = releaseContinuationClaim("retryable-run", { storeDir });
-  assert.equal(released.released, true);
-  assert.equal(released.runs.has("retryable-run"), false);
-  assert.equal(persistContinuationClaim("retryable-run", { storeDir }).claimed, true);
+  const moduleUrl = new URL("../lib/continuation-store.mjs", import.meta.url).href;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    const { persistContinuationClaim } = await import(process.argv[1]);
+    persistContinuationClaim("retryable-run", { storeDir: process.argv[2] });
+  `, moduleUrl, storeDir], { encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+
+  const pending = JSON.parse(readFileSync(join(storeDir, CONTINUATION_STATE_FILENAME), "utf8"));
+  assert.equal(pending.records[0].state, "pending");
+  assert.deepEqual(Array.from(loadPendingContinuations({ storeDir })), ["retryable-run"]);
+  assert.equal(persistContinuationClaim("retryable-run", { storeDir }).claimed, false);
+
+  const startupRetry = persistContinuationClaim("retryable-run", { storeDir, retryPending: true });
+  assert.equal(startupRetry.claimed, true);
+  assert.equal(markContinuationDelivered("retryable-run", { storeDir }).delivered, true);
+  const delivered = JSON.parse(readFileSync(join(storeDir, CONTINUATION_STATE_FILENAME), "utf8"));
+  assert.equal(delivered.records[0].state, "delivered");
+  assert.deepEqual(Array.from(loadPendingContinuations({ storeDir })), []);
+  assert.equal(persistContinuationClaim("retryable-run", { storeDir, retryPending: true }).claimed, false);
+});
+
+test("pending claims retain a stable durable delivery id across reload and retry", (t) => {
+  const storeDir = temporaryStore(t);
+  const claimantId = createContinuationClaimantId();
+  const first = persistContinuationClaim("stable-delivery-run", { storeDir, claimantId });
+
+  const [reloaded] = loadPendingContinuationRecords({ storeDir });
+  const retried = persistContinuationClaim("stable-delivery-run", {
+    storeDir,
+    retryPending: true,
+    claimantId,
+  });
+
+  assert.ok(first.deliveryId);
+  assert.equal(reloaded.deliveryId, first.deliveryId);
+  assert.equal(retried.deliveryId, first.deliveryId);
+});
+
+test("session shutdown relinquishes only its claims while the process remains alive", (t) => {
+  const storeDir = temporaryStore(t);
+  const owner = createContinuationClaimantId();
+  const other = createContinuationClaimantId();
+  const processStart = currentProcessStartIdentity();
+  assert.equal(persistContinuationClaim("shutdown-run", { storeDir, claimantId: owner, claimantProcessStart: processStart }).claimed, true);
+  assert.equal(persistContinuationClaim("other-run", { storeDir, claimantId: other, claimantProcessStart: processStart }).claimed, true);
+
+  assert.equal(persistContinuationClaim("shutdown-run", { storeDir, retryPending: true, claimantId: other, claimantProcessStart: processStart }).claimed, false,
+    "a genuinely active claimant must not be stolen");
+  const relinquished = relinquishContinuationClaims({ storeDir, claimantId: owner, claimantProcessStart: processStart });
+  assert.equal(relinquished.relinquished, 1);
+  assert.equal(persistContinuationClaim("shutdown-run", { storeDir, retryPending: true, claimantId: other, claimantProcessStart: processStart }).claimed, true);
+  assert.equal(persistContinuationClaim("other-run", { storeDir, retryPending: true, claimantId: owner, claimantProcessStart: processStart }).claimed, false,
+    "shutdown must not relinquish another runtime's claim");
+});
+
+test("startup retry does not steal a pending claim from a live concurrent claimant", async (t) => {
+  const storeDir = temporaryStore(t);
+  const moduleUrl = new URL("../lib/continuation-store.mjs", import.meta.url).href;
+  const ready = join(storeDir, "claim.ready");
+  const release = join(storeDir, "claim.release");
+  const child = spawn(process.execPath, ["--input-type=module", "-e", `
+    import { existsSync, writeFileSync } from "node:fs";
+    const { persistContinuationClaim } = await import(process.argv[1]);
+    persistContinuationClaim("concurrent-run", { storeDir: process.argv[2] });
+    writeFileSync(process.argv[3], "ready");
+    while (!existsSync(process.argv[4])) await new Promise((resolve) => setTimeout(resolve, 5));
+  `, moduleUrl, storeDir, ready, release], { stdio: ["ignore", "pipe", "pipe"] });
+  const completed = new Promise((resolve) => child.once("close", resolve));
+  try {
+    const deadline = Date.now() + 5_000;
+    while (!existsSync(ready)) {
+      assert.ok(Date.now() < deadline, "claimant did not become ready");
+      await delay(10);
+    }
+    assert.equal(persistContinuationClaim("concurrent-run", { storeDir, retryPending: true }).claimed, false);
+  } finally {
+    writeFileSync(release, "release");
+    await completed;
+  }
+});
+
+test("release remains a compatibility escape hatch for pending claims", (t) => {
+  const storeDir = temporaryStore(t);
+  assert.equal(persistContinuationClaim("released-run", { storeDir }).claimed, true);
+  assert.equal(releaseContinuationClaim("released-run", { storeDir }).released, true);
+  assert.equal(persistContinuationClaim("released-run", { storeDir }).claimed, true);
 });
 
 test("stale snapshots cannot prune competing claims at capacity", (t) => {
@@ -359,5 +493,5 @@ test("canonical continuation history remains stable and claimed across consecuti
   assert.deepEqual(Array.from(secondReload), expected);
   assert.deepEqual(afterSecondReload, expected);
   assert.deepEqual(Array.from(thirdReload), expected);
-  assert.deepEqual(readdirSync(storeDir), ["continued-runs.json", "continued-runs.timestamps.json"]);
+  assert.deepEqual(readdirSync(storeDir).sort(), ["continuations.json", "continued-runs.json", "continued-runs.timestamps.json"]);
 });

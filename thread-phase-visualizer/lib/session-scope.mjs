@@ -115,6 +115,7 @@ export function mergeMonitorRuns(runs, cwd, sessionId, runningStatus = "running"
 function shellSegments(command) {
   const segments = [];
   let segment = "";
+  let separator;
   let quote;
   let escaped = false;
   for (let index = 0; index < command.length; index++) {
@@ -140,15 +141,22 @@ function shellSegments(command) {
       continue;
     }
     if (char === ";" || (char === "&" && command[index + 1] === "&")) {
-      if (segment.trim()) segments.push(segment.trim());
+      if (!segment.trim()) return [];
+      segments.push({ command: segment.trim(), separator });
       segment = "";
+      separator = char === ";" ? ";" : "&&";
       if (char === "&") index++;
       continue;
     }
     segment += char;
   }
   if (quote || escaped) return [];
-  if (segment.trim()) segments.push(segment.trim());
+  if (!segment.trim()) {
+    // A trailing semicolon terminates a complete shell list; a trailing && is
+    // incomplete and must not be interpreted as a successful cd chain.
+    return separator === ";" ? segments : [];
+  }
+  segments.push({ command: segment.trim(), separator });
   return segments;
 }
 
@@ -158,18 +166,22 @@ function shellUnquote(value) {
   return trimmed.replace(/\\ /g, " ");
 }
 
-/** Return targets only when every shell segment is a simple cd command. */
-export function parseCdTargets(command) {
+function parseCdChain(command) {
   if (typeof command !== "string") return [];
   const segments = shellSegments(command.trim());
   if (!segments.length) return [];
-  const targets = [];
+  const commands = [];
   for (const segment of segments) {
-    const match = segment.match(/^cd(?:\s+(.+))?$/);
+    const match = segment.command.match(/^cd(?:\s+(.+))?$/);
     if (!match) return [];
-    targets.push(shellUnquote(match[1] || "~"));
+    commands.push({ target: shellUnquote(match[1] || "~"), separator: segment.separator });
   }
-  return targets;
+  return commands;
+}
+
+/** Return targets only when every shell segment is a simple cd command. */
+export function parseCdTargets(command) {
+  return parseCdChain(command).map(({ target }) => target);
 }
 
 function existingDirectory(value) {
@@ -187,13 +199,17 @@ export function createCwdState(initialCwd) {
 
 /** Apply one or more chained cd commands, preserving shell-like cd - swaps. */
 export function trackCwdCommand(state, command, eventCwd) {
-  const targets = parseCdTargets(command);
-  if (!targets.length) return state;
+  const commands = parseCdChain(command);
+  if (!commands.length) return state;
   let activeCwd = canonicalCwd(state?.activeCwd || eventCwd) || path.resolve(eventCwd || process.cwd());
   let previousCwd = canonicalCwd(state?.previousCwd || activeCwd) || activeCwd;
-  for (const target of targets) {
+  let succeeded = true;
+  for (const { target, separator } of commands) {
+    // `&&` executes only after success; `;` starts a new unconditional list.
+    if (separator === "&&" && !succeeded) continue;
     const next = target === "-" ? previousCwd : canonicalCwd(target, activeCwd);
-    if (!existingDirectory(next)) break;
+    succeeded = existingDirectory(next);
+    if (!succeeded) continue;
     previousCwd = activeCwd;
     activeCwd = next;
   }

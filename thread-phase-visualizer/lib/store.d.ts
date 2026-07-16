@@ -5,6 +5,7 @@ export type ThreadPhaseArtifact = {
   kind: "markdown" | "file" | "url" | "json" | string;
   title: string;
   path?: string;
+  url?: string;
   content?: string;
   preview?: string;
   data?: unknown;

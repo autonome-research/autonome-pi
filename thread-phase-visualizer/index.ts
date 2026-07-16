@@ -18,7 +18,17 @@ import {
 } from "./lib/store.mjs";
 import { belongsToSession, formatOwnerMetadata, formatStaleIndicator, runSessionId } from "./lib/run-display.mjs";
 import { canonicalCwd, canInspectRun, createCwdState, matchesRunCwd, mergeMonitorRuns as mergeScopedMonitorRuns, trackCwdCommand } from "./lib/session-scope.mjs";
-import { loadContinuedRuns, persistContinuationClaim, releaseContinuationClaim, shouldAutoContinue } from "./lib/continuation-store.mjs";
+import {
+	createContinuationClaimantId,
+	currentProcessStartIdentity,
+	loadContinuedRuns,
+	loadPendingContinuationRecords,
+	markContinuationDelivered,
+	persistContinuationClaim,
+	relinquishContinuationClaims,
+	shouldAutoContinue,
+} from "./lib/continuation-store.mjs";
+import { formatMarkedContinuation, sessionHistoryHasContinuation } from "./lib/continuation-message.mjs";
 
 const MAX_MESSAGE_BYTES = 20_000;
 
@@ -137,6 +147,8 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	let cwdState = createCwdState(process.cwd());
 	let continuedRuns = new Set<string>();
 	const seen = new Set<string>();
+	const continuationClaimantId = createContinuationClaimantId();
+	const continuationClaimantProcessStart = currentProcessStartIdentity();
 
 	pi.registerTool({
 		name: "thread_phase_runs",
@@ -196,6 +208,24 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		cwdState = trackCwdCommand(cwdState, event.command, event.cwd || ctx.cwd);
 	});
 
+	pi.on("message_start", (event, ctx) => {
+		// Pi persists a finalized user entry after its message_end handlers. A
+		// subsequent assistant start is therefore the first lifecycle point where
+		// active-branch history can safely prove durable acceptance.
+		if (event.message?.role !== "assistant") return;
+		const storeDir = path.dirname(INDEX_FILE);
+		try {
+			const branchEntries = ctx.sessionManager.getBranch();
+			for (const pending of loadPendingContinuationRecords({ storeDir })) {
+				if (!sessionHistoryHasContinuation(branchEntries, pending.deliveryId)) continue;
+				const delivered = markContinuationDelivered(pending.runId, { storeDir, deliveryId: pending.deliveryId });
+				continuedRuns = delivered.runs;
+			}
+		} catch (error) {
+			if (ctx.hasUI) ctx.ui.notify(`A thread-phase continuation is present in active-branch history, but delivered-state persistence failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+		}
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		ensureStore();
 		cwdState = createCwdState(ctx.cwd);
@@ -211,42 +241,78 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		// Normalize/prune persisted history at startup. This set mirrors the durable
 		// state for diagnostics only; live delivery decisions never use it as a
 		// precondition because entries can expire while this session remains open.
-		continuedRuns = loadContinuedRuns({ storeDir: path.dirname(INDEX_FILE) });
-		const attemptAutoContinuation = (summary: AnyEvent, runId: string) => {
+		const continuationStoreDir = path.dirname(INDEX_FILE);
+		continuedRuns = loadContinuedRuns({ storeDir: continuationStoreDir });
+		let pendingContinuationRecords = loadPendingContinuationRecords({ storeDir: continuationStoreDir });
+
+		// Only the active branch proves that a continuation is visible to the
+		// user. Markers on abandoned session-tree branches must not suppress replay.
+		// If branch history is unavailable or no marker is present, replay remains
+		// deliberately at-least-once rather than claiming exactly-once.
+		let branchEntries: readonly AnyEvent[] | undefined;
+		try {
+			branchEntries = ctx.sessionManager.getBranch();
+		} catch {
+			branchEntries = undefined;
+		}
+		const historyProvenRunIds = new Set<string>();
+		if (branchEntries) {
+			for (const pending of pendingContinuationRecords) {
+				if (!sessionHistoryHasContinuation(branchEntries, pending.deliveryId)) continue;
+				historyProvenRunIds.add(pending.runId);
+				try {
+					const reconciled = markContinuationDelivered(pending.runId, { storeDir: continuationStoreDir, deliveryId: pending.deliveryId });
+					continuedRuns = reconciled.runs;
+					if (!reconciled.delivered) throw new Error("pending continuation record changed before reconciliation");
+				} catch (error) {
+					if (ctx.hasUI) ctx.ui.notify(`Thread-phase continuation ${pending.deliveryId} is already enqueued, but delivered-state persistence failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				}
+			}
+			pendingContinuationRecords = loadPendingContinuationRecords({ storeDir: continuationStoreDir });
+		}
+
+		const attemptAutoContinuation = (summary: AnyEvent, runId: string, retryPending = false) => {
 			let claim;
 			try {
-				claim = persistContinuationClaim(runId, { storeDir: path.dirname(INDEX_FILE) });
+				claim = persistContinuationClaim(runId, {
+					storeDir: continuationStoreDir,
+					retryPending,
+					claimantId: continuationClaimantId,
+					claimantProcessStart: continuationClaimantProcessStart,
+				});
 				continuedRuns = claim.runs;
 			} catch (error) {
 				if (ctx.hasUI) ctx.ui.notify(`Could not persist thread-phase continuation claim: ${error instanceof Error ? error.message : String(error)}`, "warning");
 				return;
 			}
-			if (!claim.claimed) return;
+			if (!claim.claimed || !claim.deliveryId) return;
+			const prompt = formatMarkedContinuation(formatContinuationPrompt(summary), claim.deliveryId);
 			try {
-				const prompt = formatContinuationPrompt(summary);
 				if (ctx.isIdle()) pi.sendUserMessage(prompt);
 				else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 			} catch (error) {
-				try {
-					continuedRuns = releaseContinuationClaim(runId, { storeDir: path.dirname(INDEX_FILE) }).runs;
-				} catch (releaseError) {
-					if (ctx.hasUI) ctx.ui.notify(`Continuation delivery failed and its claim could not be released: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`, "warning");
-					return;
-				}
-				if (ctx.hasUI) ctx.ui.notify(`Could not deliver thread-phase continuation; it remains retryable: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				// The extension wrapper rarely surfaces asynchronous input failures, but
+				// any synchronous rejection still leaves the durable record pending.
+				if (ctx.hasUI) ctx.ui.notify(`Could not submit thread-phase continuation ${claim.deliveryId}; it remains pending for retry: ${error instanceof Error ? error.message : String(error)}`, "warning");
 			}
+			// Delivery is acknowledged only by message_start or persisted active-branch
+			// history. sendUserMessage() itself is fire-and-forget.
+
 		};
 
-		// Prime completion rendering while retrying explicitly opted-in runs whose
-		// prior synchronous continuation enqueue failed and released its claim.
+		// Prime completion rendering while reclaiming durable pending deliveries.
+		// Legacy continuation ids migrate as delivered and are never replayed.
 		const startupEvents = readIndex({ limit: 5000 });
 		for (const event of startupEvents) seen.add(eventKey(event));
-		const startupRuns = new Set<string>();
+		const startupRuns = new Set<string>(pendingContinuationRecords
+			.filter((record: AnyEvent) => !historyProvenRunIds.has(record.runId))
+			.map((record: AnyEvent) => record.runId));
 		for (const event of startupEvents) {
-			if (event.type !== EVENT_TYPES.WORKFLOW_END || !event.runId || startupRuns.has(event.runId)) continue;
-			startupRuns.add(event.runId);
-			const summary = getRunSummary(event.runId);
-			if (belongsToSession(summary, currentSessionId, cwdState.activeCwd) && shouldAutoContinue(summary)) attemptAutoContinuation(summary, event.runId);
+			if (event.type === EVENT_TYPES.WORKFLOW_END && event.runId && !historyProvenRunIds.has(event.runId)) startupRuns.add(event.runId);
+		}
+		for (const runId of startupRuns) {
+			const summary = getRunSummary(runId);
+			if (belongsToSession(summary, currentSessionId, cwdState.activeCwd) && shouldAutoContinue(summary)) attemptAutoContinuation(summary, runId, true);
 		}
 		updateStatus();
 
@@ -279,6 +345,15 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	pi.on("session_shutdown", (_event, ctx) => {
 		watcher?.close();
 		watcher = undefined;
+		try {
+			relinquishContinuationClaims({
+				storeDir: path.dirname(INDEX_FILE),
+				claimantId: continuationClaimantId,
+				claimantProcessStart: continuationClaimantProcessStart,
+			});
+		} catch (error) {
+			if (ctx.hasUI) ctx.ui.notify(`Could not relinquish pending thread-phase continuation claims during shutdown: ${error instanceof Error ? error.message : String(error)}`, "warning");
+		}
 		if (ctx.hasUI) {
 			ctx.ui.setStatus("thread-phase", undefined);
 			ctx.ui.setStatus("thread-phase-cwd", undefined);

@@ -12,6 +12,9 @@ Default store:
 ~/.pi/agent/thread-phase/
 ├── index.jsonl          # global append-only event stream
 ├── run-starts.jsonl     # compact append-only ownership lookup catalog
+├── continuations.json   # authoritative v3 pending/delivered + delivery/claim identity state
+├── continued-runs.json  # legacy-compatible delivered/claimed id mirror
+├── continued-runs.timestamps.json # legacy-compatible retention metadata
 ├── index-pending/       # transient durable index-reconciliation markers
 ├── index-quarantine/    # malformed/unsupported recovery markers
 ├── run-start-quarantine/# dead orphan start reservations
@@ -60,6 +63,7 @@ type ThreadPhaseUiEvent = {
     kind: "markdown" | "file" | "url" | "json" | string;
     title: string;
     path?: string;
+    url?: string;
     content?: string;
     preview?: string;
     data?: unknown;
@@ -230,9 +234,9 @@ The demo script is intentionally not exposed as a slash command. Larger workflow
 ## Remaining visualizer work
 
 - Add usage budgets/threshold warnings on top of projected usage summaries.
-- Replace full JSONL reads with bounded tail/offset reads for large stores.
-- Add formal workflow owner metadata (`sessionId`, `sessionFile`, launch source, cwd at launch) and use it consistently for monitor filtering, tool inspection, continuation, and cancellation.
-- Add tests for session scoping, once-only continuation, cancellation request files, large artifacts, and corrupt JSONL tolerance.
+- Continue improving monitor ergonomics and projection-level diagnostics as new generic workflow event patterns emerge.
+
+JSONL reads are bounded, workflow-start ownership is verified within explicit scan/byte budgets, and focused coverage exists for ownership/session scoping, continuation/restart behavior, cancellation files, large artifacts, and corrupt JSONL. These are maintained correctness properties rather than unfinished work.
 
 ## Current UI components
 
@@ -240,7 +244,12 @@ The first UI layer is implemented as generic custom message renderers:
 
 - `thread-phase-run`: collapsed one-line workflow status; expand with Pi's tool/message expansion key to show phases, errors, and summary artifact content.
 - live monitor overlay: session-scoped keyboard-driven progress view with animated live workflow glyphs, compact recent/active phase summaries, arrow/enter navigation across phases and artifacts in one detail view, cancellation (`x` for running workflows), markdown-rendered artifact content, and separate phase glyphs (`◆`, `◈`, `◇`) for quick visual scanning.
-- session continuations: successful background/session-launched workflows can emit a normal follow-up user message for the current Pi session; if the main agent is still generating, the continuation is queued with Pi's follow-up delivery instead of interrupting the stream. Dynamic workflows opt in with `autoContinue: true`.
+- session continuations: successful background/session-launched workflows can emit a normal follow-up user message for the current Pi session; if the main agent is still generating, the continuation is queued with Pi's follow-up delivery instead of interrupting the stream. Workflows opt in through generic `autoContinue: true` metadata. Before submission, the visualizer durably records `pending` with a stable delivery ID and claimant identity. The queued user message includes a `thread-phase-continuation/v1` machine marker carrying that ID. Because `sendUserMessage()` is fire-and-forget and user `message_start` precedes persistence, the record remains pending until active-branch history proves acceptance. The visualizer checks at startup and at the subsequent assistant `message_start`, after Pi has persisted the finalized user entry; only then is `delivered` persisted.
+  - On startup, pending records are reconciled against `ctx.sessionManager.getBranch()`. Only a marker visible on the active branch proves that Pi accepted the message; markers on abandoned branches do not suppress replay.
+  - If current-session history is unavailable, truncated, branched away, or otherwise cannot prove enqueue, a pending record is replayed with **at-least-once** semantics. The extension does not claim exactly-once delivery.
+  - Pending claims carry PID, process-start identity when the platform exposes it, a per-extension-runtime claimant ID, and a bounded claimant lease (default 30 minutes). A genuinely active claimant is not stolen during its lease. `session_shutdown` relinquishes that runtime's claims without deleting pending work; lease expiry guarantees eventual recovery after PID reuse on platforms without process-start identity.
+  - Pending work is never silently expired or capacity-pruned. New claims are rejected once the independent pending-record bound (default 500) is reached, making backlog growth explicit instead of dropping work.
+  - Notifications distinguish claim persistence failure, synchronous submission rejection, and acknowledgement persistence failure. Asynchronous input rejection produces no `message_start`, so the record remains pending and is relinquished on shutdown for retry. Delivered and safely migrated legacy records remain deduplicated while retained. The v3 state reader accepts v2 documents and legacy ID/timestamp mirrors, assigns deterministic delivery IDs during migration, and rewrites canonical v3 state. Legacy mirrors retain their old file shape; a downgrade that does not understand v3 conservatively sees mirrored IDs as already continued rather than replaying pending work.
 - `thread_phase_runs` is session-scoped by default; session-owned history stays private to its owner, while unscoped running/direct-CLI runs are visible only from a canonically matching active or explicitly requested cwd.
 
 Component files:
