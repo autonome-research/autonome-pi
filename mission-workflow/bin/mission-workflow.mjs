@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
+import { acquireFleetLease } from "./fleet.mjs";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -1172,6 +1173,10 @@ function piParserResult(state) {
 
 async function runPi({ cwd, prompt, tools, model, timeoutMs = DEFAULT_PI_TIMEOUT_MS, idleTimeoutMs = DEFAULT_PI_IDLE_TIMEOUT_MS, signal, operationLabel = "pi agent", phase }) {
   if (signal?.aborted) return { ok: false, aborted: true, error: String(signal.reason || "cancelled"), text: "" };
+  // PI_FLEET routing (no-op when unset): sticky per-label endpoint lease;
+  // the lease's provider/model pins this agent to one vLLM instance.
+  const fleetLease = await acquireFleetLease(operationLabel || cwd, prompt ? prompt.length : 0);
+  if (fleetLease?.model) model = fleetLease.model;
   const args = [
     "--mode", "json", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
     "--tools", tools.join(","), "-p", prompt,
@@ -1243,6 +1248,7 @@ async function runPi({ cwd, prompt, tools, model, timeoutMs = DEFAULT_PI_TIMEOUT
       const exitCode = syntheticExitCode({ timedOut: timedOut || idleTimedOut, aborted, code, signal: signalName });
       const error = errorMessage || errorText(result) || (signalName ? `pi terminated by ${signalName}: ${operationLabel}` : code === 0 ? undefined : stderr || `pi exited ${code}`);
       const ok = code === 0 && !result.parserError && !aborted && !signalName && !timedOut && !idleTimedOut;
+      fleetLease?.release(ok);
       op.finish(ok ? "success" : "failed", { ...(error ? { error } : {}), ...(signalName ? { signal: signalName } : {}), ...(forced ? { forced: true } : {}), timedOut, idleTimedOut });
       emitIo(ok ? "success" : timedOut ? "timeout" : idleTimedOut ? "idle-timeout" : aborted ? "cancelled" : "failed", true);
       resolve({ ok, code: exitCode, signal: signalName || undefined, stderr, aborted, timedOut, idleTimedOut, forced, ...result, error });
