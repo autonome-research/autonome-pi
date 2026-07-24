@@ -35,6 +35,36 @@ test("dynamic runner reports a phase timeout instead of generic exit 143", { ski
   }
 });
 
+test("ordinary failures mentioning cancellation remain failed", () => {
+  const temp = mkdtempSync(join(tmpdir(), "dynamic-cancel-word-failure-test-"));
+  try {
+    const specPath = join(temp, "spec.json");
+    const store = join(temp, "store");
+    writeFileSync(specPath, JSON.stringify({
+      name: "cancel-word-failure",
+      permissions: "rwx",
+      phases: [{ type: "shell", name: "fails", command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("console.error('operation cancelled by remote service'); process.exit(7)")}` }],
+    }));
+    const result = spawnSync(process.execPath, [cli, "--spec-file", specPath, "--cwd", temp], {
+      cwd: root,
+      env: { ...process.env, PI_THREAD_PHASE_STORE_DIR: store },
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+
+    assert.equal(result.status, 1, result.stderr);
+    const details = JSON.parse(result.stdout);
+    assert.equal(details.ok, false);
+    assert.equal(details.cancelled, undefined);
+    assert.match(details.error, /operation cancelled by remote service/);
+    const runFile = join(store, "runs", readdirSync(join(store, "runs"))[0]);
+    const events = readFileSync(runFile, "utf8").trim().split("\n").map(JSON.parse);
+    assert.equal(events.filter((event) => event.type === "workflow_end").at(-1)?.status, "failed");
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
 test("background spawn failure does not emit a success acknowledgement", () => {
   const temp = mkdtempSync(join(tmpdir(), "dynamic-background-spawn-test-"));
   try {
