@@ -94,9 +94,10 @@ test("legacy nested spec arguments are prepared into the flat public format", ()
     spec: {
       name: "legacy",
       permissions: "r",
+      metadata: { ticket: "PR-2" },
       phases: [
         { type: "pi", name: "one", prompt: "inspect" },
-        { type: "fanout_pi", name: "many", items: ["a"], promptTemplate: "review {{item}}" },
+        { type: "fanout_pi", name: "many", items: ["a"], label: "files", promptTemplate: "review {{item}}" },
       ],
     },
     background: true,
@@ -105,10 +106,22 @@ test("legacy nested spec arguments are prepared into the flat public format", ()
   assert.equal(prepared.name, "legacy");
   assert.equal(prepared.background, true);
   assert.equal(prepared.timeoutMs, 1234);
+  assert.deepEqual(prepared.metadata, { ticket: "PR-2" });
   assert.deepEqual(prepared.phases, [
     { type: "agent", name: "one", prompt: "inspect" },
-    { type: "fanout", name: "many", items: ["a"], prompt: "review {{item}}" },
+    { type: "fanout", name: "many", items: ["a"], label: "files", prompt: "review {{item}}" },
   ]);
+});
+
+test("legacy preparation rejects conflicts and options the simplified format cannot preserve", () => {
+  const tools = new Map();
+  registerDynamicWorkflows({ registerTool: (definition) => tools.set(definition.name, definition) });
+  const prepare = tools.get("dynamic_workflow").prepareArguments;
+  assert.throws(() => prepare({ spec: artifactSpec("permissions-conflict"), permissions: "rw" }), /permissions conflict/);
+  assert.throws(() => prepare({ spec: { ...artifactSpec("timeout-conflict"), timeoutMs: 100 }, timeout: 200 }), /timeout conflicts/);
+  assert.throws(() => prepare({
+    spec: { name: "legacy-artifact", phases: [{ type: "pi", name: "review", prompt: "review", artifact: true }] },
+  }), /cannot be represented by the simplified format/);
 });
 
 test("legacy alias is registered but removed from the default active tool set", () => {

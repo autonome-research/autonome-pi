@@ -46,7 +46,7 @@ Permissions are capabilities rather than tool names:
 | `rw` | all read and write tools |
 | `rwx` | read/write tools plus `bash`; also permits `shell` phases |
 
-A shell is inherently able to read and write, so `x` is not offered independently: shell and Pi `bash` execution require `rwx`. A phase-level `tools` list may narrow the tools granted by its permissions but cannot expand them. Every request is bounded by `PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS` (default `rwx`).
+A shell is inherently able to read and write, so `x` is not offered independently: shell and Pi `bash` execution require `rwx`. A non-empty phase-level `tools` list may narrow the tools granted by its permissions but cannot expand them; omit `tools` to receive all tools allowed by the phase permissions. Every request is bounded by `PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS` (default `rwx`).
 
 ```json
 {
@@ -100,11 +100,15 @@ Or use an earlier phase's output as items:
   "type": "fanout",
   "name": "review-files",
   "itemsFrom": "find-files",
+  "label": "files",
+  "failOnItemFailure": false,
   "prompt": "Review {{item}} (item {{index}})."
 }
 ```
 
-Fanout is capped at 1,000 items and concurrency 64; operators may configure lower limits.
+`itemsFrom` accepts an array directly. String output is parsed as a JSON array/object when possible, otherwise as non-empty lines with leading `-` or `*` bullets removed; numbered-list prefixes are preserved. `failOnItemFailure` defaults to true and fails only after all siblings settle. `label` customizes fanout progress events.
+
+Fanout is capped at 1,000 items and concurrency 64 in the public tool schema; operators may configure lower runtime limits.
 
 ### `shell`
 
@@ -134,7 +138,7 @@ An artifact phase must provide exactly one of `content` or `from`.
 
 Phases are ordered. References must point to earlier phases.
 
-- `{{outputs.phase-name}}` — earlier phase output
+- `{{outputs.phase-name}}` — complete earlier phase output (JSON subfield access is not supported)
 - `{{item}}` — current fanout item
 - `{{index}}` — current fanout index
 - `{{cwd}}` and `{{runId}}` — workflow context
@@ -150,7 +154,7 @@ Retries are explicit and bounded:
 }
 ```
 
-Do not retry side-effecting work unless it is idempotent.
+Retries use exponential backoff (`baseDelayMs`, then double for each later retry) without jitter. Do not retry side-effecting work unless it is idempotent.
 
 ## Execution controls
 
@@ -162,7 +166,8 @@ Top-level controls:
 - `timeoutMs` — inherited agent/shell timeout
 - `concurrency` — inherited fanout concurrency
 - `background` — detach after durable readiness and return `runId` + `pid`
-- `autoContinue` — after successful background completion, queue a Pi follow-up
+- `autoContinue` — after successful background completion, queue a Pi follow-up through the visualizer continuation service
+- `metadata` — optional caller metadata retained in the compiled workflow input
 
 Use `background: true` for long workflows. `autoContinue` defaults to false.
 
@@ -187,7 +192,9 @@ Prefer `dynamic_workflow` for normal composition. Reusable or operationally impo
 
 ## Compatibility
 
-The deprecated `dynamic_thread_phase_workflow` tool remains registered for old `{ spec: ... }` and harness calls but is inactive by default. Set `PI_DYNAMIC_WORKFLOW_ENABLE_LEGACY_ALIAS=1` only when an old session must call it. The canonical tool's `prepareArguments` also upgrades ordinary legacy nested structured calls and old `pi`/`fanout_pi` phase names.
+The deprecated `dynamic_thread_phase_workflow` tool remains registered for old `{ spec: ... }` and harness calls but is inactive by default. Set `PI_DYNAMIC_WORKFLOW_ENABLE_LEGACY_ALIAS=1` only when an old session must call it. The canonical tool's `prepareArguments` upgrades ordinary legacy nested structured calls, metadata, fanout labels, old `pi`/`fanout_pi` phase names, and `timeout` to `timeoutMs`. Conflicting duplicate defaults fail clearly.
+
+Legacy per-phase output-artifact configuration and control fields on artifact phases cannot be represented by the simplified schema. Convert them to an explicit `artifact` phase, or temporarily use the enabled legacy alias; argument preparation reports this case rather than silently dropping behavior.
 
 The runner CLI accepts both the new `agent`/`fanout` spec names and the old `pi`/`fanout_pi` names:
 

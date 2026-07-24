@@ -39,7 +39,7 @@ Dynamic workflows compile onto thread-phase. Deterministic means the encoded pha
 - `rw`: all read and write tools
 - `rwx`: read/write plus Pi `bash` and `shell` phases
 
-A shell can inherently read and write, so command execution requires full `rwx`; there is no isolated `x` mode. Top-level permissions are phase defaults. A phase may override that default within `PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS` policy. A `tools` array may narrow, never expand, the tools allowed by permissions.
+A shell can inherently read and write, so command execution requires full `rwx`; there is no isolated `x` mode. Top-level permissions are phase defaults. A phase may override that default within `PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS` policy. A non-empty `tools` array may narrow, never expand, the tools allowed by permissions; omit it for all permitted tools.
 
 ## Phase types
 
@@ -65,7 +65,7 @@ Parallel Pi subagents over explicit or earlier-phase items:
 }
 ```
 
-Use `itemsFrom: "phase-name"` instead of `items` to consume an earlier output.
+Use `itemsFrom: "phase-name"` instead of `items` to consume an earlier output. Arrays pass through; strings are parsed as JSON arrays/objects when possible, otherwise as non-empty lines with `-`/`*` bullets removed. `failOnItemFailure` defaults to true and waits for siblings to settle; `label` customizes progress event wording.
 
 ### `shell`
 
@@ -85,11 +85,12 @@ Artifact phases require exactly one of `content` or `from`.
 
 - Phases execute in declared order.
 - Names must be unique.
-- Use `{{outputs.phase-name}}` to reference an earlier phase output.
+- Use `{{outputs.phase-name}}` to reference a complete earlier phase output; JSON subfield access is not supported.
 - Fanout prompts may use `{{item}}` and `{{index}}`.
 - References may not point forward.
 - `fanout` requires exactly one of `items` or `itemsFrom`.
 - Retries are explicit and bounded: `retry: { maxAttempts, baseDelayMs }`.
+- Retry delays use exponential backoff without jitter.
 - Do not retry non-idempotent side effects casually.
 
 Mixed-permission example:
@@ -110,6 +111,7 @@ Mixed-permission example:
 ## Execution policy
 
 - Set `cwd` explicitly when execution differs from the Pi session cwd.
+- Top-level `model`, `timeoutMs`, and `concurrency` provide phase defaults; `metadata` retains optional caller metadata in the compiled input.
 - Use `background: true` for long workflows.
 - Use `autoContinue: true` only when successful completion should queue a follow-up.
 - Add an artifact phase when the user expects a durable report.
@@ -134,7 +136,7 @@ Prefer a standalone TypeScript extension using thread-phase directly when logic 
 
 ## Compatibility
 
-`dynamic_thread_phase_workflow` is a deprecated legacy interface and is inactive by default. Do not use it for new calls. Ordinary old `{ spec: ... }` structured arguments are upgraded by `dynamic_workflow.prepareArguments`; full legacy harness compatibility remains available through the alias when explicitly enabled.
+`dynamic_thread_phase_workflow` is a deprecated legacy interface and is inactive by default. Do not use it for new calls. Ordinary old `{ spec: ... }` structured arguments are upgraded by `dynamic_workflow.prepareArguments`; full legacy harness and per-phase artifact-option compatibility remains available through the alias when explicitly enabled. Unsupported legacy-only phase options fail with an actionable migration error rather than being silently discarded.
 
 ## Checklist
 

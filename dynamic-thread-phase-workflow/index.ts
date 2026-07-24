@@ -218,7 +218,7 @@ function workflowParametersSchema() {
 			...common,
 			type: StringEnum(["agent"] as const),
 			prompt: Type.String({ minLength: 1 }),
-			tools: Type.Optional(Type.Array(Type.String())),
+			tools: Type.Optional(Type.Array(Type.String(), { minItems: 1 })),
 			model: Type.Optional(Type.String()),
 		}, { additionalProperties: false }),
 		Type.Object({
@@ -228,9 +228,10 @@ function workflowParametersSchema() {
 			items: Type.Optional(Type.Array(Type.Union([Type.String(), Type.Number(), Type.Boolean()]), { minItems: 1, maxItems: 1_000 })),
 			itemsFrom: Type.Optional(Type.String({ description: "Earlier phase whose line/array output supplies fanout items." })),
 			concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
-			tools: Type.Optional(Type.Array(Type.String())),
+			label: Type.Optional(Type.String({ description: "Fanout item label used in progress events." })),
+			tools: Type.Optional(Type.Array(Type.String(), { minItems: 1 })),
 			model: Type.Optional(Type.String()),
-			failOnItemFailure: Type.Optional(Type.Boolean()),
+			failOnItemFailure: Type.Optional(Type.Boolean({ description: "Fail after all siblings settle if any item fails. Default true." })),
 		}, { additionalProperties: false }),
 		Type.Object({
 			...common,
@@ -259,6 +260,7 @@ function workflowParametersSchema() {
 		concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 64, description: "Default fanout concurrency." })),
 		background: Type.Optional(Type.Boolean({ description: "Run in the background and return a run id immediately." })),
 		autoContinue: Type.Optional(Type.Boolean({ description: "After successful background completion, queue a follow-up in this Pi session." })),
+		metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Optional workflow metadata persisted with the compiled input." })),
 		phases: Type.Array(phases, { minItems: 1, maxItems: 30 }),
 	}, { additionalProperties: false });
 }
@@ -281,8 +283,17 @@ function legacySpecToPublic(args: any): any {
 	if (!args || typeof args !== "object" || Array.isArray(args) || !args.spec || args.harness !== undefined || args.harnessFile !== undefined) return args;
 	const spec = args.spec;
 	if (typeof spec !== "object" || Array.isArray(spec)) return args;
+	if (args.permissions !== undefined && spec.permissions !== undefined && args.permissions !== spec.permissions) {
+		throw new Error("Top-level permissions conflict with spec.permissions.");
+	}
+	if (args.timeout !== undefined && spec.timeoutMs !== undefined && args.timeout !== spec.timeoutMs) {
+		throw new Error("Legacy timeout conflicts with spec.timeoutMs; use one timeout value.");
+	}
 	const phases = Array.isArray(spec.phases) ? spec.phases.map((phase: any) => {
 		if (!phase || typeof phase !== "object" || Array.isArray(phase)) return phase;
+		if (phase.artifact !== undefined || (phase.type === "artifact" && (phase.permissions !== undefined || phase.timeoutMs !== undefined || phase.retry !== undefined))) {
+			throw new Error(`Legacy phase options on ${phase.name || "unnamed phase"} cannot be represented by the simplified format. Use an explicit artifact phase, or temporarily enable dynamic_thread_phase_workflow for the full legacy interface.`);
+		}
 		if (phase.type === "pi") return { ...phase, type: "agent" };
 		if (phase.type === "fanout_pi") {
 			const { promptTemplate, ...rest } = phase;
@@ -290,7 +301,7 @@ function legacySpecToPublic(args: any): any {
 		}
 		return phase;
 	}) : spec.phases;
-	const { schema: _schema, metadata: _metadata, ...publicSpec } = spec;
+	const { schema: _schema, ...publicSpec } = spec;
 	return {
 		...publicSpec,
 		phases,
@@ -404,6 +415,11 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 		name: "dynamic_workflow_harness",
 		label: "Dynamic Workflow Harness",
 		description: "Advanced unsandboxed JavaScript workflow harness for loops, branching, tournaments, or custom control flow. Prefer dynamic_workflow for normal subagent composition.",
+		promptGuidelines: [
+			"Use dynamic_workflow_harness only when structured dynamic_workflow phases cannot express the required control flow.",
+			"dynamic_workflow_harness executes arbitrary unsandboxed Node.js and always requires explicit permissions=rwx.",
+			"dynamic_workflow_harness provides ctx.phase, ctx.shell, ctx.pi, ctx.fanout, ctx.artifact, ctx.emit, ctx.cancelled(), and ctx.signal.",
+		],
 		parameters: harnessParametersSchema(),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			return executeDynamicWorkflow({ ...params, timeout: params.timeoutMs }, signal, onUpdate, ctx, "");

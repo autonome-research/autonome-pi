@@ -451,8 +451,9 @@ function toolsForPermissions(permissions) {
 
 function normalizePiTools(tools, permissions, label) {
   if (tools !== undefined && (!Array.isArray(tools) || !tools.every((tool) => typeof tool === "string"))) throw new Error(`${label}.tools must be an array of strings`);
+  if (Array.isArray(tools) && tools.length === 0) throw new Error(`${label}.tools must contain at least one tool when provided; omit tools to use all tools allowed by permissions`);
   const allowed = new Set(toolsForPermissions(permissions));
-  const requested = asArray(tools).length ? asArray(tools).map(String) : [...allowed];
+  const requested = tools === undefined ? [...allowed] : tools.map(String);
   const unknown = requested.filter((tool) => !PI_TOOL_REQUIREMENTS[tool]);
   if (unknown.length) throw new Error(`${label} requested unsupported Pi tools: ${unknown.join(", ")}`);
   const rejected = requested.filter((tool) => !allowed.has(tool));
