@@ -66,6 +66,7 @@ Recent changes:
 - Structured specs now have a strict phase schema, semantic reference/permission/resource preflight, bounded supervised fanout, explicit retries, collision-safe artifacts, multipart Pi output handling, partial failure results, and background readiness acknowledgements containing `runId` + `pid`.
 - Reusable or operationally important workflows should graduate into standalone TypeScript extensions using thread-phase directly.
 - Dynamic workflows do not auto-continue by default; pass `autoContinue: true` for successful-run follow-up.
+- Reusable structured workflows and self-contained harnesses can be loaded by safe template name from `~/.pi/agent/workflows/`; template loading is bounded, rejects traversal/symlinks, preserves provenance, and still enforces normal validation and permission ceilings.
 - Usage events are aggregated into run, phase, and fanout-item summaries and rendered in tools/monitor/completion cards.
 - `npm test` runs smoke coverage for extension load, permission denial before harness import, structured validation, JS harness mode, structured shell mode, usage projection, and mission registry/resume/strict-handoff checks.
 - The package now ships workflow skills so fresh Pi sessions get progressive-disclosure guidance for dynamic workflows and mission workflows.
@@ -78,9 +79,8 @@ Recent changes:
 
 High-value follow-ups:
 
-- Dynamic workflow hardening: add tests for harness cancellation, broader permission matrices, and additional fanout terminal races.
+- Dynamic workflow hardening: add broader permission-matrix coverage.
 - Usage budgets: optionally fail/stop workflows when projected token usage exceeds configured limits.
-- Saved workflow templates: support reusable specs/harnesses under a Pi workflow directory.
 - Resume support: allow structured/dynamic workflows to resume/reuse completed phase artifacts after interruption.
 - Mission workflow follow-ups: validation categories/completion levels, operational-readiness contracts, heterogeneous model role policy, smarter repair planning, richer agent handoffs/shared mission notes, registry integrity/resume explain mode, external integration test conventions, and larger dogfood tests.
 

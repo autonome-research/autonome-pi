@@ -118,6 +118,15 @@ Mixed-permission example:
 - Keep fanout item count and concurrency minimal.
 - Use `thread_phase_runs` to inspect results and `ctrl+shift+t` to monitor/cancel interactively.
 
+## Saved templates
+
+Store reusable workflows under `~/.pi/agent/workflows/` (or `PI_DYNAMIC_WORKFLOW_TEMPLATE_DIR`):
+
+- `<name>.json` is a flat structured `dynamic_workflow` object. Invoke it with `{ "template": "name", "inputs": { ... } }` instead of phases. Use `{{inputs.key}}` placeholders; exact placeholders preserve JSON values, while placeholders embedded in text require scalars.
+- `<name>.mjs` is a self-contained advanced harness. Invoke it with `dynamic_workflow_harness` using `{ "template": "name", "permissions": "rwx" }`.
+
+Missing or unused structured-template inputs fail preflight. Invocation-level workflow defaults override structured-template defaults; metadata is merged and records `savedTemplate`. Do not provide both `template` and `phases`, or combine a harness template with `harness`/`harnessFile`. Template names are safe identifiers rather than paths. Symlinks, non-files, traversal, and files above 1 MB fail preflight. Templates do not bypass permission ceilings or normal validation. Authoring remains explicit and file-based; the tools do not overwrite saved templates.
+
 ## Advanced harnesses
 
 Use the separate `dynamic_workflow_harness` tool only for loops, branching, tournaments, custom scoring, or control flow that structured phases cannot represent. It requires explicit `permissions: "rwx"` and executes arbitrary unsandboxed JavaScript.
@@ -149,4 +158,5 @@ Prefer a standalone TypeScript extension using thread-phase directly when logic 
 7. Use background mode for long runs.
 8. Include a durable artifact when appropriate.
 9. Keep retries and fanout bounded.
-10. Use `dynamic_workflow_harness` only for genuinely advanced control flow.
+10. Use a saved template for repeated workflows; use direct phases for one-off composition.
+11. Use `dynamic_workflow_harness` only for genuinely advanced control flow.
