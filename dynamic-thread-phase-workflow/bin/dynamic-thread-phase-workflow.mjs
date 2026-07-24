@@ -66,7 +66,7 @@ async function loadThreadPhaseCore() {
 const threadPhaseCore = await loadThreadPhaseCore();
 for (const name of ["PipelineCache", "boundedFanout", "runPipeline", "withRetry"]) {
   if (typeof threadPhaseCore[name] !== "function") {
-    throw new Error(`thread-phase v5 compatibility error: missing callable export ${name}`);
+    throw new Error(`thread-phase compatibility error: missing callable export ${name}`);
   }
 }
 const { PipelineCache, boundedFanout, runPipeline, withRetry } = threadPhaseCore;
@@ -152,7 +152,24 @@ function validateName(name, label) {
   if (!/^[a-zA-Z0-9_.:-]+$/.test(name)) throw new Error(`${label}.name may only contain letters, numbers, _, ., :, and -`);
 }
 
-function validateSpec(spec) {
+function normalizePublicSpec(spec) {
+  if (!spec || typeof spec !== "object" || Array.isArray(spec) || !Array.isArray(spec.phases)) return spec;
+  return {
+    ...spec,
+    phases: spec.phases.map((phase) => {
+      if (!phase || typeof phase !== "object" || Array.isArray(phase)) return phase;
+      if (phase.type === "agent") return { ...phase, type: "pi" };
+      if (phase.type === "fanout") {
+        const { prompt, ...rest } = phase;
+        return { ...rest, type: "fanout_pi", promptTemplate: prompt };
+      }
+      return phase;
+    }),
+  };
+}
+
+function validateSpec(input) {
+  const spec = normalizePublicSpec(input);
   if (!spec || typeof spec !== "object" || Array.isArray(spec)) throw new Error("spec must be an object");
   const workflowKeys = new Set(["schema", "name", "description", "phases", "permissions", "cwd", "model", "timeoutMs", "concurrency", "autoContinue", "metadata"]);
   rejectUnknownKeys(spec, workflowKeys, "spec");
@@ -434,8 +451,9 @@ function toolsForPermissions(permissions) {
 
 function normalizePiTools(tools, permissions, label) {
   if (tools !== undefined && (!Array.isArray(tools) || !tools.every((tool) => typeof tool === "string"))) throw new Error(`${label}.tools must be an array of strings`);
+  if (Array.isArray(tools) && tools.length === 0) throw new Error(`${label}.tools must contain at least one tool when provided; omit tools to use all tools allowed by permissions`);
   const allowed = new Set(toolsForPermissions(permissions));
-  const requested = asArray(tools).length ? asArray(tools).map(String) : [...allowed];
+  const requested = tools === undefined ? [...allowed] : tools.map(String);
   const unknown = requested.filter((tool) => !PI_TOOL_REQUIREMENTS[tool]);
   if (unknown.length) throw new Error(`${label} requested unsupported Pi tools: ${unknown.join(", ")}`);
   const rejected = requested.filter((tool) => !allowed.has(tool));

@@ -105,7 +105,7 @@ test("structured specs reject explicit and resolved fanouts above the item cap",
   }
 });
 
-test("fanout progress reaches total when failures are allowed", () => {
+test("canonical fanout phase format executes and progress reaches total when failures are allowed", () => {
   const temp = mkdtempSync(join(tmpdir(), "dynamic-fanout-progress-test-"));
   try {
     const fakePi = join(temp, "fake-pi.mjs");
@@ -115,7 +115,7 @@ test("fanout progress reaches total when failures are allowed", () => {
     const store = join(temp, "store");
     writeFileSync(specPath, JSON.stringify({
       name: "fanout-progress", permissions: "r", phases: [{
-        type: "fanout_pi", name: "allowed-failures", items: ["a", "b"], promptTemplate: "{{item}}", failOnItemFailure: false,
+        type: "fanout", name: "allowed-failures", items: ["a", "b"], prompt: "{{item}}", failOnItemFailure: false,
       }],
     }));
     const result = spawnSync(process.execPath, [cli, "--spec-file", specPath, "--cwd", temp], {
@@ -151,6 +151,30 @@ test("structured specs reject invalid fanout concurrency before execution", () =
       assert.notEqual(result.status, 0);
       assert.match(result.stderr, /never-runs\.concurrency must be an integer between 1 and 64/);
     }
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("structured specs reject an explicitly empty agent tool list", () => {
+  const temp = mkdtempSync(join(tmpdir(), "dynamic-empty-tools-test-"));
+  try {
+    const specPath = join(temp, "spec.json");
+    const store = join(temp, "store");
+    writeFileSync(specPath, JSON.stringify({
+      name: "empty-tools",
+      permissions: "r",
+      phases: [{ type: "agent", name: "never-runs", prompt: "inspect", tools: [] }],
+    }));
+    const result = spawnSync(process.execPath, [cli, "--spec-file", specPath, "--cwd", temp], {
+      cwd: root,
+      env: { ...process.env, PI_THREAD_PHASE_STORE_DIR: store },
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /tools must contain at least one tool when provided/);
+    assert.equal(existsSync(join(store, "runs")), false);
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }
