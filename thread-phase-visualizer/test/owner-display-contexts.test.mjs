@@ -61,6 +61,7 @@ test("active run widget lines display canonical owner metadata for live runs", (
   delete live.stale;
   const output = activeRunWidgetLines([live]).join("\n");
   assert.match(output, /sessionId: session-owner-42  launch source: background  cwd at launch: \/repo\/at-launch/);
+  assert.match(output, /\/workflows open dashboard/);
 });
 
 test("active run widget omits stale and terminal runs", () => {

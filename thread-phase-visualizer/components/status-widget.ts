@@ -25,7 +25,7 @@ export function activeRunWidgetLines(runs: RunSummary[], options: { maxRuns?: nu
 	if (active.length === 0) return [];
 
 	const maxRuns = options.maxRuns ?? 3;
-	const lines = ["thread-phase workflows"];
+	const lines = ["thread-phase workflows · /workflows open dashboard"];
 	for (const run of active.slice(0, maxRuns)) {
 		const phase = latestActivePhase(run);
 		const phasePart = phase?.phase ? `: ${phase.phase}${progressText(phase)}` : "";

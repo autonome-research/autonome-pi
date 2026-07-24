@@ -228,7 +228,8 @@ The demo script is intentionally not exposed as a slash command. Larger workflow
 ## Pi usage
 
 - Tool: `thread_phase_runs` for agent/API inspection
-- Shortcut: `ctrl+shift+t` opens the live monitor overlay
+- Command: select `/workflows` from the slash-command menu under the editor to open the interactive dashboard
+- Shortcut: `ctrl+shift+t` opens the same dashboard directly
 - In the monitor, press `x` on a running workflow to request cancellation. Cancellation is requested through `~/.pi/agent/thread-phase/cancel/<runId>.json`; workflow runners cooperatively abort their thread-phase `AbortSignal` and terminate child subprocesses.
 
 ## Remaining visualizer work
@@ -243,7 +244,7 @@ JSONL reads are bounded, workflow-start ownership is verified within explicit sc
 The first UI layer is implemented as generic custom message renderers:
 
 - `thread-phase-run`: collapsed one-line workflow status; expand with Pi's tool/message expansion key to show phases, errors, and summary artifact content.
-- below-editor status widget: shows only genuinely live workflows; terminal and stale/dead-PID runs are removed, including when liveness changes without a new store event.
+- below-editor status widget: shows only genuinely live workflows; terminal and stale/dead-PID runs are removed, including when liveness changes without a new store event. Its `/workflows open dashboard` hint points to the selectable slash-command entry under the editor.
 - live monitor overlay: session-scoped keyboard-driven progress view with animated live workflow glyphs, compact recent/active phase summaries, arrow/enter navigation across phases and artifacts in one detail view, cancellation (`x` for running workflows), markdown-rendered artifact content, and separate phase glyphs (`◆`, `◈`, `◇`) for quick visual scanning.
 - session continuations: successful background/session-launched workflows can emit a normal follow-up user message for the current Pi session; if the main agent is still generating, the continuation is queued with Pi's follow-up delivery instead of interrupting the stream. Workflows opt in through generic `autoContinue: true` metadata. Before submission, the visualizer durably records `pending` with a stable delivery ID and claimant identity. The queued user message includes a `thread-phase-continuation/v1` machine marker carrying that ID. Because `sendUserMessage()` is fire-and-forget and user `message_start` precedes persistence, the record remains pending until active-branch history proves acceptance. The visualizer checks at startup and at the subsequent assistant `message_start`, after Pi has persisted the finalized user entry; only then is `delivered` persisted.
   - On startup, pending records are reconciled against `ctx.sessionManager.getBranch()`. Only a marker visible on the active branch proves that Pi accepted the message; markers on abandoned branches do not suppress replay.

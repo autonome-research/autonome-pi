@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { showThreadPhaseMonitor } from "./components/monitor.ts";
 import { registerThreadPhaseMessageRenderers } from "./components/run-message-renderer.ts";
@@ -201,12 +201,19 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		},
 	});
 
+	const openWorkflowDashboard = async (ctx: ExtensionContext) => {
+		ensureStore();
+		await showThreadPhaseMonitor(ctx, cwdState.activeCwd || canonicalCwd(ctx.cwd) || path.resolve(ctx.cwd));
+	};
+
+	pi.registerCommand?.("workflows", {
+		description: "Open the interactive thread-phase workflow dashboard",
+		handler: async (_args, ctx) => openWorkflowDashboard(ctx),
+	});
+
 	pi.registerShortcut("ctrl+shift+t", {
-		description: "Open live thread-phase monitor",
-		handler: async (ctx) => {
-			ensureStore();
-			await showThreadPhaseMonitor(ctx, cwdState.activeCwd || canonicalCwd(ctx.cwd) || path.resolve(ctx.cwd));
-		},
+		description: "Open the interactive thread-phase workflow dashboard",
+		handler: openWorkflowDashboard,
 	});
 
 	pi.on("user_bash", (event, ctx) => {

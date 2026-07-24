@@ -36,7 +36,7 @@ Pi identifies git packages by repository URL, so remove the old source before in
 ## Usage
 
 - `/detach [--name <tmux-name>] [--now|--wait] [prompt]` hands the current session off to tmux; `/detach-status` reports the latest handoff. See [`detach/README.md`](detach/README.md).
-- `ctrl+shift+t` opens the thread-phase monitor for workflows launched by the current Pi session, including cooperative cancellation via `x`.
+- Select `/workflows` from the slash-command menu under the editor, or press `ctrl+shift+t`, to open the interactive thread-phase dashboard; select a run for details or request cooperative cancellation via `x`.
 - Background/session-launched workflows can queue a session follow-up after successful completion. Dynamic workflows are opt-in via `autoContinue: true` to avoid noisy autonomous callbacks.
 - `/codebase-explore` starts codebase exploration in the background by default.
 - `/code-review` runs code review workflows.
