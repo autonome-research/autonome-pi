@@ -56,8 +56,15 @@ test("expanded run messages display canonical owner metadata and stale reason", 
   assert.match(output, /\[STALE\] heartbeat_stale/);
 });
 
-test("active run widget lines display canonical owner metadata and stale reason", () => {
-  const output = activeRunWidgetLines([displayRun()]).join("\n");
+test("active run widget lines display canonical owner metadata for live runs", () => {
+  const live = displayRun();
+  delete live.stale;
+  const output = activeRunWidgetLines([live]).join("\n");
   assert.match(output, /sessionId: session-owner-42  launch source: background  cwd at launch: \/repo\/at-launch/);
-  assert.match(output, /\[STALE\] heartbeat_stale/);
+});
+
+test("active run widget omits stale and terminal runs", () => {
+  const stale = displayRun();
+  const timedOut = { ...displayRun(), runId: "timed-out", normalizedStatus: "failed", status: "timed_out", stale: undefined };
+  assert.deepEqual(activeRunWidgetLines([stale, timedOut]), []);
 });
