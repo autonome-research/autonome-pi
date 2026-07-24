@@ -66,7 +66,7 @@ async function loadThreadPhaseCore() {
 const threadPhaseCore = await loadThreadPhaseCore();
 for (const name of ["PipelineCache", "boundedFanout", "runPipeline", "withRetry"]) {
   if (typeof threadPhaseCore[name] !== "function") {
-    throw new Error(`thread-phase v5 compatibility error: missing callable export ${name}`);
+    throw new Error(`thread-phase compatibility error: missing callable export ${name}`);
   }
 }
 const { PipelineCache, boundedFanout, runPipeline, withRetry } = threadPhaseCore;
