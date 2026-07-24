@@ -455,7 +455,11 @@ async function runProcess(command, args, options) {
 
 async function runPi({ cwd, prompt, model, tools, timeoutMs, signal }) {
   const args = [
-    "--mode", "json", "--no-session", "--no-extensions", "--no-skills",
+    // Note: --no-extensions is intentionally omitted so that extensions
+    // like local-vllm.ts can register dynamically-discovered local providers
+    // (e.g. vllm-laguna) for use in pi phases. models.json providers are
+    // always loaded as a static fallback.
+    "--mode", "json", "--no-session", "--no-skills",
     "--no-prompt-templates", "--no-context-files", "--tools", tools.join(","), "-p", prompt,
   ];
   if (model) args.unshift("--model", model);
