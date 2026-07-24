@@ -152,7 +152,24 @@ function validateName(name, label) {
   if (!/^[a-zA-Z0-9_.:-]+$/.test(name)) throw new Error(`${label}.name may only contain letters, numbers, _, ., :, and -`);
 }
 
-function validateSpec(spec) {
+function normalizePublicSpec(spec) {
+  if (!spec || typeof spec !== "object" || Array.isArray(spec) || !Array.isArray(spec.phases)) return spec;
+  return {
+    ...spec,
+    phases: spec.phases.map((phase) => {
+      if (!phase || typeof phase !== "object" || Array.isArray(phase)) return phase;
+      if (phase.type === "agent") return { ...phase, type: "pi" };
+      if (phase.type === "fanout") {
+        const { prompt, ...rest } = phase;
+        return { ...rest, type: "fanout_pi", promptTemplate: prompt };
+      }
+      return phase;
+    }),
+  };
+}
+
+function validateSpec(input) {
+  const spec = normalizePublicSpec(input);
   if (!spec || typeof spec !== "object" || Array.isArray(spec)) throw new Error("spec must be an object");
   const workflowKeys = new Set(["schema", "name", "description", "phases", "permissions", "cwd", "model", "timeoutMs", "concurrency", "autoContinue", "metadata"]);
   rejectUnknownKeys(spec, workflowKeys, "spec");

@@ -105,7 +105,7 @@ test("structured specs reject explicit and resolved fanouts above the item cap",
   }
 });
 
-test("fanout progress reaches total when failures are allowed", () => {
+test("canonical fanout phase format executes and progress reaches total when failures are allowed", () => {
   const temp = mkdtempSync(join(tmpdir(), "dynamic-fanout-progress-test-"));
   try {
     const fakePi = join(temp, "fake-pi.mjs");
@@ -115,7 +115,7 @@ test("fanout progress reaches total when failures are allowed", () => {
     const store = join(temp, "store");
     writeFileSync(specPath, JSON.stringify({
       name: "fanout-progress", permissions: "r", phases: [{
-        type: "fanout_pi", name: "allowed-failures", items: ["a", "b"], promptTemplate: "{{item}}", failOnItemFailure: false,
+        type: "fanout", name: "allowed-failures", items: ["a", "b"], prompt: "{{item}}", failOnItemFailure: false,
       }],
     }));
     const result = spawnSync(process.execPath, [cli, "--spec-file", specPath, "--cwd", temp], {
