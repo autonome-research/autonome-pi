@@ -59,6 +59,37 @@ test("monitor detail renders canonical owner metadata and stale reason", () => {
   assert.match(detail, /sessionId: session-42  launch source: background  cwd at launch: \/repo-at-launch/);
 });
 
+test("dashboard detail shows aggregate duration and total tokens without timestamp or token breakdown noise", () => {
+  const monitor = component([run({
+    normalizedStatus: "success",
+    status: "success",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T01:02:03.000Z",
+    usage: { entries: 2, inputTokens: 8000, outputTokens: 750, totalTokens: 8750, cachedInputTokens: 4000, models: { "test/model": {} } },
+    phases: [{
+      phase: "compile",
+      normalizedStatus: "success",
+      status: "success",
+      startedAt: "2026-01-01T00:01:00.000Z",
+      endedAt: "2026-01-01T00:03:03.000Z",
+      updatedAt: "2026-01-01T00:03:03.000Z",
+      usage: { entries: 1, inputTokens: 1000, outputTokens: 250, totalTokens: 1250, reasoningTokens: 100 },
+    }],
+  })]);
+
+  const list = text(monitor.render(100));
+  assert.match(list, /1h 2m 3s · 8\.8K tok/);
+
+  monitor.handleInput("\r");
+  monitor.handleInput("\r");
+  const detail = text(monitor.render(100));
+  assert.match(detail, /duration: 1h 2m 3s/);
+  assert.match(detail, /tokens: 8\.8K tok/);
+  assert.match(detail, /duration: 2m 3s/);
+  assert.match(detail, /tokens: 1\.3K tok/);
+  assert.doesNotMatch(detail, /started:|ended:|updated:|8K in|750 out|cached|reasoning|test\/model/);
+});
+
 test("h toggles the monitor stale-run filter and escape restores stale runs", () => {
   const monitor = component([
     run({ runId: "stale-run", workflow: "Stale Run", normalizedStatus: "running", status: "running", stale: { reason: "pid_not_running" } }),
