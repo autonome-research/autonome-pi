@@ -33,6 +33,7 @@ test("projectRun transitions a phase through start, event, and end", () => {
       phase: "build",
       status: store.STATUSES.RUNNING,
       message: "build started",
+      data: { type: "pi", model: "configured/model" },
     }),
     event("phase-progress", 2, store.EVENT_TYPES.PHASE_EVENT, {
       phase: "build",
@@ -50,6 +51,8 @@ test("projectRun transitions a phase through start, event, and end", () => {
   assert.equal(started.status, store.STATUSES.RUNNING);
   assert.equal(started.normalizedStatus, store.STATUSES.RUNNING);
   assert.equal(started.startedAt, events[1].timestamp);
+  assert.equal(started.type, "pi");
+  assert.equal(started.model, "configured/model");
   assert.equal(started.endedAt, undefined);
   assert.equal(started.eventCount, 0);
 

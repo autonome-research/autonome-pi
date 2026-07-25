@@ -73,6 +73,8 @@ test("dashboard detail shows aggregate duration and total tokens without timesta
       startedAt: "2026-01-01T00:01:00.000Z",
       endedAt: "2026-01-01T00:03:03.000Z",
       updatedAt: "2026-01-01T00:03:03.000Z",
+      lastMessage: "compile success",
+      model: "provider/inference-model",
       usage: { entries: 1, inputTokens: 1000, outputTokens: 250, totalTokens: 1250, reasoningTokens: 100 },
     }],
   })]);
@@ -87,7 +89,23 @@ test("dashboard detail shows aggregate duration and total tokens without timesta
   assert.match(detail, /tokens: 8\.8K tok/);
   assert.match(detail, /duration: 2m 3s/);
   assert.match(detail, /tokens: 1\.3K tok/);
-  assert.doesNotMatch(detail, /started:|ended:|updated:|8K in|750 out|cached|reasoning|test\/model/);
+  assert.match(detail, /compile — provider\/inference-model/);
+  assert.doesNotMatch(detail, /compile success|started:|ended:|updated:|8K in|750 out|cached|reasoning|test\/model/);
+});
+
+test("dashboard prefers observed inference models over a configured model pattern", () => {
+  const monitor = component([run({ normalizedStatus: "running", status: "running", phases: [{
+    phase: "review",
+    normalizedStatus: "success",
+    status: "success",
+    model: "configured/pattern",
+    usage: { entries: 2, models: { "actual/model-a": {}, "actual/model-b": {} } },
+  }] })]);
+  assert.match(text(monitor.render(100)), /review · actual\/model-a \+1/);
+  monitor.handleInput("\r");
+  const detail = text(monitor.render(100));
+  assert.match(detail, /review — actual\/model-a \+1/);
+  assert.doesNotMatch(detail, /configured\/pattern/);
 });
 
 test("h toggles the monitor stale-run filter and escape restores stale runs", () => {

@@ -81,7 +81,6 @@ High-value follow-ups:
 
 - Dynamic workflow hardening: add broader permission-matrix coverage.
 - Usage budgets: optionally fail/stop workflows when projected token usage exceeds configured limits.
-- Resume support: allow structured/dynamic workflows to resume/reuse completed phase artifacts after interruption.
 - Mission workflow follow-ups: validation categories/completion levels, operational-readiness contracts, heterogeneous model role policy, smarter repair planning, richer agent handoffs/shared mission notes, registry integrity/resume explain mode, external integration test conventions, and larger dogfood tests.
 
 ## Notes

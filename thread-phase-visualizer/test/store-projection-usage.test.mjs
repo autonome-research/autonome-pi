@@ -31,6 +31,7 @@ test("projectRun sums input, output, and reasoning tokens across usage events", 
   const projected = store.projectRun([
     usageEvent("snake-case", 1, {
       kind: "usage",
+      model: "provider/model-a",
       usage: {
         input_tokens: 10,
         output_tokens: 4,
@@ -63,6 +64,7 @@ test("projectRun sums input, output, and reasoning tokens across usage events", 
     },
   );
   assert.equal(projected.phases.length, 1);
+  assert.equal(projected.phases[0].model, "provider/model-a");
   assert.deepEqual(
     {
       inputTokens: projected.phases[0].usage.inputTokens,

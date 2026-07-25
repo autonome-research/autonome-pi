@@ -69,6 +69,28 @@ test("saved structured workflow executes by safe template name and records prove
   }
 });
 
+test("dynamic_workflow forwards resumeRunId without changing the compiled structured spec", async () => {
+  const testDir = mkdtempSync(join(tmpdir(), "dynamic-tool-resume-"));
+  const env = withTemplateEnvironment(testDir);
+  try {
+    const workflow = registeredTools().get("dynamic_workflow");
+    const params = {
+      name: "tool-resume",
+      permissions: "r",
+      phases: [{ type: "artifact", name: "result", content: "durable output" }],
+    };
+    const first = await workflow.execute("test", params, undefined, undefined, executionContext(testDir));
+    assert.equal(first.details.ok, true);
+    const resumed = await workflow.execute("test", { ...params, resumeRunId: first.details.runId }, undefined, undefined, executionContext(testDir));
+    assert.equal(resumed.details.ok, true);
+    assert.equal(resumed.details.resumedFromRunId, first.details.runId);
+    assert.equal(resumed.details.resumedPhaseCount, 1);
+  } finally {
+    env.restore();
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
 test("saved self-contained harness executes by safe template name", async () => {
   const testDir = mkdtempSync(join(tmpdir(), "dynamic-saved-harness-"));
   const env = withTemplateEnvironment(testDir);
@@ -122,6 +144,7 @@ test("saved templates reject ambiguous modes, traversal, symlinks, invalid JSON,
     await assert.rejects(workflow("test", { template: "missing" }, undefined, undefined, ctx), /Available: embedded-input, invalid, needs-input, valid, wrong-kind/);
     await assert.rejects(harness("test", { template: "harness-report", harness: "export default async()=>{}", permissions: "rwx" }, undefined, undefined, ctx), /exactly one of template, harness, or harnessFile/);
     await assert.rejects(harness("test", { template: "harness-report", inputs: { message: "x" }, permissions: "rwx" }, undefined, undefined, ctx), /only by saved structured workflow templates/);
+    await assert.rejects(harness("test", { harness: "export default async()=>{}", permissions: "rwx", resumeRunId: "source-run" }, undefined, undefined, ctx), /supported only for structured workflows/);
     assert.equal(existsSync(env.store), false, "template preflight failures must not create visualizer runs");
   } finally {
     env.restore();

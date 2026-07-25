@@ -127,6 +127,26 @@ Store reusable workflows under `~/.pi/agent/workflows/` (or `PI_DYNAMIC_WORKFLOW
 
 Missing or unused structured-template inputs fail preflight. Invocation-level workflow defaults override structured-template defaults; metadata is merged and records `savedTemplate`. Do not provide both `template` and `phases`, or combine a harness template with `harness`/`harnessFile`. Template names are safe identifiers rather than paths. Symlinks, non-files, traversal, and files above 1 MB fail preflight. Templates do not bypass permission ceilings or normal validation. Authoring remains explicit and file-based; the tools do not overwrite saved templates.
 
+## Structured artifact resume
+
+Structured workflows write an atomic `workflow-checkpoint.json` plus hashed per-phase output artifacts after each successfully completed phase. To continue an interrupted run, invoke the same workflow with `resumeRunId` set to the earlier run id:
+
+```json
+{
+  "name": "review-src",
+  "permissions": "r",
+  "resumeRunId": "review-src-...",
+  "phases": [
+    { "type": "agent", "name": "review", "prompt": "Review src." },
+    { "type": "artifact", "name": "report", "from": "review" }
+  ]
+}
+```
+
+Resume is fail-closed. The compiled spec, real working directory, effective model, and Pi session must match. Checkpoints must contain a contiguous prefix of matching phases, output files must remain inside the source run's artifact directory, and their sizes and SHA-256 hashes must verify. Validated outputs are copied into the new run's own checkpoint chain; completed phases are not re-executed, and execution continues at the first uncheckpointed phase. Harness workflows cannot use `resumeRunId`. A single resumable phase output is capped at 4 MB.
+
+Resume proves that the earlier phase completed and that its output artifact is intact. It cannot make an interrupted, non-checkpointed side effect idempotent; design shell/write phases accordingly.
+
 ## Advanced harnesses
 
 Use the separate `dynamic_workflow_harness` tool only for loops, branching, tournaments, custom scoring, or control flow that structured phases cannot represent. It requires explicit `permissions: "rwx"` and executes arbitrary unsandboxed JavaScript.
@@ -159,4 +179,5 @@ Prefer a standalone TypeScript extension using thread-phase directly when logic 
 8. Include a durable artifact when appropriate.
 9. Keep retries and fanout bounded.
 10. Use a saved template for repeated workflows; use direct phases for one-off composition.
-11. Use `dynamic_workflow_harness` only for genuinely advanced control flow.
+11. Use `resumeRunId` only with the identical structured workflow, cwd, model, and session.
+12. Use `dynamic_workflow_harness` only for genuinely advanced control flow.
