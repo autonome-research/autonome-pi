@@ -15,7 +15,7 @@ Autonome's Pi package for shared extensions, workflow tooling, and skills.
 ## Install
 
 ```bash
-pi install git:git@github.com:Code4me2/autonome-pi@v0.15.0
+pi install git:git@github.com:Code4me2/autonome-pi@v0.16.0
 ```
 
 For active development:
@@ -28,7 +28,7 @@ To migrate an installation that still uses the old repository identity:
 
 ```bash
 pi remove git:git@github.com:Code4me2/pi-thread-phase-tools@v0.12.0
-pi install git:git@github.com:Code4me2/autonome-pi@v0.15.0
+pi install git:git@github.com:Code4me2/autonome-pi@v0.16.0
 ```
 
 Pi identifies git packages by repository URL, so remove the old source before installing the renamed one to avoid loading both copies.
@@ -47,7 +47,7 @@ Pi identifies git packages by repository URL, so remove the old source before in
 
 ## Current status
 
-Latest release: `v0.15.0`.
+Latest release: `v0.16.0`.
 
 Recent changes:
 
@@ -67,6 +67,8 @@ Recent changes:
 - Reusable or operationally important workflows should graduate into standalone TypeScript extensions using thread-phase directly.
 - Dynamic workflows do not auto-continue by default; pass `autoContinue: true` for successful-run follow-up.
 - Reusable structured workflows and self-contained harnesses can be loaded by safe template name from `~/.pi/agent/workflows/`; template loading is bounded, rejects traversal/symlinks, preserves provenance, and still enforces normal validation and permission ceilings.
+- Structured workflows support fail-closed `resumeRunId` recovery through atomic checkpoint manifests and bounded, hashed phase-output artifacts; spec, cwd, model, session, phase identity, containment, size, and integrity must verify before reuse.
+- The workflow dashboard is available through selectable `/workflows` and `ctrl+shift+t` entry points, shows compact elapsed-time and aggregate-token metrics, and labels phase/fanout rows with observed inference models instead of redundant worded statuses.
 - Usage events are aggregated into run, phase, and fanout-item summaries and rendered in tools/monitor/completion cards.
 - `npm test` runs smoke coverage for extension load, permission denial before harness import, structured validation, JS harness mode, structured shell mode, usage projection, and mission registry/resume/strict-handoff checks.
 - The package now ships workflow skills so fresh Pi sessions get progressive-disclosure guidance for dynamic workflows and mission workflows.
