@@ -348,7 +348,9 @@ function legacyParametersSchema() {
 		model: Type.Optional(Type.String({ description: "Optional default Pi model pattern for pi/fanout_pi phases." })),
 		background: Type.Optional(Type.Boolean({ description: "Start the workflow in the background and return immediately." })),
 		autoContinue: Type.Optional(Type.Boolean({ description: "Queue a follow-up assistant continuation when the workflow completes successfully. Default false for dynamic workflows." })),
+		resumeRunId: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Prior structured run whose validated phase-output artifacts should be reused." })),
 		timeout: Type.Optional(Type.Number({ minimum: 1, maximum: MAX_TIMEOUT_MS, multipleOf: 1, description: "Default phase timeout in milliseconds (positive integer)." })),
+
 	});
 }
 
@@ -409,6 +411,7 @@ function workflowParametersSchema() {
 		concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 64, description: "Default fanout concurrency." })),
 		background: Type.Optional(Type.Boolean({ description: "Run in the background and return a run id immediately." })),
 		autoContinue: Type.Optional(Type.Boolean({ description: "After successful background completion, queue a follow-up in this Pi session." })),
+		resumeRunId: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Prior structured run whose validated completed phase artifacts should be reused. The spec, cwd, model, and session must match." })),
 		template: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", description: "Saved structured workflow name from ~/.pi/agent/workflows/<name>.json. Use instead of phases." })),
 		inputs: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Values for {{inputs.key}} placeholders in a saved structured workflow template." })),
 		metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Optional workflow metadata persisted with the compiled input." })),
@@ -463,11 +466,12 @@ function legacySpecToPublic(args: any): any {
 		...(args.timeout !== undefined ? { timeoutMs: args.timeout } : {}),
 		...(args.background !== undefined ? { background: args.background } : {}),
 		...(args.autoContinue !== undefined ? { autoContinue: args.autoContinue } : {}),
+		...(args.resumeRunId !== undefined ? { resumeRunId: args.resumeRunId } : {}),
 	};
 }
 
 function publicWorkflowToLegacySpec(params: any): any {
-	const { background: _background, template: _template, ...spec } = params;
+	const { background: _background, template: _template, resumeRunId: _resumeRunId, ...spec } = params;
 	return {
 		...spec,
 		phases: spec.phases.map((phase: any) => {
@@ -487,6 +491,7 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 	const hasHarnessFile = params.harnessFile !== undefined;
 	const inputModes = [hasSpec, hasHarness, hasHarnessFile].filter(Boolean).length;
 	if (inputModes !== 1) throw new Error("Provide exactly one of spec, harness, or harnessFile.");
+	if ((hasHarness || hasHarnessFile) && params.resumeRunId !== undefined) throw new Error("resumeRunId is supported only for structured workflows, not harnesses.");
 	if (hasSpec && (!params.spec || typeof params.spec !== "object" || Array.isArray(params.spec))) throw new Error("spec must be a non-null object.");
 	if (hasHarness && (typeof params.harness !== "string" || !params.harness.trim())) throw new Error("harness must be a non-empty string.");
 	if (hasHarnessFile && (typeof params.harnessFile !== "string" || !params.harnessFile.trim())) throw new Error("harnessFile must be a non-empty path.");
@@ -514,6 +519,7 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 		if (params.timeout !== undefined) args.push("--timeout", String(normalizeTimeoutMs(params.timeout, "timeout")));
 		if (params.background) args.push("--background");
 		if (params.autoContinue) args.push("--auto-continue");
+		if (params.resumeRunId) args.push("--resume-run-id", params.resumeRunId);
 		addSessionArgs(args, ctx);
 		onUpdate?.({ content: [{ type: "text", text: `Starting ${legacyName ? "dynamic thread-phase" : "dynamic"} workflow in ${cwd}...` }] });
 		const result = await runScript(args, cwd, signal);
@@ -542,6 +548,7 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 		"Use {{outputs.phase-name}} only to reference earlier phase outputs; fanout prompts may also use {{item}} and {{index}}.",
 		"Use dynamic_workflow background=true for long workflows and autoContinue=true only when a successful run should queue a follow-up.",
 		"Reusable structured workflows may be loaded by template name from ~/.pi/agent/workflows/<name>.json instead of supplying phases.",
+		"Set resumeRunId only for the same structured workflow, cwd, model, and Pi session; validated completed phase-output artifacts are reused and later phases continue.",
 	];
 
 	pi.registerTool({
@@ -561,6 +568,7 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 				model: resolved.model,
 				background: resolved.background,
 				autoContinue: resolved.autoContinue,
+				resumeRunId: resolved.resumeRunId,
 			}, signal, onUpdate, ctx, "");
 		},
 	});

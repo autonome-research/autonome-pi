@@ -81,6 +81,7 @@ export type ThreadPhaseFanoutItemSummary = {
   endedAt?: string;
   lastMessage?: string;
   error?: unknown;
+  model?: string;
   usage?: ThreadPhaseUsageSummary;
 };
 
@@ -146,6 +147,8 @@ export type ThreadPhasePhaseSummary = {
   endedAt?: string;
   eventCount: number;
   lastMessage?: string;
+  type?: string;
+  model?: string;
   progress?: { current?: number; total?: number; percent?: number; message?: string };
   fanout?: ThreadPhaseFanoutSummary;
   usage?: ThreadPhaseUsageSummary;

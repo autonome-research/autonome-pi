@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { accessSync, constants as fsConstants, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, closeSync, constants as fsConstants, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -42,6 +42,9 @@ const MAX_FANOUT_CONCURRENCY = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_CONCUR
 const MAX_FANOUT_ITEMS = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_FANOUT_ITEMS || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_FANOUT_ITEMS || 1_000);
 const MAX_PHASE_TIMEOUT_MS = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_PHASE_TIMEOUT_MS || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_PHASE_TIMEOUT_MS || 60 * 60 * 1000);
 const MAX_OUTPUT_BYTES = 250_000;
+const MAX_RESUME_MANIFEST_BYTES = 1_000_000;
+const MAX_RESUME_OUTPUT_BYTES = 4_000_000;
+const RESUME_RUN_ID = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$/;
 const DEFAULT_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_WORKFLOW_DEFAULT_PERMISSIONS || process.env.PI_DYNAMIC_THREAD_PHASE_DEFAULT_PERMISSIONS || "r", "PI_DYNAMIC_WORKFLOW_DEFAULT_PERMISSIONS");
 const MAX_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_PERMISSIONS || "rwx", "PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS");
 
@@ -535,6 +538,177 @@ function safeStringify(value) {
   }, 2);
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value === undefined ? null : value);
+}
+
+function workflowFingerprint(spec, cwd, model) {
+  return createHash("sha256").update(canonicalJson({ spec, cwd: realpathSync(cwd), model: model || null })).digest("hex");
+}
+
+function readBoundedRegularFile(file, maxBytes, label) {
+  let descriptor;
+  try {
+    descriptor = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+    const info = fstatSync(descriptor);
+    if (!info.isFile()) throw new Error(`${label} must be a regular file`);
+    if (info.size > maxBytes) throw new Error(`${label} exceeds ${maxBytes} bytes`);
+    const buffer = Buffer.allocUnsafe(info.size);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const count = readSync(descriptor, buffer, offset, buffer.length - offset, offset);
+      if (count === 0) break;
+      offset += count;
+    }
+    return buffer.subarray(0, offset);
+  } catch (error) {
+    throw new Error(`Could not read ${label}: ${error?.message || error}`);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function resumeRunDirectory(runId) {
+  if (typeof runId !== "string" || !RESUME_RUN_ID.test(runId)) throw new Error("resumeRunId must be a safe workflow run identifier, not a path");
+  const root = realpathSync(ARTIFACTS_DIR);
+  const candidate = join(root, runId);
+  const info = lstatSync(candidate);
+  if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`Resume source must be a regular artifact directory: ${runId}`);
+  const realCandidate = realpathSync(candidate);
+  if (dirname(realCandidate) !== root) throw new Error(`Resume source resolves outside the workflow artifact store: ${runId}`);
+  return realCandidate;
+}
+
+function parseBoundedJson(file, maxBytes, label) {
+  try {
+    return JSON.parse(readBoundedRegularFile(file, maxBytes, label).toString("utf8"));
+  } catch (error) {
+    if (String(error?.message || error).startsWith("Could not read")) throw error;
+    throw new Error(`Could not parse ${label}: ${error?.message || error}`);
+  }
+}
+
+function phaseOutputFileName(index, phaseName) {
+  return `${String(index).padStart(2, "0")}-${safeName(phaseName)}.txt`;
+}
+
+function hashText(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function loadResumeState(runId, { spec, cwd, model, sessionId }) {
+  const sourceDir = resumeRunDirectory(runId);
+  const manifest = parseBoundedJson(join(sourceDir, "workflow-checkpoint.json"), MAX_RESUME_MANIFEST_BYTES, "workflow resume checkpoint");
+  if (manifest?.schema !== "pi-dynamic-workflow-checkpoint/v1") throw new Error("Resume checkpoint has an unsupported schema");
+  if (manifest.runId !== runId) throw new Error("Resume checkpoint runId does not match its artifact directory");
+  if (manifest.cwd !== realpathSync(cwd)) throw new Error(`Resume checkpoint cwd does not match this invocation: ${manifest.cwd || "unknown"}`);
+  const normalizedSessionId = sessionId ? String(sessionId) : undefined;
+  if ((manifest.sessionId || normalizedSessionId) && manifest.sessionId !== normalizedSessionId) throw new Error("Resume checkpoint belongs to a different Pi session");
+  const sourceSpec = validateSpec(parseBoundedJson(join(sourceDir, "workflow-spec.json"), MAX_RESUME_MANIFEST_BYTES, "resume source workflow spec"));
+  const sourceFingerprint = workflowFingerprint(sourceSpec, cwd, manifest.model);
+  const requestedFingerprint = workflowFingerprint(spec, cwd, model);
+  if (manifest.specHash !== sourceFingerprint || requestedFingerprint !== sourceFingerprint) throw new Error("Resume checkpoint does not match the requested structured workflow spec, cwd, and model");
+  if (!Array.isArray(manifest.completed) || manifest.completed.length > spec.phases.length) throw new Error("Resume checkpoint completed-phase list is invalid");
+
+  const outputDir = join(sourceDir, "phase-outputs");
+  if (manifest.completed.length) {
+    const outputDirInfo = lstatSync(outputDir);
+    if (outputDirInfo.isSymbolicLink() || !outputDirInfo.isDirectory() || dirname(realpathSync(outputDir)) !== sourceDir) throw new Error("Resume phase-output directory failed containment validation");
+  }
+  const entries = manifest.completed.map((entry, index) => {
+    const phase = spec.phases[index];
+    if (!entry || entry.index !== index || entry.name !== phase?.name || entry.type !== phase?.type) throw new Error(`Resume checkpoint phase ${index} does not match the requested workflow`);
+    const expectedFile = phaseOutputFileName(index, phase.name);
+    if (entry.outputFile !== `phase-outputs/${expectedFile}`) throw new Error(`Resume checkpoint phase ${phase.name} has an invalid output artifact path`);
+    const output = readBoundedRegularFile(join(outputDir, expectedFile), MAX_RESUME_OUTPUT_BYTES, `resume output for phase ${phase.name}`).toString("utf8");
+    if (Buffer.byteLength(output, "utf8") !== entry.outputBytes || hashText(output) !== entry.outputSha256) throw new Error(`Resume output for phase ${phase.name} failed integrity validation`);
+    return { ...entry, output };
+  });
+  return { sourceRunId: runId, entries, specHash: sourceFingerprint };
+}
+
+function phaseModel(ctx, phase) {
+  const result = ctx.results[phase.name];
+  const values = Array.isArray(result) ? result.map((item) => item?.model) : [result?.model];
+  const models = [...new Set(values.filter(Boolean).map(String))];
+  return models.length ? models.join(", ") : phase.model || ctx.model;
+}
+
+function persistResumeCheckpoint(ctx) {
+  const runDir = join(ARTIFACTS_DIR, ctx.visualizerRun.runId);
+  ctx.checkpoint.updatedAt = new Date().toISOString();
+  const checkpointPath = join(runDir, "workflow-checkpoint.json");
+  const checkpointTemporary = `${checkpointPath}.${process.pid}.tmp`;
+  writeFileSync(checkpointTemporary, safeStringify(ctx.checkpoint), { encoding: "utf8", flag: "wx" });
+  renameSync(checkpointTemporary, checkpointPath);
+  artifact(ctx.visualizerRun, { kind: "json", title: "Workflow resume checkpoint", path: checkpointPath, metadata: { resumablePhases: ctx.checkpoint.completed.length } });
+  return checkpointPath;
+}
+
+function writeResumeCheckpoint(ctx, phase, index, resume = {}) {
+  if (!ctx.checkpoint || ctx.checkpoint.completed.length !== index) throw new Error(`Cannot checkpoint non-contiguous phase ${phase.name}`);
+  const output = String(ctx.outputs[phase.name] ?? "");
+  const outputBytes = Buffer.byteLength(output, "utf8");
+  if (outputBytes > MAX_RESUME_OUTPUT_BYTES) throw new Error(`Phase ${phase.name} output exceeds the ${MAX_RESUME_OUTPUT_BYTES}-byte resume artifact limit`);
+  const runDir = join(ARTIFACTS_DIR, ctx.visualizerRun.runId);
+  const outputDir = join(runDir, "phase-outputs");
+  mkdirSync(outputDir, { recursive: true });
+  const outputFileName = phaseOutputFileName(index, phase.name);
+  const outputPath = join(outputDir, outputFileName);
+  const outputTemporary = `${outputPath}.${process.pid}.tmp`;
+  writeFileSync(outputTemporary, output, { encoding: "utf8", flag: "wx" });
+  renameSync(outputTemporary, outputPath);
+  const entry = {
+    index,
+    name: phase.name,
+    type: phase.type,
+    outputFile: `phase-outputs/${outputFileName}`,
+    outputBytes,
+    outputSha256: hashText(output),
+    model: phaseModel(ctx, phase),
+    resumedFromRunId: resume.sourceRunId,
+  };
+  ctx.checkpoint.completed.push(entry);
+  persistResumeCheckpoint(ctx);
+  return entry;
+}
+
+function checkpointPhase(base, specPhase, index) {
+  return {
+    ...base,
+    async *run(ctx, ...args) {
+      yield* base.run(ctx, ...args);
+      writeResumeCheckpoint(ctx, specPhase, index);
+    },
+  };
+}
+
+function phaseDisplayInput(phase, ctx, extra = {}) {
+  return { type: phase.type, model: phase.model || ctx.model, ...extra };
+}
+
+function restoreCompletedPhases(ctx, resumeState) {
+  for (const entry of resumeState?.entries || []) {
+    if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
+    const phase = ctx.spec.phases[entry.index];
+    ctx.outputs[phase.name] = entry.output;
+    ctx.results[phase.name] = { resumed: true, sourceRunId: resumeState.sourceRunId, model: entry.model };
+    phaseStart(ctx.visualizerRun, phase.name, phaseDisplayInput(phase, ctx, { resumedFromRunId: resumeState.sourceRunId }));
+    try {
+      phaseEvent(ctx.visualizerRun, phase.name, { kind: "resume", model: entry.model, sourceRunId: resumeState.sourceRunId, message: `Reused validated output artifact from ${resumeState.sourceRunId}` });
+      writeResumeCheckpoint(ctx, phase, entry.index, resumeState);
+      phaseEnd(ctx.visualizerRun, phase.name, STATUSES.SUCCESS, { resumed: true, sourceRunId: resumeState.sourceRunId });
+    } catch (error) {
+      phaseEnd(ctx.visualizerRun, phase.name, STATUSES.FAILED, { resumed: true, sourceRunId: resumeState.sourceRunId, error: { message: error?.message || String(error) } });
+      throw error;
+    }
+  }
+}
+
 function emitTextArtifact(ctx, phase, content, defaults = {}) {
   const artifactSpec = phase.artifact;
   if (artifactSpec === false) return undefined;
@@ -649,7 +823,7 @@ async function* runFanoutPiPhase(ctx, phase) {
         if (result.usage?.length) phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", itemId: `${index}:${item}`, item, index, usage: result.usage, model: result.model });
         terminal++;
         if (result.ok) successful++; else failed++;
-        push({ type: "fanout", kind: "fanout_item_end", itemId: `${index}:${item}`, label: item, index, status: result.ok ? STATUSES.SUCCESS : STATUSES.FAILED, message: result.ok ? `Complete ${item}` : `Failed ${item}`, error: result.error });
+        push({ type: "fanout", kind: "fanout_item_end", itemId: `${index}:${item}`, label: item, index, status: result.ok ? STATUSES.SUCCESS : STATUSES.FAILED, model: result.model, message: result.ok ? `Complete ${item}` : `Failed ${item}`, error: result.error });
         push({ type: "progress", kind: "progress", completed: terminal, total: items.length, message: `${terminal}/${items.length} settled (${successful} successful)` });
         return { item, index, ok: result.ok, text, model: result.model, stopReason: result.stopReason, error: result.error };
       } catch (error) {
@@ -816,6 +990,7 @@ async function main() {
   if (harnessInput !== undefined && !String(harnessInput).trim()) throw new Error("workflow harness path must be non-empty");
   let harnessFile = harnessInput !== undefined ? preflightHarnessFile(harnessInput) : undefined;
   if (harnessFile && (args.spec || args["spec-file"])) throw new Error("Provide either spec input or --js-file, not both");
+  if (harnessFile && args["resume-run-id"] !== undefined) throw new Error("resumeRunId is supported only for structured workflows, not JavaScript harnesses");
   const spec = harnessFile
     ? (() => {
         if (!args.permissions) throw new Error("JavaScript harness mode requires explicit --permissions rwx");
@@ -839,13 +1014,20 @@ async function main() {
   if (await maybeBackground(rawArgv, args)) return;
   const cwd = resolve(String(args.cwd || spec.cwd || process.cwd()));
   if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new Error(`workflow cwd is not a directory: ${cwd}`);
+  const effectiveModel = args.model ? String(args.model) : spec.model;
+  const resumeState = args["resume-run-id"] === undefined ? undefined : loadResumeState(String(args["resume-run-id"]), {
+    spec,
+    cwd,
+    model: effectiveModel,
+    sessionId: args["session-id"],
+  });
   const workflow = spec.name || "dynamic-workflow";
   const visualizerRun = createRun({
     workflow,
     cwd,
     trigger: { kind: process.env.PI_DYNAMIC_WORKFLOW_BACKGROUND || process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND ? "background" : "manual", dynamic: true },
     input: spec,
-    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, mode: harnessFile ? "javascript" : "spec", permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, autoContinue: isTruthyFlag(args["auto-continue"] ?? spec.autoContinue), sessionId: args["session-id"], sessionFile: args["session-file"] },
+    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, mode: harnessFile ? "javascript" : "spec", permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, autoContinue: isTruthyFlag(args["auto-continue"] ?? spec.autoContinue), sessionId: args["session-id"], sessionFile: args["session-file"], resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length },
     message: `${workflow} started`,
   });
   activeRun = visualizerRun;
@@ -882,12 +1064,23 @@ async function main() {
       visualizerRun,
       spec,
       cwd,
-      model: args.model ? String(args.model) : spec.model,
+      model: effectiveModel,
       timeoutMs,
       outputs: {},
       results: {},
       signal: controller.signal,
+      checkpoint: {
+        schema: "pi-dynamic-workflow-checkpoint/v1",
+        runId: visualizerRun.runId,
+        workflow,
+        cwd: realpathSync(cwd),
+        model: effectiveModel,
+        sessionId: args["session-id"] ? String(args["session-id"]) : undefined,
+        specHash: workflowFingerprint(spec, cwd, effectiveModel),
+        completed: [],
+      },
     };
+    if (!harnessFile) persistResumeCheckpoint(ctx);
     if (args["ready-file"]) {
       const readyFile = String(args["ready-file"]);
       const readyTemp = `${readyFile}.${process.pid}.tmp`;
@@ -900,20 +1093,27 @@ async function main() {
         // wrapPhases mirrors phase lifecycle and yielded events to the visualizer.
       }
     } else {
-      const compiled = spec.phases.map((phase) => {
+      restoreCompletedPhases(ctx, resumeState);
+      const resumedCount = resumeState?.entries.length || 0;
+      const remaining = spec.phases.slice(resumedCount).map((phase, relativeIndex) => {
+        const index = resumedCount + relativeIndex;
         const base = dynamicPhase(phase);
-        return phase.retry ? withRetry(base, phase.retry) : base;
+        const retrying = phase.retry ? withRetry(base, phase.retry) : base;
+        return checkpointPhase(retrying, phase, index);
       });
-      const phases = wrapPhases(compiled, visualizerRun);
-      for await (const _event of runPipeline(phases, ctx, { signal: controller.signal })) {
-        // wrapPhases mirrors phase lifecycle and yielded events to the visualizer.
+      const displayOptions = Object.fromEntries(spec.phases.slice(resumedCount).map((phase) => [phase.name, { input: (runCtx) => phaseDisplayInput(phase, runCtx) }]));
+      const phases = wrapPhases(remaining, visualizerRun, displayOptions);
+      if (phases.length) {
+        for await (const _event of runPipeline(phases, ctx, { signal: controller.signal })) {
+          // wrapPhases mirrors phase lifecycle and yielded events to the visualizer.
+        }
       }
     }
     if (controller.signal.aborted) throw abortError(controller.signal.reason || "cancelled");
     const resultPath = writeWorkflowResult(ctx, STATUSES.SUCCESS);
-    completeRun(visualizerRun, STATUSES.SUCCESS, { ok: true, phases: spec.phases?.length ?? 1, mode: harnessFile ? "harness" : "spec", resultPath });
+    completeRun(visualizerRun, STATUSES.SUCCESS, { ok: true, phases: spec.phases?.length ?? 1, mode: harnessFile ? "harness" : "spec", resultPath, resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length || 0 });
     activeRun = undefined;
-    console.log(JSON.stringify({ ok: true, runId: visualizerRun.runId, workflow, cwd, resultPath }, null, 2));
+    console.log(JSON.stringify({ ok: true, runId: visualizerRun.runId, workflow, cwd, resultPath, resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length || 0 }, null, 2));
   } catch (error) {
     const cancelled = cancellationRequested || isAbortError(error) || controller.signal.aborted;
     try {

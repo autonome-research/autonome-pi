@@ -212,6 +212,27 @@ Use exactly one of `template`, `harness`, or `harnessFile`. Saved harnesses rema
 
 Template names are identifiers, not paths. Traversal and symlinked files are rejected, files must be regular files no larger than 1 MB, and parse/preflight failures occur before a visualizer run is created. Template authoring is intentionally file-based; this tool does not silently create or overwrite persistent templates.
 
+## Structured artifact resume
+
+After every successfully completed structured phase, the runner atomically writes a `workflow-checkpoint.json` manifest and a hashed output file under that run's `phase-outputs/` artifact directory. Continue an interrupted workflow by supplying the earlier run id with the otherwise identical invocation:
+
+```json
+{
+  "name": "review-and-fix",
+  "permissions": "rw",
+  "resumeRunId": "review-and-fix-...",
+  "phases": [
+    { "type": "agent", "name": "review", "permissions": "r", "prompt": "Review the repository." },
+    { "type": "agent", "name": "fix", "prompt": "Implement {{outputs.review}}." },
+    { "type": "artifact", "name": "report", "from": "fix" }
+  ]
+}
+```
+
+Resume validates the compiled spec, real cwd, effective model, Pi session, contiguous phase identities, artifact containment, output size, and SHA-256 hash before creating the new run. Validated outputs are copied into the new run's checkpoint chain, completed phases are represented in its lifecycle without re-execution, and execution starts at the first uncheckpointed phase. Any mismatch fails preflight. JavaScript harnesses cannot be resumed this way.
+
+A checkpoint proves completion only for phases whose output artifact was durably written. An interrupted phase runs again, so side-effecting shell/write phases still need idempotent design. Each resumable phase output is capped at 4 MB.
+
 ## Advanced JavaScript harnesses
 
 `dynamic_workflow_harness` is a separate advanced tool for loops, branching, tournaments, custom scoring, or other control flow that structured phases cannot express. Harness code is arbitrary unsandboxed Node.js and requires explicit `permissions: "rwx"`.
@@ -252,6 +273,8 @@ Advanced harness CLI:
 ## Runtime bounds
 
 - Saved structured/harness template file: 1 MB
+- Resumable phase output artifact: 4 MB
+- Resume checkpoint manifest: 1 MB
 - Workflow phase count: 30
 - Fanout items: 1,000
 - Fanout concurrency: 64

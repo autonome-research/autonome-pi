@@ -62,8 +62,17 @@ function currentPhaseText(run: RunSummary): string {
 	const phase = [...phases].reverse().find((p) => p.normalizedStatus === STATUSES.RUNNING) || phases[phases.length - 1];
 	if (!phase) return "";
 	const progress = phase.fanout ? formatFanout(phase.fanout) : formatProgress(phase.progress);
+	const inference = inferenceLabel(phase);
 	const io = run.activeIo?.component || run.activeIo?.role || run.activeIo?.command;
-	return `${phase.phase || "phase"}${progress}${io ? ` · io:${String(io).slice(0, 32)}` : ""}`;
+	return `${phase.phase || "phase"}${progress}${inference ? ` · ${inference}` : ""}${io ? ` · io:${String(io).slice(0, 32)}` : ""}`;
+}
+
+function inferenceLabel(value: Record<string, any>): string {
+	const models = value?.usage?.models && typeof value.usage.models === "object" ? Object.keys(value.usage.models).filter(Boolean) : [];
+	if (models.length === 1) return models[0];
+	if (models.length > 1) return `${models[0]} +${models.length - 1}`;
+	if (value?.model) return String(value.model);
+	return value?.type === "shell" || value?.type === "artifact" ? value.type : "";
 }
 
 function cwdLabel(cwd: string | undefined): string {
@@ -500,7 +509,8 @@ export class ThreadPhaseMonitorComponent {
 			const progress = phase.fanout ? formatFanout(phase.fanout) : formatProgress(phase.progress);
 			const selected = itemCursor === this.selectedDetail;
 			const prefix = selected ? t.fg("accent", "›") : " ";
-			add(`${prefix} ${t.fg(statusColor(pStatus), phaseStatusGlyph(pStatus))} ${selected ? t.fg("accent", phase.phase || "phase") : phase.phase || "phase"}${t.fg("muted", progress)}${phase.lastMessage ? t.fg("dim", ` — ${phase.lastMessage}`) : ""}`, true);
+			const inference = inferenceLabel(phase);
+			add(`${prefix} ${t.fg(statusColor(pStatus), phaseStatusGlyph(pStatus))} ${selected ? t.fg("accent", phase.phase || "phase") : phase.phase || "phase"}${t.fg("muted", progress)}${inference ? t.fg("dim", ` — ${inference}`) : ""}`, true);
 			if (this.expandedPhase === itemCursor - 1) fanoutVisibleRange = this.addPhaseDetails(lines, phase, width);
 		}
 		add("");
@@ -536,7 +546,8 @@ export class ThreadPhaseMonitorComponent {
 		for (const item of page.items) {
 			const iStatus = item.normalizedStatus || item.status;
 			const tokens = formatTotalTokens(item.usage);
-			lines.push(truncateToWidth(`      ${t.fg(statusColor(iStatus), statusIcon(iStatus))} ${item.label || item.itemId}${tokens ? t.fg("muted", ` · ${tokens}`) : ""}${item.lastMessage ? t.fg("dim", ` — ${item.lastMessage}`) : ""}`, width));
+			const inference = inferenceLabel(item);
+			lines.push(truncateToWidth(`      ${t.fg(statusColor(iStatus), statusIcon(iStatus))} ${item.label || item.itemId}${tokens ? t.fg("muted", ` · ${tokens}`) : ""}${inference ? t.fg("dim", ` — ${inference}`) : ""}`, width));
 		}
 		// Track the complete expanded fanout block rather than one anchor line so
 		// expansion, page changes, and responsive re-renders can keep the page

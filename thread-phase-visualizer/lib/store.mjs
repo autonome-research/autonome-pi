@@ -1152,6 +1152,8 @@ export function projectRun(events = [], options = {}) {
         updatedAt: event.timestamp,
         eventCount: 0,
         lastMessage: event.message,
+        type: event.data?.type,
+        model: event.data?.model,
       });
     }
     if (event.type === EVENT_TYPES.PHASE_EVENT && event.phase) {
@@ -1163,6 +1165,8 @@ export function projectRun(events = [], options = {}) {
       });
       phase.updatedAt = event.timestamp || phase.updatedAt;
       phase.lastMessage = event.message || phase.lastMessage;
+      if (event.data?.model) phase.model = String(event.data.model);
+      if (event.data?.key === "model" && event.data?.value) phase.model = String(event.data.value);
       phase.eventCount = (phase.eventCount || 0) + 1;
       const progress = extractProgress(event.data);
       if (progress) {
@@ -1932,6 +1936,7 @@ function applyFanoutUsage(phase, data, usage, model) {
   const item = phase._fanoutItemMap?.[itemId];
   if (!item) return;
   item.usage ||= emptyUsageSummary();
+  if (model) item.model = String(model);
   addUsage(item.usage, usage, model);
 }
 
@@ -1987,6 +1992,7 @@ function applyFanoutEvent(phase, data, event) {
   };
   item.label = data.label || item.label;
   item.index = data.index ?? item.index;
+  if (data.model) item.model = String(data.model);
   item.updatedAt = event.timestamp;
   item.lastMessage = data.message || item.lastMessage;
 
