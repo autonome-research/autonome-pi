@@ -83,7 +83,7 @@ function abortError(reason = "cancelled") {
 }
 
 function isAbortError(error) {
-  return error?.name === "AbortError" || /aborted|cancelled/i.test(String(error?.message || error));
+  return error?.name === "AbortError" || error?.code === "ABORT_ERR";
 }
 
 function requestCancel(signalName = "SIGTERM") {

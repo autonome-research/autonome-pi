@@ -171,6 +171,47 @@ Top-level controls:
 
 Use `background: true` for long workflows. `autoContinue` defaults to false.
 
+## Saved workflow templates
+
+Reusable workflows can be stored under `~/.pi/agent/workflows/`. Set `PI_DYNAMIC_WORKFLOW_TEMPLATE_DIR` to use a different operator-managed directory.
+
+A structured template is a flat `dynamic_workflow` JSON object saved as `<name>.json`:
+
+```json
+{
+  "name": "repository-review",
+  "permissions": "r",
+  "background": true,
+  "phases": [
+    { "type": "agent", "name": "review", "prompt": "Review {{inputs.target}} in the current repository. Do not modify files." },
+    { "type": "artifact", "name": "report", "title": "Repository review", "from": "review" }
+  ]
+}
+```
+
+Invoke `~/.pi/agent/workflows/repository-review.json` with:
+
+```json
+{
+  "template": "repository-review",
+  "inputs": { "target": "src" },
+  "autoContinue": true,
+  "metadata": { "requestedBy": "operator" }
+}
+```
+
+Use exactly one of `template` or `phases`. `{{inputs.key}}` placeholders make structured templates reusable: an exact placeholder preserves the input's JSON type, while a placeholder embedded in text requires a scalar. Missing and unused inputs fail preflight to catch mistakes. Invocation-level workflow controls override template defaults; metadata is merged, and `metadata.savedTemplate` records the selected template. Phases cannot be replaced at invocation time. The normal schema, permission ceiling, semantic preflight, cancellation, and runtime bounds still apply after loading.
+
+A saved advanced harness is a self-contained `<name>.mjs` file in the same directory. Invoke it through the separate harness tool:
+
+```json
+{ "template": "custom-tournament", "permissions": "rwx", "background": true }
+```
+
+Use exactly one of `template`, `harness`, or `harnessFile`. Saved harnesses remain arbitrary unsandboxed JavaScript and still require explicit `rwx`. They must be self-contained because the runner executes a durable copy from the run artifact directory.
+
+Template names are identifiers, not paths. Traversal and symlinked files are rejected, files must be regular files no larger than 1 MB, and parse/preflight failures occur before a visualizer run is created. Template authoring is intentionally file-based; this tool does not silently create or overwrite persistent templates.
+
 ## Advanced JavaScript harnesses
 
 `dynamic_workflow_harness` is a separate advanced tool for loops, branching, tournaments, custom scoring, or other control flow that structured phases cannot express. Harness code is arbitrary unsandboxed Node.js and requires explicit `permissions: "rwx"`.
@@ -210,6 +251,7 @@ Advanced harness CLI:
 
 ## Runtime bounds
 
+- Saved structured/harness template file: 1 MB
 - Workflow phase count: 30
 - Fanout items: 1,000
 - Fanout concurrency: 64

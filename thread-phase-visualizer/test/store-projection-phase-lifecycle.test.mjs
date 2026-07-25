@@ -118,6 +118,13 @@ test("projectRun closes open phases only after observing workflow_end", () => {
 
   const withWorkflowEnd = store.projectRun([phaseEventOnly, error, workflowEnd]);
   assert.equal(withWorkflowEnd.normalizedStatus, store.STATUSES.FAILED);
+  assert.equal(withWorkflowEnd.endedAt, workflowEnd.timestamp);
   assert.equal(withWorkflowEnd.phases[0].normalizedStatus, store.STATUSES.FAILED);
   assert.equal(withWorkflowEnd.phases[0].endedAt, workflowEnd.timestamp);
+
+  const laterArtifact = event("later-artifact", 4, store.EVENT_TYPES.ARTIFACT, { artifact: { kind: "file", path: "/tmp/result" } });
+  const withLaterArtifact = store.projectRun([phaseEventOnly, error, workflowEnd, laterArtifact]);
+  assert.equal(withLaterArtifact.updatedAt, laterArtifact.timestamp);
+  assert.equal(withLaterArtifact.endedAt, workflowEnd.timestamp, "post-terminal artifacts must not inflate elapsed workflow time");
+  assert.equal(withLaterArtifact.phases[0].endedAt, workflowEnd.timestamp);
 });

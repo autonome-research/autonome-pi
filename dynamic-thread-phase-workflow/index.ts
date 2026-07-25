@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, mkdtempSync, openSync, readSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -17,6 +17,155 @@ const MAX_RUNNER_CAPTURE_BYTES = 1_000_000;
 // SIGTERM to SIGKILL. Keep the wrapper alive longer so that escalation cannot
 // be cut off and leave detached descendants behind.
 const RUNNER_KILL_GRACE_MS = 8_000;
+const MAX_SAVED_TEMPLATE_BYTES = 1_000_000;
+const SAVED_TEMPLATE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+
+function savedWorkflowDirectory(): string {
+	return path.resolve(process.env.PI_DYNAMIC_WORKFLOW_TEMPLATE_DIR || path.join(homedir(), ".pi", "agent", "workflows"));
+}
+
+function availableSavedTemplates(extension: ".json" | ".mjs"): string[] {
+	const directory = savedWorkflowDirectory();
+	try {
+		return readdirSync(directory)
+			.filter((entry) => entry.endsWith(extension))
+			.filter((entry) => {
+				try {
+					const info = lstatSync(path.join(directory, entry));
+					return info.isFile() && !info.isSymbolicLink() && info.size <= MAX_SAVED_TEMPLATE_BYTES;
+				} catch {
+					return false;
+				}
+			})
+			.map((entry) => entry.slice(0, -extension.length))
+			.filter((entry) => SAVED_TEMPLATE_NAME.test(entry))
+			.sort()
+			.slice(0, 50);
+	} catch {
+		return [];
+	}
+}
+
+function savedTemplatePath(name: unknown, extension: ".json" | ".mjs"): string {
+	if (typeof name !== "string" || !SAVED_TEMPLATE_NAME.test(name)) {
+		throw new Error("Saved workflow template names must start with an alphanumeric character and contain only letters, numbers, _, ., and -; paths are not accepted.");
+	}
+	const directory = savedWorkflowDirectory();
+	const candidate = path.join(directory, `${name}${extension}`);
+	let info;
+	try {
+		info = lstatSync(candidate);
+	} catch (error: any) {
+		if (error?.code !== "ENOENT") throw error;
+		const available = availableSavedTemplates(extension);
+		throw new Error(`Saved workflow template ${name}${extension} was not found under ${directory}.${available.length ? ` Available: ${available.join(", ")}` : ""}`);
+	}
+	if (info.isSymbolicLink()) throw new Error(`Saved workflow template must not be a symbolic link: ${candidate}`);
+	if (!info.isFile()) throw new Error(`Saved workflow template must be a regular file: ${candidate}`);
+	if (info.size > MAX_SAVED_TEMPLATE_BYTES) throw new Error(`Saved workflow template exceeds the ${MAX_SAVED_TEMPLATE_BYTES}-byte limit: ${candidate}`);
+	const realDirectory = realpathSync(directory);
+	const realCandidate = realpathSync(candidate);
+	const relative = path.relative(realDirectory, realCandidate);
+	if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error(`Saved workflow template resolves outside its template directory: ${candidate}`);
+	return realCandidate;
+}
+
+function readSavedTemplate(name: unknown, extension: ".json" | ".mjs"): { file: string; source: string } {
+	const file = savedTemplatePath(name, extension);
+	let descriptor: number | undefined;
+	try {
+		descriptor = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+		const info = fstatSync(descriptor);
+		if (!info.isFile()) throw new Error(`Saved workflow template must remain a regular file: ${file}`);
+		if (info.size > MAX_SAVED_TEMPLATE_BYTES) throw new Error(`Saved workflow template exceeds the ${MAX_SAVED_TEMPLATE_BYTES}-byte limit: ${file}`);
+		const buffer = Buffer.allocUnsafe(MAX_SAVED_TEMPLATE_BYTES + 1);
+		let bytesRead = 0;
+		while (bytesRead < buffer.length) {
+			const count = readSync(descriptor, buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+			if (count === 0) break;
+			bytesRead += count;
+		}
+		if (bytesRead > MAX_SAVED_TEMPLATE_BYTES) throw new Error(`Saved workflow template exceeds the ${MAX_SAVED_TEMPLATE_BYTES}-byte limit: ${file}`);
+		return { file, source: buffer.subarray(0, bytesRead).toString("utf8") };
+	} finally {
+		if (descriptor !== undefined) closeSync(descriptor);
+	}
+}
+
+function loadStructuredTemplate(name: unknown): any {
+	const { file, source } = readSavedTemplate(name, ".json");
+	let template;
+	try {
+		template = JSON.parse(source);
+	} catch (error: any) {
+		throw new Error(`Could not parse saved workflow template ${file}: ${error?.message || error}`);
+	}
+	if (!template || typeof template !== "object" || Array.isArray(template)) throw new Error(`Saved workflow template must contain a JSON object: ${file}`);
+	if (!Array.isArray(template.phases) || template.phases.length === 0) throw new Error(`Saved workflow template must contain a non-empty phases array: ${file}`);
+	if (["template", "inputs", "harness", "harnessFile", "spec"].some((key) => template[key] !== undefined)) throw new Error(`Saved structured workflow templates may contain only flat dynamic_workflow arguments: ${file}`);
+	return template;
+}
+
+function definedProperties(value: any): any {
+	return Object.fromEntries(Object.entries(value).filter(([, nested]) => nested !== undefined));
+}
+
+const SAVED_INPUT_REFERENCE = /\{\{\s*inputs\.([a-zA-Z0-9_.-]+)\s*\}\}/g;
+
+function renderStructuredTemplate(value: any, inputs: Record<string, any>, used: Set<string>): any {
+	if (Array.isArray(value)) return value.map((nested) => renderStructuredTemplate(nested, inputs, used));
+	if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, renderStructuredTemplate(nested, inputs, used)]));
+	if (typeof value !== "string") return value;
+	const exact = value.match(/^\{\{\s*inputs\.([a-zA-Z0-9_.-]+)\s*\}\}$/);
+	if (exact) {
+		const key = exact[1];
+		if (!Object.prototype.hasOwnProperty.call(inputs, key)) throw new Error(`Saved workflow template requires input: ${key}`);
+		used.add(key);
+		return inputs[key];
+	}
+	return value.replace(SAVED_INPUT_REFERENCE, (_match, key) => {
+		if (!Object.prototype.hasOwnProperty.call(inputs, key)) throw new Error(`Saved workflow template requires input: ${key}`);
+		const replacement = inputs[key];
+		if (replacement !== null && typeof replacement === "object") throw new Error(`Saved workflow template input ${key} must be a scalar when embedded in text`);
+		used.add(key);
+		return String(replacement ?? "");
+	});
+}
+
+function resolvePublicWorkflowParams(params: any): any {
+	const hasTemplate = params?.template !== undefined;
+	const hasPhases = params?.phases !== undefined;
+	if (hasTemplate === hasPhases) throw new Error("Provide exactly one of template or phases.");
+	if (!hasTemplate) {
+		if (params?.inputs !== undefined) throw new Error("inputs may only be used with a saved structured workflow template.");
+		return params;
+	}
+	const templateName = params.template;
+	const rawInputs = params.inputs ?? {};
+	if (!rawInputs || typeof rawInputs !== "object" || Array.isArray(rawInputs)) throw new Error("Saved workflow template inputs must be an object.");
+	const usedInputs = new Set<string>();
+	const template = renderStructuredTemplate(loadStructuredTemplate(templateName), rawInputs, usedInputs);
+	const unusedInputs = Object.keys(rawInputs).filter((key) => !usedInputs.has(key));
+	if (unusedInputs.length) throw new Error(`Saved workflow template received unused inputs: ${unusedInputs.sort().join(", ")}`);
+	const { template: _template, inputs: _inputs, phases: _phases, ...rawOverrides } = params;
+	const overrides = definedProperties(rawOverrides);
+	return {
+		...template,
+		...overrides,
+		metadata: { ...(template.metadata || {}), ...(overrides.metadata || {}), savedTemplate: templateName },
+	};
+}
+
+function resolveHarnessParams(params: any): any {
+	if (params?.inputs !== undefined) throw new Error("inputs are supported only by saved structured workflow templates, not harnesses.");
+	const modes = [params?.template !== undefined, params?.harness !== undefined, params?.harnessFile !== undefined].filter(Boolean).length;
+	if (modes !== 1) throw new Error("Provide exactly one of template, harness, or harnessFile.");
+	if (params.template === undefined) return params;
+	const templateName = params.template;
+	const { template: _template, ...overrides } = params;
+	const { source } = readSavedTemplate(templateName, ".mjs");
+	return { ...overrides, harness: source, name: params.name || templateName };
+}
 
 function truncate(text: string, max = MAX_TOOL_TEXT): string {
 	if (Buffer.byteLength(text, "utf8") <= max) return text;
@@ -260,13 +409,16 @@ function workflowParametersSchema() {
 		concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 64, description: "Default fanout concurrency." })),
 		background: Type.Optional(Type.Boolean({ description: "Run in the background and return a run id immediately." })),
 		autoContinue: Type.Optional(Type.Boolean({ description: "After successful background completion, queue a follow-up in this Pi session." })),
+		template: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", description: "Saved structured workflow name from ~/.pi/agent/workflows/<name>.json. Use instead of phases." })),
+		inputs: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Values for {{inputs.key}} placeholders in a saved structured workflow template." })),
 		metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Optional workflow metadata persisted with the compiled input." })),
-		phases: Type.Array(phases, { minItems: 1, maxItems: 30 }),
+		phases: Type.Optional(Type.Array(phases, { minItems: 1, maxItems: 30, description: "Ordered phases. Use exactly one of phases or template." })),
 	}, { additionalProperties: false });
 }
 
 function harnessParametersSchema() {
 	return Type.Object({
+		template: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", description: "Saved harness name from ~/.pi/agent/workflows/<name>.mjs. Use instead of harness/harnessFile." })),
 		harness: Type.Optional(Type.String({ description: "JavaScript module source exporting default async function(ctx)." })),
 		harnessFile: Type.Optional(Type.String({ description: "Path to a JavaScript harness module." })),
 		name: Type.Optional(Type.String()),
@@ -315,7 +467,7 @@ function legacySpecToPublic(args: any): any {
 }
 
 function publicWorkflowToLegacySpec(params: any): any {
-	const { background: _background, ...spec } = params;
+	const { background: _background, template: _template, ...spec } = params;
 	return {
 		...spec,
 		phases: spec.phases.map((phase: any) => {
@@ -389,24 +541,26 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 		"Use dynamic_workflow agent phases for one subagent and fanout phases for parallel subagents. Shell phases require rwx.",
 		"Use {{outputs.phase-name}} only to reference earlier phase outputs; fanout prompts may also use {{item}} and {{index}}.",
 		"Use dynamic_workflow background=true for long workflows and autoContinue=true only when a successful run should queue a follow-up.",
+		"Reusable structured workflows may be loaded by template name from ~/.pi/agent/workflows/<name>.json instead of supplying phases.",
 	];
 
 	pi.registerTool({
 		name: "dynamic_workflow",
 		label: "Dynamic Workflow",
-		description: "Compose and execute a validated workflow of ordered agent, fanout, shell, and artifact phases.",
+		description: "Compose and execute a validated workflow of ordered agent, fanout, shell, and artifact phases, or run a saved structured workflow template.",
 		promptSnippet: "Compose bounded subagent workflows with agent, fanout, shell, and artifact phases",
 		promptGuidelines: guidelines,
 		parameters: workflowParametersSchema(),
 		prepareArguments: legacySpecToPublic,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const spec = publicWorkflowToLegacySpec(params);
+			const resolved = resolvePublicWorkflowParams(params);
+			const spec = publicWorkflowToLegacySpec(resolved);
 			return executeDynamicWorkflow({
 				spec,
-				cwd: params.cwd,
-				model: params.model,
-				background: params.background,
-				autoContinue: params.autoContinue,
+				cwd: resolved.cwd,
+				model: resolved.model,
+				background: resolved.background,
+				autoContinue: resolved.autoContinue,
 			}, signal, onUpdate, ctx, "");
 		},
 	});
@@ -414,15 +568,17 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "dynamic_workflow_harness",
 		label: "Dynamic Workflow Harness",
-		description: "Advanced unsandboxed JavaScript workflow harness for loops, branching, tournaments, or custom control flow. Prefer dynamic_workflow for normal subagent composition.",
+		description: "Advanced unsandboxed JavaScript workflow harness for loops, branching, tournaments, custom control flow, or a saved harness template. Prefer dynamic_workflow for normal subagent composition.",
 		promptGuidelines: [
 			"Use dynamic_workflow_harness only when structured dynamic_workflow phases cannot express the required control flow.",
 			"dynamic_workflow_harness executes arbitrary unsandboxed Node.js and always requires explicit permissions=rwx.",
 			"dynamic_workflow_harness provides ctx.phase, ctx.shell, ctx.pi, ctx.fanout, ctx.artifact, ctx.emit, ctx.cancelled(), and ctx.signal.",
+			"Reusable self-contained harnesses may be loaded by template name from ~/.pi/agent/workflows/<name>.mjs.",
 		],
 		parameters: harnessParametersSchema(),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			return executeDynamicWorkflow({ ...params, timeout: params.timeoutMs }, signal, onUpdate, ctx, "");
+			const resolved = resolveHarnessParams(params);
+			return executeDynamicWorkflow({ ...resolved, timeout: resolved.timeoutMs }, signal, onUpdate, ctx, "");
 		},
 	});
 

@@ -165,6 +165,7 @@ export type ThreadPhaseRunSummary = {
   workflowStartCwdPresent?: boolean;
   startedAt?: string;
   updatedAt?: string;
+  endedAt?: string;
   status: ThreadPhaseUiStatus;
   normalizedStatus: ThreadPhaseNormalizedStatus;
   phases: ThreadPhasePhaseSummary[];

@@ -1,11 +1,11 @@
 import { getMarkdownTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, Markdown, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { basename } from "node:path";
-import { STATUSES, formatUsageSummary, latestRunSummaries, readArtifactContent, requestCancellation } from "../lib/store.mjs";
+import { STATUSES, latestRunSummaries, readArtifactContent, requestCancellation } from "../lib/store.mjs";
 import { artifactEditorActionHint, artifactEditorTarget } from "../lib/artifact-action.mjs";
 import { MONITOR_SORTS, MONITOR_STATUS_FILTERS, cycleMonitorOption, filterAndSortMonitorRuns } from "../lib/monitor-state.mjs";
 import { FANOUT_PAGE_SIZE, detailViewportHeight, pageItems, windowLineRange } from "../lib/monitor-pagination.mjs";
-import { formatOwnerMetadata, formatStaleIndicator } from "../lib/run-display.mjs";
+import { formatElapsedDuration, formatOwnerMetadata, formatStaleIndicator, formatTotalTokens } from "../lib/run-display.mjs";
 import { canInspectRun, mergeMonitorRuns } from "../lib/session-scope.mjs";
 import { framePanel } from "./bordered-panel.ts";
 import { formatFanout, formatProgress, statusColor, statusIcon } from "./phase-timeline.ts";
@@ -69,6 +69,18 @@ function currentPhaseText(run: RunSummary): string {
 function cwdLabel(cwd: string | undefined): string {
 	if (!cwd) return "unknown cwd";
 	return basename(cwd) || cwd;
+}
+
+function elapsedForRun(run: RunSummary, now = Date.now()): string {
+	const status = run.normalizedStatus || run.status;
+	const end = status === STATUSES.RUNNING && !run.stale ? now : run.endedAt || run.updatedAt;
+	return formatElapsedDuration(run.startedAt, end);
+}
+
+function elapsedForPhase(phase: PhaseSummary, now = Date.now()): string {
+	const status = phase.normalizedStatus || phase.status;
+	const end = status === STATUSES.RUNNING ? now : phase.endedAt || phase.updatedAt;
+	return formatElapsedDuration(phase.startedAt, end);
 }
 
 function monitorRuns(cwd: string, sessionId?: string): RunSummary[] {
@@ -442,7 +454,8 @@ export class ThreadPhaseMonitorComponent {
 			const current = status === STATUSES.RUNNING ? currentPhaseText(run) : "";
 			const cwd = this.searchQuery ? String(run.cwd || "") : cwdLabel(run.cwd);
 			const location = run.cwd ? t.fg("dim", ` @ ${highlightMatch(cwd, this.searchQuery, t)}`) : "";
-			lines.push(truncateToWidth(`${head}${location}${current ? t.fg("muted", ` — ${current}`) : ""}`, width));
+			const metrics = [elapsedForRun(run), formatTotalTokens(run.usage)].filter((value) => value && value !== "?").join(" · ");
+			lines.push(truncateToWidth(`${head}${location}${metrics ? t.fg("muted", ` · ${metrics}`) : ""}${current ? t.fg("muted", ` — ${current}`) : ""}`, width));
 			if (status === STATUSES.RUNNING) lines.push(truncateToWidth(`  ${deterministicPhaseLine(run, t)}`, width));
 		}
 		const remaining = runs.length - start - visible.length;
@@ -472,11 +485,12 @@ export class ThreadPhaseMonitorComponent {
 		add(t.fg("dim", `← back • ↑↓ select • ctrl+u/d page • enter ${selectedItem?.kind === "artifact" ? "open" : "expand"}${cancelHint} • q close`));
 		add(t.fg("accent", t.bold(`${workflowGlyph(status, t)} ${run.workflow || "workflow"}`)) + t.fg("dim", ` [${run.runId || "unknown"}]`));
 		const pid = runtimePid(run);
-		add(t.fg("dim", `status: ${run.status || status}${run.stale ? `  ${formatStaleIndicator(run)}` : ""}  updated: ${run.updatedAt || "?"}${pid && status === STATUSES.RUNNING ? `  pid: ${pid}` : ""}`));
+		add(t.fg("dim", `status: ${run.status || status}${run.stale ? `  ${formatStaleIndicator(run)}` : ""}  duration: ${elapsedForRun(run)}${pid && status === STATUSES.RUNNING ? `  pid: ${pid}` : ""}`));
 		const owner = formatOwnerMetadata(run);
 		if (owner) add(t.fg("dim", owner));
 		if (run.heartbeat?.timestamp) add(t.fg("dim", `heartbeat: ${run.heartbeat.timestamp}${run.heartbeat.featureId ? `  feature: ${run.heartbeat.featureId}` : ""}`));
-		if (run.usage?.entries) add(t.fg("muted", `usage: ${formatUsageSummary(run.usage)}`));
+		const runTokens = formatTotalTokens(run.usage);
+		if (runTokens) add(t.fg("muted", `tokens: ${runTokens}`));
 		this.addActiveIo(lines, run.activeIo, width, "active I/O");
 		add("");
 		add(t.fg("toolTitle", t.bold("Phases")) + t.fg("dim", ` (${(run.phases || []).length})`));
@@ -508,10 +522,10 @@ export class ThreadPhaseMonitorComponent {
 
 	private addPhaseDetails(lines: string[], phase: PhaseSummary, width: number): DetailLineRange | undefined {
 		const t = this.theme;
-		if (phase.startedAt) lines.push(t.fg("dim", `    started: ${phase.startedAt}`));
-		if (phase.endedAt) lines.push(t.fg("dim", `    ended:   ${phase.endedAt}`));
+		if (phase.startedAt) lines.push(t.fg("dim", `    duration: ${elapsedForPhase(phase)}`));
 		if (phase.progress) lines.push(t.fg("muted", `    progress: ${compactJson(phase.progress)}`));
-		if (phase.usage?.entries) lines.push(t.fg("muted", `    usage: ${formatUsageSummary(phase.usage)}`));
+		const phaseTokens = formatTotalTokens(phase.usage);
+		if (phaseTokens) lines.push(t.fg("muted", `    tokens: ${phaseTokens}`));
 		this.addActiveIo(lines, phase.activeIo, width, "    I/O");
 		if (!phase.fanout) return undefined;
 		const fanoutSummaryLine = lines.length;
@@ -521,8 +535,8 @@ export class ThreadPhaseMonitorComponent {
 		if (page.pageCount > 1) lines.push(t.fg("dim", `      items ${page.start + 1}-${page.end} of ${page.total} • ctrl+u/d page (${page.page + 1}/${page.pageCount})`));
 		for (const item of page.items) {
 			const iStatus = item.normalizedStatus || item.status;
-			const usage = item.usage?.entries ? t.fg("muted", ` · ${formatUsageSummary(item.usage)}`) : "";
-			lines.push(truncateToWidth(`      ${t.fg(statusColor(iStatus), statusIcon(iStatus))} ${item.label || item.itemId}${usage}${item.lastMessage ? t.fg("dim", ` — ${item.lastMessage}`) : ""}`, width));
+			const tokens = formatTotalTokens(item.usage);
+			lines.push(truncateToWidth(`      ${t.fg(statusColor(iStatus), statusIcon(iStatus))} ${item.label || item.itemId}${tokens ? t.fg("muted", ` · ${tokens}`) : ""}${item.lastMessage ? t.fg("dim", ` — ${item.lastMessage}`) : ""}`, width));
 		}
 		// Track the complete expanded fanout block rather than one anchor line so
 		// expansion, page changes, and responsive re-renders can keep the page

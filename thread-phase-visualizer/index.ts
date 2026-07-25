@@ -1,10 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { showThreadPhaseMonitor } from "./components/monitor.ts";
 import { registerThreadPhaseMessageRenderers } from "./components/run-message-renderer.ts";
-import { activeRunWidgetLines } from "./components/status-widget.ts";
+import { activeRunWidgetLines, isLiveRun } from "./components/status-widget.ts";
 import {
 	EVENT_TYPES,
 	INDEX_FILE,
@@ -31,6 +31,10 @@ import {
 import { formatMarkedContinuation, sessionHistoryHasContinuation } from "./lib/continuation-message.mjs";
 
 const MAX_MESSAGE_BYTES = 20_000;
+const requestedStatusRefreshMs = Number(process.env.PI_THREAD_PHASE_STATUS_REFRESH_MS || 5_000);
+const STATUS_REFRESH_MS = Number.isFinite(requestedStatusRefreshMs) && requestedStatusRefreshMs >= 10
+	? Math.floor(requestedStatusRefreshMs)
+	: 5_000;
 
 type AnyEvent = Record<string, any>;
 
@@ -144,6 +148,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	registerThreadPhaseMessageRenderers(pi);
 
 	let watcher: fs.FSWatcher | undefined;
+	let statusRefreshTimer: NodeJS.Timeout | undefined;
 	let cwdState = createCwdState(process.cwd());
 	let continuedRuns = new Set<string>();
 	const seen = new Set<string>();
@@ -196,12 +201,19 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		},
 	});
 
+	const openWorkflowDashboard = async (ctx: ExtensionContext) => {
+		ensureStore();
+		await showThreadPhaseMonitor(ctx, cwdState.activeCwd || canonicalCwd(ctx.cwd) || path.resolve(ctx.cwd));
+	};
+
+	pi.registerCommand?.("workflows", {
+		description: "Open the interactive thread-phase workflow dashboard",
+		handler: async (_args, ctx) => openWorkflowDashboard(ctx),
+	});
+
 	pi.registerShortcut("ctrl+shift+t", {
-		description: "Open live thread-phase monitor",
-		handler: async (ctx) => {
-			ensureStore();
-			await showThreadPhaseMonitor(ctx, cwdState.activeCwd || canonicalCwd(ctx.cwd) || path.resolve(ctx.cwd));
-		},
+		description: "Open the interactive thread-phase workflow dashboard",
+		handler: openWorkflowDashboard,
 	});
 
 	pi.on("user_bash", (event, ctx) => {
@@ -228,11 +240,13 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		ensureStore();
+		if (statusRefreshTimer) clearInterval(statusRefreshTimer);
+		statusRefreshTimer = undefined;
 		cwdState = createCwdState(ctx.cwd);
 		const updateStatus = () => {
 			if (!ctx.hasUI) return;
 			const runs = mergeMonitorRuns(cwdState.activeCwd, currentSessionId);
-			const running = runs.filter((run: AnyEvent) => run.normalizedStatus === STATUSES.RUNNING).length;
+			const running = runs.filter(isLiveRun).length;
 			ctx.ui.setStatus("thread-phase", running > 0 ? `${running} workflow(s) running` : undefined);
 			const widgetLines = activeRunWidgetLines(runs);
 			ctx.ui.setWidget("thread-phase", widgetLines.length > 0 ? widgetLines : undefined, { placement: "belowEditor" });
@@ -340,11 +354,18 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 
 		watcher?.close();
 		watcher = fs.watch(INDEX_FILE, { persistent: false }, () => processNewEvents());
+		// Index events refresh the widget immediately. This bounded poll also
+		// removes runs that become stale solely because time passes or their PID
+		// exits, neither of which necessarily appends another event.
+		statusRefreshTimer = setInterval(updateStatus, STATUS_REFRESH_MS);
+		statusRefreshTimer.unref?.();
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		watcher?.close();
 		watcher = undefined;
+		if (statusRefreshTimer) clearInterval(statusRefreshTimer);
+		statusRefreshTimer = undefined;
 		try {
 			relinquishContinuationClaims({
 				storeDir: path.dirname(INDEX_FILE),

@@ -81,7 +81,7 @@ test("advanced harness tool rejects ambiguous and empty inputs", async () => {
   registerDynamicWorkflows({ registerTool: (definition) => tools.set(definition.name, definition) });
   const execute = tools.get("dynamic_workflow_harness").execute;
   const ctx = { cwd: root, sessionManager: {} };
-  await assert.rejects(execute("test", { harness: "export default async function workflow() {}", harnessFile: "/tmp/workflow.mjs", permissions: "rwx" }, undefined, undefined, ctx), /exactly one of spec, harness, or harnessFile/);
+  await assert.rejects(execute("test", { harness: "export default async function workflow() {}", harnessFile: "/tmp/workflow.mjs", permissions: "rwx" }, undefined, undefined, ctx), /exactly one of template, harness, or harnessFile/);
   await assert.rejects(execute("test", { harness: "", permissions: "rwx" }, undefined, undefined, ctx), /harness must be a non-empty string/);
   await assert.rejects(execute("test", { harness: "   ", permissions: "rwx" }, undefined, undefined, ctx), /harness must be a non-empty string/);
   await assert.rejects(execute("test", { harnessFile: "", permissions: "rwx" }, undefined, undefined, ctx), /harnessFile must be a non-empty path/);

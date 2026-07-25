@@ -1054,7 +1054,7 @@ function closeOpenPhasesForTerminalRun(summary, sawWorkflowEnd = false) {
     if (phase.normalizedStatus !== STATUSES.RUNNING || phase.endedAt) continue;
     phase.status = terminal;
     phase.normalizedStatus = terminal;
-    phase.endedAt = summary.updatedAt;
+    phase.endedAt = summary.endedAt || summary.updatedAt;
   }
 }
 
@@ -1131,6 +1131,7 @@ export function projectRun(events = [], options = {}) {
     }
     if (event.type === EVENT_TYPES.WORKFLOW_END) {
       sawWorkflowEnd = true;
+      summary.endedAt = event.timestamp || summary.updatedAt;
       summary.status = event.status || STATUSES.SUCCESS;
       summary.normalizedStatus = normalizeStatus(event.status || STATUSES.SUCCESS);
     }
