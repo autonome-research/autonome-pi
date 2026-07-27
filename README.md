@@ -37,7 +37,7 @@ Pi identifies git packages by repository URL, so remove the old source before in
 
 - `/detach [--name <tmux-name>] [--now|--wait] [prompt]` hands the current session off to tmux; `/detach-status` reports the latest handoff. See [`detach/README.md`](detach/README.md).
 - Select `/workflows` from the slash-command menu under the editor, or press `ctrl+shift+t`, to open the interactive thread-phase dashboard; select a run for details or request cooperative cancellation via `x`.
-- Background/session-launched workflows can queue a session follow-up after successful completion. Dynamic workflows are opt-in via `autoContinue: true` to avoid noisy autonomous callbacks.
+- Background dynamic workflows durably return control to the launching Pi session after success or failure; failed continuations identify failed phases/errors/partial artifacts, while user-cancelled runs never auto-continue.
 - `/codebase-explore` starts codebase exploration in the background by default.
 - `/code-review` runs code review workflows.
 - `dynamic_workflow` composes validated subagent workflows directly from flat `agent`, `fanout`, `shell`, and `artifact` phases. `dynamic_workflow_harness` is the separate advanced JavaScript interface; `dynamic_thread_phase_workflow` is an inactive deprecated compatibility alias.
@@ -65,7 +65,7 @@ Recent changes:
 - `dynamic_thread_phase_workflow` remains registered for compatibility but is inactive by default, avoiding a duplicate legacy schema in normal model context.
 - Structured specs now have a strict phase schema, semantic reference/permission/resource preflight, bounded supervised fanout, explicit retries, collision-safe artifacts, multipart Pi output handling, partial failure results, and background readiness acknowledgements containing `runId` + `pid`.
 - Reusable or operationally important workflows should graduate into standalone TypeScript extensions using thread-phase directly.
-- Dynamic workflows do not auto-continue by default; pass `autoContinue: true` for successful-run follow-up.
+- Dynamic workflow runs carry system-generated chain provenance. A terminal successful or failed parent accepts at most one session-scoped successor through `after`; cancelled parents cannot continue a chain.
 - Reusable structured workflows and self-contained harnesses can be loaded by safe template name from `~/.pi/agent/workflows/`; template loading is bounded, rejects traversal/symlinks, preserves provenance, and still enforces normal validation and permission ceilings.
 - Structured workflows support fail-closed `resumeRunId` recovery through atomic checkpoint manifests and bounded, hashed phase-output artifacts; spec, cwd, model, session, phase identity, containment, size, and integrity must verify before reuse.
 - The workflow dashboard is available through selectable `/workflows` and `ctrl+shift+t` entry points, shows compact elapsed-time and aggregate-token metrics, and labels phase/fanout rows with observed inference models instead of redundant worded statuses.

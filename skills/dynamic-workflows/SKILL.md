@@ -112,8 +112,8 @@ Mixed-permission example:
 
 - Set `cwd` explicitly when execution differs from the Pi session cwd.
 - Top-level `model`, `timeoutMs`, and `concurrency` provide phase defaults; `metadata` retains optional caller metadata in the compiled input.
-- Use `background: true` for long workflows.
-- Use `autoContinue: true` only when successful completion should queue a follow-up.
+- Use `background: true` for long workflows. Success and failure durably return control to chat; user cancellation does not.
+- Use `after` with a trusted terminal successful or failed run id to launch its single chained successor. Do not chain from a cancelled run.
 - Add an artifact phase when the user expects a durable report.
 - Keep fanout item count and concurrency minimal.
 - Use `thread_phase_runs` to inspect results and `ctrl+shift+t` to monitor/cancel interactively.
@@ -127,23 +127,25 @@ Store reusable workflows under `~/.pi/agent/workflows/` (or `PI_DYNAMIC_WORKFLOW
 
 Missing or unused structured-template inputs fail preflight. Invocation-level workflow defaults override structured-template defaults; metadata is merged and records `savedTemplate`. Do not provide both `template` and `phases`, or combine a harness template with `harness`/`harnessFile`. Template names are safe identifiers rather than paths. Symlinks, non-files, traversal, and files above 1 MB fail preflight. Templates do not bypass permission ceilings or normal validation. Authoring remains explicit and file-based; the tools do not overwrite saved templates.
 
-## Structured artifact resume
+## Chaining
 
-Structured workflows write an atomic `workflow-checkpoint.json` plus hashed per-phase output artifacts after each successfully completed phase. To continue an interrupted run, invoke the same workflow with `resumeRunId` set to the earlier run id:
+Each dynamic run receives system-generated chain and run identities. The model never authors the child run id. Launch a different successor or recovery workflow with:
 
 ```json
-{
-  "name": "review-src",
-  "permissions": "r",
-  "resumeRunId": "review-src-...",
-  "phases": [
-    { "type": "agent", "name": "review", "prompt": "Review src." },
-    { "type": "artifact", "name": "report", "from": "review" }
-  ]
-}
+{ "after": "parent-run-id", "template": "recovery", "inputs": { "target": "src" }, "background": true }
 ```
 
-Resume is fail-closed. The compiled spec, real working directory, effective model, and Pi session must match. Checkpoints must contain a contiguous prefix of matching phases, output files must remain inside the source run's artifact directory, and their sizes and SHA-256 hashes must verify. Validated outputs are copied into the new run's own checkpoint chain; completed phases are not re-executed, and execution continues at the first uncheckpointed phase. Harness workflows cannot use `resumeRunId`. A single resumable phase output is capped at 4 MB.
+The parent must be terminal success or failure, belong to the same Pi session, contain valid chain provenance, remain below the operator chain-depth limit, and have no existing child. Parallel work belongs in `fanout`. Use `resumeRunId` for the same interrupted structured workflow; use `after` for a different next workflow. Cancelled parents do not auto-continue and cannot have successors.
+
+## Structured artifact resume
+
+Structured workflows write an atomic `workflow-checkpoint.json` plus hashed per-phase output artifacts after each successfully completed phase. Continue an interrupted run with its system-generated id only:
+
+```json
+{ "resumeRunId": "review-src-..." }
+```
+
+Resume is fail-closed. The trusted run supplies the compiled spec, real working directory, effective model, permissions, template provenance, and Pi session; repeating or overriding them is rejected. Checkpoints must contain a contiguous prefix of matching phases, output files must remain inside the source run's artifact directory, and their sizes and SHA-256 hashes must verify. Validated outputs are copied into the new run's own checkpoint chain; completed phases are not re-executed, and execution continues at the first uncheckpointed phase. Harness workflows cannot use `resumeRunId`. A single resumable phase output is capped at 4 MB.
 
 Resume proves that the earlier phase completed and that its output artifact is intact. It cannot make an interrupted, non-checkpointed side effect idempotent; design shell/write phases accordingly.
 
@@ -179,5 +181,6 @@ Prefer a standalone TypeScript extension using thread-phase directly when logic 
 8. Include a durable artifact when appropriate.
 9. Keep retries and fanout bounded.
 10. Use a saved template for repeated workflows; use direct phases for one-off composition.
-11. Use `resumeRunId` only with the identical structured workflow, cwd, model, and session.
-12. Use `dynamic_workflow_harness` only for genuinely advanced control flow.
+11. Use `after` for one different successor and `resumeRunId` for the same interrupted workflow.
+12. Invoke `resumeRunId` alone; the trusted source run supplies its structured workflow, cwd, model, permissions, and session.
+13. Use `dynamic_workflow_harness` only for genuinely advanced control flow.

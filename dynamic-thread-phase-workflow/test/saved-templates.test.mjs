@@ -47,7 +47,7 @@ test("saved structured workflow executes by safe template name and records prove
     }));
     const result = await registeredTools().get("dynamic_workflow").execute(
       "test",
-      { template: "review", inputs: { subject: "cancellation", targets: ["src", "tests"] }, name: "saved-review-override", metadata: { ticket: "T-1" } },
+      { template: "review", inputs: { subject: "cancellation", targets: ["src", "tests"] }, name: "saved-review-override", metadata: { ticket: "T-1" }, background: true },
       undefined,
       undefined,
       executionContext(testDir),
@@ -56,6 +56,8 @@ test("saved structured workflow executes by safe template name and records prove
     assert.equal(result.details.ok, true);
     assert.equal(result.details.workflow, "saved-review-override");
     const runId = result.details.runId;
+    const start = JSON.parse(readFileSync(join(env.store, "runs", `${runId}.start.json`), "utf8"));
+    assert.equal(start.metadata.continuationMode, "terminal", "background workflows return success or failure to chat by default");
     const compiled = JSON.parse(readFileSync(join(env.store, "artifacts", runId, "workflow-spec.json"), "utf8"));
     assert.equal(compiled.metadata.owner, "test");
     assert.equal(compiled.metadata.ticket, "T-1");
@@ -69,7 +71,7 @@ test("saved structured workflow executes by safe template name and records prove
   }
 });
 
-test("dynamic_workflow forwards resumeRunId without changing the compiled structured spec", async () => {
+test("dynamic_workflow resumes from runId alone without repeating the structured spec", async () => {
   const testDir = mkdtempSync(join(tmpdir(), "dynamic-tool-resume-"));
   const env = withTemplateEnvironment(testDir);
   try {
@@ -81,7 +83,7 @@ test("dynamic_workflow forwards resumeRunId without changing the compiled struct
     };
     const first = await workflow.execute("test", params, undefined, undefined, executionContext(testDir));
     assert.equal(first.details.ok, true);
-    const resumed = await workflow.execute("test", { ...params, resumeRunId: first.details.runId }, undefined, undefined, executionContext(testDir));
+    const resumed = await workflow.execute("test", { resumeRunId: first.details.runId }, undefined, undefined, executionContext(testDir));
     assert.equal(resumed.details.ok, true);
     assert.equal(resumed.details.resumedFromRunId, first.details.runId);
     assert.equal(resumed.details.resumedPhaseCount, 1);
@@ -131,8 +133,9 @@ test("saved templates reject ambiguous modes, traversal, symlinks, invalid JSON,
     writeFileSync(join(testDir, "outside.json"), JSON.stringify({ permissions: "r", phases: direct }));
     symlinkSync(join(testDir, "outside.json"), join(env.templates, "linked.json"));
 
-    await assert.rejects(workflow("test", { template: "valid", phases: direct }, undefined, undefined, ctx), /exactly one of template or phases/);
-    await assert.rejects(workflow("test", {}, undefined, undefined, ctx), /exactly one of template or phases/);
+    await assert.rejects(workflow("test", { template: "valid", phases: direct }, undefined, undefined, ctx), /exactly one of template, phases, or resumeRunId/);
+    await assert.rejects(workflow("test", {}, undefined, undefined, ctx), /exactly one of template, phases, or resumeRunId/);
+    await assert.rejects(workflow("test", { resumeRunId: "source-run", name: "do-not-override" }, undefined, undefined, ctx), /accepts only resumeRunId and background/);
     await assert.rejects(workflow("test", { template: "../outside" }, undefined, undefined, ctx), /paths are not accepted/);
     await assert.rejects(workflow("test", { template: "linked" }, undefined, undefined, ctx), /must not be a symbolic link/);
     await assert.rejects(workflow("test", { template: "invalid" }, undefined, undefined, ctx), /Could not parse saved workflow template/);

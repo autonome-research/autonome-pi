@@ -17,9 +17,17 @@ const LEGACY_CONTINUATION_STATE_SCHEMA = "thread-phase-continuations/v2";
 // a competing writer has already pruned or move them behind newer claims.
 const loadedSnapshotBaselines = new WeakMap();
 
-/** Only explicitly opted-in successful runs may queue an automatic continuation. */
+/**
+ * Background dynamic workflows hand control back to chat after success or
+ * failure. Cancellation remains authoritative and never auto-continues.
+ * Explicit success-only opt-in remains for non-dynamic integrations until the
+ * v2 public schema migration removes the old flag.
+ */
 export function shouldAutoContinue(run) {
-  if (run?.normalizedStatus !== "success") return false;
+  const status = run?.normalizedStatus;
+  if (status === "cancelled" || (status !== "success" && status !== "failed")) return false;
+  if (run?.metadata?.continuationMode === "terminal") return true;
+  if (status !== "success") return false;
   return run?.metadata?.autoContinue === true || run?.metadata?.autoContinue === "always";
 }
 

@@ -13,7 +13,7 @@ const loaderUrl = new URL("./support/pi-peer-loader.mjs", import.meta.url);
 if (nodeModule.registerHooks) nodeModule.registerHooks(await import(loaderUrl));
 else nodeModule.register(loaderUrl);
 const { default: registerVisualizer } = await import("../index.ts");
-const { completeRun, createRun } = await import("../lib/store.mjs");
+const { STATUSES, completeRun, createRun } = await import("../lib/store.mjs");
 const {
   CONTINUATION_STATE_FILENAME,
   CONTINUATION_TIMESTAMPS_FILENAME,
@@ -158,6 +158,35 @@ test("fire-and-forget submission remains pending until message_start acknowledge
   harness.handlers.get("message_start")({ message: { role: "assistant", content: [] } }, persistedContext);
   state = JSON.parse(readFileSync(join(storeDir, CONTINUATION_STATE_FILENAME), "utf8"));
   assert.equal(state.records.find((record) => record.runId === run.runId).state, "delivered");
+});
+
+test("background terminal policy continues failed runs but not cancelled runs", async (t) => {
+  const context = sessionContext();
+  const harness = extensionHarness();
+  registerVisualizer(harness.api);
+  await harness.handlers.get("session_start")({}, context);
+  t.after(() => harness.handlers.get("session_shutdown")({}, context));
+
+  const failed = createRun({
+    runId: "lifecycle-background-failed",
+    workflow: "background-failed",
+    cwd: storeDir,
+    metadata: { sessionId: "lifecycle-session", continuationMode: "terminal" },
+  });
+  completeRun(failed, STATUSES.FAILED);
+  await waitFor(() => harness.userMessages.length === 1, "failed background run did not continue");
+  assert.match(harness.userMessages[0].message, /workflow failed/i);
+  assert.match(harness.userMessages[0].message, /Do not proceed as though the workflow succeeded/);
+
+  const cancelled = createRun({
+    runId: "lifecycle-background-cancelled",
+    workflow: "background-cancelled",
+    cwd: storeDir,
+    metadata: { sessionId: "lifecycle-session", continuationMode: "terminal" },
+  });
+  completeRun(cancelled, STATUSES.CANCELLED);
+  await delay(150);
+  assert.equal(harness.userMessages.length, 1, "cancelled background run must not auto-continue");
 });
 
 test("session shutdown relinquishes an enqueue-failed claim for same-process replacement", async (t) => {

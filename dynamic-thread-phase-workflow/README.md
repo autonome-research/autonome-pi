@@ -166,10 +166,10 @@ Top-level controls:
 - `timeoutMs` — inherited agent/shell timeout
 - `concurrency` — inherited fanout concurrency
 - `background` — detach after durable readiness and return `runId` + `pid`
-- `autoContinue` — after successful background completion, queue a Pi follow-up through the visualizer continuation service
+- `after` — terminal successful or failed parent run; this run becomes its single session-scoped successor
 - `metadata` — optional caller metadata retained in the compiled workflow input
 
-Use `background: true` for long workflows. `autoContinue` defaults to false.
+Use `background: true` for long workflows. Successful and failed background runs durably return control to the launching Pi chat. Failure continuations include failed phases, errors, checkpoints, and partial artifacts. User-cancelled runs never auto-continue and cannot launch a chained successor.
 
 ## Saved workflow templates
 
@@ -195,7 +195,7 @@ Invoke `~/.pi/agent/workflows/repository-review.json` with:
 {
   "template": "repository-review",
   "inputs": { "target": "src" },
-  "autoContinue": true,
+  "background": true,
   "metadata": { "requestedBy": "operator" }
 }
 ```
@@ -214,24 +214,30 @@ Template names are identifiers, not paths. Traversal and symlinked files are rej
 
 ## Structured artifact resume
 
-After every successfully completed structured phase, the runner atomically writes a `workflow-checkpoint.json` manifest and a hashed output file under that run's `phase-outputs/` artifact directory. Continue an interrupted workflow by supplying the earlier run id with the otherwise identical invocation:
+After every successfully completed structured phase, the runner atomically writes a `workflow-checkpoint.json` manifest and a hashed output file under that run's `phase-outputs/` artifact directory. Continue an interrupted workflow using only its system-generated run id:
+
+```json
+{ "resumeRunId": "review-and-fix-..." }
+```
+
+The trusted source run supplies the compiled spec, real cwd, effective model, permissions, template provenance, Pi session, and prior outputs. Repeating or overriding them is rejected. Resume validates contiguous phase identities, artifact containment, output size, and SHA-256 hash before creating the new run. Validated outputs are copied into the new run's checkpoint chain, completed phases are represented in its lifecycle without re-execution, and execution starts at the first uncheckpointed phase. Any mismatch fails preflight. JavaScript harnesses cannot be resumed this way.
+
+A checkpoint proves completion only for phases whose output artifact was durably written. An interrupted phase runs again, so side-effecting shell/write phases still need idempotent design. Each resumable phase output is capped at 4 MB.
+
+## Chained workflows
+
+Every run receives system-generated `chainId`, `rootRunId`, and `chainStep` provenance. To launch a different workflow after a terminal successful or failed parent, pass its trusted run id:
 
 ```json
 {
-  "name": "review-and-fix",
-  "permissions": "rw",
-  "resumeRunId": "review-and-fix-...",
-  "phases": [
-    { "type": "agent", "name": "review", "permissions": "r", "prompt": "Review the repository." },
-    { "type": "agent", "name": "fix", "prompt": "Implement {{outputs.review}}." },
-    { "type": "artifact", "name": "report", "from": "fix" }
-  ]
+  "after": "review-run-id",
+  "template": "implement-review",
+  "inputs": { "target": "src" },
+  "background": true
 }
 ```
 
-Resume validates the compiled spec, real cwd, effective model, Pi session, contiguous phase identities, artifact containment, output size, and SHA-256 hash before creating the new run. Validated outputs are copied into the new run's checkpoint chain, completed phases are represented in its lifecycle without re-execution, and execution starts at the first uncheckpointed phase. Any mismatch fails preflight. JavaScript harnesses cannot be resumed this way.
-
-A checkpoint proves completion only for phases whose output artifact was durably written. An interrupted phase runs again, so side-effecting shell/write phases still need idempotent design. Each resumable phase output is capped at 4 MB.
+The child receives a new system-generated run id, inherits the parent's chain identity, and records `parentRunId`. Parent ownership and Pi session identity fail closed. A parent can commit only one child, chain length is operator-bounded by `PI_DYNAMIC_WORKFLOW_MAX_CHAIN_RUNS` (default 20), and a user-cancelled parent cannot continue. Use `resumeRunId` for the same interrupted structured workflow; use `after` for a different recovery or successor workflow. Parallel work belongs inside a `fanout` phase.
 
 ## Advanced JavaScript harnesses
 

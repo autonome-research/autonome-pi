@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { accessSync, closeSync, constants as fsConstants, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { PiJsonEventCollector } from "../lib/pi-json-stream.mjs";
+import { commitSuccessor, releaseSuccessor, reserveSuccessor } from "../lib/chain-store.mjs";
 import { normalizeTimeoutMs, runBoundedProcess, terminateChild } from "../lib/subprocess.mjs";
 import {
   ARTIFACTS_DIR,
@@ -13,7 +14,9 @@ import {
   artifact,
   completeRun,
   createRun,
+  createRunId,
   failRun,
+  getRunSummary,
   phaseEnd,
   phaseEvent,
   phaseStart,
@@ -45,6 +48,8 @@ const MAX_OUTPUT_BYTES = 250_000;
 const MAX_RESUME_MANIFEST_BYTES = 1_000_000;
 const MAX_RESUME_OUTPUT_BYTES = 4_000_000;
 const RESUME_RUN_ID = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$/;
+const CHAIN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MAX_CHAIN_RUNS = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_CHAIN_RUNS || 20);
 const DEFAULT_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_WORKFLOW_DEFAULT_PERMISSIONS || process.env.PI_DYNAMIC_THREAD_PHASE_DEFAULT_PERMISSIONS || "r", "PI_DYNAMIC_WORKFLOW_DEFAULT_PERMISSIONS");
 const MAX_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_PERMISSIONS || "rwx", "PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS");
 
@@ -413,6 +418,7 @@ function validateRunnerLimits() {
     ["PI_DYNAMIC_WORKFLOW_MAX_CONCURRENCY", MAX_FANOUT_CONCURRENCY, 1, 64],
     ["PI_DYNAMIC_WORKFLOW_MAX_FANOUT_ITEMS", MAX_FANOUT_ITEMS, 1, 10_000],
     ["PI_DYNAMIC_WORKFLOW_MAX_PHASE_TIMEOUT_MS", MAX_PHASE_TIMEOUT_MS, 100, 24 * 60 * 60 * 1000],
+    ["PI_DYNAMIC_WORKFLOW_MAX_CHAIN_RUNS", MAX_CHAIN_RUNS, 1, 1000],
   ]) {
     if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error(`${label} must be an integer from ${min} to ${max}`);
   }
@@ -517,6 +523,7 @@ function writeWorkflowResult(ctx, status, error) {
     status,
     updatedAt: new Date().toISOString(),
     error: error ? { name: error.name, message: error.message || String(error) } : undefined,
+    ...ctx.chain,
     outputs: ctx.outputs,
     results: ctx.results,
   };
@@ -600,6 +607,19 @@ function hashText(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function loadResumeInvocation(runId, sessionId) {
+  const sourceDir = resumeRunDirectory(runId);
+  const manifest = parseBoundedJson(join(sourceDir, "workflow-checkpoint.json"), MAX_RESUME_MANIFEST_BYTES, "workflow resume checkpoint");
+  if (manifest?.schema !== "pi-dynamic-workflow-checkpoint/v1" || manifest.runId !== runId) throw new Error("Resume checkpoint identity is invalid");
+  const requestedSessionId = sessionId ? String(sessionId) : undefined;
+  if ((manifest.sessionId || requestedSessionId) && manifest.sessionId !== requestedSessionId) throw new Error("Resume checkpoint belongs to a different Pi session");
+  if (typeof manifest.cwd !== "string" || !manifest.cwd || !existsSync(manifest.cwd) || !statSync(manifest.cwd).isDirectory() || realpathSync(manifest.cwd) !== manifest.cwd) {
+    throw new Error("Resume checkpoint cwd is no longer an authoritative real directory");
+  }
+  const spec = validateSpec(parseBoundedJson(join(sourceDir, "workflow-spec.json"), MAX_RESUME_MANIFEST_BYTES, "resume source workflow spec"));
+  return { spec, cwd: manifest.cwd, model: manifest.model };
+}
+
 function loadResumeState(runId, { spec, cwd, model, sessionId }) {
   const sourceDir = resumeRunDirectory(runId);
   const manifest = parseBoundedJson(join(sourceDir, "workflow-checkpoint.json"), MAX_RESUME_MANIFEST_BYTES, "workflow resume checkpoint");
@@ -612,6 +632,10 @@ function loadResumeState(runId, { spec, cwd, model, sessionId }) {
   const sourceFingerprint = workflowFingerprint(sourceSpec, cwd, manifest.model);
   const requestedFingerprint = workflowFingerprint(spec, cwd, model);
   if (manifest.specHash !== sourceFingerprint || requestedFingerprint !== sourceFingerprint) throw new Error("Resume checkpoint does not match the requested structured workflow spec, cwd, and model");
+  if (!CHAIN_ID.test(String(manifest.chainId || "")) || !RESUME_RUN_ID.test(String(manifest.rootRunId || "")) || !Number.isInteger(manifest.chainStep) || manifest.chainStep < 0) {
+    throw new Error("Resume checkpoint chain provenance is invalid");
+  }
+  if (manifest.chainStep + 1 >= MAX_CHAIN_RUNS) throw new Error(`Workflow chain reached the ${MAX_CHAIN_RUNS}-run limit`);
   if (!Array.isArray(manifest.completed) || manifest.completed.length > spec.phases.length) throw new Error("Resume checkpoint completed-phase list is invalid");
 
   const outputDir = join(sourceDir, "phase-outputs");
@@ -628,7 +652,24 @@ function loadResumeState(runId, { spec, cwd, model, sessionId }) {
     if (Buffer.byteLength(output, "utf8") !== entry.outputBytes || hashText(output) !== entry.outputSha256) throw new Error(`Resume output for phase ${phase.name} failed integrity validation`);
     return { ...entry, output };
   });
-  return { sourceRunId: runId, entries, specHash: sourceFingerprint };
+  return { sourceRunId: runId, entries, specHash: sourceFingerprint, chainId: manifest.chainId, rootRunId: manifest.rootRunId, chainStep: manifest.chainStep };
+}
+
+function loadParentChain(runId, sessionId) {
+  if (typeof runId !== "string" || !RESUME_RUN_ID.test(runId)) throw new Error("after must be a safe workflow run identifier, not a path");
+  const parent = getRunSummary(runId);
+  if (!parent?.workflowStartResolved || parent.runId !== runId) throw new Error(`No authoritative parent workflow found for after=${runId}`);
+  if (parent.normalizedStatus === STATUSES.CANCELLED) throw new Error("A user-cancelled workflow cannot launch a chained successor");
+  if (parent.normalizedStatus !== STATUSES.SUCCESS && parent.normalizedStatus !== STATUSES.FAILED) throw new Error("A chained successor requires a terminal successful or failed parent workflow");
+  const requestedSessionId = sessionId ? String(sessionId) : undefined;
+  const parentSessionId = parent.metadata?.sessionId ? String(parent.metadata.sessionId) : undefined;
+  if ((requestedSessionId || parentSessionId) && requestedSessionId !== parentSessionId) throw new Error("Parent workflow belongs to a different Pi session");
+  const chainId = String(parent.metadata?.chainId || "");
+  const rootRunId = String(parent.metadata?.rootRunId || "");
+  const chainStep = Number(parent.metadata?.chainStep);
+  if (!CHAIN_ID.test(chainId) || !RESUME_RUN_ID.test(rootRunId) || !Number.isInteger(chainStep) || chainStep < 0) throw new Error("Parent workflow chain provenance is invalid");
+  if (chainStep + 1 >= MAX_CHAIN_RUNS) throw new Error(`Workflow chain reached the ${MAX_CHAIN_RUNS}-run limit`);
+  return { sourceRunId: runId, chainId, rootRunId, chainStep };
 }
 
 function phaseModel(ctx, phase) {
@@ -979,7 +1020,7 @@ async function main() {
   const rawArgv = process.argv.slice(2);
   const args = parseArgs(rawArgv);
   if (args.help || args.h) {
-    console.log("Usage: dynamic-thread-phase-workflow.mjs --spec-file spec.json | --js-file workflow.mjs [--cwd REPO] [--background] [--model MODEL]");
+    console.log("Usage: dynamic-thread-phase-workflow.mjs --spec-file spec.json | --resume-run-id RUN | --js-file workflow.mjs [--cwd REPO] [--background] [--model MODEL]");
     return;
   }
 
@@ -991,6 +1032,13 @@ async function main() {
   let harnessFile = harnessInput !== undefined ? preflightHarnessFile(harnessInput) : undefined;
   if (harnessFile && (args.spec || args["spec-file"])) throw new Error("Provide either spec input or --js-file, not both");
   if (harnessFile && args["resume-run-id"] !== undefined) throw new Error("resumeRunId is supported only for structured workflows, not JavaScript harnesses");
+  const hasSpecInput = args.spec !== undefined || args["spec-file"] !== undefined;
+  const resumeOnly = args["resume-run-id"] !== undefined;
+  if (resumeOnly && hasSpecInput) throw new Error("resumeRunId must be used without structured spec input");
+  if (args.after !== undefined && resumeOnly) throw new Error("Provide only one of after or resumeRunId");
+  if (!harnessFile && !hasSpecInput && !resumeOnly) throw new Error("Provide structured spec input or --resume-run-id");
+  if (resumeOnly && (args.cwd !== undefined || args.model !== undefined || args.permissions !== undefined)) throw new Error("Run-ID-only resume derives cwd, model, and permissions from the trusted source run");
+  const resumeInvocation = resumeOnly ? loadResumeInvocation(String(args["resume-run-id"]), args["session-id"]) : undefined;
   const spec = harnessFile
     ? (() => {
         if (!args.permissions) throw new Error("JavaScript harness mode requires explicit --permissions rwx");
@@ -999,7 +1047,7 @@ async function main() {
         assertWithinMaxPermissions(permissions, "harness permissions");
         return { name: args.name ? String(args.name) : safeName(basename(harnessFile).replace(/\.[cm]?js$/, "")), mode: "harness", permissions, harnessFile };
       })()
-    : validateSpec(loadSpec(args));
+    : resumeInvocation?.spec || validateSpec(loadSpec(args));
   const cleanupInputFile = args["js-file"] || args["harness-file"] || args["spec-file"];
   if (isTruthyFlag(args["cleanup-input"]) && cleanupInputFile) generatedInputDirectory(cleanupInputFile);
   // Validate CLI timeout before creating a visualizer run so bad input cannot
@@ -1012,24 +1060,42 @@ async function main() {
   await new Promise((resolveTick) => setImmediate(resolveTick));
   if (cancellationRequested) throw abortError("cancelled before background launch");
   if (await maybeBackground(rawArgv, args)) return;
-  const cwd = resolve(String(args.cwd || spec.cwd || process.cwd()));
+  const cwd = resolve(String(resumeInvocation?.cwd || args.cwd || spec.cwd || process.cwd()));
   if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new Error(`workflow cwd is not a directory: ${cwd}`);
-  const effectiveModel = args.model ? String(args.model) : spec.model;
+  const effectiveModel = resumeInvocation ? resumeInvocation.model : args.model ? String(args.model) : spec.model;
   const resumeState = args["resume-run-id"] === undefined ? undefined : loadResumeState(String(args["resume-run-id"]), {
     spec,
     cwd,
     model: effectiveModel,
     sessionId: args["session-id"],
   });
+  const parentChain = args.after === undefined ? undefined : loadParentChain(String(args.after), args["session-id"]);
   const workflow = spec.name || "dynamic-workflow";
-  const visualizerRun = createRun({
-    workflow,
-    cwd,
-    trigger: { kind: process.env.PI_DYNAMIC_WORKFLOW_BACKGROUND || process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND ? "background" : "manual", dynamic: true },
-    input: spec,
-    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, mode: harnessFile ? "javascript" : "spec", permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, autoContinue: isTruthyFlag(args["auto-continue"] ?? spec.autoContinue), sessionId: args["session-id"], sessionFile: args["session-file"], resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length },
-    message: `${workflow} started`,
-  });
+  const isBackground = Boolean(process.env.PI_DYNAMIC_WORKFLOW_BACKGROUND || process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND);
+  const runId = createRunId(workflow);
+  const predecessor = parentChain || resumeState;
+  const chain = predecessor
+    ? { chainId: predecessor.chainId, rootRunId: predecessor.rootRunId, parentRunId: predecessor.sourceRunId, chainStep: predecessor.chainStep + 1 }
+    : { chainId: randomUUID(), rootRunId: runId, parentRunId: undefined, chainStep: 0 };
+  let successorReservation;
+  let visualizerRun;
+  try {
+    if (parentChain) successorReservation = reserveSuccessor(parentChain.sourceRunId, runId, { chainId: chain.chainId });
+    visualizerRun = createRun({
+      runId,
+      workflow,
+      cwd,
+      trigger: { kind: isBackground ? "background" : "manual", dynamic: true },
+      input: spec,
+      metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, mode: harnessFile ? "javascript" : "spec", permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, continuationMode: isBackground ? "terminal" : "none", autoContinue: isTruthyFlag(args["auto-continue"] ?? spec.autoContinue), sessionId: args["session-id"], sessionFile: args["session-file"], ...chain, resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length },
+      message: `${workflow} started`,
+    });
+    if (successorReservation) commitSuccessor(successorReservation);
+  } catch (error) {
+    if (successorReservation) releaseSuccessor(successorReservation);
+    if (visualizerRun) failRun(visualizerRun, error);
+    throw error;
+  }
   activeRun = visualizerRun;
   const controller = new AbortController();
   activeAbortController = controller;
@@ -1069,6 +1135,7 @@ async function main() {
       outputs: {},
       results: {},
       signal: controller.signal,
+      chain,
       checkpoint: {
         schema: "pi-dynamic-workflow-checkpoint/v1",
         runId: visualizerRun.runId,
@@ -1077,6 +1144,7 @@ async function main() {
         model: effectiveModel,
         sessionId: args["session-id"] ? String(args["session-id"]) : undefined,
         specHash: workflowFingerprint(spec, cwd, effectiveModel),
+        ...chain,
         completed: [],
       },
     };
@@ -1084,7 +1152,7 @@ async function main() {
     if (args["ready-file"]) {
       const readyFile = String(args["ready-file"]);
       const readyTemp = `${readyFile}.${process.pid}.tmp`;
-      writeFileSync(readyTemp, JSON.stringify({ ok: true, ready: true, runId: visualizerRun.runId, workflow, cwd }, null, 2), "utf8");
+      writeFileSync(readyTemp, JSON.stringify({ ok: true, ready: true, runId: visualizerRun.runId, workflow, cwd, ...chain }, null, 2), "utf8");
       renameSync(readyTemp, readyFile);
     }
     if (harnessFile) {
@@ -1113,7 +1181,7 @@ async function main() {
     const resultPath = writeWorkflowResult(ctx, STATUSES.SUCCESS);
     completeRun(visualizerRun, STATUSES.SUCCESS, { ok: true, phases: spec.phases?.length ?? 1, mode: harnessFile ? "harness" : "spec", resultPath, resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length || 0 });
     activeRun = undefined;
-    console.log(JSON.stringify({ ok: true, runId: visualizerRun.runId, workflow, cwd, resultPath, resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length || 0 }, null, 2));
+    console.log(JSON.stringify({ ok: true, runId: visualizerRun.runId, workflow, cwd, resultPath, ...chain, resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length || 0 }, null, 2));
   } catch (error) {
     const cancelled = cancellationRequested || isAbortError(error) || controller.signal.aborted;
     try {
@@ -1125,11 +1193,11 @@ async function main() {
     }
     if (cancelled) {
       if (activeRun === visualizerRun) completeRun(visualizerRun, STATUSES.CANCELLED, { cancelled: true, reason: controller.signal.reason || error?.message });
-      console.log(JSON.stringify({ ok: false, cancelled: true, runId: visualizerRun.runId, workflow, cwd }, null, 2));
+      console.log(JSON.stringify({ ok: false, cancelled: true, runId: visualizerRun.runId, workflow, cwd, ...chain }, null, 2));
       process.exitCode = 130;
     } else {
       failRun(visualizerRun, error);
-      console.log(JSON.stringify({ ok: false, runId: visualizerRun.runId, workflow, cwd, error: error.message }, null, 2));
+      console.log(JSON.stringify({ ok: false, runId: visualizerRun.runId, workflow, cwd, ...chain, error: error.message }, null, 2));
       process.exitCode = 1;
     }
     activeRun = undefined;

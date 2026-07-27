@@ -112,15 +112,16 @@ function formatCompletion(event: AnyEvent): string {
 	return formatRunDetail(run);
 }
 
-function formatContinuationPrompt(run: AnyEvent): string {
+export function formatContinuationPrompt(run: AnyEvent): string {
 	const artifacts = (run.artifacts || [])
 		.map((artifact: AnyEvent) => `- ${artifact.title || artifact.kind}: ${artifact.path || artifact.preview || (artifact.content ? "(inline)" : "")}`)
 		.join("\n");
 	const phases = (run.phases || [])
 		.map((phase: AnyEvent) => `- ${statusIcon(phase.normalizedStatus)} ${phase.phase}${phase.lastMessage ? ` — ${phase.lastMessage}` : ""}`)
 		.join("\n");
+	const failed = run.normalizedStatus === STATUSES.FAILED;
 	return [
-		`A thread-phase workflow completed in this Pi session.`,
+		failed ? `A thread-phase workflow failed in this Pi session.` : `A thread-phase workflow completed in this Pi session.`,
 		``,
 		`Workflow: ${run.workflow || "workflow"}`,
 		`Status: ${run.status || run.normalizedStatus || "unknown"}`,
@@ -131,7 +132,9 @@ function formatContinuationPrompt(run: AnyEvent): string {
 		artifacts ? `\nArtifacts:\n${artifacts}` : undefined,
 		run.errors?.length ? `\nErrors:\n${run.errors.map((e: AnyEvent) => `- ${e.phase ? `${e.phase}: ` : ""}${e.message || e.error?.message || "error"}`).join("\n")}` : undefined,
 		``,
-		`Please inspect the workflow result/artifacts as needed, summarize the outcome, and continue with the user's task.`,
+		failed
+			? `The workflow failed. Inspect the failed phases, errors, checkpoints, and partial artifacts. Decide whether to resume the structured run, launch a recovery workflow, or report the blocker. Do not proceed as though the workflow succeeded.`
+			: `Please inspect the workflow result/artifacts as needed, summarize the outcome, and continue with the user's task.`,
 	].filter(Boolean).join("\n").slice(0, 12000);
 }
 

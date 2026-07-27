@@ -1233,8 +1233,9 @@ function compactOwnerMetadata(metadata) {
   const compact = {};
   for (const key of [
     "sessionId", "sessionFile", "launchSource", "source", "cwdAtLaunch", "cwd",
-    "pid", "ppid", "hostname", "cancellable", "cancelSignal", "autoContinue",
-    "dynamic", "mode", "permissions", "maxPermissions",
+    "pid", "ppid", "hostname", "cancellable", "cancelSignal", "autoContinue", "continuationMode",
+    "dynamic", "mode", "permissions", "maxPermissions", "chainId", "rootRunId", "parentRunId", "chainStep",
+    "resumedFromRunId", "resumedPhaseCount",
   ]) {
     const value = metadata[key];
     if (["string", "number", "boolean"].includes(typeof value)) compact[key] = value;
