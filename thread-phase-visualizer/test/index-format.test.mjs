@@ -11,7 +11,7 @@ process.on("exit", () => rmSync(storeDir, { recursive: true, force: true }));
 const loaderUrl = new URL("./support/pi-peer-loader.mjs", import.meta.url);
 if (nodeModule.registerHooks) nodeModule.registerHooks(await import(loaderUrl));
 else nodeModule.register(loaderUrl);
-const { default: registerVisualizer, formatRunSummary } = await import("../index.ts");
+const { default: registerVisualizer, formatContinuationPrompt, formatRunSummary } = await import("../index.ts");
 const store = await import("../lib/store.mjs");
 
 test("formatRunSummary includes canonical stale and owner metadata", () => {
@@ -27,6 +27,23 @@ test("formatRunSummary includes canonical stale and owner metadata", () => {
   });
   assert.match(output, /\[STALE\] heartbeat_stale/);
   assert.match(output, /sessionId: session-a  launch source: background  cwd at launch: \/repo/);
+});
+
+test("failed continuation prompts identify failure and recovery choices", () => {
+  const prompt = formatContinuationPrompt({
+    runId: "failed-run",
+    workflow: "failed-workflow",
+    status: "failed",
+    normalizedStatus: "failed",
+    phases: [{ phase: "build", normalizedStatus: "failed", lastMessage: "build failed" }],
+    artifacts: [{ title: "Partial workflow result", path: "/tmp/partial.json" }],
+    errors: [{ phase: "build", message: "exit 1" }],
+  });
+  assert.match(prompt, /^A thread-phase workflow failed/);
+  assert.match(prompt, /Status: failed/);
+  assert.match(prompt, /build: exit 1/);
+  assert.match(prompt, /resume the structured run, launch a recovery workflow, or report the blocker/);
+  assert.match(prompt, /Do not proceed as though the workflow succeeded/);
 });
 
 test("thread_phase_runs details expose the owning sessionId", async () => {

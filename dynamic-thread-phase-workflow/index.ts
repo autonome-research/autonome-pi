@@ -135,7 +135,13 @@ function renderStructuredTemplate(value: any, inputs: Record<string, any>, used:
 function resolvePublicWorkflowParams(params: any): any {
 	const hasTemplate = params?.template !== undefined;
 	const hasPhases = params?.phases !== undefined;
-	if (hasTemplate === hasPhases) throw new Error("Provide exactly one of template or phases.");
+	const hasResume = params?.resumeRunId !== undefined;
+	if ([hasTemplate, hasPhases, hasResume].filter(Boolean).length !== 1) throw new Error("Provide exactly one of template, phases, or resumeRunId.");
+	if (hasResume) {
+		const unsupported = Object.keys(definedProperties(params)).filter((key) => !["resumeRunId", "background"].includes(key));
+		if (unsupported.length) throw new Error(`Run-ID-only resume accepts only resumeRunId and background; remove: ${unsupported.join(", ")}`);
+		return params;
+	}
 	if (!hasTemplate) {
 		if (params?.inputs !== undefined) throw new Error("inputs may only be used with a saved structured workflow template.");
 		return params;
@@ -348,6 +354,7 @@ function legacyParametersSchema() {
 		model: Type.Optional(Type.String({ description: "Optional default Pi model pattern for pi/fanout_pi phases." })),
 		background: Type.Optional(Type.Boolean({ description: "Start the workflow in the background and return immediately." })),
 		autoContinue: Type.Optional(Type.Boolean({ description: "Queue a follow-up assistant continuation when the workflow completes successfully. Default false for dynamic workflows." })),
+		after: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Terminal parent run whose single chained successor this workflow becomes." })),
 		resumeRunId: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Prior structured run whose validated phase-output artifacts should be reused." })),
 		timeout: Type.Optional(Type.Number({ minimum: 1, maximum: MAX_TIMEOUT_MS, multipleOf: 1, description: "Default phase timeout in milliseconds (positive integer)." })),
 
@@ -409,9 +416,9 @@ function workflowParametersSchema() {
 		model: Type.Optional(Type.String({ description: "Default model pattern for agent/fanout phases." })),
 		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 3_600_000, description: "Default agent/shell phase timeout." })),
 		concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 64, description: "Default fanout concurrency." })),
-		background: Type.Optional(Type.Boolean({ description: "Run in the background and return a run id immediately." })),
-		autoContinue: Type.Optional(Type.Boolean({ description: "After successful background completion, queue a follow-up in this Pi session." })),
-		resumeRunId: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Prior structured run whose validated completed phase artifacts should be reused. The spec, cwd, model, and session must match." })),
+		background: Type.Optional(Type.Boolean({ description: "Run in the background; successful and failed terminal runs return control to this Pi session, while cancellation does not." })),
+		after: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Terminal successful or failed parent run. This workflow becomes its single chained successor." })),
+		resumeRunId: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Resume this structured run from its trusted spec, cwd, model, permissions, session, and completed phase artifacts. Use without phases or template." })),
 		template: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", description: "Saved structured workflow name from ~/.pi/agent/workflows/<name>.json. Use instead of phases." })),
 		inputs: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Values for {{inputs.key}} placeholders in a saved structured workflow template." })),
 		metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Optional workflow metadata persisted with the compiled input." })),
@@ -429,8 +436,8 @@ function harnessParametersSchema() {
 		cwd: Type.Optional(Type.String()),
 		model: Type.Optional(Type.String()),
 		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_TIMEOUT_MS })),
-		background: Type.Optional(Type.Boolean()),
-		autoContinue: Type.Optional(Type.Boolean()),
+		background: Type.Optional(Type.Boolean({ description: "Run in the background and return to chat after success or failure, but not cancellation." })),
+		after: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$" })),
 	}, { additionalProperties: false });
 }
 
@@ -466,12 +473,13 @@ function legacySpecToPublic(args: any): any {
 		...(args.timeout !== undefined ? { timeoutMs: args.timeout } : {}),
 		...(args.background !== undefined ? { background: args.background } : {}),
 		...(args.autoContinue !== undefined ? { autoContinue: args.autoContinue } : {}),
+		...(args.after !== undefined ? { after: args.after } : {}),
 		...(args.resumeRunId !== undefined ? { resumeRunId: args.resumeRunId } : {}),
 	};
 }
 
 function publicWorkflowToLegacySpec(params: any): any {
-	const { background: _background, template: _template, resumeRunId: _resumeRunId, ...spec } = params;
+	const { after: _after, background: _background, template: _template, resumeRunId: _resumeRunId, ...spec } = params;
 	return {
 		...spec,
 		phases: spec.phases.map((phase: any) => {
@@ -489,9 +497,11 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 	const hasSpec = params.spec !== undefined;
 	const hasHarness = params.harness !== undefined;
 	const hasHarnessFile = params.harnessFile !== undefined;
-	const inputModes = [hasSpec, hasHarness, hasHarnessFile].filter(Boolean).length;
-	if (inputModes !== 1) throw new Error("Provide exactly one of spec, harness, or harnessFile.");
+	const hasResumeOnly = params.resumeRunId !== undefined && !hasSpec && !hasHarness && !hasHarnessFile;
+	const inputModes = [hasSpec, hasHarness, hasHarnessFile, hasResumeOnly].filter(Boolean).length;
+	if (inputModes !== 1) throw new Error("Provide exactly one of spec, resumeRunId, harness, or harnessFile.");
 	if ((hasHarness || hasHarnessFile) && params.resumeRunId !== undefined) throw new Error("resumeRunId is supported only for structured workflows, not harnesses.");
+	if (params.after !== undefined && params.resumeRunId !== undefined) throw new Error("Provide only one of after or resumeRunId.");
 	if (hasSpec && (!params.spec || typeof params.spec !== "object" || Array.isArray(params.spec))) throw new Error("spec must be a non-null object.");
 	if (hasHarness && (typeof params.harness !== "string" || !params.harness.trim())) throw new Error("harness must be a non-empty string.");
 	if (hasHarnessFile && (typeof params.harnessFile !== "string" || !params.harnessFile.trim())) throw new Error("harnessFile must be a non-empty path.");
@@ -499,13 +509,13 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 	let generatedInputFile: string | undefined;
 	let retainGeneratedInput = false;
 	try {
-		const args = ["--cwd", cwd];
+		const args = hasResumeOnly ? [] : ["--cwd", cwd];
 		if (hasHarness || hasHarnessFile) {
 			if (params.permissions !== "rwx") throw new Error("JavaScript harness mode requires explicit permissions: \"rwx\".");
 			const harnessFile = hasHarnessFile ? path.resolve(ctx.cwd, params.harnessFile) : (generatedInputFile = writeHarnessFile(params.harness));
 			args.push("--js-file", harnessFile, "--permissions", params.permissions);
 			if (params.name) args.push("--name", params.name);
-		} else {
+		} else if (hasSpec) {
 			const spec = { ...params.spec };
 			if (params.permissions) {
 				if (spec.permissions && spec.permissions !== params.permissions) throw new Error("Top-level permissions conflict with spec.permissions.");
@@ -519,6 +529,7 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 		if (params.timeout !== undefined) args.push("--timeout", String(normalizeTimeoutMs(params.timeout, "timeout")));
 		if (params.background) args.push("--background");
 		if (params.autoContinue) args.push("--auto-continue");
+		if (params.after) args.push("--after", params.after);
 		if (params.resumeRunId) args.push("--resume-run-id", params.resumeRunId);
 		addSessionArgs(args, ctx);
 		onUpdate?.({ content: [{ type: "text", text: `Starting ${legacyName ? "dynamic thread-phase" : "dynamic"} workflow in ${cwd}...` }] });
@@ -546,9 +557,10 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 		"Set dynamic_workflow permissions to r, w, rw, or rwx; phases inherit that default and may override it within operator policy.",
 		"Use dynamic_workflow agent phases for one subagent and fanout phases for parallel subagents. Shell phases require rwx.",
 		"Use {{outputs.phase-name}} only to reference earlier phase outputs; fanout prompts may also use {{item}} and {{index}}.",
-		"Use dynamic_workflow background=true for long workflows and autoContinue=true only when a successful run should queue a follow-up.",
+		"Use background=true for long workflows. Successful and failed background runs return control to chat; user-cancelled runs do not.",
 		"Reusable structured workflows may be loaded by template name from ~/.pi/agent/workflows/<name>.json instead of supplying phases.",
-		"Set resumeRunId only for the same structured workflow, cwd, model, and Pi session; validated completed phase-output artifacts are reused and later phases continue.",
+		"Use after with a terminal successful or failed run id to create its single model-selected chained successor; Pi generates the child run and chain identities.",
+		"Use resumeRunId by itself to continue the same structured workflow from its trusted stored spec and validated completed phase-output artifacts.",
 	];
 
 	pi.registerTool({
@@ -561,14 +573,16 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 		prepareArguments: legacySpecToPublic,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const resolved = resolvePublicWorkflowParams(params);
+			if (resolved.resumeRunId !== undefined) {
+				return executeDynamicWorkflow({ resumeRunId: resolved.resumeRunId, background: resolved.background }, signal, onUpdate, ctx, "");
+			}
 			const spec = publicWorkflowToLegacySpec(resolved);
 			return executeDynamicWorkflow({
 				spec,
 				cwd: resolved.cwd,
 				model: resolved.model,
 				background: resolved.background,
-				autoContinue: resolved.autoContinue,
-				resumeRunId: resolved.resumeRunId,
+				after: resolved.after,
 			}, signal, onUpdate, ctx, "");
 		},
 	});

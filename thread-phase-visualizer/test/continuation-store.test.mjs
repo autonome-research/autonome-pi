@@ -109,9 +109,13 @@ test("persisted continuation ids load after a simulated extension restart", (t) 
   assert.ok(Object.values(persistedTimestamps(storeDir)).every((timestamp) => Number.isFinite(Date.parse(timestamp))));
 });
 
-test("shouldAutoContinue rejects non-success runs even when they opt in", () => {
-  assert.equal(shouldAutoContinue({ normalizedStatus: "running", metadata: { autoContinue: true } }), false);
-  assert.equal(shouldAutoContinue({ normalizedStatus: "failed", metadata: { autoContinue: "always" } }), false);
+test("shouldAutoContinue returns terminal background success and failure to chat but respects cancellation", () => {
+  const terminal = { continuationMode: "terminal" };
+  assert.equal(shouldAutoContinue({ normalizedStatus: "running", metadata: terminal }), false);
+  assert.equal(shouldAutoContinue({ normalizedStatus: "success", metadata: terminal }), true);
+  assert.equal(shouldAutoContinue({ normalizedStatus: "failed", metadata: terminal }), true);
+  assert.equal(shouldAutoContinue({ normalizedStatus: "cancelled", metadata: terminal }), false);
+  assert.equal(shouldAutoContinue({ normalizedStatus: "failed", metadata: { autoContinue: "always" } }), false, "legacy opt-in remains success-only");
   assert.equal(shouldAutoContinue({ normalizedStatus: "success", metadata: { autoContinue: true } }), true);
   assert.equal(shouldAutoContinue(undefined), false);
 });

@@ -48,6 +48,10 @@ test("flat public workflow arguments execute without a spec wrapper", async () =
     const result = await tools.get("dynamic_workflow").execute("test", artifactSpec("flat-public"), undefined, undefined, { cwd: testDir, sessionManager: {} });
     assert.equal(result.details.ok, true);
     assert.equal(result.details.workflow, "flat-public");
+    assert.match(result.details.chainId, /^[0-9a-f-]{36}$/);
+    assert.equal(result.details.rootRunId, result.details.runId);
+    assert.equal(result.details.parentRunId, undefined);
+    assert.equal(result.details.chainStep, 0);
   } finally {
     if (previousStore === undefined) delete process.env.PI_THREAD_PHASE_STORE_DIR;
     else process.env.PI_THREAD_PHASE_STORE_DIR = previousStore;
