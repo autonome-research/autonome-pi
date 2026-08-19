@@ -15,7 +15,7 @@ Autonome's Pi package for shared extensions, workflow tooling, and skills.
 ## Install
 
 ```bash
-pi install git:git@github.com:Code4me2/autonome-pi@v0.16.0
+pi install git:git@github.com:Code4me2/autonome-pi@v0.16.1
 ```
 
 For active development:
@@ -28,7 +28,7 @@ To migrate an installation that still uses the old repository identity:
 
 ```bash
 pi remove git:git@github.com:Code4me2/pi-thread-phase-tools@v0.12.0
-pi install git:git@github.com:Code4me2/autonome-pi@v0.16.0
+pi install git:git@github.com:Code4me2/autonome-pi@v0.16.1
 ```
 
 Pi identifies git packages by repository URL, so remove the old source before installing the renamed one to avoid loading both copies.
@@ -47,7 +47,7 @@ Pi identifies git packages by repository URL, so remove the old source before in
 
 ## Current status
 
-Latest release: `v0.16.0`.
+Latest release: `v0.16.1`.
 
 Recent changes:
 
