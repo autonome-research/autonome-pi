@@ -62,7 +62,13 @@ export function renderPhaseTimeline(run: RunSummary, theme: Theme, expanded: boo
 		if (expanded && phase.fanout?.items?.length) {
 			for (const item of phase.fanout.items.slice(0, 20)) {
 				const itemStatus = item.normalizedStatus || item.status;
-				container.addChild(new Text(`  ${theme.fg(statusColor(itemStatus), statusIcon(itemStatus))} ${theme.fg("muted", item.label || item.itemId)}${item.lastMessage ? theme.fg("dim", ` — ${item.lastMessage}`) : ""}`, 0, 0));
+				// Render each fanout stage with the same visual indicator as a phase
+				// (status icon+color, accent name, per-stage usage) so stages read as
+				// first-class rows rather than anonymous sub-lines.
+				const name = theme.fg("accent", item.label || item.itemId);
+				const usage = item.usage && item.usage.entries ? theme.fg("muted", ` · ${formatUsageSummary(item.usage)}`) : "";
+				const message = item.lastMessage ? theme.fg("dim", ` — ${item.lastMessage}`) : "";
+				container.addChild(new Text(`  ${theme.fg(statusColor(itemStatus), statusIcon(itemStatus))} ${name}${usage}${message}`, 0, 0));
 			}
 			if (phase.fanout.items.length > 20) container.addChild(new Text(theme.fg("dim", `  … ${phase.fanout.items.length - 20} more item(s)`), 0, 0));
 		}
