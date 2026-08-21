@@ -1214,9 +1214,12 @@ export function projectRun(events = [], options = {}) {
       if (artifactPhase) {
         const phase = summary.phaseMap[artifactPhase];
         if (phase) {
-          (phase.artifacts ||= []).push(record);
           const itemId = event.artifact?.metadata?.itemId;
-          if (itemId !== undefined) {
+          if (itemId === undefined) {
+            // Non-stage artifact: attach to the generating phase.
+            (phase.artifacts ||= []).push(record);
+          } else {
+            // Stage artifact: attach to the exact fanout stage that produced it.
             const item = phase._fanoutItemMap?.[String(itemId)];
             if (item) (item.artifacts ||= []).push(record);
           }

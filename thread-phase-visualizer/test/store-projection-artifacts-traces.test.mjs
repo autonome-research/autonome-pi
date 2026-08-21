@@ -72,10 +72,11 @@ test("projectRun nests artifacts under their generating phase and fanout stage w
 
   const compile = projected.phases.find((p) => p.phase === "compile");
   const stages = projected.phases.find((p) => p.phase === "stages");
-  // Phase-level nesting.
+  // Non-stage artifacts nest under their generating phase.
   assert.deepEqual(compile.artifacts.map((a) => a.path), ["/tmp/compile.md"]);
-  assert.ok(stages.artifacts.some((a) => a.path === "/tmp/stages-alpha.md"));
-  // Fanout-stage-level nesting (keyed by itemId).
+  // Stage artifacts nest under the exact fanout stage, not duplicated on the
+  // fanout phase itself.
+  assert.equal((stages.artifacts ?? []).length, 0);
   const alpha = stages.fanout.items.find((item) => item.itemId === "0:alpha");
   assert.ok(alpha);
   assert.deepEqual(alpha.artifacts.map((a) => a.path), ["/tmp/stages-alpha.md"]);
