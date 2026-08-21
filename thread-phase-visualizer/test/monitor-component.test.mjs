@@ -65,7 +65,7 @@ test("monitor renders a consistently framed Thread-phase panel", () => {
   assert.match(lines.at(-1), /^╰─+╯$/);
   assert.ok(lines.slice(1, -1).every((line) => line.startsWith("│ ") && line.endsWith(" │")));
   assert.ok(lines.every((line) => visibleWidth(line) === width));
-  assert.match(text(lines), /Thread-phase monitor/);
+  assert.match(text(lines), /↑↓ select/);
 });
 
 test("monitor detail renders canonical owner metadata and stale reason", () => {
@@ -78,7 +78,8 @@ test("monitor detail renders canonical owner metadata and stale reason", () => {
   monitor.handleInput("\r");
   const detail = text(monitor.render(100));
   assert.match(detail, /\[STALE\] heartbeat_stale/);
-  assert.match(detail, /sessionId: session-42  launch source: background  cwd at launch: \/repo-at-launch/);
+  // Owner telemetry (sessionId / cwd at launch) is dropped as low-signal (audit MUST).
+  assert.doesNotMatch(detail, /sessionId: session-42|cwd at launch|launch source/);
 });
 
 test("dashboard detail shows aggregate duration and total tokens without timestamp or token breakdown noise", () => {
@@ -142,7 +143,8 @@ test("h toggles the monitor stale-run filter and escape restores stale runs", ()
   assert.doesNotMatch(rendered, /Stale Run/);
   monitor.handleInput("\x1b");
   rendered = text(monitor.render(90));
-  assert.match(rendered, /stale:shown/);
+  // With no active filter the summary line is hidden; stale runs are restored.
+  assert.doesNotMatch(rendered, /stale:/);
   assert.match(rendered, /Stale Run/);
 });
 
@@ -164,7 +166,7 @@ test("handleInput transitions list to detail to nested artifact and left returns
   monitor.handleInput("\x1b[D");
   assert.match(text(monitor.render(72)), /Phases/);
   monitor.handleInput("\x1b[D");
-  assert.match(text(monitor.render(72)), /Thread-phase monitor/);
+  assert.match(text(monitor.render(72)), /↑↓ select/);
 });
 
 test("artifact c action delivers path and URL targets through the monitor callback", () => {
@@ -302,13 +304,14 @@ test("search input filters mock runs and escape restores the full list", () => {
   const filtered = text(monitor.render(80));
   assert.match(filtered, /Beta Review/);
   assert.doesNotMatch(filtered, /Alpha Build/);
-  assert.match(filtered, /Filter: bEtA/);
+  assert.match(filtered, /search:bEtA/);
 
   monitor.handleInput("\x1b");
   const cleared = text(monitor.render(80));
   assert.match(cleared, /Alpha Build/);
   assert.match(cleared, /Beta Review/);
-  assert.match(cleared, /Filter: \(none\)/);
+  // With no active filter the summary line is hidden entirely (signal dedup).
+  assert.doesNotMatch(cleared, /Filter:|search:|status:|stale:/);
 });
 
 test("clear actions restore the unfiltered list from every mode and reset selection", () => {
@@ -330,7 +333,7 @@ test("clear actions restore the unfiltered list from every mode and reset select
   assert.match(text(monitor.render(80)), /› ✓ Beta Review/);
   monitor.handleInput("b");
   let cleared = text(monitor.render(80));
-  assert.match(cleared, /Thread-phase monitor/);
+  assert.match(cleared, /↑↓ select/);
   assert.match(cleared, /Alpha Build/);
   assert.match(cleared, /› .* Alpha Build LIVE/);
 
@@ -349,7 +352,7 @@ test("clear actions restore the unfiltered list from every mode and reset select
   assert.match(text(monitor.render(80)), /Phases/);
   monitor.handleInput("\x1b");
   cleared = text(monitor.render(80));
-  assert.match(cleared, /Thread-phase monitor/);
+  assert.match(cleared, /↑↓ select/);
   assert.match(cleared, /Alpha Build/);
   assert.match(cleared, /› .* Alpha Build LIVE/);
 
@@ -365,7 +368,7 @@ test("clear actions restore the unfiltered list from every mode and reset select
   assert.match(text(monitor.render(80)), /Build report/);
   monitor.handleInput("b");
   cleared = text(monitor.render(80));
-  assert.match(cleared, /Thread-phase monitor/);
+  assert.match(cleared, /↑↓ select/);
   assert.match(cleared, /Alpha Build/);
   assert.match(cleared, /› .* Alpha Build LIVE/);
 });
@@ -391,7 +394,7 @@ test("escape and back keys navigate consistently in list, detail, and artifact m
     const detailMonitor = makeMonitor();
     detailMonitor.handleInput("\r");
     detailMonitor.handleInput(key);
-    assert.match(text(detailMonitor.render(80)), /Thread-phase monitor/);
+    assert.match(text(detailMonitor.render(80)), /↑↓ select/);
     assert.equal(closeCount, 0, `${JSON.stringify(key)} returns from detail without closing`);
 
     const artifactMonitor = makeMonitor();
@@ -490,7 +493,7 @@ test("artifact view keeps its run identity across reloads and exits if that run 
   runs = runs.filter((candidate) => candidate.runId !== "run-beta");
   monitor.invalidate();
   const fallback = text(monitor.render(80));
-  assert.match(fallback, /Thread-phase monitor/);
+  assert.match(fallback, /↑↓ select/);
   assert.doesNotMatch(fallback, /beta-only|↑↓ line/);
 });
 
@@ -504,7 +507,7 @@ test("detail view returns safely to the list if its selected run disappears", ()
   monitor.invalidate();
 
   const fallback = text(monitor.render(80));
-  assert.match(fallback, /Thread-phase monitor/);
+  assert.match(fallback, /↑↓ select/);
   assert.match(fallback, /Beta Review/);
   assert.doesNotMatch(fallback, /Phases/);
 });

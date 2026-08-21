@@ -42,6 +42,18 @@ export function formatFanout(fanout: any): string {
 	return text;
 }
 
+const MAX_MESSAGE_CHARS = 48;
+function showsMessage(status: string | undefined): boolean {
+	return status === STATUSES.RUNNING || status === STATUSES.FAILED || status === STATUSES.CANCELLED || status === STATUSES.UNKNOWN;
+}
+function truncateMessage(value: string): string {
+	const text = String(value || "").replace(/\s+/g, " ").trim();
+	if (!text) return "";
+	let out = text.slice(0, MAX_MESSAGE_CHARS);
+	while (Buffer.byteLength(out, "utf8") > MAX_MESSAGE_CHARS) out = out.slice(0, -1);
+	return out.length < text.length ? `${out}…` : out;
+}
+
 export function renderPhaseTimeline(run: RunSummary, theme: Theme, expanded: boolean) {
 	const phases: PhaseSummary[] = run.phases || [];
 	const container = new Container();
@@ -55,9 +67,14 @@ export function renderPhaseTimeline(run: RunSummary, theme: Theme, expanded: boo
 		const normalized = phase.normalizedStatus || phase.status;
 		const icon = theme.fg(statusColor(normalized), statusIcon(normalized));
 		const name = theme.fg("accent", phase.phase || "phase");
-		const progress = theme.fg("muted", phase.fanout ? formatFanout(phase.fanout) : formatProgress(phase.progress));
+		// When a fanout's child rows are already expanded, its aggregated
+		// completed/running summary is redundant (signal dedup).
+		const progress = theme.fg("muted", expanded && phase.fanout?.items?.length
+			? ""
+			: phase.fanout ? formatFanout(phase.fanout) : formatProgress(phase.progress));
 		const usage = expanded && phase.usage ? theme.fg("muted", ` · ${formatUsageSummary(phase.usage)}`) : "";
-		const message = expanded && phase.lastMessage ? theme.fg("dim", ` — ${phase.lastMessage}`) : "";
+		const message = expanded && phase.lastMessage && showsMessage(normalized)
+			? theme.fg("dim", ` — ${truncateMessage(phase.lastMessage)}`) : "";
 		container.addChild(new Text(`${icon} ${name}${progress}${usage}${message}`, 0, 0));
 		if (expanded && phase.fanout?.items?.length) {
 			for (const item of phase.fanout.items.slice(0, 20)) {
@@ -65,10 +82,11 @@ export function renderPhaseTimeline(run: RunSummary, theme: Theme, expanded: boo
 				// Render each fanout stage with the same visual indicator as a phase
 				// (status icon+color, accent name, per-stage usage) so stages read as
 				// first-class rows rather than anonymous sub-lines.
-				const name = theme.fg("accent", item.label || item.itemId);
-				const usage = item.usage && item.usage.entries ? theme.fg("muted", ` · ${formatUsageSummary(item.usage)}`) : "";
-				const message = item.lastMessage ? theme.fg("dim", ` — ${item.lastMessage}`) : "";
-				container.addChild(new Text(`  ${theme.fg(statusColor(itemStatus), statusIcon(itemStatus))} ${name}${usage}${message}`, 0, 0));
+				const stageName = theme.fg("accent", item.label || item.itemId);
+				const stageUsage = item.usage && item.usage.entries ? theme.fg("muted", ` · ${formatUsageSummary(item.usage)}`) : "";
+				const stageMessage = item.lastMessage && showsMessage(itemStatus)
+					? theme.fg("dim", ` — ${truncateMessage(item.lastMessage)}`) : "";
+				container.addChild(new Text(`  ${theme.fg(statusColor(itemStatus), statusIcon(itemStatus))} ${stageName}${stageUsage}${stageMessage}`, 0, 0));
 			}
 			if (phase.fanout.items.length > 20) container.addChild(new Text(theme.fg("dim", `  … ${phase.fanout.items.length - 20} more item(s)`), 0, 0));
 		}

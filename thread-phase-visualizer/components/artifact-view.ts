@@ -24,7 +24,9 @@ export function renderArtifactList(run: RunSummary, theme: Theme, expanded: bool
 
 	for (const artifact of artifacts) {
 		const title = artifact.title || artifact.kind || "artifact";
-		const target = artifact.path || artifact.preview || (artifact.content ? "(inline)" : "");
+		// Never put preview/content in the list-row metadata (signal dedup): a path is
+		// enough; opening an artifact renders its content.
+		const target = artifact.path || "";
 		container.addChild(new Text(`${theme.fg("success", "◉")} ${theme.fg("accent", title)}${target ? theme.fg("dim", ` — ${target}`) : ""}`, 0, 0));
 		const isSummary = /summary/i.test(String(title));
 		const shouldRenderContent = expanded && (contentMode === "all" || (contentMode === "summary" && isSummary));

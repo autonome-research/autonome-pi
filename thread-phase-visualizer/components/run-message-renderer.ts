@@ -13,16 +13,21 @@ function shortRunId(runId: string | undefined): string {
 	return parts.length > 1 ? parts.slice(-1)[0] : runId.slice(0, 12);
 }
 
-function compactRunLine(run: RunSummary, theme: any): string {
+function compactRunLine(run: RunSummary, theme: any, expanded = false): string {
 	const status = run.normalizedStatus || run.status;
 	const icon = theme.fg(statusColor(status), statusIcon(status));
 	const workflow = theme.fg("accent", run.workflow || "workflow");
 	const statusText = status === STATUSES.RUNNING ? "running" : status === STATUSES.FAILED ? "failed" : "completed";
 	const stale = run.stale ? ` ${theme.fg("warning", formatStaleIndicator(run))}` : "";
 	const usage = run.usage?.entries ? ` · ${formatUsageSummary(run.usage)}` : "";
-	const counts = theme.fg("muted", `${phaseSummaryText(run)} · ${artifactSummaryText(run)}${usage}`);
 	const id = theme.fg("dim", shortRunId(run.runId));
-	return `${icon} phased workflow ${statusText}: ${workflow}${stale} ${theme.fg("dim", "[")}${id}${theme.fg("dim", "]")} ${counts}`;
+	// When expanded (timeline + artifact rows visible), the header's phase/artifact
+	// counts would duplicate those surfaces, so retain only exceptional status.
+	const counts = expanded
+		? (status === STATUSES.FAILED ? theme.fg("warning", "failed") : "")
+		: theme.fg("muted", `${phaseSummaryText(run)} · ${artifactSummaryText(run)}${usage}`);
+	const countPart = counts ? ` ${counts}` : "";
+	return `${icon} ${workflow} ${statusText}${stale}${countPart} ${theme.fg("dim", "[")}${id}${theme.fg("dim", "]")}`;
 }
 
 function runFromMessage(message: any): RunSummary | undefined {
@@ -38,7 +43,7 @@ function renderRunMessage(message: any, expanded: boolean, theme: any) {
 
 	const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
 	const container = new Container();
-	container.addChild(new Text(compactRunLine(run, theme), 0, 0));
+	container.addChild(new Text(compactRunLine(run, theme, expanded), 0, 0));
 
 	if (!expanded) {
 		container.addChild(new Text(theme.fg("dim", keyHint("app.tools.expand", "expand")), 0, 0));
@@ -53,10 +58,6 @@ function renderRunMessage(message: any, expanded: boolean, theme: any) {
 	if (run.startedAt || run.updatedAt) {
 		container.addChild(new Text(theme.fg("dim", `Started: ${run.startedAt || "?"}  Updated: ${run.updatedAt || "?"}`), 0, 0));
 	}
-	if (run.heartbeat?.timestamp) container.addChild(new Text(theme.fg("dim", `Heartbeat: ${run.heartbeat.timestamp}${run.heartbeat.featureId ? ` feature=${run.heartbeat.featureId}` : ""}`), 0, 0));
-	if (run.stale) container.addChild(new Text(theme.fg("warning", formatStaleIndicator(run)), 0, 0));
-	if (run.usage?.entries) container.addChild(new Text(theme.fg("muted", `Usage: ${formatUsageSummary(run.usage)}`), 0, 0));
-
 	container.addChild(new Spacer(1));
 	container.addChild(new Text(theme.fg("toolTitle", theme.bold("Phases")), 0, 0));
 	container.addChild(renderPhaseTimeline(run, theme, true));
@@ -73,7 +74,9 @@ function renderRunMessage(message: any, expanded: boolean, theme: any) {
 	if (run.artifacts?.length) {
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(theme.fg("toolTitle", theme.bold("Artifacts")), 0, 0));
-		container.addChild(renderArtifactList(run, theme, true, { contentMode: "summary" }));
+		// Show title/path only; opening an artifact renders its content. Inlining full
+		// bodies here drowned the workflow signal (audit MUST).
+		container.addChild(renderArtifactList(run, theme, true, { contentMode: "none" }));
 	}
 
 	box.addChild(container);

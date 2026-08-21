@@ -5,7 +5,7 @@ import { STATUSES, latestRunSummaries, readArtifactContent, requestCancellation 
 import { artifactEditorActionHint, artifactEditorTarget } from "../lib/artifact-action.mjs";
 import { MONITOR_SORTS, MONITOR_STATUS_FILTERS, cycleMonitorOption, filterAndSortMonitorRuns } from "../lib/monitor-state.mjs";
 import { detailViewportHeight, windowLineRange } from "../lib/monitor-pagination.mjs";
-import { formatElapsedDuration, formatOwnerMetadata, formatStaleIndicator, formatTotalTokens } from "../lib/run-display.mjs";
+import { formatElapsedDuration, formatStaleIndicator, formatTotalTokens } from "../lib/run-display.mjs";
 import { canInspectRun, mergeMonitorRuns } from "../lib/session-scope.mjs";
 import { framePanel } from "./bordered-panel.ts";
 import { formatFanout, formatProgress, statusColor, statusIcon } from "./phase-timeline.ts";
@@ -141,15 +141,20 @@ function artifactTarget(artifact: ArtifactSummary | undefined): string {
 	return artifact?.path || artifact?.url || artifact?.preview || (artifact?.content ? "(inline)" : "");
 }
 
-function compactJson(value: any): string {
-	try { return JSON.stringify(value); }
-	catch { return String(value); }
-}
-
 function sanitizeIoText(value: any): string {
 	return String(value || "")
 		.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
 		.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "�");
+}
+
+function ioIdentity(io: any): string | undefined {
+	return io?.componentId || io?.component || io?.role || io?.command;
+}
+
+function activeIoMatches(a: any, b: any): boolean {
+	const ai = ioIdentity(a);
+	const bi = ioIdentity(b);
+	return Boolean(ai && ai === bi);
 }
 
 function phaseKey(phase: PhaseSummary): string {
@@ -491,10 +496,18 @@ export class ThreadPhaseMonitorComponent {
 		const t = this.theme;
 		const lines: string[] = [];
 		const selectedRun = runs[this.selected];
-		const cancelHint = isRunningCancellable(selectedRun) ? " • x cancel" : "";
-		lines.push(truncateToWidth(t.fg("accent", t.bold("Thread-phase monitor")) + t.fg("dim", `  ↑↓ select • enter details${cancelHint} • / search • f status • h stale • s sort • q close`), width));
-		const searchPrompt = this.searchMode ? `${this.searchQuery}▌` : this.searchQuery || "(none)";
-		lines.push(truncateToWidth(t.fg("toolTitle", "Filter: ") + t.fg(this.searchMode ? "accent" : "muted", searchPrompt) + t.fg("dim", `  status:${this.statusFilter}  stale:${this.hideStale ? "hidden" : "shown"}  sort:${this.sortMode}${this.hasFilters() ? "  • esc/b clear" : ""}`), width));
+		const cancelHint = isRunningCancellable(selectedRun) ? " · x cancel" : "";
+		// The panel frame already titles this surface; keep the first line to action keys only.
+		lines.push(truncateToWidth(t.fg("dim", `↑↓ select · enter details${cancelHint} · / search · f status · h stale · s sort · q close`), width));
+		// Show the filter line ONLY when a search or non-default filter/sort is active.
+		if (this.searchMode || this.searchQuery || this.statusFilter !== "all" || this.hideStale || this.sortMode !== "status") {
+			const active: string[] = [];
+			if (this.searchMode || this.searchQuery) active.push(`search:${this.searchQuery || "…"}`);
+			if (this.statusFilter !== "all") active.push(`status:${this.statusFilter}`);
+			if (this.hideStale) active.push("stale:hidden");
+			if (this.sortMode !== "status") active.push(`sort:${this.sortMode}`);
+			lines.push(truncateToWidth(t.fg("toolTitle", active.join("  ") + "  • esc/b clear"), width));
+		}
 		lines.push(truncateToWidth(t.fg("borderMuted", "─".repeat(Math.max(0, width))), width));
 		if (runs.length === 0) {
 			const message = this.hasFilters() ? "No runs match filter." : "No runs for this working directory.";
@@ -521,7 +534,9 @@ export class ThreadPhaseMonitorComponent {
 			const location = run.cwd ? t.fg("dim", ` @ ${highlightMatch(cwd, this.searchQuery, t)}`) : "";
 			const metrics = [elapsedForRun(run), formatTotalTokens(run.usage)].filter((value) => value && value !== "?").join(" · ");
 			lines.push(truncateToWidth(`${head}${location}${metrics ? t.fg("muted", ` · ${metrics}`) : ""}${current ? t.fg("muted", ` — ${current}`) : ""}`, width));
-			if (status === STATUSES.RUNNING) lines.push(truncateToWidth(`  ${deterministicPhaseLine(run, t)}`, width));
+			if (status === STATUSES.RUNNING && (run.phases || []).filter((p) => p.normalizedStatus === STATUSES.RUNNING || p.status === STATUSES.RUNNING).length > 1) {
+				lines.push(truncateToWidth(`  ${deterministicPhaseLine(run, t)}`, width));
+			}
 		}
 		const remaining = runs.length - start - visible.length;
 		if (remaining > 0) lines.push(truncateToWidth(t.fg("dim", `… ${remaining} older run(s)`), width));
@@ -551,12 +566,10 @@ export class ThreadPhaseMonitorComponent {
 		add(t.fg("accent", t.bold(`${workflowGlyph(status, t)} ${run.workflow || "workflow"}`)) + t.fg("dim", ` [${run.runId || "unknown"}]`));
 		const pid = runtimePid(run);
 		add(t.fg("dim", `status: ${run.status || status}${run.stale ? `  ${formatStaleIndicator(run)}` : ""}  duration: ${elapsedForRun(run)}${pid && status === STATUSES.RUNNING ? `  pid: ${pid}` : ""}`));
-		const owner = formatOwnerMetadata(run);
-		if (owner) add(t.fg("dim", owner));
-		if (run.heartbeat?.timestamp) add(t.fg("dim", `heartbeat: ${run.heartbeat.timestamp}${run.heartbeat.featureId ? `  feature: ${run.heartbeat.featureId}` : ""}`));
 		const runTokens = formatTotalTokens(run.usage);
 		if (runTokens) add(t.fg("muted", `tokens: ${runTokens}`));
-		this.addActiveIo(lines, run.activeIo, width, "active I/O");
+		const runAnchorIo = run.activeIo;
+		this.addActiveIo(lines, runAnchorIo, width, "active I/O");
 		add("");
 		add(t.fg("toolTitle", t.bold("Phases")) + t.fg("dim", ` (${(run.phases || []).length})`));
 		if (!(run.phases || []).length) add(t.fg("dim", "No phases recorded."));
@@ -573,7 +586,7 @@ export class ThreadPhaseMonitorComponent {
 					: (phase.fanout?.items?.length || phase.artifacts?.length || (isRunningNode(phase) && phase.recentItems?.length)) ? t.fg("dim", "▸ ") : "  ";
 				add(`${prefix} ${expandMark}${t.fg(statusColor(pStatus), phaseStatusGlyph(pStatus))} ${selected ? t.fg("accent", phase.phase || "phase") : phase.phase || "phase"}${t.fg("muted", progress)}${inference ? t.fg("dim", ` — ${inference}`) : ""}`, true);
 				if (this.expandedPhases.has(row.key)) {
-					this.addPhaseHeader(lines, phase, width);
+					this.addPhaseHeader(lines, phase, width, runAnchorIo);
 					if (isRunningNode(phase) && phase.recentItems?.length) this.addTracePane(lines, phase.recentItems, width);
 				}
 			} else if (row.kind === "stage") {
@@ -600,18 +613,21 @@ export class ThreadPhaseMonitorComponent {
 		return this.windowLines(lines, width, this.viewportHeight, selectedLine);
 	}
 
-	private addPhaseHeader(lines: string[], phase: PhaseSummary, width: number): void {
+	private addPhaseHeader(lines: string[], phase: PhaseSummary, width: number, runAnchorIo?: any): void {
 		const t = this.theme;
 		if (phase.startedAt) lines.push(t.fg("dim", `    duration: ${elapsedForPhase(phase)}`));
-		if (phase.progress) lines.push(t.fg("muted", `    progress: ${compactJson(phase.progress)}`));
 		const phaseTokens = formatTotalTokens(phase.usage);
 		if (phaseTokens) lines.push(t.fg("muted", `    tokens: ${phaseTokens}`));
-		this.addActiveIo(lines, phase.activeIo, width, "    I/O");
+		// Suppress phase-level I/O when it duplicates the run-anchor I/O (signal dedup).
+		if (phase.activeIo && !activeIoMatches(phase.activeIo, runAnchorIo)) {
+			this.addActiveIo(lines, phase.activeIo, width, "    I/O");
+		}
 		if (phase.fanout) lines.push(t.fg("muted", `    fanout:${formatFanout(phase.fanout)} ${phase.fanout.label || ""}`));
 	}
 
 	// Render the most recent live reasoning / tool-call trace for a running phase or
-	// stage, from its projected recentItems. Non-selectable detail lines.
+	// stage, from its projected recentItems. Non-selectable detail lines. Reasoning
+	// content deltas are coalesced into a single assembled line (signal dedup).
 	private addTracePane(lines: string[], items: any[], width: number): void {
 		const t = this.theme;
 		lines.push(truncateToWidth(t.fg("toolTitle", "    trace:") + t.fg("dim", " live reasoning / tool calls"), width));
@@ -619,18 +635,25 @@ export class ThreadPhaseMonitorComponent {
 		const MAX_VISIBLE_TRACE = 12;
 		const hideOlder = total > MAX_VISIBLE_TRACE;
 		const visible = hideOlder ? items.slice(-MAX_VISIBLE_TRACE) : items;
-		if (hideOlder) lines.push(truncateToWidth(t.fg("dim", `      … ${total - MAX_VISIBLE_TRACE} earlier item(s) (showing most recent)`), width));
+		if (hideOlder) lines.push(truncateToWidth(t.fg("dim", `      … ${total - MAX_VISIBLE_TRACE} earlier`), width));
+		const reasoning: string[] = [];
+		const flushReasoning = () => {
+			if (!reasoning.length) return;
+			const text = reasoning.join("").replace(/\s+/g, " ").trim();
+			if (text) lines.push(truncateToWidth(t.fg("muted", `      ⎙ ${text}`), width));
+			reasoning.length = 0;
+		};
 		for (const item of visible) {
 			if (!item || typeof item !== "object") continue;
-			if (item.type === "content_delta") {
-				const text = String(item.delta ?? "").trim();
-				if (text) lines.push(truncateToWidth(t.fg("muted", `      ⎙ ${text}`), width));
-			} else if (item.type === "tool_call_started") {
-				lines.push(truncateToWidth(t.fg("warning", `      🔧 ${item.toolCallId ? `#${item.toolCallId}` : "tool"} call started`), width));
+			if (item.type === "content_delta") { reasoning.push(String(item.delta ?? "")); continue; }
+			flushReasoning();
+			if (item.type === "tool_call_started") {
+				lines.push(truncateToWidth(t.fg("warning", `      🔧 ${item.toolName || "tool"} call started`), width));
 			} else if (item.type === "tool_call_completed") {
 				lines.push(truncateToWidth(t.fg("success", `      ✓ ${item.toolName || "tool"}${item.args ? ` ${String(item.args).slice(0, 60)}` : ""}`), width));
 			}
 		}
+		flushReasoning();
 	}
 
 	private addActiveIo(lines: string[], io: any, width: number, title = "I/O"): void {

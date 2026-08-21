@@ -26,7 +26,10 @@ test("formatRunSummary includes canonical stale and owner metadata", () => {
     artifacts: [],
   });
   assert.match(output, /\[STALE\] heartbeat_stale/);
-  assert.match(output, /sessionId: session-a  launch source: background  cwd at launch: \/repo/);
+  // Owner metadata is trimmed to high-signal fields (audit MUST): full sessionId
+  // and launch cwd are dropped, stale + short launch source retained.
+  assert.match(output, /launch source: background/);
+  assert.doesNotMatch(output, /sessionId: session-a|cwd at launch/);
 });
 
 test("failed continuation prompts identify failure and recovery choices", () => {

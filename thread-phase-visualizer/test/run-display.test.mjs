@@ -40,6 +40,8 @@ test("owner and stale display use one canonical representation", () => {
     metadata: { sessionId: "session-a", launchSource: "background", cwdAtLaunch: "/repo" },
     stale: { reason: "pid_not_running", pid: 123 },
   };
-  assert.equal(formatOwnerMetadata(run), "sessionId: session-a  launch source: background  cwd at launch: /repo");
+  // Owner metadata is trimmed to high-signal fields only (audit MUST): full session
+  // IDs and launch cwd are dropped as low-value provenance.
+  assert.equal(formatOwnerMetadata(run), "launch source: background");
   assert.equal(formatStaleIndicator(run), "[STALE] pid_not_running");
 });

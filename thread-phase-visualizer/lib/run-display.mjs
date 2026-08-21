@@ -16,11 +16,11 @@ export function runOwnerMetadata(run) {
 
 export function formatOwnerMetadata(run) {
   const owner = runOwnerMetadata(run);
-  return [
-    owner.sessionId ? `sessionId: ${owner.sessionId}` : undefined,
-    owner.launchSource ? `launch source: ${owner.launchSource}` : undefined,
-    owner.cwdAtLaunch ? `cwd at launch: ${owner.cwdAtLaunch}` : undefined,
-  ].filter(Boolean).join("  ");
+  // Low-signal, non-actionable provenance is omit from normal displays (audit
+  // MUST): opaque full session IDs and launch cwd. Retain only short launchSource.
+  return [owner.launchSource ? `launch source: ${owner.launchSource}` : undefined]
+    .filter(Boolean)
+    .join("  ");
 }
 
 export function formatStaleIndicator(run) {

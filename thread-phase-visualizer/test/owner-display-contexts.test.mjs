@@ -52,7 +52,10 @@ test("expanded run messages display canonical owner metadata and stale reason", 
 
   const rendered = renderer({ details: { summary: displayRun() } }, { expanded: true }, theme);
   const output = componentText(rendered);
-  assert.match(output, /sessionId: session-owner-42  launch source: background  cwd at launch: \/repo\/at-launch/);
+  // Owner metadata is trimmed to high-signal fields (audit MUST): sessionId/cwd
+  // dropped, short launch source retained, stale reason kept.
+  assert.match(output, /launch source: background/);
+  assert.doesNotMatch(output, /sessionId: session-owner-42|cwd at launch/);
   assert.match(output, /\[STALE\] heartbeat_stale/);
 });
 
@@ -60,7 +63,8 @@ test("active run widget lines display canonical owner metadata for live runs", (
   const live = displayRun();
   delete live.stale;
   const output = activeRunWidgetLines([live]).join("\n");
-  assert.match(output, /sessionId: session-owner-42  launch source: background  cwd at launch: \/repo\/at-launch/);
+  assert.match(output, /launch source: background/);
+  assert.doesNotMatch(output, /sessionId: session-owner-42|cwd at launch/);
   assert.match(output, /\/workflows open dashboard/);
 });
 
