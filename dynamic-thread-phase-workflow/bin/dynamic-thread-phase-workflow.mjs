@@ -6,7 +6,7 @@ import { tmpdir, homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { PiJsonEventCollector } from "../lib/pi-json-stream.mjs";
-import { commitSuccessor, releaseSuccessor, reserveSuccessor } from "../lib/chain-store.mjs";
+import { commitSuccessor, releaseSuccessor, reserveSuccessor } from "../../thread-phase-visualizer/lib/chain-store.mjs";
 import { normalizeTimeoutMs, runBoundedProcess, terminateChild } from "../lib/subprocess.mjs";
 import {
   ARTIFACTS_DIR,

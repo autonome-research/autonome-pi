@@ -1,6 +1,7 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import { readSuccessor } from "./chain-store.mjs";
 
 export const DEFAULT_CONTINUATION_LIMIT = 500;
 export const DEFAULT_PENDING_CONTINUATION_LIMIT = 500;
@@ -26,7 +27,16 @@ const loadedSnapshotBaselines = new WeakMap();
 export function shouldAutoContinue(run) {
   const status = run?.normalizedStatus;
   if (status === "cancelled" || (status !== "success" && status !== "failed")) return false;
-  if (run?.metadata?.continuationMode === "terminal") return true;
+  if (run?.metadata?.continuationMode === "terminal") {
+    // An intermediate chain node with a runner-managed (committed) successor does
+    // not enqueue a duplicate chat continuation; the chain's terminal run hands
+    // control back to chat. Only a committed successor suppresses — a reserved
+    // (pending) record means the child may never have launched.
+    if (run?.runId) {
+      try { if (readSuccessor(String(run.runId))?.state === "committed") return false; } catch { /* non-chain run id: no successor */ }
+    }
+    return true;
+  }
   if (status !== "success") return false;
   return run?.metadata?.autoContinue === true || run?.metadata?.autoContinue === "always";
 }

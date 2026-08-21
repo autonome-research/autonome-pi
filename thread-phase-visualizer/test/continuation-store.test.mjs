@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
@@ -22,6 +23,7 @@ import {
   pruneContinuedRuns,
   shouldAutoContinue,
 } from "../lib/continuation-store.mjs";
+import { reserveSuccessor, commitSuccessor } from "../lib/chain-store.mjs";
 
 function persistedRecords(storeDir) {
   return JSON.parse(readFileSync(continuedRunsFile(storeDir), "utf8"));
@@ -498,4 +500,27 @@ test("canonical continuation history remains stable and claimed across consecuti
   assert.deepEqual(afterSecondReload, expected);
   assert.deepEqual(Array.from(thirdReload), expected);
   assert.deepEqual(readdirSync(storeDir).sort(), ["continuations.json", "continued-runs.json", "continued-runs.timestamps.json"]);
+});
+
+test("shouldAutoContinue suppresses an intermediate chain node with a committed successor", () => {
+  const storeDir = mkdtempSync(join(tmpdir(), "thread-phase-continuation-successor-"));
+  const previous = process.env.PI_THREAD_PHASE_STORE_DIR;
+  process.env.PI_THREAD_PHASE_STORE_DIR = storeDir;
+  try {
+    const runId = "chain-parent-1";
+    const childRunId = "chain-child-1";
+    const reservation = reserveSuccessor(runId, childRunId, { chainId: randomUUID() });
+    const terminal = { runId, normalizedStatus: "success", metadata: { continuationMode: "terminal" } };
+    // A reserved-but-not-committed successor must NOT suppress (child may never launch).
+    assert.equal(shouldAutoContinue(terminal), true);
+    commitSuccessor(reservation);
+    // A committed successor -> intermediate node does not auto-continue to chat.
+    assert.equal(shouldAutoContinue(terminal), false);
+    // A run with no successor still auto-continues.
+    assert.equal(shouldAutoContinue({ runId: "chain-other-1", normalizedStatus: "success", metadata: { continuationMode: "terminal" } }), true);
+  } finally {
+    if (previous === undefined) delete process.env.PI_THREAD_PHASE_STORE_DIR;
+    else process.env.PI_THREAD_PHASE_STORE_DIR = previous;
+    rmSync(storeDir, { recursive: true, force: true });
+  }
 });
