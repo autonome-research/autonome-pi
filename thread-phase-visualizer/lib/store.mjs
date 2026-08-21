@@ -721,7 +721,10 @@ export function wrapPhase(phase, run, options = {}) {
         }
         phaseEnd(run, phaseName, ctx?.stop ? STATUSES.CANCELLED : STATUSES.SUCCESS, options.output?.(ctx));
       } catch (error) {
-        const cancelled = error?.name === "AbortError" || /aborted|cancelled/i.test(String(error?.message || error));
+        // Classify as cancelled only on an authoritative abort signal, not on a
+        // scanning of the message (an ordinary failure mentioning "cancelled" is
+        // a failure, not a cancellation).
+        const cancelled = error?.name === "AbortError" || Boolean(ctx?.signal?.aborted);
         phaseEnd(run, phaseName, cancelled ? STATUSES.CANCELLED : STATUSES.FAILED, { error: serializeError(error) });
         throw error;
       }

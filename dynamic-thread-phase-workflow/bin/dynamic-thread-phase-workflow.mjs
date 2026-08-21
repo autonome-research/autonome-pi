@@ -1256,8 +1256,12 @@ async function main() {
     console.log(JSON.stringify({ ok: true, runId: visualizerRun.runId, workflow, cwd, resultPath, ...chain, resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length || 0 }, null, 2));
   } catch (error) {
     const cancelled = cancellationRequested || isAbortError(error) || controller.signal.aborted;
+    // Write a workflow-result artifact even when the setup failed before ctx was
+    // built (e.g. spec/harness copy or checkpoint-context setup), so every run
+    // that emitted workflow_start also records a durable result.
+    const resultCtx = ctx || { visualizerRun, outputs: {}, results: {}, chain };
     try {
-      if (ctx) writeWorkflowResult(ctx, cancelled ? STATUSES.CANCELLED : STATUSES.FAILED, error);
+      writeWorkflowResult(resultCtx, cancelled ? STATUSES.CANCELLED : STATUSES.FAILED, error);
     } catch (artifactError) {
       const message = artifactError?.message || String(artifactError);
       console.error(`failed to persist workflow result artifact: ${message}`);
