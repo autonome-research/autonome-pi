@@ -79,16 +79,21 @@ export function renderPhaseTimeline(run: RunSummary, theme: Theme, expanded: boo
 		if (expanded && phase.fanout?.items?.length) {
 			for (const item of phase.fanout.items.slice(0, 20)) {
 				const itemStatus = item.normalizedStatus || item.status;
-				// Render each fanout stage with the same visual indicator as a phase
-				// (status icon+color, accent name, per-stage usage) so stages read as
-				// first-class rows rather than anonymous sub-lines.
 				const stageName = theme.fg("accent", item.label || item.itemId);
 				const stageUsage = item.usage && item.usage.entries ? theme.fg("muted", ` · ${formatUsageSummary(item.usage)}`) : "";
 				const stageMessage = item.lastMessage && showsMessage(itemStatus)
 					? theme.fg("dim", ` — ${truncateMessage(item.lastMessage)}`) : "";
 				container.addChild(new Text(`  ${theme.fg(statusColor(itemStatus), statusIcon(itemStatus))} ${stageName}${stageUsage}${stageMessage}`, 0, 0));
+				for (const artifact of (item.artifacts || []).slice(0, 10)) {
+					container.addChild(new Text(`    ${theme.fg("success", "◉")} ${theme.fg("accent", artifact.title || artifact.kind || "artifact")}${artifact.path ? theme.fg("dim", ` — ${artifact.path}`) : ""}`, 0, 0));
+				}
 			}
 			if (phase.fanout.items.length > 20) container.addChild(new Text(theme.fg("dim", `  … ${phase.fanout.items.length - 20} more item(s)`), 0, 0));
+		} else if (expanded && phase.artifacts?.length) {
+			// Nested artifacts for non-fanout phases (shown inside the phase dropdown).
+			for (const artifact of phase.artifacts.slice(0, 10)) {
+				container.addChild(new Text(`  ${theme.fg("success", "◉")} ${theme.fg("accent", artifact.title || artifact.kind || "artifact")}${artifact.path ? theme.fg("dim", ` — ${artifact.path}`) : ""}`, 0, 0));
+			}
 		}
 	}
 	if (!expanded && phases.length > visible.length) {

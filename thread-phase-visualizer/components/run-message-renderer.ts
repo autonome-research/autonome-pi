@@ -2,7 +2,7 @@ import { keyHint, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { STATUSES, formatUsageSummary } from "../lib/store.mjs";
 import { formatOwnerMetadata, formatStaleIndicator } from "../lib/run-display.mjs";
-import { artifactSummaryText, renderArtifactList } from "./artifact-view.ts";
+import { artifactSummaryText } from "./artifact-view.ts";
 import { phaseSummaryText, renderPhaseTimeline, statusColor, statusIcon } from "./phase-timeline.ts";
 
 type RunSummary = Record<string, any>;
@@ -69,14 +69,6 @@ function renderRunMessage(message: any, expanded: boolean, theme: any) {
 			const prefix = error.phase ? `${error.phase}: ` : "";
 			container.addChild(new Text(theme.fg("error", `- ${prefix}${error.message || error.error?.message || "error"}`), 0, 0));
 		}
-	}
-
-	if (run.artifacts?.length) {
-		container.addChild(new Spacer(1));
-		container.addChild(new Text(theme.fg("toolTitle", theme.bold("Artifacts")), 0, 0));
-		// Show title/path only; opening an artifact renders its content. Inlining full
-		// bodies here drowned the workflow signal (audit MUST).
-		container.addChild(renderArtifactList(run, theme, true, { contentMode: "none" }));
 	}
 
 	box.addChild(container);

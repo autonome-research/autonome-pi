@@ -5,6 +5,9 @@ import { randomUUID } from "node:crypto";
 import { canonicalCwd } from "./session-scope.mjs";
 
 export const SCHEMA_VERSION = "thread-phase-ui/v1";
+// Bump when the projected summary shape changes (nested artifacts / traces) so a
+// monitor can surface whether the loaded store is current.
+export const STORE_BUILD = "3-artifacts-traces";
 export const EVENT_TYPES = Object.freeze({
   WORKFLOW_START: "workflow_start",
   WORKFLOW_END: "workflow_end",

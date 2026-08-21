@@ -1,7 +1,7 @@
 import { getMarkdownTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, Markdown, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { basename } from "node:path";
-import { STATUSES, latestRunSummaries, readArtifactContent, requestCancellation } from "../lib/store.mjs";
+import { STATUSES, latestRunSummaries, readArtifactContent, requestCancellation, STORE_BUILD } from "../lib/store.mjs";
 import { artifactEditorActionHint, artifactEditorTarget } from "../lib/artifact-action.mjs";
 import { MONITOR_SORTS, MONITOR_STATUS_FILTERS, cycleMonitorOption, filterAndSortMonitorRuns } from "../lib/monitor-state.mjs";
 import { detailViewportHeight, windowLineRange } from "../lib/monitor-pagination.mjs";
@@ -24,6 +24,10 @@ type DetailLineRange = { start: number; end: number };
 const MAX_VISIBLE_RUNS = 12;
 const MAX_ARTIFACT_BYTES = 100_000;
 const LIVE_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+// Bump this so a reloaded session's monitor title shows the current build and you
+// can tell the running extension has the latest viewer code.
+export const MONITOR_BUILD = "3-tree";
 
 function shortRunId(runId: string | undefined): string {
 	if (!runId) return "unknown";
@@ -489,7 +493,7 @@ export class ThreadPhaseMonitorComponent {
 	}
 
 	private withBorder(content: string[], width: number): string[] {
-		return framePanel(content, width, this.theme, { title: "Thread-phase" });
+		return framePanel(content, width, this.theme, { title: `Thread-phase ${MONITOR_BUILD}/${STORE_BUILD}` });
 	}
 
 	private renderList(width: number, runs: RunSummary[]): string[] {
