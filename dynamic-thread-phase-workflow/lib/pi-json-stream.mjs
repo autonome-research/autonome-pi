@@ -255,15 +255,21 @@ export class PiJsonEventCollector {
 
     // Throttled retention: accumulate reasoning up to a fixed cap, never the
     // full stream, so an unbounded number of tiny deltas cannot grow heap.
-    let keep = safeDelta;
+    // Every retained content_delta record must honor the reasoning char budget
+    // (maxReasoningChars). When the accumulation is already at budget there is
+    // no room left, so `keep` stays empty and the whole delta is excluded —
+    // never leave `keep` as the full uncapped safeDelta, which would let a
+    // single record carry up to maxLineBytes of text into the window for
+    // non-coalescing content streams.
+    let keep = "";
     if (this.reasoning.length < this.maxReasoningChars) {
       const added = safeDelta.slice(0, this.maxReasoningChars - this.reasoning.length);
       this.reasoning += added;
-      if (added.length < safeDelta.length) this.traceExcluded++;
       keep = added;
-    } else {
-      this.traceExcluded++;
     }
+    // Align traceExcluded with what was truly not retained: any portion of the
+    // delta beyond the remaining budget (or the entire delta, when at budget).
+    if (keep.length < safeDelta.length) this.traceExcluded++;
 
     const record = { type: "content_delta", agent: "assistant", contentType, contentIndex, delta: keep };
     if (this.onTrace) safeCall(this.onTrace, record);

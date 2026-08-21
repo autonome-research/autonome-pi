@@ -252,6 +252,39 @@ test("collector throttles an unbounded number of tiny reasoning deltas", () => {
   assert.equal(result.piJson.reasoningDeltas, 50_000);
 });
 
+test("captureContentDelta caps retained window records at the reasoning budget for non-coalescing streams", () => {
+  // Small budget so reasoning fills up quickly; a distinct contentIndex per
+  // record prevents window coalescing, exercising the path that used to leave
+  // `keep` as the full uncapped safeDelta once the accumulation was at budget.
+  const collector = new PiJsonEventCollector({ maxReasoningChars: 4, maxTraceWindow: 16 });
+  const hugeDelta = "z".repeat(1_000);
+  collector.push(eventLine({
+    type: "message_update",
+    assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "abcd" },
+  }));
+  // Now at budget. A non-coalescing stream (different contentIndex) with a
+  // huge delta arrives: the retained window record must honor the budget, not
+  // carry the full delta text, and traceExcluded must reflect the exclusion.
+  collector.push(eventLine({
+    type: "message_update",
+    assistantMessageEvent: { type: "thinking_delta", contentIndex: 1, delta: hugeDelta },
+  }));
+  collector.push(eventLine(finalMessage()));
+  const result = collector.finish();
+
+  const contentDeltas = result.trace.window.filter((rec) => rec.type === "content_delta");
+  for (const rec of contentDeltas) {
+    assert.ok(Buffer.byteLength(rec.delta, "utf8") <= collector.maxReasoningChars, "window record delta honors the reasoning budget");
+  }
+  // The buffer filled with the first record, then the huge delta was entirely
+  // excluded (keep was empty): reasoning stayed at budget.
+  assert.ok(Buffer.byteLength(result.trace.reasoning, "utf8") <= 4);
+  assert.ok(result.piJson.traceExcluded >= 1);
+  assert.equal(result.trace.reasoning, "abcd");
+  // No window record may carry even a fragment of the 1000-char delta.
+  assert.ok(!contentDeltas.some((rec) => rec.delta.includes("z")), "uncapped delta text must not reach the retained window");
+});
+
 test("collector captures tool-call start and completed records", () => {
   const traces = [];
   const collector = new PiJsonEventCollector({ onTrace: (evt) => traces.push(evt) });
