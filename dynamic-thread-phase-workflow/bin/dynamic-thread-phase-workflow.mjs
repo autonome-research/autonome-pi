@@ -15,6 +15,7 @@ import {
   completeRun,
   createRun,
   createRunId,
+  emitAgentEvent,
   failRun,
   getRunSummary,
   phaseEnd,
@@ -480,7 +481,40 @@ async function runProcess(command, args, options) {
   });
 }
 
-async function runPi({ cwd, prompt, model, tools, timeoutMs, signal, onUsage }) {
+const TRACE_THROTTLE_MS = 250;
+
+// Throttled bridge from the collector's live trace stream (onTrace) to the
+// store's AGENT_EVENT bridge (emitAgentEvent). Reasoning content deltas are
+// buffered and flushed on a fixed cadence (or via flush()) so a chatty reasoning
+// stream cannot emit an unbounded number of events; tool-call start/completed
+// events forward immediately. identity carries optional fanout item linkage so
+// the store can project per-stage traces.
+function throttledTraceEmitter(run, phaseName, identity = {}) {
+  let lastFlush = 0;
+  let pendingDelta = "";
+  let pendingMeta = {};
+  const flush = () => {
+    if (!pendingDelta) return;
+    lastFlush = Date.now();
+    emitAgentEvent(run, phaseName, { type: "content_delta", agent: "assistant", ...pendingMeta, delta: pendingDelta, ...identity });
+    pendingDelta = "";
+    pendingMeta = {};
+  };
+  const emitter = (trace) => {
+    if (trace && trace.type === "content_delta") {
+      pendingDelta += trace.delta || "";
+      pendingMeta = { contentType: trace.contentType, contentIndex: trace.contentIndex };
+      if (Date.now() - lastFlush >= TRACE_THROTTLE_MS) flush();
+      return;
+    }
+    flush();
+    emitAgentEvent(run, phaseName, { ...trace, ...identity });
+  };
+  emitter.flush = flush;
+  return emitter;
+}
+
+async function runPi({ cwd, prompt, model, tools, timeoutMs, signal, onUsage, onTrace }) {
   const args = [
     // Note: --no-extensions is intentionally omitted so that extensions
     // like local-vllm.ts can register dynamically-discovered local providers
@@ -494,7 +528,7 @@ async function runPi({ cwd, prompt, model, tools, timeoutMs, signal, onUsage }) 
   // Parse Pi's NDJSON incrementally and do not retain raw message_update
   // records. Those records contain cumulative tool-call arguments and can make
   // a large generated file produce quadratic stdout volume in memory.
-  const collector = new PiJsonEventCollector({ onUsage });
+  const collector = new PiJsonEventCollector({ onUsage, onTrace });
   const result = await runProcess(DEFAULT_PI, args, {
     cwd,
     timeoutMs,
@@ -750,7 +784,7 @@ function restoreCompletedPhases(ctx, resumeState) {
   }
 }
 
-function emitTextArtifact(ctx, phase, content, defaults = {}) {
+function emitTextArtifact(ctx, phase, content, defaults = {}, metadata = {}) {
   const artifactSpec = phase.artifact;
   if (artifactSpec === false) return undefined;
   const spec = artifactSpec && typeof artifactSpec === "object" ? artifactSpec : {};
@@ -759,7 +793,7 @@ function emitTextArtifact(ctx, phase, content, defaults = {}) {
   const fileName = renderTemplate(spec.fileName || defaults.fileName || `${phase.name}.${kind === "json" ? "json" : "md"}`, ctx);
   const path = makeArtifactPath(ctx, phase.name, fileName);
   writeFileSync(path, content, "utf8");
-  artifact(ctx.visualizerRun, { kind, title, path, metadata: { phase: phase.name, type: phase.type } });
+  artifact(ctx.visualizerRun, { kind, title, path, metadata: { phase: phase.name, type: phase.type, ...metadata } });
   return path;
 }
 
@@ -812,8 +846,10 @@ async function* runPiPhase(ctx, phase) {
   yield { type: "data", kind: "data", key: "permissions", value: permissions, message: `Running pi agent with ${permissions} permissions` };
   yield { type: "data", kind: "data", key: "tools", value: tools, message: `Running pi agent` };
   if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
-  const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs ?? ctx.timeoutMs, signal: ctx.signal, onUsage: ({ usage, model: usedModel }) =>
+  const traceEmitter = throttledTraceEmitter(ctx.visualizerRun, phase.name);
+  const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs ?? ctx.timeoutMs, signal: ctx.signal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
       phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage, model: usedModel || phase.model || ctx.model }) });
+  traceEmitter.flush();
   if (result.aborted) throw abortError(result.error || "cancelled");
   ctx.outputs[phase.name] = compactText(result.text || "");
   ctx.results[phase.name] = { ok: result.ok, model: result.model, stopReason: result.stopReason, code: result.code, signal: result.signal, timedOut: result.timedOut, durationMs: result.durationMs, termination: result.termination, error: result.error, piJson: result.piJson };
@@ -845,8 +881,10 @@ async function* runFanoutPiPhase(ctx, phase) {
       try {
         if (itemSignal?.aborted) throw abortError(itemSignal.reason || "cancelled");
         const prompt = renderTemplate(phase.promptTemplate, ctx, { item, index });
-        const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: itemSignal, onUsage: ({ usage, model: usedModel }) =>
+        const traceEmitter = throttledTraceEmitter(ctx.visualizerRun, phase.name, { itemId: `${index}:${item}`, item, index });
+        const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: itemSignal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
             phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", itemId: `${index}:${item}`, item, index, usage, model: usedModel || phase.model || ctx.model }) });
+        traceEmitter.flush();
         if (result.aborted) throw abortError(result.error || "cancelled");
         const text = compactText(result.text || "");
         const itemHash = createHash("sha256").update(`${index}\0${item}`).digest("hex").slice(0, 10);
@@ -861,7 +899,7 @@ async function* runFanoutPiPhase(ctx, phase) {
             fileName: fileNameTemplate ? renderTemplate(fileNameTemplate, ctx, { item, index }) : `${phase.name}-${index}-${itemHash}-${safeName(item)}.md`,
           },
         };
-        emitTextArtifact(ctx, artifactPhase, text, { title: `${phase.name}: ${item}` });
+        emitTextArtifact(ctx, artifactPhase, text, { title: `${phase.name}: ${item}` }, { phase: phase.name, itemId: `${index}:${item}`, index });
         terminal++;
         if (result.ok) successful++; else failed++;
         push({ type: "fanout", kind: "fanout_item_end", itemId: `${index}:${item}`, label: item, index, status: result.ok ? STATUSES.SUCCESS : STATUSES.FAILED, model: result.model, message: result.ok ? `Complete ${item}` : `Failed ${item}`, error: result.error });
@@ -955,8 +993,10 @@ async function runHarness(ctx, harnessFile) {
         const phase = { name: options.name || `pi-${autoPhase}`, permissions: options.permissions || ctx.spec.permissions || DEFAULT_PERMISSIONS };
         const permissions = permissionsForPhase(ctx, phase);
         const tools = normalizePiTools(options.tools, permissions, phase.name);
-        const result = await runPi({ cwd: options.cwd || ctx.cwd, prompt, model: options.model || ctx.model, tools, timeoutMs: options.timeoutMs || ctx.timeoutMs, signal: options.signal || ctx.signal, onUsage: ({ usage, model: usedModel }) =>
+        const traceEmitter = throttledTraceEmitter(ctx.visualizerRun, phase.name);
+        const result = await runPi({ cwd: options.cwd || ctx.cwd, prompt, model: options.model || ctx.model, tools, timeoutMs: options.timeoutMs || ctx.timeoutMs, signal: options.signal || ctx.signal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
             phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage, model: usedModel || options.model || ctx.model }) });
+        traceEmitter.flush();
         if (result.aborted) throw abortError(result.error || "cancelled");
         if (!result.ok && options.reject !== false) throw new Error(result.error || "pi helper failed");
         return compactText(result.text || "");
