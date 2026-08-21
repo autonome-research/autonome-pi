@@ -1,6 +1,6 @@
 {
   "name": "autonome-pi",
-  "version": "0.16.2",
+  "version": "0.17.0",
   "private": true,
   "description": "Autonome's extensions, workflow tools, and skills for Pi.",
   "scripts": {
