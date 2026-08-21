@@ -205,6 +205,36 @@ test("collector captures bounded reasoning deltas into the trace window", () => 
   assert.equal(result.piJson.reasoningDeltas, 2);
 });
 
+test("collector streams reasoning content_delta records live via onTrace", () => {
+  const traces = [];
+  // Snapshot each record at delivery time so the test asserts the live payload
+  // rather than depending on window-coalescing aliasing of the same object.
+  const collector = new PiJsonEventCollector({ onTrace: (evt) => traces.push({ ...evt }) });
+  collector.push(eventLine({
+    type: "message_update",
+    assistantMessageEvent: { type: "thinking_delta", contentIndex: 2, delta: "Live " },
+  }));
+  collector.push(eventLine({
+    type: "message_update",
+    assistantMessageEvent: { type: "thinking_delta", contentIndex: 2, delta: "reasoning. " },
+  }));
+  collector.push(eventLine(finalMessage("done")));
+  const result = collector.finish();
+
+  // onTrace delivers each individual reasoning delta as it streams in, in the
+  // AgentStreamEvent content_delta shape, even though the retained window
+  // coalesces them into a single record.
+  assert.equal(traces.length, 2);
+  assert.ok(traces.every((t) => t.type === "content_delta"));
+  assert.equal(traces[0].contentType, "thinking");
+  assert.equal(traces[0].contentIndex, 2);
+  assert.equal(traces[0].delta, "Live ");
+  assert.equal(traces[1].delta, "reasoning. ");
+  // The retained window coalesces the same stream into one content_delta.
+  assert.equal(result.trace.window.length, 1);
+  assert.equal(result.trace.window[0].delta, "Live reasoning. ");
+});
+
 test("collector throttles an unbounded number of tiny reasoning deltas", () => {
   const collector = new PiJsonEventCollector({ maxReasoningChars: 128, maxTraceWindow: 8 });
   for (let index = 0; index < 50_000; index++) {
