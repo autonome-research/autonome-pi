@@ -20,7 +20,7 @@ function finalMessage(text = "done") {
   };
 }
 
-test("collector discards cumulative message updates and retains final metadata", () => {
+test("collector excludes cumulative tool-call argument deltas without materializing the cumulative message", () => {
   const collector = new PiJsonEventCollector();
   for (let index = 1; index <= 100; index++) {
     collector.push(eventLine({
@@ -32,11 +32,16 @@ test("collector discards cumulative message updates and retains final metadata",
   collector.push(eventLine(finalMessage("complete")));
   const result = collector.finish();
 
+  // The cumulative `message` payload is never retained; only the tiny nested
+  // discriminator is inspected. toolcall argument deltas are excluded (never
+  // accumulated -> no quadratic growth), not counted as dropped records.
   assert.equal(result.text, "complete");
   assert.equal(result.model, "test-model");
   assert.equal(result.usage.length, 1);
-  assert.equal(result.piJson.droppedEvents, 100);
+  assert.equal(result.piJson.droppedEvents, 0);
+  assert.equal(result.piJson.traceExcluded, 100);
   assert.equal(result.piJson.bufferedBytes, 0);
+  assert.equal(result.trace.window.length, 0);
 });
 
 test("collector aggregates arbitrarily many usage events into one bounded record", () => {
@@ -176,4 +181,95 @@ test("collector omits onUsage callback when none is supplied", () => {
   collector.push(eventLine(finalMessage("plain")));
   collector.finish();
   assert.equal(collector.onUsage, undefined);
+});
+
+test("collector captures bounded reasoning deltas into the trace window", () => {
+  const collector = new PiJsonEventCollector();
+  collector.push(eventLine({
+    type: "message_update",
+    assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "Let me " },
+  }));
+  collector.push(eventLine({
+    type: "message_update",
+    assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "reason about this." },
+  }));
+  collector.push(eventLine(finalMessage("done")));
+  const result = collector.finish();
+
+  const window = result.trace.window;
+  assert.equal(window.length, 1);
+  assert.equal(window[0].type, "content_delta");
+  assert.equal(window[0].contentType, "thinking");
+  assert.equal(window[0].delta, "Let me reason about this.");
+  assert.equal(result.trace.reasoning, "Let me reason about this.");
+  assert.equal(result.piJson.reasoningDeltas, 2);
+});
+
+test("collector throttles an unbounded number of tiny reasoning deltas", () => {
+  const collector = new PiJsonEventCollector({ maxReasoningChars: 128, maxTraceWindow: 8 });
+  for (let index = 0; index < 50_000; index++) {
+    collector.push(eventLine({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "ab" },
+    }));
+  }
+  collector.push(eventLine(finalMessage()));
+  const result = collector.finish();
+
+  // Reasoning is capped and the window stays tiny regardless of delta count.
+  assert.ok(Buffer.byteLength(result.trace.reasoning, "utf8") <= 128);
+  assert.ok(result.trace.window.length <= 8);
+  assert.equal(result.piJson.reasoningDeltas, 50_000);
+});
+
+test("collector captures tool-call start and completed records", () => {
+  const traces = [];
+  const collector = new PiJsonEventCollector({ onTrace: (evt) => traces.push(evt) });
+  collector.push(eventLine({
+    type: "message_update",
+    assistantMessageEvent: { type: "toolcall_start", contentIndex: 1 },
+  }));
+  collector.push(eventLine({
+    type: "message_update",
+    assistantMessageEvent: { type: "toolcall_delta", contentIndex: 1, delta: "{\"path\":\"a" },
+  }));
+  collector.push(eventLine({
+    type: "message_update",
+    assistantMessageEvent: { type: "toolcall_end", contentIndex: 1, toolCall: { id: "tc-1", name: "read", arguments: { path: "a/b/c" } } },
+  }));
+  const result = collector.finish();
+
+  const window = result.trace.window;
+  assert.equal(window[0].type, "tool_call_started");
+  assert.equal(window[0].toolCallId, "tc-1");
+  assert.equal(window[1].type, "tool_call_completed");
+  assert.equal(window[1].toolName, "read");
+  assert.match(window[1].args, /a\/b\/c/);
+  assert.equal(result.piJson.toolCallStarted, 1);
+  assert.equal(result.piJson.toolCallCompleted, 1);
+  assert.equal(result.piJson.traceExcluded, 1); // the argument delta was excluded
+  // Live onTrace received the start and completed records but not the excluded delta.
+  assert.deepEqual(traces.map((t) => t.type), ["tool_call_started", "tool_call_completed"]);
+});
+
+test("collector redacts secrets from captured reasoning text", () => {
+  const collector = new PiJsonEventCollector();
+  collector.push(eventLine({
+    type: "message_update",
+    assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "key sk-abcdefghijklmnopqrstuvwxyz appears" },
+  }));
+  const result = collector.finish();
+  assert.equal(result.trace.reasoning, "key [redacted-api-key] appears");
+});
+
+test("collector keeps onTrace optional and never breaks on a throwing observer", () => {
+  const collector = new PiJsonEventCollector({ onTrace: () => { throw new Error("observer boom"); } });
+  collector.push(eventLine({
+    type: "message_update",
+    assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "hi" },
+  }));
+  collector.push(eventLine(finalMessage()));
+  const result = collector.finish();
+  assert.equal(result.text, "done");
+  assert.equal(result.trace.window.length, 1);
 });
