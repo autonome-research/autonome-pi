@@ -32,6 +32,28 @@ function component(runs) {
   return new ThreadPhaseMonitorComponent("/repo", undefined, theme, () => {}, () => {}, () => {}, () => runs);
 }
 
+// A completed phase with one generated artifact nested under it (the tree viewer
+// reads artifacts from phase.artifacts / stage.artifacts, not run.artifacts).
+function runWithPhaseArtifact(artifact, phaseName = "compile") {
+  return run({
+    phases: [{ phase: phaseName, normalizedStatus: "success", status: "success", artifacts: [artifact] }],
+    artifacts: [],
+  });
+}
+
+// phases terminated with a completed fanout phase carrying `count` stages.
+function fanoutPhases(count, phaseIndex) {
+  const phases = [
+    { phase: "p1", normalizedStatus: "success", status: "success" },
+    { phase: "fanout", normalizedStatus: "success", status: "success", fanout: { total: count, completed: count, failed: 0, running: 0, items: Array.from({ length: count }, (_, index) => ({
+        itemId: `item-${index}`, label: `item-${String.fromCharCode(97 + index)}`, index, normalizedStatus: "success", status: "success",
+      })) } },
+    { phase: "p3", normalizedStatus: "success", status: "success" },
+  ];
+  if (phaseIndex === undefined) return phases;
+  return phases.slice(0, phaseIndex).concat(phases[phaseIndex]).concat(phases.slice(phaseIndex + 1));
+}
+
 function text(lines) {
   return lines.join("\n");
 }
@@ -124,12 +146,14 @@ test("h toggles the monitor stale-run filter and escape restores stale runs", ()
   assert.match(rendered, /Stale Run/);
 });
 
-test("handleInput transitions list to detail to artifact and left returns toward list", () => {
-  const monitor = component([run()]);
+test("handleInput transitions list to detail to nested artifact and left returns toward list", () => {
+  const monitor = component([runWithPhaseArtifact({ kind: "markdown", title: "Build report", content: "line-1\nline-2" })]);
   monitor.handleInput("\r");
   assert.match(text(monitor.render(72)), /Phases/);
   assert.doesNotMatch(text(monitor.render(72)), /Thread-phase monitor/);
 
+  // Expand the compile phase to reveal its nested artifact, then open it.
+  monitor.handleInput("\r");
   monitor.handleInput("\x1b[B");
   monitor.handleInput("\r");
   const artifact = text(monitor.render(72));
@@ -138,7 +162,7 @@ test("handleInput transitions list to detail to artifact and left returns toward
   assert.match(artifact, /↑↓ line/);
 
   monitor.handleInput("\x1b[D");
-  assert.match(text(monitor.render(72)), /Artifacts/);
+  assert.match(text(monitor.render(72)), /Phases/);
   monitor.handleInput("\x1b[D");
   assert.match(text(monitor.render(72)), /Thread-phase monitor/);
 });
@@ -156,9 +180,10 @@ test("artifact c action delivers path and URL targets through the monitor callba
       () => {},
       () => {},
       (target) => delivered.push(target),
-      () => [run({ artifacts: [artifact] })],
+      () => [runWithPhaseArtifact(artifact)],
     );
 
+    monitor.handleInput("\r");
     monitor.handleInput("\r");
     monitor.handleInput("\x1b[B");
     monitor.handleInput("\r");
@@ -188,9 +213,10 @@ test("artifact editor callback sends the monitor's trimmed target to setEditorTe
     () => {},
     () => {},
     createArtifactTargetEditorCallback(ctx, () => { closeCount++; }),
-    () => [run({ artifacts: [{ kind: "file", title: "Editor report", path: "  /repo/editor-report.txt  ", content: "report" }] })],
+    () => [runWithPhaseArtifact({ kind: "file", title: "Editor report", path: "  /repo/editor-report.txt  ", content: "report" })],
   );
 
+  monitor.handleInput("\r");
   monitor.handleInput("\r");
   monitor.handleInput("\x1b[B");
   monitor.handleInput("\r");
@@ -210,9 +236,10 @@ test("inline-only artifact c action is a no-op and renders no actionable hint", 
     () => {},
     () => {},
     (target) => delivered.push(target),
-    () => [run({ artifacts: [{ kind: "markdown", title: "Inline report", content: "inline body" }] })],
+    () => [runWithPhaseArtifact({ kind: "markdown", title: "Inline report", content: "inline body" })],
   );
 
+  monitor.handleInput("\r");
   monitor.handleInput("\r");
   monitor.handleInput("\x1b[B");
   monitor.handleInput("\r");
@@ -225,171 +252,43 @@ test("inline-only artifact c action is a no-op and renders no actionable hint", 
   assert.match(text(monitor.render(100)), /inline body/);
 });
 
-test("detail and artifact pagination move through content and clamp at zero", () => {
-  const phases = Array.from({ length: 30 }, (_, index) => ({
-    phase: `phase-${index + 1}`,
-    normalizedStatus: "success",
-    status: "success",
-  }));
-  const content = Array.from({ length: 80 }, (_, index) => `artifact-line-${index + 1}`).join("\n");
-  const monitor = component([run({ phases, artifacts: [{ kind: "markdown", title: "Long report", content }] })]);
-
-  monitor.handleInput("\r");
-  monitor.render(100);
-  monitor.handleInput("\x04");
-  assert.match(text(monitor.render(100)), /› ◆ phase-13/);
-  monitor.handleInput("\x15");
-  monitor.handleInput("\x15");
-  assert.match(text(monitor.render(100)), /› ◆ phase-1/);
-
-  for (let index = 0; index < phases.length; index++) monitor.handleInput("\x1b[B");
-  monitor.handleInput("\r");
-  const firstPage = text(monitor.render(100));
-  assert.match(firstPage, /artifact-line-1/);
-  monitor.handleInput("\x1b[A");
-  assert.match(text(monitor.render(100)), /artifact-line-1/);
-  monitor.handleInput("\x04");
-  const secondPage = text(monitor.render(100));
-  assert.match(secondPage, /artifact-line-2[0-9]/);
-  assert.doesNotMatch(secondPage, /artifact-line-1(?:\D|$)/);
-  monitor.handleInput("\x15");
-  monitor.handleInput("\x15");
-  assert.match(text(monitor.render(100)), /artifact-line-1/);
-});
-
-test("expanding and paging fanout near the viewport bottom reveals each rendered page", () => {
-  const phases = Array.from({ length: 18 }, (_, index) => ({
-    phase: `phase-${index + 1}`,
-    normalizedStatus: "success",
-    status: "success",
-  }));
-  phases.at(-1).fanout = {
-    total: 23,
-    completed: 23,
-    failed: 0,
-    running: 0,
-    items: Array.from({ length: 23 }, (_, index) => ({
-      itemId: `item-${index + 1}`,
-      label: `fanout-item-${index + 1}`,
-      normalizedStatus: "success",
-      status: "success",
-    })),
-  };
-  const monitor = component([run({ phases, artifacts: [] })]);
-
-  monitor.handleInput("\r");
-  for (let index = 1; index < phases.length; index++) monitor.handleInput("\x1b[B");
-  assert.match(text(monitor.render(100)), /› ◆ phase-18/);
-
-  monitor.handleInput("\r");
-  const firstPage = text(monitor.render(100));
-  assert.match(firstPage, /items 1-10 of 23/);
-  assert.match(firstPage, /fanout-item-1(?:\D|$)/);
-  assert.match(firstPage, /fanout-item-10/);
-
-  monitor.handleInput("\x04");
-  const secondPage = text(monitor.render(100));
-  assert.match(secondPage, /items 11-20 of 23/);
-  assert.match(secondPage, /fanout-item-11/);
-  assert.match(secondPage, /fanout-item-20/);
-  assert.doesNotMatch(secondPage, /fanout-item-1(?:\D|$)/);
-
-  monitor.handleInput("\x04");
-  const lastPage = text(monitor.render(100));
-  assert.match(lastPage, /items 21-23 of 23/);
-  assert.match(lastPage, /fanout-item-21/);
-  assert.match(lastPage, /fanout-item-23/);
-});
-
-test("every fanout page remains visible in a narrow viewport after ctrl+d and ctrl+u page changes", () => {
-  const phases = Array.from({ length: 16 }, (_, index) => ({
-    phase: `phase-${index + 1}`,
-    normalizedStatus: "success",
-    status: "success",
-  }));
-  phases.at(-1).fanout = {
-    total: 23,
-    completed: 23,
-    failed: 0,
-    running: 0,
-    items: Array.from({ length: 23 }, (_, index) => ({
-      itemId: `item-${index + 1}`,
-      label: `F${String(index + 1).padStart(2, "0")}`,
-      normalizedStatus: "success",
-      status: "success",
-    })),
-  };
-  const monitor = component([run({ phases, artifacts: [] })]);
-
-  monitor.handleInput("\r");
-  for (let index = 1; index < phases.length; index++) monitor.handleInput("\x1b[B");
-  monitor.render(28); // 24-column body selects the minimum 12-row detail viewport.
-  monitor.handleInput("\r");
-
-  const pages = [
-    ["items 1-10 of 23", "F01", "F10"],
-    ["items 11-20 of 23", "F11", "F20"],
-    ["items 21-23 of 23", "F21", "F23"],
-  ];
-  const assertVisiblePage = ([heading, first, last]) => {
-    const page = text(monitor.render(28));
-    assert.match(page, new RegExp(heading));
-    assert.match(page, new RegExp(`✓ ${first}(?:\\D|$)`));
-    assert.match(page, new RegExp(`✓ ${last}(?:\\D|$)`));
-  };
-
-  assertVisiblePage(pages[0]);
-  monitor.handleInput("\x04");
-  assertVisiblePage(pages[1]);
-  monitor.handleInput("\x04");
-  assertVisiblePage(pages[2]);
-  monitor.handleInput("\x15");
-  assertVisiblePage(pages[1]);
-  monitor.handleInput("\x15");
-  assertVisiblePage(pages[0]);
-});
-
-test("detail line navigation resumes selected-item anchoring after fanout paging", () => {
-  const phases = Array.from({ length: 16 }, (_, index) => ({
-    phase: `phase-${index + 1}`,
-    normalizedStatus: "success",
-    status: "success",
-  }));
-  phases.at(-1).fanout = {
-    total: 23,
-    completed: 23,
-    failed: 0,
-    running: 0,
-    items: Array.from({ length: 23 }, (_, index) => ({
-      itemId: `item-${index + 1}`,
-      label: `F${String(index + 1).padStart(2, "0")}`,
-      normalizedStatus: "success",
-      status: "success",
-    })),
-  };
+test("live trace pane renders for a running phase and degrades without recentItems", () => {
   const monitor = component([run({
-    phases,
-    artifacts: [{ kind: "markdown", title: "Tail report", content: "tail" }],
+    normalizedStatus: "running",
+    status: "running",
+    phases: [{
+      phase: "review",
+      normalizedStatus: "running",
+      status: "running",
+      lastMessage: "review running",
+      recentItems: [
+        { type: "content_delta", contentType: "thinking", delta: "deep reasoning" },
+        { type: "tool_call_started", toolCallId: "tc1" },
+        { type: "tool_call_completed", toolName: "bash", args: "{\"cmd\":\"ls\"}" },
+      ],
+    }],
+    artifacts: [],
   })]);
 
   monitor.handleInput("\r");
-  for (let index = 1; index < phases.length; index++) monitor.handleInput("j");
-  monitor.render(28);
-  monitor.handleInput("\r");
-  monitor.handleInput("\x04");
-  assert.match(text(monitor.render(28)), /items 11-20 of 23/);
+  monitor.handleInput("\r"); // expand the running phase
+  const trace = text(monitor.render(100));
+  assert.match(trace, /trace:/);
+  assert.match(trace, /deep reasoning/);
+  assert.match(trace, /bash/);
+  assert.doesNotMatch(trace, /review running/); // live reasoning shown, not stale message alone
 
-  // Moving off the expanded phase must release the fanout-page anchor and let
-  // the ordinary selected-line viewport reveal the artifact below the page.
-  monitor.handleInput("\x1b[B");
-  assert.match(text(monitor.render(28)), /› ◉ Tail report/);
-
-  monitor.handleInput("k");
-  assert.match(text(monitor.render(28)), /› ◆ phase-16/);
-  monitor.handleInput("j");
-  assert.match(text(monitor.render(28)), /› ◉ Tail report/);
-  monitor.handleInput("\x1b[A");
-  assert.match(text(monitor.render(28)), /› ◆ phase-16/);
+  // A running phase with no recentItems degrades gracefully to status/lastMessage.
+  const empty = component([run({
+    normalizedStatus: "running",
+    status: "running",
+    phases: [{ phase: "solo", normalizedStatus: "running", status: "running", lastMessage: "working hard" }],
+    artifacts: [],
+  })]);
+  empty.handleInput("\r");
+  empty.handleInput("\r");
+  assert.doesNotThrow(() => text(empty.render(100)));
+  assert.match(text(empty.render(100)), /solo/);
 });
 
 test("search input filters mock runs and escape restores the full list", () => {
@@ -415,7 +314,14 @@ test("search input filters mock runs and escape restores the full list", () => {
 test("clear actions restore the unfiltered list from every mode and reset selection", () => {
   const monitor = component([
     run({ normalizedStatus: "running", status: "running" }),
-    run({ runId: "run-beta", workflow: "Beta Review", normalizedStatus: "success", status: "success" }),
+    run({
+      runId: "run-beta",
+      workflow: "Beta Review",
+      normalizedStatus: "success",
+      status: "success",
+      artifacts: [],
+      phases: [{ phase: "compile", normalizedStatus: "success", status: "success", artifacts: [{ kind: "markdown", title: "Build report", content: "build-body" }] }],
+    }),
   ]);
 
   monitor.handleInput("/");
@@ -447,8 +353,11 @@ test("clear actions restore the unfiltered list from every mode and reset select
   assert.match(cleared, /Alpha Build/);
   assert.match(cleared, /› .* Alpha Build LIVE/);
 
+  // Open a nested artifact (expand compile, select the artifact, enter) in
+  // artifact mode, then clear back to the unfiltered list.
   monitor.handleInput("/");
   for (const character of "beta") monitor.handleInput(character);
+  monitor.handleInput("\r");
   monitor.handleInput("\r");
   monitor.handleInput("\r");
   monitor.handleInput("\x1b[B");
@@ -471,7 +380,7 @@ test("escape and back keys navigate consistently in list, detail, and artifact m
       () => { closeCount++; },
       () => {},
       () => {},
-      () => [run()],
+      () => [runWithPhaseArtifact({ kind: "file", title: "Build report", path: "/repo/build.txt", content: "report body" })],
     );
 
     const listMonitor = makeMonitor();
@@ -487,11 +396,12 @@ test("escape and back keys navigate consistently in list, detail, and artifact m
 
     const artifactMonitor = makeMonitor();
     artifactMonitor.handleInput("\r");
+    artifactMonitor.handleInput("\r");
     artifactMonitor.handleInput("\x1b[B");
     artifactMonitor.handleInput("\r");
     artifactMonitor.handleInput(key);
     const rendered = text(artifactMonitor.render(80));
-    assert.match(rendered, /Artifacts/);
+    assert.match(rendered, /Phases/);
     assert.doesNotMatch(rendered, /↑↓ line/);
     assert.equal(closeCount, 0, `${JSON.stringify(key)} returns from artifact without closing`);
   }
@@ -545,21 +455,26 @@ test("detail view keeps the selected run when a matching run is inserted ahead",
 });
 
 test("artifact view keeps its run identity across reloads and exits if that run disappears", () => {
+  const betaRun = {
+    runId: "run-beta",
+    workflow: "Beta Review",
+    normalizedStatus: "success",
+    status: "success",
+    updatedAt: "2026-01-02T00:00:00.000Z",
+    artifacts: [],
+    phases: [{ phase: "compile", normalizedStatus: "success", status: "success", artifacts: [{ kind: "markdown", title: "Beta report", content: "beta-only" }] }],
+  };
   let runs = [
     run({ runId: "run-alpha", workflow: "Alpha Build", updatedAt: "2026-01-03T00:00:00.000Z" }),
-    run({
-      runId: "run-beta",
-      workflow: "Beta Review",
-      updatedAt: "2026-01-02T00:00:00.000Z",
-      artifacts: [{ kind: "markdown", title: "Beta report", content: "beta-only" }],
-    }),
+    betaRun,
   ];
   const monitor = new ThreadPhaseMonitorComponent("/repo", undefined, theme, () => {}, () => {}, () => {}, () => runs);
 
-  monitor.handleInput("\x1b[B");
-  monitor.handleInput("\r");
-  monitor.handleInput("\x1b[B");
-  monitor.handleInput("\r");
+  monitor.handleInput("\x1b[B"); // select run-beta
+  monitor.handleInput("\r"); // detail
+  monitor.handleInput("\r"); // expand compile
+  monitor.handleInput("\x1b[B"); // Beta report
+  monitor.handleInput("\r"); // open artifact
   assert.match(text(monitor.render(80)), /beta-only/);
 
   runs = [

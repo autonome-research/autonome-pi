@@ -4,7 +4,7 @@ import { basename } from "node:path";
 import { STATUSES, latestRunSummaries, readArtifactContent, requestCancellation } from "../lib/store.mjs";
 import { artifactEditorActionHint, artifactEditorTarget } from "../lib/artifact-action.mjs";
 import { MONITOR_SORTS, MONITOR_STATUS_FILTERS, cycleMonitorOption, filterAndSortMonitorRuns } from "../lib/monitor-state.mjs";
-import { FANOUT_PAGE_SIZE, detailViewportHeight, pageItems, windowLineRange } from "../lib/monitor-pagination.mjs";
+import { detailViewportHeight, windowLineRange } from "../lib/monitor-pagination.mjs";
 import { formatElapsedDuration, formatOwnerMetadata, formatStaleIndicator, formatTotalTokens } from "../lib/run-display.mjs";
 import { canInspectRun, mergeMonitorRuns } from "../lib/session-scope.mjs";
 import { framePanel } from "./bordered-panel.ts";
@@ -14,7 +14,11 @@ type RunSummary = Record<string, any>;
 type PhaseSummary = Record<string, any>;
 type ArtifactSummary = Record<string, any>;
 type Mode = "list" | "detail" | "artifact";
-type DetailItem = { kind: "phase"; index: number; phase: PhaseSummary } | { kind: "artifact"; index: number; artifact: ArtifactSummary };
+type FanoutStageSummary = Record<string, any>;
+type DetailRow =
+	| { kind: "phase"; key: string; phase: PhaseSummary }
+	| { kind: "stage"; key: string; phase: PhaseSummary; stage: FanoutStageSummary }
+	| { kind: "artifact"; key: string; artifact: ArtifactSummary };
 type DetailLineRange = { start: number; end: number };
 
 const MAX_VISIBLE_RUNS = 12;
@@ -148,11 +152,57 @@ function sanitizeIoText(value: any): string {
 		.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "�");
 }
 
-function detailItems(run: RunSummary | undefined): DetailItem[] {
+function phaseKey(phase: PhaseSummary): string {
+	return `phase:${phase?.phase ?? "phase"}`;
+}
+function stageKey(phase: PhaseSummary, stage: FanoutStageSummary): string {
+	return `stage:${phase?.phase ?? "phase"}:${stage?.itemId ?? "item"}`;
+}
+function artifactKey(artifact: ArtifactSummary): string {
+	return `artifact:${artifact?.eventId || artifact?.path || artifact?.title || "artifact"}`;
+}
+function isRunningNode(node: Record<string, any> | undefined): boolean {
+	return node?.normalizedStatus === STATUSES.RUNNING || node?.status === STATUSES.RUNNING;
+}
+
+// Build the ordered list of selectable tree rows for a run. Selection is keyed by
+// stable row identity (phase name, stage itemId, artifact key) so that expending
+// or collapsing a fanout phase never silently remaps the cursor onto a different
+// node (the previous positional-index bug). Row composition is derived from the
+// current expansion state on every call.
+function buildDetailRows(run: RunSummary | undefined, expandedPhases: Set<string>, expandedStages: Set<string>): DetailRow[] {
 	if (!run) return [];
-	const phases = (run.phases || []).map((phase: PhaseSummary, index: number) => ({ kind: "phase" as const, index, phase }));
-	const artifacts = (run.artifacts || []).map((artifact: ArtifactSummary, index: number) => ({ kind: "artifact" as const, index, artifact }));
-	return [...phases, ...artifacts];
+	const rows: DetailRow[] = [];
+	for (const phase of run.phases || []) {
+		const pkey = phaseKey(phase);
+		rows.push({ kind: "phase", key: pkey, phase });
+		if (!expandedPhases.has(pkey)) continue;
+		if (phase.fanout?.items?.length) {
+			// Fanout phase: reveal stages; a completed stage reveals its artifacts and a
+			// running stage shows a live trace pane instead.
+			for (const stage of phase.fanout.items) {
+				const skey = stageKey(phase, stage);
+				rows.push({ kind: "stage", key: skey, phase, stage });
+				if (expandedStages.has(skey) && !isRunningNode(stage) && stage.artifacts?.length) {
+					for (const artifact of stage.artifacts) rows.push({ kind: "artifact", key: artifactKey(artifact), artifact });
+				}
+			}
+		} else if (!isRunningNode(phase) && phase.artifacts?.length) {
+			// Deterministic / completed phase: reveal its generated artifacts.
+			for (const artifact of phase.artifacts) rows.push({ kind: "artifact", key: artifactKey(artifact), artifact });
+		}
+	}
+	return rows;
+}
+
+function findArtifactByKey(run: RunSummary | undefined, key: string | undefined): ArtifactSummary | undefined {
+	if (!run || !key) return undefined;
+	const match = (artifact: ArtifactSummary) => artifactKey(artifact) === key;
+	for (const phase of run.phases || []) {
+		for (const artifact of phase.artifacts || []) if (match(artifact)) return artifact;
+		for (const stage of phase.fanout?.items || []) for (const artifact of stage.artifacts || []) if (match(artifact)) return artifact;
+	}
+	return run.artifacts?.find(match);
 }
 
 function isMarkdownArtifact(artifact: ArtifactSummary): boolean {
@@ -170,11 +220,10 @@ export class ThreadPhaseMonitorComponent {
 	private mode: Mode = "list";
 	private selected = 0;
 	private selectedRunId?: string;
-	private selectedDetail = 0;
-	private expandedPhase?: number;
-	private fanoutPage = 0;
-	private anchorExpandedFanout = false;
-	private selectedArtifact = 0;
+	private selectedKey?: string;
+	private selectedArtifactKey?: string;
+	private expandedPhases = new Set<string>();
+	private expandedStages = new Set<string>();
 	private scroll = 0;
 	private viewportHeight = 24;
 	private searchMode = false;
@@ -239,7 +288,6 @@ export class ThreadPhaseMonitorComponent {
 		}
 		if (this.mode === "list" && data === "s") {
 			this.sortMode = cycleMonitorOption(this.sortMode, MONITOR_SORTS);
-			this.selectedDetail = 0;
 			this.scroll = 0;
 			this.invalidate();
 			return;
@@ -247,7 +295,6 @@ export class ThreadPhaseMonitorComponent {
 
 		const runs = this.visibleRuns();
 		const run = runs[this.selected];
-		const items = detailItems(run);
 
 		if (matchesKey(data, "b") || matchesKey(data, Key.left)) {
 			this.backOrClose();
@@ -261,23 +308,23 @@ export class ThreadPhaseMonitorComponent {
 		}
 
 		if (this.mode === "artifact" && data === "c") {
-			const target = artifactEditorTarget(run?.artifacts?.[this.selectedArtifact]);
+			const target = artifactEditorTarget(findArtifactByKey(run, this.selectedArtifactKey));
 			if (target) this.onSendArtifactTarget(target);
 			return;
 		}
 
 		if (matchesKey(data, Key.ctrl("d"))) {
-			this.movePage(1, run, items);
+			this.movePage(1, run);
 			return;
 		}
 		if (matchesKey(data, Key.ctrl("u"))) {
-			this.movePage(-1, run, items);
+			this.movePage(-1, run);
 			return;
 		}
 
-		if (matchesKey(data, Key.down) || data === "j") this.move(1, run, items);
-		else if (matchesKey(data, Key.up) || data === "k") this.move(-1, run, items);
-		else if (matchesKey(data, Key.enter) || matchesKey(data, Key.right)) this.enter(run, items);
+		if (matchesKey(data, Key.down) || data === "j") this.move(1, run);
+		else if (matchesKey(data, Key.up) || data === "k") this.move(-1, run);
+		else if (matchesKey(data, Key.enter) || matchesKey(data, Key.right)) this.enter(run);
 	}
 
 	render(width: number): string[] {
@@ -315,11 +362,10 @@ export class ThreadPhaseMonitorComponent {
 			// a different run as though it were the original selection.
 			if (this.selectedRunId && this.mode !== "list") {
 				this.mode = "list";
-				this.selectedDetail = 0;
-				this.expandedPhase = undefined;
-				this.fanoutPage = 0;
-				this.anchorExpandedFanout = false;
-				this.selectedArtifact = 0;
+				this.selectedKey = undefined;
+				this.selectedArtifactKey = undefined;
+				this.expandedPhases.clear();
+				this.expandedStages.clear();
 				this.scroll = 0;
 			}
 			this.selected = Math.max(0, Math.min(this.selected, Math.max(0, runs.length - 1)));
@@ -364,40 +410,43 @@ export class ThreadPhaseMonitorComponent {
 	private resetListSelection(): void {
 		this.selected = 0;
 		this.selectedRunId = undefined;
-		this.selectedDetail = 0;
+		this.selectedKey = undefined;
+		this.selectedArtifactKey = undefined;
+		this.expandedPhases.clear();
+		this.expandedStages.clear();
 		this.scroll = 0;
 		this.invalidate();
 	}
 
-	private move(delta: number, run?: RunSummary, items: DetailItem[] = []): void {
+	private move(delta: number, run?: RunSummary): void {
 		if (this.mode === "list") {
 			const runs = this.visibleRuns();
 			this.selected = Math.max(0, Math.min(this.selected + delta, Math.max(0, runs.length - 1)));
 			this.selectedRunId = runs[this.selected]?.runId ? String(runs[this.selected].runId) : undefined;
-			this.selectedDetail = 0;
 		} else if (this.mode === "detail") {
-			this.selectedDetail = Math.max(0, Math.min(this.selectedDetail + delta, Math.max(0, items.length - 1)));
-			this.anchorExpandedFanout = false;
+			if (!run) return;
+			const rows = buildDetailRows(run, this.expandedPhases, this.expandedStages);
+			const current = Math.max(0, rows.findIndex((row) => row.key === this.selectedKey));
+			const next = Math.max(0, Math.min(current + delta, Math.max(0, rows.length - 1)));
+			const row = rows[current] ?? rows[0];
+			if (current !== -1 && row) this.selectedKey = row.key;
+			if (rows[next]) this.selectedKey = rows[next].key;
 		} else {
 			this.scroll = Math.max(0, this.scroll + delta);
 		}
 		this.invalidate();
 	}
 
-	private movePage(delta: number, run?: RunSummary, items: DetailItem[] = []): void {
+	private movePage(delta: number, run?: RunSummary): void {
 		if (this.mode === "artifact") {
 			this.scroll = Math.max(0, this.scroll + delta * Math.max(1, this.viewportHeight - 1));
 		} else if (this.mode === "detail") {
-			const selected = items[this.selectedDetail];
-			if (selected?.kind === "phase" && this.expandedPhase === selected.index && (selected.phase.fanout?.items || []).length > FANOUT_PAGE_SIZE) {
-				const page = pageItems(selected.phase.fanout.items, this.fanoutPage + delta, FANOUT_PAGE_SIZE);
-				this.fanoutPage = page.page;
-				this.anchorExpandedFanout = true;
-			} else {
-				const itemStep = Math.max(1, Math.floor(this.viewportHeight / 2));
-				this.selectedDetail = Math.max(0, Math.min(this.selectedDetail + delta * itemStep, Math.max(0, items.length - 1)));
-				this.anchorExpandedFanout = false;
-			}
+			if (!run) return;
+			const rows = buildDetailRows(run, this.expandedPhases, this.expandedStages);
+			const current = Math.max(0, rows.findIndex((row) => row.key === this.selectedKey));
+			const step = Math.max(1, Math.floor(this.viewportHeight / 2));
+			const next = Math.max(0, Math.min(current + delta * step, Math.max(0, rows.length - 1)));
+			if (rows[next]) this.selectedKey = rows[next].key;
 		} else {
 			const runs = this.visibleRuns();
 			this.selected = Math.max(0, Math.min(this.selected + delta * MAX_VISIBLE_RUNS, Math.max(0, runs.length - 1)));
@@ -406,20 +455,27 @@ export class ThreadPhaseMonitorComponent {
 		this.invalidate();
 	}
 
-	private enter(run?: RunSummary, items: DetailItem[] = []): void {
+	private enter(run?: RunSummary): void {
 		if (this.mode === "list") {
 			this.mode = "detail";
 			this.scroll = 0;
 		} else if (this.mode === "detail") {
-			const item = items[this.selectedDetail];
-			if (item?.kind === "phase") {
-				const expanding = this.expandedPhase !== item.index;
-				this.expandedPhase = expanding ? item.index : undefined;
-				if (expanding) this.fanoutPage = 0;
-				this.anchorExpandedFanout = Boolean(expanding && item.phase.fanout);
-			}
-			if (item?.kind === "artifact") {
-				this.selectedArtifact = item.index;
+			if (!run) return;
+			const rows = buildDetailRows(run, this.expandedPhases, this.expandedStages);
+			const row = rows.find((candidate) => candidate.key === this.selectedKey) || rows[0];
+			if (!row) return;
+			this.selectedKey = row.key;
+			if (row.kind === "phase") {
+				const key = row.key;
+				if (this.expandedPhases.has(key)) {
+					this.expandedPhases.delete(key);
+					for (const stage of row.phase.fanout?.items || []) this.expandedStages.delete(stageKey(row.phase, stage));
+				} else this.expandedPhases.add(key);
+			} else if (row.kind === "stage") {
+				if (this.expandedStages.has(row.key)) this.expandedStages.delete(row.key);
+				else this.expandedStages.add(row.key);
+			} else if (row.kind === "artifact") {
+				this.selectedArtifactKey = row.key;
 				this.mode = "artifact";
 				this.scroll = 0;
 			}
@@ -476,22 +532,22 @@ export class ThreadPhaseMonitorComponent {
 		const t = this.theme;
 		const run = runs[this.selected];
 		if (!run) return this.renderList(width, runs);
-		const items = detailItems(run);
-		this.selectedDetail = Math.max(0, Math.min(this.selectedDetail, Math.max(0, items.length - 1)));
-		const selectedItem = items[this.selectedDetail];
+		const rows = buildDetailRows(run, this.expandedPhases, this.expandedStages);
+		let selectedIndex = rows.findIndex((row) => row.key === this.selectedKey);
+		if (selectedIndex < 0) selectedIndex = rows.length ? 0 : -1;
+		const selectedKey = rows[selectedIndex]?.key;
 		const status = run.normalizedStatus || run.status;
 		const lines: string[] = [];
-		let itemCursor = 0;
 		let selectedLine = 0;
-		let fanoutVisibleRange: DetailLineRange | undefined;
+		let selectableIndex = 0;
 		const add = (line: string, selectable = false) => {
-			if (selectable && itemCursor === this.selectedDetail) selectedLine = lines.length;
+			if (selectable && selectableIndex === selectedIndex) selectedLine = lines.length;
 			lines.push(line);
-			if (selectable) itemCursor++;
+			if (selectable) selectableIndex++;
 		};
 
 		const cancelHint = isRunningCancellable(run) ? " • x cancel" : "";
-		add(t.fg("dim", `← back • ↑↓ select • ctrl+u/d page • enter ${selectedItem?.kind === "artifact" ? "open" : "expand"}${cancelHint} • q close`));
+		add(t.fg("dim", `← back • ↑↓ select • enter explore${cancelHint} • q close`));
 		add(t.fg("accent", t.bold(`${workflowGlyph(status, t)} ${run.workflow || "workflow"}`)) + t.fg("dim", ` [${run.runId || "unknown"}]`));
 		const pid = runtimePid(run);
 		add(t.fg("dim", `status: ${run.status || status}${run.stale ? `  ${formatStaleIndicator(run)}` : ""}  duration: ${elapsedForRun(run)}${pid && status === STATUSES.RUNNING ? `  pid: ${pid}` : ""}`));
@@ -504,55 +560,73 @@ export class ThreadPhaseMonitorComponent {
 		add("");
 		add(t.fg("toolTitle", t.bold("Phases")) + t.fg("dim", ` (${(run.phases || []).length})`));
 		if (!(run.phases || []).length) add(t.fg("dim", "No phases recorded."));
-		for (const phase of run.phases || []) {
-			const pStatus = phase.normalizedStatus || phase.status;
-			const progress = phase.fanout ? formatFanout(phase.fanout) : formatProgress(phase.progress);
-			const selected = itemCursor === this.selectedDetail;
+		for (const row of rows) {
+			const selected = row.key === selectedKey;
 			const prefix = selected ? t.fg("accent", "›") : " ";
-			const inference = inferenceLabel(phase);
-			add(`${prefix} ${t.fg(statusColor(pStatus), phaseStatusGlyph(pStatus))} ${selected ? t.fg("accent", phase.phase || "phase") : phase.phase || "phase"}${t.fg("muted", progress)}${inference ? t.fg("dim", ` — ${inference}`) : ""}`, true);
-			if (this.expandedPhase === itemCursor - 1) fanoutVisibleRange = this.addPhaseDetails(lines, phase, width);
-		}
-		add("");
-		add(t.fg("toolTitle", t.bold("Artifacts")) + t.fg("dim", ` (${(run.artifacts || []).length})`));
-		if (!(run.artifacts || []).length) add(t.fg("dim", "No artifacts recorded."));
-		for (const artifact of run.artifacts || []) {
-			const selected = itemCursor === this.selectedDetail;
-			const prefix = selected ? t.fg("accent", "›") : " ";
-			add(`${prefix} ${t.fg("success", "◉")} ${selected ? t.fg("accent", artifactTitle(artifact)) : artifactTitle(artifact)}${artifactTarget(artifact) ? t.fg("dim", ` — ${artifactTarget(artifact)}`) : ""}`, true);
+			if (row.kind === "phase") {
+				const phase = row.phase;
+				const pStatus = phase.normalizedStatus || phase.status;
+				const progress = phase.fanout ? formatFanout(phase.fanout) : formatProgress(phase.progress);
+				const inference = inferenceLabel(phase);
+				const expandMark = this.expandedPhases.has(row.key)
+					? t.fg("dim", "▾ ")
+					: (phase.fanout?.items?.length || phase.artifacts?.length || (isRunningNode(phase) && phase.recentItems?.length)) ? t.fg("dim", "▸ ") : "  ";
+				add(`${prefix} ${expandMark}${t.fg(statusColor(pStatus), phaseStatusGlyph(pStatus))} ${selected ? t.fg("accent", phase.phase || "phase") : phase.phase || "phase"}${t.fg("muted", progress)}${inference ? t.fg("dim", ` — ${inference}`) : ""}`, true);
+				if (this.expandedPhases.has(row.key)) {
+					this.addPhaseHeader(lines, phase, width);
+					if (isRunningNode(phase) && phase.recentItems?.length) this.addTracePane(lines, phase.recentItems, width);
+				}
+			} else if (row.kind === "stage") {
+				const stage = row.stage;
+				const iStatus = stage.normalizedStatus || stage.status;
+				const tokens = formatTotalTokens(stage.usage);
+				const inference = inferenceLabel(stage);
+				const expandable = stage.artifacts?.length || (isRunningNode(stage) && stage.recentItems?.length);
+				const expandMark = this.expandedStages.has(row.key) ? t.fg("dim", "▾") : expandable ? t.fg("dim", "▸") : " ";
+				add(`${prefix}   ${expandMark}${t.fg(statusColor(iStatus), statusIcon(iStatus))} ${selected ? t.fg("accent", stage.label || stage.itemId) : t.fg("accent", stage.label || stage.itemId)}${tokens ? t.fg("muted", ` · ${tokens}`) : ""}${inference ? t.fg("dim", ` — ${inference}`) : ""}`, true);
+				if (this.expandedStages.has(row.key) && isRunningNode(stage) && stage.recentItems?.length) {
+					this.addTracePane(lines, stage.recentItems, width);
+				}
+			} else if (row.kind === "artifact") {
+				const artifact = row.artifact;
+				add(`${prefix}     ${t.fg("success", "◉")} ${selected ? t.fg("accent", artifactTitle(artifact)) : artifactTitle(artifact)}${artifactTarget(artifact) ? t.fg("dim", ` — ${artifactTarget(artifact)}`) : ""}`, true);
+			}
 		}
 		if (run.errors?.length) {
 			add("");
 			add(t.fg("error", t.bold("Errors")));
 			for (const error of run.errors) add(t.fg("error", `- ${error.phase ? `${error.phase}: ` : ""}${error.message || error.error?.message || "error"}`));
 		}
-		const visibleRange = this.anchorExpandedFanout ? fanoutVisibleRange : undefined;
-		return this.windowLines(lines, width, this.viewportHeight, visibleRange ? undefined : selectedLine, visibleRange);
+		return this.windowLines(lines, width, this.viewportHeight, selectedLine);
 	}
 
-	private addPhaseDetails(lines: string[], phase: PhaseSummary, width: number): DetailLineRange | undefined {
+	private addPhaseHeader(lines: string[], phase: PhaseSummary, width: number): void {
 		const t = this.theme;
 		if (phase.startedAt) lines.push(t.fg("dim", `    duration: ${elapsedForPhase(phase)}`));
 		if (phase.progress) lines.push(t.fg("muted", `    progress: ${compactJson(phase.progress)}`));
 		const phaseTokens = formatTotalTokens(phase.usage);
 		if (phaseTokens) lines.push(t.fg("muted", `    tokens: ${phaseTokens}`));
 		this.addActiveIo(lines, phase.activeIo, width, "    I/O");
-		if (!phase.fanout) return undefined;
-		const fanoutSummaryLine = lines.length;
-		lines.push(t.fg("muted", `    fanout:${formatFanout(phase.fanout)} ${phase.fanout.label || ""}`));
-		const page = pageItems(phase.fanout.items || [], this.fanoutPage, FANOUT_PAGE_SIZE);
-		this.fanoutPage = page.page;
-		if (page.pageCount > 1) lines.push(t.fg("dim", `      items ${page.start + 1}-${page.end} of ${page.total} • ctrl+u/d page (${page.page + 1}/${page.pageCount})`));
-		for (const item of page.items) {
-			const iStatus = item.normalizedStatus || item.status;
-			const tokens = formatTotalTokens(item.usage);
-			const inference = inferenceLabel(item);
-			lines.push(truncateToWidth(`      ${t.fg(statusColor(iStatus), statusIcon(iStatus))} ${item.label || item.itemId}${tokens ? t.fg("muted", ` · ${tokens}`) : ""}${inference ? t.fg("dim", ` — ${inference}`) : ""}`, width));
+		if (phase.fanout) lines.push(t.fg("muted", `    fanout:${formatFanout(phase.fanout)} ${phase.fanout.label || ""}`));
+	}
+
+	// Render the most recent live reasoning / tool-call trace for a running phase or
+	// stage, from its projected recentItems. Non-selectable detail lines.
+	private addTracePane(lines: string[], items: any[], width: number): void {
+		const t = this.theme;
+		lines.push(truncateToWidth(t.fg("toolTitle", "    trace:") + t.fg("dim", " live reasoning / tool calls"), width));
+		const visible = items.slice(-6);
+		for (const item of visible) {
+			if (!item || typeof item !== "object") continue;
+			if (item.type === "content_delta") {
+				const text = String(item.delta ?? "").trim();
+				if (text) lines.push(truncateToWidth(t.fg("muted", `      ⎙ ${text}`), width));
+			} else if (item.type === "tool_call_started") {
+				lines.push(truncateToWidth(t.fg("warning", `      🔧 ${item.toolCallId ? `#${item.toolCallId}` : "tool"} call started`), width));
+			} else if (item.type === "tool_call_completed") {
+				lines.push(truncateToWidth(t.fg("success", `      ✓ ${item.toolName || "tool"}${item.args ? ` ${String(item.args).slice(0, 60)}` : ""}`), width));
+			}
 		}
-		// Track the complete expanded fanout block rather than one anchor line so
-		// expansion, page changes, and responsive re-renders can keep the page
-		// heading and every rendered item in view together.
-		return { start: fanoutSummaryLine, end: Math.max(fanoutSummaryLine, lines.length - 1) };
 	}
 
 	private addActiveIo(lines: string[], io: any, width: number, title = "I/O"): void {
@@ -570,7 +644,7 @@ export class ThreadPhaseMonitorComponent {
 	private renderArtifact(width: number, runs: RunSummary[]): string[] {
 		const t = this.theme;
 		const run = runs[this.selected];
-		const artifact: ArtifactSummary | undefined = run?.artifacts?.[this.selectedArtifact];
+		const artifact = findArtifactByKey(run, this.selectedArtifactKey);
 		if (!run || !artifact) {
 			this.mode = "detail";
 			return this.renderDetail(width, runs);
