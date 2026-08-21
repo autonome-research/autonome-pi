@@ -272,7 +272,9 @@ export class PiJsonEventCollector {
     if (keep.length < safeDelta.length) this.traceExcluded++;
 
     const record = { type: "content_delta", agent: "assistant", contentType, contentIndex, delta: keep };
-    if (this.onTrace) safeCall(this.onTrace, record);
+    // Deliver a shallow copy so an external live consumer never observes the
+    // same object being coalesced/mutated inside the retained window.
+    if (this.onTrace) safeCall(this.onTrace, { ...record });
     this.retainTrace(record, true);
   }
 
@@ -285,7 +287,7 @@ export class PiJsonEventCollector {
       toolCallId: toolCallIdFor(ame.contentIndex),
       contentIndex: ame.contentIndex,
     };
-    if (this.onTrace) safeCall(this.onTrace, record);
+    if (this.onTrace) safeCall(this.onTrace, { ...record });
     this.retainTrace(record, false);
   }
 
@@ -304,7 +306,7 @@ export class PiJsonEventCollector {
       contentIndex: ame.contentIndex,
       args: truncateUtf8(redactSecrets(argsJson), this.maxToolCallArgChars),
     };
-    if (this.onTrace) safeCall(this.onTrace, record);
+    if (this.onTrace) safeCall(this.onTrace, { ...record });
     this.retainTrace(record, false);
   }
 

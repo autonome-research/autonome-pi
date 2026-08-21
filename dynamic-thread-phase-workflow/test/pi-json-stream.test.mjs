@@ -336,3 +336,22 @@ test("collector keeps onTrace optional and never breaks on a throwing observer",
   assert.equal(result.text, "done");
   assert.equal(result.trace.window.length, 1);
 });
+
+test("onTrace receives a shallow copy not aliased to the coalesced retained window", () => {
+  // Hold the exact references (no defensive snapshot) so aliasing would surface:
+  // if onTrace delivered the retained-window object, later coalescing would
+  // mutate the deltas we already saw.
+  const received = [];
+  const collector = new PiJsonEventCollector({ onTrace: (evt) => received.push(evt) });
+  collector.push(eventLine({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "a" } }));
+  collector.push(eventLine({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "b" } }));
+  collector.push(eventLine({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "c" } }));
+  const result = collector.finish();
+
+  // Each delivered object still carries only its own individual delta.
+  assert.equal(received.length, 3);
+  assert.deepEqual(received.map((record) => record.delta), ["a", "b", "c"]);
+  // The retained window coalesced the stream into one content_delta.
+  assert.equal(result.trace.window.length, 1);
+  assert.equal(result.trace.window[0].delta, "abc");
+});
