@@ -3,7 +3,7 @@ import { Key, Markdown, matchesKey, truncateToWidth } from "@earendil-works/pi-t
 import { basename } from "node:path";
 import { STATUSES, latestRunSummaries, readArtifactContent, requestCancellation, STORE_BUILD } from "../lib/store.mjs";
 import { artifactEditorActionHint, artifactEditorTarget } from "../lib/artifact-action.mjs";
-import { MONITOR_SORTS, MONITOR_STATUS_FILTERS, cycleMonitorOption, filterAndSortMonitorRuns } from "../lib/monitor-state.mjs";
+import { DEFAULT_MONITOR_SORT, MONITOR_SORTS, MONITOR_STATUS_FILTERS, cycleMonitorOption, filterAndSortMonitorRuns } from "../lib/monitor-state.mjs";
 import { detailViewportHeight, windowLineRange } from "../lib/monitor-pagination.mjs";
 import { formatElapsedDuration, formatStaleIndicator, formatTotalTokens } from "../lib/run-display.mjs";
 import { canInspectRun, mergeMonitorRuns } from "../lib/session-scope.mjs";
@@ -246,7 +246,7 @@ export class ThreadPhaseMonitorComponent {
 	private searchQuery = "";
 	private statusFilter = "all";
 	private hideStale = false;
-	private sortMode = "status";
+	private sortMode = DEFAULT_MONITOR_SORT;
 	private showBuild = false;
 	private traceOffset = 0;
 	private traceRowKey?: string;
@@ -530,12 +530,12 @@ export class ThreadPhaseMonitorComponent {
 		// The panel frame already titles this surface; keep the first line to action keys only.
 		lines.push(truncateToWidth(t.fg("dim", `↑↓ select · enter details${cancelHint} · / search · f status · h stale · s sort · q close`), width));
 		// Show the filter line ONLY when a search or non-default filter/sort is active.
-		if (this.searchMode || this.searchQuery || this.statusFilter !== "all" || this.hideStale || this.sortMode !== "status") {
+		if (this.searchMode || this.searchQuery || this.statusFilter !== "all" || this.hideStale || this.sortMode !== DEFAULT_MONITOR_SORT) {
 			const active: string[] = [];
 			if (this.searchMode || this.searchQuery) active.push(`search:${this.searchQuery || "…"}`);
 			if (this.statusFilter !== "all") active.push(`status:${this.statusFilter}`);
 			if (this.hideStale) active.push("stale:hidden");
-			if (this.sortMode !== "status") active.push(`sort:${this.sortMode}`);
+			if (this.sortMode !== DEFAULT_MONITOR_SORT) active.push(`sort:${this.sortMode}`);
 			lines.push(truncateToWidth(t.fg("toolTitle", active.join("  ") + "  • esc/b clear"), width));
 		}
 		lines.push(truncateToWidth(t.fg("borderMuted", "─".repeat(Math.max(0, width))), width));

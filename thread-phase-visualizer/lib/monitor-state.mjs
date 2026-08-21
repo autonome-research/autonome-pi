@@ -8,7 +8,9 @@ export const MONITOR_STATUS_FILTERS = Object.freeze([
   "unknown",
 ]);
 
-export const MONITOR_SORTS = Object.freeze(["status", "updated", "workflow"]);
+export const DEFAULT_MONITOR_SORT = "updated";
+// 'updated' (most recently updated) is the default order; 's' cycles the rest.
+export const MONITOR_SORTS = Object.freeze(["updated", "status", "workflow"]);
 
 const STATUS_ORDER = new Map([
   ["running", 0],
@@ -30,7 +32,7 @@ export function runMatchesSearch(run, query) {
     .some((value) => normalizedText(value).includes(needle));
 }
 
-export function filterAndSortMonitorRuns(runs, { query = "", status = "all", sort = "status", hideStale = false } = {}) {
+export function filterAndSortMonitorRuns(runs, { query = "", status = "all", sort = DEFAULT_MONITOR_SORT, hideStale = false } = {}) {
   const statusFilter = normalizedText(status) || "all";
   const visible = (runs || []).filter((run) => {
     const runStatus = normalizedText(run?.normalizedStatus || run?.status || "unknown");

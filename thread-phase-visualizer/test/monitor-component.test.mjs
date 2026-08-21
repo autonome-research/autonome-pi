@@ -417,11 +417,10 @@ test("selection follows runId across sorting changes and live reloads", () => {
   ];
   const monitor = new ThreadPhaseMonitorComponent("/repo", undefined, theme, () => {}, () => {}, () => {}, () => runs);
 
-  monitor.render(80);
-  monitor.handleInput("\x1b[B");
+  // Default order is most-recently-updated first, so alpha (01-03) is selected.
   assert.match(text(monitor.render(80)), /› ✓ Alpha Build/);
 
-  monitor.handleInput("s");
+  monitor.handleInput("s"); // cycle to the status sort; selection still follows alpha by runId
   assert.match(text(monitor.render(80)), /› ✓ Alpha Build/);
 
   runs = [
