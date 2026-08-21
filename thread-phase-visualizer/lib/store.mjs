@@ -1196,12 +1196,42 @@ export function projectRun(events = [], options = {}) {
       phase.lastMessage = event.message || phase.lastMessage;
       if (!phase.startedAt) phase.startedAt = event.timestamp;
     }
+    if (event.type === EVENT_TYPES.AGENT_EVENT && event.phase) {
+      const phase = summary.phaseMap[event.phase] || upsertPhase(summary, event.phase, {
+        phase: event.phase,
+        status: STATUSES.RUNNING,
+        normalizedStatus: STATUSES.RUNNING,
+        startedAt: event.timestamp,
+      });
+      phase.updatedAt = event.timestamp || phase.updatedAt;
+      phase.lastMessage = event.message || phase.lastMessage;
+      applyAgentTraceEvent(phase, event.data, event.timestamp);
+    }
     if (event.type === EVENT_TYPES.ARTIFACT && event.artifact) {
-      summary.artifacts.push({ ...event.artifact, eventId: event.eventId, timestamp: event.timestamp });
+      const record = { ...event.artifact, eventId: event.eventId, timestamp: event.timestamp };
+      summary.artifacts.push(record);
+      const artifactPhase = event.artifact?.metadata?.phase;
+      if (artifactPhase) {
+        const phase = summary.phaseMap[artifactPhase];
+        if (phase) {
+          (phase.artifacts ||= []).push(record);
+          const itemId = event.artifact?.metadata?.itemId;
+          if (itemId !== undefined) {
+            const item = phase._fanoutItemMap?.[String(itemId)];
+            if (item) (item.artifacts ||= []).push(record);
+          }
+        }
+      }
     }
   }
 
-  for (const phase of Object.values(summary.phaseMap)) finalizeFanout(phase);
+  for (const phase of Object.values(summary.phaseMap)) {
+    finalizeFanout(phase);
+    if (phase.artifacts) phase.artifacts = dedupeArtifacts(phase.artifacts);
+    for (const item of phase.fanout?.items || []) {
+      if (item.artifacts) item.artifacts = dedupeArtifacts(item.artifacts);
+    }
+  }
   closeOpenPhasesForTerminalRun(summary, sawWorkflowEnd);
   summary.artifacts = dedupeArtifacts(summary.artifacts);
   summary.phases = Object.values(summary.phaseMap).sort((a, b) => String(a.startedAt || "").localeCompare(String(b.startedAt || "")));
@@ -1965,6 +1995,54 @@ function formatNumber(value) {
   if (value >= 10_000) return `${Math.round(value / 1_000)}K`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
   return String(value);
+}
+
+// Bounded live-trace projection budgets. recentItems is a fixed-size window so
+// agent_event growth can never become unbounded; individual trace text is
+// truncated to keep any single record small.
+const MAX_RECENT_ITEMS = 100;
+const MAX_TRACE_TEXT_BYTES = 2000;
+
+function traceTextBounds(text, maxBytes) {
+  let value = String(text ?? "");
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  let out = value.slice(0, maxBytes);
+  while (Buffer.byteLength(out, "utf8") > maxBytes) out = out.slice(0, -1);
+  return out;
+}
+
+function pushBounded(list, item, cap) {
+  list.push(item);
+  while (list.length > cap) list.shift();
+}
+
+// Project an AGENT_EVENT record into a bounded per-phase (and per-stage, when it
+// carries itemId identity) recentItems window, adopting thread-phase's
+// AgentStreamEvent shape (content_delta reasoning, tool_call_started/completed).
+function applyAgentTraceEvent(phase, data, timestamp) {
+  if (!data || typeof data !== "object") return;
+  const type = data.type;
+  if (!type) return;
+  let trace;
+  if (type === "content_delta") {
+    trace = { type, agent: data.agent, contentType: data.contentType, contentIndex: data.contentIndex, at: timestamp, delta: traceTextBounds(data.delta, MAX_TRACE_TEXT_BYTES) };
+  } else if (type === "tool_call_started") {
+    trace = { type, agent: data.agent, toolCallId: data.toolCallId, contentIndex: data.contentIndex, at: timestamp };
+  } else if (type === "tool_call_completed") {
+    trace = { type, agent: data.agent, toolCallId: data.toolCallId, toolName: data.toolName, contentIndex: data.contentIndex, at: timestamp, args: traceTextBounds(data.args, MAX_TRACE_TEXT_BYTES) };
+  } else {
+    return; // only adopt the AgentStreamEvent shapes
+  }
+  const itemId = data.itemId ?? data.id;
+  if (itemId !== undefined) {
+    const item = phase._fanoutItemMap?.[String(itemId)];
+    if (item) {
+      item.recentItems ||= [];
+      pushBounded(item.recentItems, trace, MAX_RECENT_ITEMS);
+    }
+  }
+  phase.recentItems ||= [];
+  pushBounded(phase.recentItems, trace, MAX_RECENT_ITEMS);
 }
 
 function applyFanoutEvent(phase, data, event) {
