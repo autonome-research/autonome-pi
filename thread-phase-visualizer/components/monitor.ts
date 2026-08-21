@@ -1,7 +1,7 @@
 import { getMarkdownTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, Markdown, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { basename } from "node:path";
-import { STATUSES, latestRunSummaries, readArtifactContent, requestCancellation } from "../lib/store.mjs";
+import { STATUSES, latestRunSummaries, readArtifactContent, requestCancellation, STORE_BUILD } from "../lib/store.mjs";
 import { artifactEditorActionHint, artifactEditorTarget } from "../lib/artifact-action.mjs";
 import { MONITOR_SORTS, MONITOR_STATUS_FILTERS, cycleMonitorOption, filterAndSortMonitorRuns } from "../lib/monitor-state.mjs";
 import { detailViewportHeight, windowLineRange } from "../lib/monitor-pagination.mjs";
@@ -174,6 +174,13 @@ function isRunningNode(node: Record<string, any> | undefined): boolean {
 	return node?.normalizedStatus === STATUSES.RUNNING || node?.status === STATUSES.RUNNING;
 }
 
+function traceItemsForRow(row: DetailRow | undefined, expandedPhases: Set<string>, expandedStages: Set<string>): any[] | undefined {
+	if (!row) return undefined;
+	if (row.kind === "phase" && expandedPhases.has(row.key) && isRunningNode(row.phase) && row.phase.recentItems?.length) return row.phase.recentItems;
+	if (row.kind === "stage" && expandedStages.has(row.key) && isRunningNode(row.stage) && row.stage.recentItems?.length) return row.stage.recentItems;
+	return undefined;
+}
+
 // Build the ordered list of selectable tree rows for a run. Selection is keyed by
 // stable row identity (phase name, stage itemId, artifact key) so that expending
 // or collapsing a fanout phase never silently remaps the cursor onto a different
@@ -240,6 +247,9 @@ export class ThreadPhaseMonitorComponent {
 	private statusFilter = "all";
 	private hideStale = false;
 	private sortMode = "status";
+	private showBuild = false;
+	private traceOffset = 0;
+	private traceRowKey?: string;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 
@@ -298,6 +308,13 @@ export class ThreadPhaseMonitorComponent {
 		if (this.mode === "list" && data === "s") {
 			this.sortMode = cycleMonitorOption(this.sortMode, MONITOR_SORTS);
 			this.scroll = 0;
+			this.invalidate();
+			return;
+		}
+
+		// Diagnostics toggle: press v to reveal the viewer/store build in the title bar.
+		if (data === "v") {
+			this.showBuild = !this.showBuild;
 			this.invalidate();
 			return;
 		}
@@ -453,9 +470,18 @@ export class ThreadPhaseMonitorComponent {
 			if (!run) return;
 			const rows = buildDetailRows(run, this.expandedPhases, this.expandedStages);
 			const current = Math.max(0, rows.findIndex((row) => row.key === this.selectedKey));
-			const step = Math.max(1, Math.floor(this.viewportHeight / 2));
-			const next = Math.max(0, Math.min(current + delta * step, Math.max(0, rows.length - 1)));
-			if (rows[next]) this.selectedKey = rows[next].key;
+			// When the selected row is an expanded running node with a live trace, ctrl+u/d
+			// scrolls the trace window instead of moving the selection (interactive trace).
+			const row = rows[current];
+			const traceItems = traceItemsForRow(row, this.expandedPhases, this.expandedStages);
+			if (traceItems) {
+				const tracePage = Math.max(1, this.viewportHeight - 4);
+				this.traceOffset = Math.max(0, Math.min(this.traceOffset + delta * tracePage, Math.max(0, traceItems.length - 1)));
+			} else {
+				const step = Math.max(1, Math.floor(this.viewportHeight / 2));
+				const next = Math.max(0, Math.min(current + delta * step, Math.max(0, rows.length - 1)));
+				if (rows[next]) this.selectedKey = rows[next].key;
+			}
 		} else {
 			const runs = this.visibleRuns();
 			this.selected = Math.max(0, Math.min(this.selected + delta * MAX_VISIBLE_RUNS, Math.max(0, runs.length - 1)));
@@ -493,7 +519,7 @@ export class ThreadPhaseMonitorComponent {
 	}
 
 	private withBorder(content: string[], width: number): string[] {
-		return framePanel(content, width, this.theme, { title: "Thread-phase" });
+		return framePanel(content, width, this.theme, { title: this.showBuild ? `Thread-phase ${MONITOR_BUILD}/${STORE_BUILD}` : "Thread-phase" });
 	}
 
 	private renderList(width: number, runs: RunSummary[]): string[] {
@@ -555,6 +581,13 @@ export class ThreadPhaseMonitorComponent {
 		let selectedIndex = rows.findIndex((row) => row.key === this.selectedKey);
 		if (selectedIndex < 0) selectedIndex = rows.length ? 0 : -1;
 		const selectedKey = rows[selectedIndex]?.key;
+		// Reset the interactive trace window when the selected (trace-eligible) row changes.
+		const traceRow = traceItemsForRow(rows[selectedIndex], this.expandedPhases, this.expandedStages);
+		const traceKey = traceRow ? rows[selectedIndex].key : undefined;
+		if (this.traceRowKey !== traceKey) {
+			this.traceRowKey = traceKey;
+			this.traceOffset = 0;
+		}
 		const status = run.normalizedStatus || run.status;
 		const lines: string[] = [];
 		let selectedLine = 0;
@@ -634,12 +667,15 @@ export class ThreadPhaseMonitorComponent {
 	// content deltas are coalesced into a single assembled line (signal dedup).
 	private addTracePane(lines: string[], items: any[], width: number): void {
 		const t = this.theme;
-		lines.push(truncateToWidth(t.fg("toolTitle", "    trace:") + t.fg("dim", " live reasoning / tool calls"), width));
 		const total = Array.isArray(items) ? items.length : 0;
-		const MAX_VISIBLE_TRACE = 12;
-		const hideOlder = total > MAX_VISIBLE_TRACE;
-		const visible = hideOlder ? items.slice(-MAX_VISIBLE_TRACE) : items;
-		if (hideOlder) lines.push(truncateToWidth(t.fg("dim", `      … ${total - MAX_VISIBLE_TRACE} earlier`), width));
+		const page = Math.max(1, this.viewportHeight - 4);
+		this.traceOffset = Math.max(0, Math.min(this.traceOffset, Math.max(0, total - 1)));
+		const newest = total;
+		const end = Math.max(0, newest - this.traceOffset);
+		const start = Math.max(0, end - page);
+		const visible = items.slice(start, end);
+		lines.push(truncateToWidth(t.fg("toolTitle", "    trace:") + t.fg("dim", " live reasoning / tool calls"), width));
+		if (total > page) lines.push(truncateToWidth(t.fg("dim", `      items ${start + 1}-${end} of ${total} • ctrl+u/d scroll`), width));
 		const reasoning: string[] = [];
 		const flushReasoning = () => {
 			if (!reasoning.length) return;

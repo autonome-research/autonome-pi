@@ -135,3 +135,29 @@ test("live trace pane renders for a running phase and degrades without recentIte
   assert.doesNotThrow(() => text(empty.render(100)));
   assert.match(text(empty.render(100)), /solo/);
 });
+
+test("live trace pane coalesces reasoning content deltas into one assembled line", () => {
+  const monitor = component([run({
+    normalizedStatus: "running",
+    status: "running",
+    phases: [{
+      phase: "think",
+      normalizedStatus: "running",
+      status: "running",
+      recentItems: [
+        { type: "content_delta", contentType: "thinking", delta: "step one " },
+        { type: "content_delta", contentType: "thinking", delta: "then step two" },
+        { type: "tool_call_completed", toolName: "bash", args: "ls" },
+      ],
+    }],
+    artifacts: [],
+  })]);
+  monitor.handleInput("\r");
+  monitor.handleInput("\r"); // expand running phase -> trace pane
+  const out = text(monitor.render(100));
+  // Consecutive reasoning fragments are joined into a single line (signal dedup).
+  assert.match(out, /step one then step two/);
+  const reasoningRows = out.split("\n").filter((line) => line.includes("⎙")).length;
+  assert.equal(reasoningRows, 1);
+  assert.match(out, /bash/);
+});

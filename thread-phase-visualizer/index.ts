@@ -82,7 +82,6 @@ export function formatRunSummary(run: AnyEvent): string {
 		`- ${statusIcon(run.normalizedStatus)} ${run.workflow} (${run.runId})${run.stale ? ` ${formatStaleIndicator(run)}` : ""}`,
 		`  updated: ${run.updatedAt}`,
 		formatOwnerMetadata(run) ? `  ${formatOwnerMetadata(run)}` : undefined,
-		run.heartbeat?.timestamp ? `  heartbeat: ${run.heartbeat.timestamp}${run.heartbeat.featureId ? ` feature=${run.heartbeat.featureId}` : ""}` : undefined,
 		run.usage?.entries ? `  usage: ${formatUsageSummary(run.usage)}` : undefined,
 		phases ? `  phases: ${phases}` : undefined,
 		artifacts.length ? `  artifacts: ${artifacts.join(", ")}` : undefined,
@@ -90,16 +89,53 @@ export function formatRunSummary(run: AnyEvent): string {
 	].filter(Boolean).join("\n");
 }
 
+function readoutPhaseLines(run: AnyEvent): string[] {
+	const nested = new Set<string>();
+	const lines: string[] = [];
+	for (const phase of run.phases || []) {
+		const icon = statusIcon(phase.normalizedStatus);
+		const usage = phase.usage?.entries ? ` · ${formatUsageSummary(phase.usage)}` : "";
+		const msg = phase.lastMessage ? ` — ${phase.lastMessage}` : "";
+		lines.push(`- ${icon} ${phase.phase}${usage}${msg}`);
+		if (phase.fanout?.items?.length) {
+			for (const stage of phase.fanout.items) {
+				const sicon = statusIcon(stage.normalizedStatus);
+				lines.push(`  - ${sicon} ${stage.label || stage.itemId}`);
+				for (const a of stage.artifacts || []) {
+					nested.add(artifactKey(a));
+					lines.push(`    · ${a.title || a.kind}: ${artifactTargetText(a)}`);
+				}
+			}
+		} else {
+			for (const a of phase.artifacts || []) {
+				nested.add(artifactKey(a));
+				lines.push(`  · ${a.title || a.kind}: ${artifactTargetText(a)}`);
+			}
+		}
+	}
+	// Any artifacts not attached to a phase/stage still render, but with no separate
+	// flat "Artifacts" section duplication.
+	for (const a of run.artifacts || []) {
+		if (!a || nested.has(artifactKey(a))) continue;
+		lines.push(`  · ${a.title || a.kind}: ${artifactTargetText(a)}`);
+	}
+	return lines;
+}
+function artifactKey(a: AnyEvent): string {
+	return String(a?.eventId || a?.path || a?.title || "");
+}
+function artifactTargetText(a: AnyEvent): string {
+	return a?.path || a?.url || "";
+}
+
 function formatRunDetail(run: AnyEvent): string {
-	const artifacts = run.artifacts || [];
+	const phases = (run.phases || []).length ? readoutPhaseLines(run) : [];
 	return truncate([
 		`${statusIcon(run.normalizedStatus)} Thread-phase workflow ${run.status}: ${run.workflow}${run.stale ? ` ${formatStaleIndicator(run)}` : ""}`,
 		`Run: ${run.runId}`,
 		formatOwnerMetadata(run) || undefined,
-		run.heartbeat?.timestamp ? `Heartbeat: ${run.heartbeat.timestamp}${run.heartbeat.featureId ? ` feature=${run.heartbeat.featureId}` : ""}` : undefined,
 		run.usage?.entries ? `Usage: ${formatUsageSummary(run.usage)}` : undefined,
-		run.phases?.length ? `\nPhases:\n${run.phases.map((p: AnyEvent) => `- ${statusIcon(p.normalizedStatus)} ${p.phase}${p.usage?.entries ? ` · ${formatUsageSummary(p.usage)}` : ""}${p.lastMessage ? ` — ${p.lastMessage}` : ""}`).join("\n")}` : undefined,
-		artifacts.length ? `\nArtifacts:\n${artifacts.map((a: AnyEvent) => `- ${a.title || a.kind}: ${a.path || a.preview || (a.content ? "(inline)" : "")}`).join("\n")}` : undefined,
+		phases.length ? `\nPhases:\n${phases.join("\n")}` : undefined,
 		run.errors?.length ? `\nErrors:\n${run.errors.map((e: AnyEvent) => `- ${e.phase ? `${e.phase}: ` : ""}${e.message || e.error?.message || "error"}`).join("\n")}` : undefined,
 		run.lastMessage ? `\n${run.lastMessage}` : undefined,
 	].filter(Boolean).join("\n"));

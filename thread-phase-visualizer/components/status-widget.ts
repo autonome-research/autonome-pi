@@ -1,5 +1,4 @@
 import { STATUSES } from "../lib/store.mjs";
-import { formatOwnerMetadata } from "../lib/run-display.mjs";
 
 type RunSummary = Record<string, any>;
 
@@ -29,8 +28,7 @@ export function activeRunWidgetLines(runs: RunSummary[], options: { maxRuns?: nu
 	for (const run of active.slice(0, maxRuns)) {
 		const phase = latestActivePhase(run);
 		const phasePart = phase?.phase ? `: ${phase.phase}${progressText(phase)}` : "";
-		const owner = formatOwnerMetadata(run);
-		lines.push(`… ${run.workflow || "workflow"}${phasePart}${owner ? ` · ${owner}` : ""}`);
+		lines.push(`… ${run.workflow || "workflow"}${phasePart}`);
 	}
 	if (active.length > maxRuns) lines.push(`… +${active.length - maxRuns} more`);
 	return lines;

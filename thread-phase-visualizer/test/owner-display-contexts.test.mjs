@@ -59,12 +59,13 @@ test("expanded run messages display canonical owner metadata and stale reason", 
   assert.match(output, /\[STALE\] heartbeat_stale/);
 });
 
-test("active run widget lines display canonical owner metadata for live runs", () => {
+test("active run widget lines display canonical workflow/phase for live runs", () => {
   const live = displayRun();
   delete live.stale;
   const output = activeRunWidgetLines([live]).join("\n");
-  assert.match(output, /launch source: background/);
-  assert.doesNotMatch(output, /sessionId: session-owner-42|cwd at launch/);
+  // Signal-first widget: no owner telemetry, just workflow + active phase.
+  assert.doesNotMatch(output, /sessionId: session-owner-42|launch source|cwd at launch/);
+  assert.match(output, /Owner display: compile/);
   assert.match(output, /\/workflows open dashboard/);
 });
 
@@ -72,4 +73,26 @@ test("active run widget omits stale and terminal runs", () => {
   const stale = displayRun();
   const timedOut = { ...displayRun(), runId: "timed-out", normalizedStatus: "failed", status: "timed_out", stale: undefined };
   assert.deepEqual(activeRunWidgetLines([stale, timedOut]), []);
+});
+
+test("inline run message nests artifacts under their phase and has no flat Artifacts section", () => {
+  let renderer;
+  registerThreadPhaseMessageRenderers({
+    registerMessageRenderer(type, callback) { assert.equal(type, "thread-phase-run"); renderer = callback; },
+  });
+  const run = {
+    runId: "run-nest", workflow: "Nested", normalizedStatus: "success", status: "success",
+    artifacts: [],
+    phases: [
+      { phase: "compile", normalizedStatus: "success", status: "success", artifacts: [{ kind: "markdown", title: "Compile out", path: "/x/compile.md" }] },
+      { phase: "fanout", normalizedStatus: "success", status: "success", fanout: { total: 1, completed: 1, items: [{ itemId: "0:one", label: "one", normalizedStatus: "success", status: "success", artifacts: [{ kind: "markdown", title: "Stage one", path: "/x/stage-one.md" }] }] } },
+    ],
+    errors: [],
+  };
+  const rendered = renderer({ details: { summary: run } }, { expanded: true }, theme);
+  const output = componentText(rendered);
+  assert.match(output, /Compile out/);
+  assert.match(output, /Stage one/);
+  // No flat "Artifacts" section header remains; artifacts are nested under phases/stages.
+  assert.doesNotMatch(output, /\nArtifacts\n|\nArtifacts:/);
 });
