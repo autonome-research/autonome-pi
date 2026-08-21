@@ -615,7 +615,11 @@ export class ThreadPhaseMonitorComponent {
 	private addTracePane(lines: string[], items: any[], width: number): void {
 		const t = this.theme;
 		lines.push(truncateToWidth(t.fg("toolTitle", "    trace:") + t.fg("dim", " live reasoning / tool calls"), width));
-		const visible = items.slice(-6);
+		const total = Array.isArray(items) ? items.length : 0;
+		const MAX_VISIBLE_TRACE = 12;
+		const hideOlder = total > MAX_VISIBLE_TRACE;
+		const visible = hideOlder ? items.slice(-MAX_VISIBLE_TRACE) : items;
+		if (hideOlder) lines.push(truncateToWidth(t.fg("dim", `      … ${total - MAX_VISIBLE_TRACE} earlier item(s) (showing most recent)`), width));
 		for (const item of visible) {
 			if (!item || typeof item !== "object") continue;
 			if (item.type === "content_delta") {

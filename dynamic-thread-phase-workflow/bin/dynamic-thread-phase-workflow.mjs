@@ -847,9 +847,15 @@ async function* runPiPhase(ctx, phase) {
   yield { type: "data", kind: "data", key: "tools", value: tools, message: `Running pi agent` };
   if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
   const traceEmitter = throttledTraceEmitter(ctx.visualizerRun, phase.name);
-  const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs ?? ctx.timeoutMs, signal: ctx.signal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
-      phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage, model: usedModel || phase.model || ctx.model }) });
-  traceEmitter.flush();
+  let result;
+  // flush() in finally so the final reasoning tail is never dropped even when the
+  // subprocess throws (spawn error / early abort) rather than returning cleanly.
+  try {
+    result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs ?? ctx.timeoutMs, signal: ctx.signal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
+        phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage, model: usedModel || phase.model || ctx.model }) });
+  } finally {
+    traceEmitter.flush();
+  }
   if (result.aborted) throw abortError(result.error || "cancelled");
   ctx.outputs[phase.name] = compactText(result.text || "");
   ctx.results[phase.name] = { ok: result.ok, model: result.model, stopReason: result.stopReason, code: result.code, signal: result.signal, timedOut: result.timedOut, durationMs: result.durationMs, termination: result.termination, error: result.error, piJson: result.piJson };
@@ -882,9 +888,13 @@ async function* runFanoutPiPhase(ctx, phase) {
         if (itemSignal?.aborted) throw abortError(itemSignal.reason || "cancelled");
         const prompt = renderTemplate(phase.promptTemplate, ctx, { item, index });
         const traceEmitter = throttledTraceEmitter(ctx.visualizerRun, phase.name, { itemId: `${index}:${item}`, item, index });
-        const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: itemSignal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
-            phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", itemId: `${index}:${item}`, item, index, usage, model: usedModel || phase.model || ctx.model }) });
-        traceEmitter.flush();
+        let result;
+        try {
+          result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: itemSignal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
+              phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", itemId: `${index}:${item}`, item, index, usage, model: usedModel || phase.model || ctx.model }) });
+        } finally {
+          traceEmitter.flush();
+        }
         if (result.aborted) throw abortError(result.error || "cancelled");
         const text = compactText(result.text || "");
         const itemHash = createHash("sha256").update(`${index}\0${item}`).digest("hex").slice(0, 10);
@@ -994,9 +1004,13 @@ async function runHarness(ctx, harnessFile) {
         const permissions = permissionsForPhase(ctx, phase);
         const tools = normalizePiTools(options.tools, permissions, phase.name);
         const traceEmitter = throttledTraceEmitter(ctx.visualizerRun, phase.name);
-        const result = await runPi({ cwd: options.cwd || ctx.cwd, prompt, model: options.model || ctx.model, tools, timeoutMs: options.timeoutMs || ctx.timeoutMs, signal: options.signal || ctx.signal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
-            phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage, model: usedModel || options.model || ctx.model }) });
-        traceEmitter.flush();
+        let result;
+        try {
+          result = await runPi({ cwd: options.cwd || ctx.cwd, prompt, model: options.model || ctx.model, tools, timeoutMs: options.timeoutMs || ctx.timeoutMs, signal: options.signal || ctx.signal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
+              phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage, model: usedModel || options.model || ctx.model }) });
+        } finally {
+          traceEmitter.flush();
+        }
         if (result.aborted) throw abortError(result.error || "cancelled");
         if (!result.ok && options.reject !== false) throw new Error(result.error || "pi helper failed");
         return compactText(result.text || "");
