@@ -480,7 +480,7 @@ async function runProcess(command, args, options) {
   });
 }
 
-async function runPi({ cwd, prompt, model, tools, timeoutMs, signal }) {
+async function runPi({ cwd, prompt, model, tools, timeoutMs, signal, onUsage }) {
   const args = [
     // Note: --no-extensions is intentionally omitted so that extensions
     // like local-vllm.ts can register dynamically-discovered local providers
@@ -494,7 +494,7 @@ async function runPi({ cwd, prompt, model, tools, timeoutMs, signal }) {
   // Parse Pi's NDJSON incrementally and do not retain raw message_update
   // records. Those records contain cumulative tool-call arguments and can make
   // a large generated file produce quadratic stdout volume in memory.
-  const collector = new PiJsonEventCollector();
+  const collector = new PiJsonEventCollector({ onUsage });
   const result = await runProcess(DEFAULT_PI, args, {
     cwd,
     timeoutMs,
@@ -812,11 +812,11 @@ async function* runPiPhase(ctx, phase) {
   yield { type: "data", kind: "data", key: "permissions", value: permissions, message: `Running pi agent with ${permissions} permissions` };
   yield { type: "data", kind: "data", key: "tools", value: tools, message: `Running pi agent` };
   if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
-  const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs ?? ctx.timeoutMs, signal: ctx.signal });
+  const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs ?? ctx.timeoutMs, signal: ctx.signal, onUsage: ({ usage, model: usedModel }) =>
+      phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage, model: usedModel || phase.model || ctx.model }) });
   if (result.aborted) throw abortError(result.error || "cancelled");
   ctx.outputs[phase.name] = compactText(result.text || "");
   ctx.results[phase.name] = { ok: result.ok, model: result.model, stopReason: result.stopReason, code: result.code, signal: result.signal, timedOut: result.timedOut, durationMs: result.durationMs, termination: result.termination, error: result.error, piJson: result.piJson };
-  if (result.usage?.length) phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage: result.usage, model: result.model });
   emitTextArtifact(ctx, phase, ctx.outputs[phase.name], { title: `Pi output: ${phase.name}`, fileName: `${phase.name}.md` });
   yield { type: "data", kind: "data", key: "model", value: result.model, message: result.ok ? "Pi agent complete" : "Pi agent failed" };
   if (!result.ok) throw new Error(result.error || "pi phase failed");
@@ -845,7 +845,8 @@ async function* runFanoutPiPhase(ctx, phase) {
       try {
         if (itemSignal?.aborted) throw abortError(itemSignal.reason || "cancelled");
         const prompt = renderTemplate(phase.promptTemplate, ctx, { item, index });
-        const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: itemSignal });
+        const result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: itemSignal, onUsage: ({ usage, model: usedModel }) =>
+            phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", itemId: `${index}:${item}`, item, index, usage, model: usedModel || phase.model || ctx.model }) });
         if (result.aborted) throw abortError(result.error || "cancelled");
         const text = compactText(result.text || "");
         const itemHash = createHash("sha256").update(`${index}\0${item}`).digest("hex").slice(0, 10);
@@ -861,7 +862,6 @@ async function* runFanoutPiPhase(ctx, phase) {
           },
         };
         emitTextArtifact(ctx, artifactPhase, text, { title: `${phase.name}: ${item}` });
-        if (result.usage?.length) phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", itemId: `${index}:${item}`, item, index, usage: result.usage, model: result.model });
         terminal++;
         if (result.ok) successful++; else failed++;
         push({ type: "fanout", kind: "fanout_item_end", itemId: `${index}:${item}`, label: item, index, status: result.ok ? STATUSES.SUCCESS : STATUSES.FAILED, model: result.model, message: result.ok ? `Complete ${item}` : `Failed ${item}`, error: result.error });
@@ -955,9 +955,9 @@ async function runHarness(ctx, harnessFile) {
         const phase = { name: options.name || `pi-${autoPhase}`, permissions: options.permissions || ctx.spec.permissions || DEFAULT_PERMISSIONS };
         const permissions = permissionsForPhase(ctx, phase);
         const tools = normalizePiTools(options.tools, permissions, phase.name);
-        const result = await runPi({ cwd: options.cwd || ctx.cwd, prompt, model: options.model || ctx.model, tools, timeoutMs: options.timeoutMs || ctx.timeoutMs, signal: options.signal || ctx.signal });
+        const result = await runPi({ cwd: options.cwd || ctx.cwd, prompt, model: options.model || ctx.model, tools, timeoutMs: options.timeoutMs || ctx.timeoutMs, signal: options.signal || ctx.signal, onUsage: ({ usage, model: usedModel }) =>
+            phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage, model: usedModel || options.model || ctx.model }) });
         if (result.aborted) throw abortError(result.error || "cancelled");
-        if (result.usage?.length) phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage: result.usage, model: result.model });
         if (!result.ok && options.reject !== false) throw new Error(result.error || "pi helper failed");
         return compactText(result.text || "");
       });

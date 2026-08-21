@@ -143,3 +143,37 @@ test("Pi NDJSON preserves raw Unicode split across byte chunks", async () => {
   assert.equal(processResult.ok, true);
   assert.equal(collector.finish().text, "café 😀");
 });
+
+test("collector streams each per-turn usage to onUsage before finishing", () => {
+  const seen = [];
+  const collector = new PiJsonEventCollector({ onUsage: (entry) => seen.push(entry) });
+  // Two assistant turns, each with its own per-turn usage delta.
+  collector.push(eventLine({
+    type: "message_end",
+    message: { role: "assistant", model: "m1", usage: { input: 5, output: 1 }, content: [{ type: "text", text: "a" }] },
+  }));
+  collector.push(eventLine({
+    type: "message_end",
+    message: { role: "assistant", model: "m2", usage: { input: 7, output: 3 }, content: [{ type: "text", text: "b" }] },
+  }));
+  const result = collector.finish();
+
+  // Live callback received both per-turn deltas as they streamed in.
+  assert.equal(seen.length, 2);
+  assert.deepEqual(seen[0].usage, { input: 5, output: 1 });
+  assert.equal(seen[0].model, "m1");
+  assert.deepEqual(seen[1].usage, { input: 7, output: 3 });
+  assert.equal(seen[1].model, "m2");
+  // The aggregate result still sums both turns for downstream metadata.
+  assert.equal(result.usage.length, 1);
+  assert.equal(result.usage[0].input, 12);
+  assert.equal(result.usage[0].output, 4);
+});
+
+test("collector omits onUsage callback when none is supplied", () => {
+  // Should not throw; onUsage stays undefined and streaming is a no-op.
+  const collector = new PiJsonEventCollector();
+  collector.push(eventLine(finalMessage("plain")));
+  collector.finish();
+  assert.equal(collector.onUsage, undefined);
+});

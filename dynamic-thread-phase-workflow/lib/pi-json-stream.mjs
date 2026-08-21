@@ -9,9 +9,13 @@ const DEFAULT_MAX_LINE_BYTES = 4_000_000;
  * they arrive and retains only the final message metadata used by workflows.
  */
 export class PiJsonEventCollector {
-  constructor({ maxLineBytes = DEFAULT_MAX_LINE_BYTES } = {}) {
+  constructor({ maxLineBytes = DEFAULT_MAX_LINE_BYTES, onUsage } = {}) {
     if (!Number.isSafeInteger(maxLineBytes) || maxLineBytes <= 0) throw new Error("maxLineBytes must be a positive safe integer");
     this.maxLineBytes = maxLineBytes;
+    // Optional live callback invoked for each non-empty per-turn usage as it is
+    // observed, before the run finishes. Lets callers stream token counts to the
+    // visualizer during a phase instead of only after it completes.
+    this.onUsage = typeof onUsage === "function" ? onUsage : undefined;
     this.pending = "";
     this.droppingLine = false;
     this.droppedEvents = 0;
@@ -125,6 +129,7 @@ export class PiJsonEventCollector {
       // an unbounded event list.
       mergeNumericUsage(this.usageTotals, message.usage);
       this.usageEvents++;
+      if (this.onUsage) this.onUsage({ usage: message.usage, model: message.model });
     }
     if (message.role !== "assistant") return;
     this.model = message.model || this.model;
