@@ -74,3 +74,26 @@ test("projectRun sums input, output, and reasoning tokens across usage events", 
     { inputTokens: 22, outputTokens: 13, reasoningTokens: 7 },
   );
 });
+
+test("projectRun accepts Pi-native token keys (input/output/reasoning/cacheRead/cacheWrite)", () => {
+  const projected = store.projectRun([
+    usageEvent("pi-native", 1, {
+      kind: "usage",
+      usage: {
+        input: 100,
+        output: 30,
+        reasoning: 12,
+        cacheRead: 40,
+        cacheWrite: 5,
+        totalTokens: 130,
+      },
+    }),
+  ]);
+  assert.equal(projected.usage.entries, 1);
+  assert.equal(projected.usage.inputTokens, 100);
+  assert.equal(projected.usage.outputTokens, 30);
+  assert.equal(projected.usage.totalTokens, 130);
+  assert.equal(projected.usage.reasoningTokens, 12);
+  assert.equal(projected.usage.cachedInputTokens, 40);
+  assert.equal(projected.usage.cacheCreationInputTokens, 5);
+});

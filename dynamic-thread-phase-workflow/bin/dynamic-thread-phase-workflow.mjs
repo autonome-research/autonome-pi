@@ -46,6 +46,7 @@ const MAX_FANOUT_CONCURRENCY = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_CONCUR
 const MAX_FANOUT_ITEMS = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_FANOUT_ITEMS || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_FANOUT_ITEMS || 1_000);
 const MAX_PHASE_TIMEOUT_MS = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_PHASE_TIMEOUT_MS || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_PHASE_TIMEOUT_MS || 60 * 60 * 1000);
 const MAX_OUTPUT_BYTES = 250_000;
+const MAX_SPEC_BYTES = 1_000_000;
 const MAX_RESUME_MANIFEST_BYTES = 1_000_000;
 const MAX_RESUME_OUTPUT_BYTES = 4_000_000;
 const RESUME_RUN_ID = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$/;
@@ -217,6 +218,7 @@ function validateSpec(input) {
 
     if (phase.type === "shell") {
       requireNonEmptyString(phase.command, `${phase.name}.command`);
+      validateTemplateReferences(phase.command, seen, `${phase.name}.command`);
       if (!permissionIncludesAll(effectivePermissions, "rwx")) throw new Error(`shell phase ${phase.name} requires rwx permissions`);
     }
     if (phase.type === "pi") {
@@ -247,6 +249,9 @@ function validateSpec(input) {
       if (hasContent && typeof phase.content !== "string") throw new Error(`${phase.name}.content must be a string`);
       if (hasFrom) requirePriorPhase(phase.from, seen, `${phase.name}.from`);
       if (hasContent) validateTemplateReferences(phase.content, seen, `${phase.name}.content`);
+      for (const field of ["title", "fileName"]) {
+        if (typeof phase[field] === "string") validateTemplateReferences(phase[field], seen, `${phase.name}.${field}`);
+      }
     }
     validateArtifactSpec(phase.artifact, phase.name);
     seen.add(phase.name);
@@ -298,8 +303,15 @@ function validateArtifactSpec(value, phaseName) {
 }
 
 function loadSpec(args) {
-  if (args["spec-file"]) return JSON.parse(readFileSync(String(args["spec-file"]), "utf8"));
-  if (args.spec) return JSON.parse(String(args.spec));
+  if (args["spec-file"]) {
+    const text = readBoundedRegularFile(String(args["spec-file"]), MAX_SPEC_BYTES, "workflow spec").toString("utf8");
+    return JSON.parse(text);
+  }
+  if (args.spec) {
+    const text = String(args.spec);
+    if (Buffer.byteLength(text, "utf8") > MAX_SPEC_BYTES) throw new Error(`inline workflow spec exceeds ${MAX_SPEC_BYTES} bytes`);
+    return JSON.parse(text);
+  }
   throw new Error("Provide --spec-file PATH or --spec JSON, or --harness-file PATH");
 }
 
@@ -656,6 +668,12 @@ function loadResumeInvocation(runId, sessionId) {
 
 function loadResumeState(runId, { spec, cwd, model, sessionId }) {
   const sourceDir = resumeRunDirectory(runId);
+  // Do not resume a source that is still running; its uncheckpointed suffix may
+  // not be durable and concurrent resumes would duplicate it.
+  const sourceSummary = getRunSummary(runId);
+  if (sourceSummary && sourceSummary.normalizedStatus === STATUSES.RUNNING) {
+    throw new Error(`Cannot resume workflow ${runId}: source run is still running`);
+  }
   const manifest = parseBoundedJson(join(sourceDir, "workflow-checkpoint.json"), MAX_RESUME_MANIFEST_BYTES, "workflow resume checkpoint");
   if (manifest?.schema !== "pi-dynamic-workflow-checkpoint/v1") throw new Error("Resume checkpoint has an unsupported schema");
   if (manifest.runId !== runId) throw new Error("Resume checkpoint runId does not match its artifact directory");

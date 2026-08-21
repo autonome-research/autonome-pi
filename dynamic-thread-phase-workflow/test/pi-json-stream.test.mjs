@@ -355,3 +355,18 @@ test("onTrace receives a shallow copy not aliased to the coalesced retained wind
   assert.equal(result.trace.window.length, 1);
   assert.equal(result.trace.window[0].delta, "abc");
 });
+
+test("collector isolates a throwing onUsage observer without breaking the stream", () => {
+  const calls = [];
+  const collector = new PiJsonEventCollector({
+    onUsage: () => { calls.push("seen"); throw new Error("boom"); },
+  });
+  collector.push(eventLine(finalMessage("still works")));
+  const result = collector.finish();
+  // The observer was invoked, its throw was swallowed, and usage/stream are intact.
+  assert.equal(calls.length, 1);
+  assert.equal(result.text, "still works");
+  assert.equal(result.usage.length, 1);
+  assert.equal(result.usage[0].input, 10);
+  assert.equal(result.usage[0].output, 2);
+});

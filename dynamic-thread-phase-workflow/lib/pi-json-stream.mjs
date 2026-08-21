@@ -178,7 +178,7 @@ export class PiJsonEventCollector {
       // an unbounded event list.
       mergeNumericUsage(this.usageTotals, message.usage);
       this.usageEvents++;
-      if (this.onUsage) this.onUsage({ usage: message.usage, model: message.model });
+      if (this.onUsage) safeCall(this.onUsage, { usage: message.usage, model: message.model });
     }
     if (message.role !== "assistant") return;
     this.model = message.model || this.model;

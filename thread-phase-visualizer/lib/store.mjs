@@ -1948,12 +1948,14 @@ function extractUsageEntries(data) {
 
 function addUsage(target, usage, model) {
   target.entries += 1;
-  const input = numberFrom(usage.input_tokens, usage.inputTokens, usage.prompt_tokens, usage.promptTokens);
-  const output = numberFrom(usage.output_tokens, usage.outputTokens, usage.completion_tokens, usage.completionTokens);
-  const total = numberFrom(usage.total_tokens, usage.totalTokens) ?? ((input || 0) + (output || 0) || undefined);
-  const cached = numberFrom(usage.cache_read_input_tokens, usage.cached_input_tokens, usage.cachedInputTokens, usage.input_token_details?.cached_tokens, usage.prompt_tokens_details?.cached_tokens);
-  const cacheCreation = numberFrom(usage.cache_creation_input_tokens, usage.cacheCreationInputTokens);
-  const reasoning = numberFrom(usage.output_token_details?.reasoning_tokens, usage.completion_tokens_details?.reasoning_tokens, usage.reasoning_tokens, usage.reasoningTokens);
+  // Accept provider/Pi-native token keys (input/output/reasoning/cacheRead/cacheWrite)
+  // alongside the snake/camel *_tokens aliases so token totals are never dropped.
+  const input = numberFrom(usage.input_tokens, usage.inputTokens, usage.prompt_tokens, usage.promptTokens, usage.input);
+  const output = numberFrom(usage.output_tokens, usage.outputTokens, usage.completion_tokens, usage.completionTokens, usage.output);
+  const total = numberFrom(usage.total_tokens, usage.totalTokens, usage.total) ?? ((input || 0) + (output || 0) || undefined);
+  const cached = numberFrom(usage.cache_read_input_tokens, usage.cached_input_tokens, usage.cachedInputTokens, usage.input_token_details?.cached_tokens, usage.prompt_tokens_details?.cached_tokens, usage.cacheRead);
+  const cacheCreation = numberFrom(usage.cache_creation_input_tokens, usage.cacheCreationInputTokens, usage.cacheWrite);
+  const reasoning = numberFrom(usage.output_token_details?.reasoning_tokens, usage.completion_tokens_details?.reasoning_tokens, usage.reasoning_tokens, usage.reasoningTokens, usage.reasoning);
   if (input) target.inputTokens += input;
   if (output) target.outputTokens += output;
   if (total) target.totalTokens += total;

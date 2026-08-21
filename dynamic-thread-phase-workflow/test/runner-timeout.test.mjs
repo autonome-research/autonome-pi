@@ -232,3 +232,31 @@ test("structured specs reject invalid phase timeout values before execution", ()
     rmSync(temp, { recursive: true, force: true });
   }
 });
+
+test("shell and artifact templates reject unknown or later output references", () => {
+  for (const phase of [
+    { type: "shell", name: "cmd", command: "echo {{outputs.later}}" },
+    { type: "artifact", name: "art", title: "t {{outputs.later}}", content: "x", from: undefined },
+  ]) {
+    const temp = mkdtempSync(join(tmpdir(), "dynamic-template-validation-test-"));
+    try {
+      const artifactPhase = phase.type === "artifact"
+        ? { type: "artifact", name: "art", title: "t {{outputs.later}}", content: "x" }
+        : phase;
+      const specPath = join(temp, "spec.json");
+      writeFileSync(specPath, JSON.stringify({ name: "bad-template-ref", permissions: "r", phases: [artifactPhase] }));
+      const store = join(temp, "store");
+      const result = spawnSync(process.execPath, [cli, "--spec-file", specPath, "--cwd", temp], {
+        cwd: root,
+        env: { ...process.env, PI_THREAD_PHASE_STORE_DIR: store },
+        encoding: "utf8",
+        timeout: 5_000,
+      });
+      assert.notEqual(result.status, 0, result.stderr);
+      assert.match(result.stderr, /references unknown or later output/);
+      assert.equal(existsSync(join(store, "runs")), false);
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
+  }
+});
