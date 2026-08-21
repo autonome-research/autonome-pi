@@ -37,7 +37,9 @@ export function formatElapsedDuration(startedAt, endedAt) {
   const hours = Math.floor(totalSeconds / 3600);
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
-  return [hours ? `${hours}h` : undefined, minutes || hours ? `${minutes}m` : undefined, `${seconds}s`].filter(Boolean).join(" ");
+  // For hour-scale durations, seconds are low-signal churn; emit h (+ m) only.
+  if (hours > 0) return `${hours}h${minutes ? ` ${minutes}m` : ""}`;
+  return [minutes ? `${minutes}m` : undefined, `${seconds}s`].filter(Boolean).join(" ");
 }
 
 export function formatTotalTokens(usage) {

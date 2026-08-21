@@ -9,8 +9,8 @@ const MAX_ARTIFACT_BYTES = 80_000;
 
 export function artifactSummaryText(run: RunSummary): string {
 	const artifacts: Artifact[] = run.artifacts || [];
-	if (artifacts.length === 0) return "0 artifacts";
-	return `${artifacts.length} artifact${artifacts.length === 1 ? "" : "s"}`;
+	// Hide a predictable "0 artifacts" for runs without output (signal dedup).
+	return artifacts.length ? `${artifacts.length} artifact${artifacts.length === 1 ? "" : "s"}` : "";
 }
 
 export function renderArtifactList(run: RunSummary, theme: Theme, expanded: boolean, options: { contentMode?: "none" | "summary" | "all" } = {}) {

@@ -1,7 +1,7 @@
 import { getMarkdownTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, Markdown, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { basename } from "node:path";
-import { STATUSES, latestRunSummaries, readArtifactContent, requestCancellation, STORE_BUILD } from "../lib/store.mjs";
+import { STATUSES, latestRunSummaries, readArtifactContent, requestCancellation } from "../lib/store.mjs";
 import { artifactEditorActionHint, artifactEditorTarget } from "../lib/artifact-action.mjs";
 import { MONITOR_SORTS, MONITOR_STATUS_FILTERS, cycleMonitorOption, filterAndSortMonitorRuns } from "../lib/monitor-state.mjs";
 import { detailViewportHeight, windowLineRange } from "../lib/monitor-pagination.mjs";
@@ -142,7 +142,7 @@ function artifactTitle(artifact: ArtifactSummary | undefined): string {
 }
 
 function artifactTarget(artifact: ArtifactSummary | undefined): string {
-	return artifact?.path || artifact?.url || artifact?.preview || (artifact?.content ? "(inline)" : "");
+	return artifact?.path || artifact?.url || "";
 }
 
 function sanitizeIoText(value: any): string {
@@ -493,7 +493,7 @@ export class ThreadPhaseMonitorComponent {
 	}
 
 	private withBorder(content: string[], width: number): string[] {
-		return framePanel(content, width, this.theme, { title: `Thread-phase ${MONITOR_BUILD}/${STORE_BUILD}` });
+		return framePanel(content, width, this.theme, { title: "Thread-phase" });
 	}
 
 	private renderList(width: number, runs: RunSummary[]): string[] {
@@ -528,7 +528,7 @@ export class ThreadPhaseMonitorComponent {
 			const status = run.normalizedStatus || run.status;
 			const prefix = selected ? t.fg("accent", "›") : " ";
 			const stale = formatStaleIndicator(run);
-			const live = stale ? t.fg("warning", ` ${stale}`) : status === STATUSES.RUNNING ? t.fg("accent", " LIVE") : "";
+			const live = stale ? t.fg("warning", ` ${stale}`) : "";
 			const workflow = highlightMatch(run.workflow || "workflow", this.searchQuery, t);
 			const runId = this.searchQuery ? String(run.runId || "unknown") : shortRunId(run.runId);
 			const statusLabel = this.searchQuery ? ` ${highlightMatch(String(status || "unknown"), this.searchQuery, t)}` : "";

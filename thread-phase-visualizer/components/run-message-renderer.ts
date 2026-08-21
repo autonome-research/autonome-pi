@@ -25,7 +25,7 @@ function compactRunLine(run: RunSummary, theme: any, expanded = false): string {
 	// counts would duplicate those surfaces, so retain only exceptional status.
 	const counts = expanded
 		? (status === STATUSES.FAILED ? theme.fg("warning", "failed") : "")
-		: theme.fg("muted", `${phaseSummaryText(run)} · ${artifactSummaryText(run)}${usage}`);
+		: theme.fg("muted", [phaseSummaryText(run), artifactSummaryText(run)].filter(Boolean).join(" · ") + usage);
 	const countPart = counts ? ` ${counts}` : "";
 	return `${icon} ${workflow} ${statusText}${stale}${countPart} ${theme.fg("dim", "[")}${id}${theme.fg("dim", "]")}`;
 }

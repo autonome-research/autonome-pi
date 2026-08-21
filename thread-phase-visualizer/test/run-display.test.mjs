@@ -24,7 +24,7 @@ test("dashboard duration uses compact aggregate hours, minutes, and seconds", ()
   const start = "2026-01-01T00:00:00.000Z";
   assert.equal(formatElapsedDuration(start, "2026-01-01T00:00:00.999Z"), "0s");
   assert.equal(formatElapsedDuration(start, "2026-01-01T00:02:03.000Z"), "2m 3s");
-  assert.equal(formatElapsedDuration(start, "2026-01-02T02:03:04.000Z"), "26h 3m 4s");
+  assert.equal(formatElapsedDuration(start, "2026-01-02T02:03:04.000Z"), "26h 3m");
   assert.equal(formatElapsedDuration("invalid", start), "?");
 });
 

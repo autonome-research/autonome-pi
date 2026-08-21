@@ -103,12 +103,12 @@ test("dashboard detail shows aggregate duration and total tokens without timesta
   })]);
 
   const list = text(monitor.render(100));
-  assert.match(list, /1h 2m 3s · 8\.8K tok/);
+  assert.match(list, /1h 2m · 8\.8K tok/);
 
   monitor.handleInput("\r");
   monitor.handleInput("\r");
   const detail = text(monitor.render(100));
-  assert.match(detail, /duration: 1h 2m 3s/);
+  assert.match(detail, /duration: 1h 2m /);
   assert.match(detail, /tokens: 8\.8K tok/);
   assert.match(detail, /duration: 2m 3s/);
   assert.match(detail, /tokens: 1\.3K tok/);
@@ -335,7 +335,7 @@ test("clear actions restore the unfiltered list from every mode and reset select
   let cleared = text(monitor.render(80));
   assert.match(cleared, /↑↓ select/);
   assert.match(cleared, /Alpha Build/);
-  assert.match(cleared, /› .* Alpha Build LIVE/);
+  assert.match(cleared, /› .* Alpha Build/);
 
   monitor.handleInput("/");
   for (const character of "beta") monitor.handleInput(character);
@@ -343,7 +343,7 @@ test("clear actions restore the unfiltered list from every mode and reset select
   cleared = text(monitor.render(80));
   assert.match(cleared, /Alpha Build/);
   assert.match(cleared, /Beta Review/);
-  assert.match(cleared, /› .* Alpha Build LIVE/);
+  assert.match(cleared, /› .* Alpha Build/);
 
   monitor.handleInput("/");
   for (const character of "beta") monitor.handleInput(character);
@@ -354,7 +354,7 @@ test("clear actions restore the unfiltered list from every mode and reset select
   cleared = text(monitor.render(80));
   assert.match(cleared, /↑↓ select/);
   assert.match(cleared, /Alpha Build/);
-  assert.match(cleared, /› .* Alpha Build LIVE/);
+  assert.match(cleared, /› .* Alpha Build/);
 
   // Open a nested artifact (expand compile, select the artifact, enter) in
   // artifact mode, then clear back to the unfiltered list.
@@ -370,7 +370,7 @@ test("clear actions restore the unfiltered list from every mode and reset select
   cleared = text(monitor.render(80));
   assert.match(cleared, /↑↓ select/);
   assert.match(cleared, /Alpha Build/);
-  assert.match(cleared, /› .* Alpha Build LIVE/);
+  assert.match(cleared, /› .* Alpha Build/);
 });
 
 test("escape and back keys navigate consistently in list, detail, and artifact modes", () => {
