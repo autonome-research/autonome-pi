@@ -1152,7 +1152,10 @@ async function main() {
   let successorReservation;
   let visualizerRun;
   try {
-    if (parentChain) successorReservation = reserveSuccessor(parentChain.sourceRunId, runId, { chainId: chain.chainId });
+    // Reserve the single child edge for both `after` chains and resume chains, so
+    // concurrent/repeated resumes cannot create multiple children of one parent.
+    const chainParent = parentChain || resumeState;
+    if (chainParent) successorReservation = reserveSuccessor(chainParent.sourceRunId, runId, { chainId: chain.chainId });
     visualizerRun = createRun({
       runId,
       workflow,
