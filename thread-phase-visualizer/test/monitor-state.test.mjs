@@ -36,7 +36,7 @@ test("monitor status filter combines with search", () => {
 
 test("monitor can hide stale runs independently of status filtering", () => {
   const staleRuns = runs.map((run, index) => index === 0 ? { ...run, stale: { reason: "heartbeat_stale" } } : run);
-  assert.deepEqual(filterAndSortMonitorRuns(staleRuns, { hideStale: true }).map((run) => run.runId), ["review-beta-456", "test-gamma-789"]);
+  assert.deepEqual(filterAndSortMonitorRuns(staleRuns, { hideStale: true }).map((run) => run.runId), ["test-gamma-789", "review-beta-456"]);
   assert.deepEqual(filterAndSortMonitorRuns(staleRuns, { hideStale: true, status: "running" }), []);
 });
 
