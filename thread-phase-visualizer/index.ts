@@ -36,6 +36,26 @@ const STATUS_REFRESH_MS = Number.isFinite(requestedStatusRefreshMs) && requested
 	? Math.floor(requestedStatusRefreshMs)
 	: 5_000;
 
+// Continuations for workflow runs that ended longer ago than this window are not
+// auto-injected on a fresh session continue. Delivered continuation records are
+// age-pruned from the store (24h retention), so without this gate a session resume
+// would re-claim and re-inject every old completed workflow — re-triggering an
+// agent turn over stale results (“often an old workflow”). Genuinely undelivered
+// work is still retried via durable pending records, which never expire by age.
+const STARTUP_CONTINUATION_FRESH_MS = (() => {
+	const v = Number(process.env.PI_THREAD_PHASE_STARTUP_FRESH_MS);
+	return Number.isFinite(v) && v >= 0 ? v : 30 * 60 * 1000;
+})();
+
+// A continuation LLM turn injected synchronously from a session_start handler runs
+// before pi has bound the interactive editor to the session's streaming context, so
+// `escape` (app.interrupt) and chat-tree navigation cannot abort it. Defer startup
+// injections a short beat so pi binds the injected turn to interrupt context first.
+const STARTUP_DELIVERY_SETTLE_MS = (() => {
+	const v = Number(process.env.PI_THREAD_PHASE_STARTUP_DELIVERY_MS);
+	return Number.isFinite(v) && v >= 0 ? v : 350;
+})();
+
 type AnyEvent = Record<string, any>;
 
 function truncate(text: string, max = MAX_MESSAGE_BYTES): string {
@@ -47,6 +67,13 @@ function truncate(text: string, max = MAX_MESSAGE_BYTES): string {
 
 function eventKey(event: AnyEvent): string {
 	return event.eventId || `${event.runId}:${event.type}:${event.timestamp}:${event.phase || ""}`;
+}
+
+/** True when a workflow_end is recent enough to auto-inject on a session continue. */
+function endedFreshly(timestamp: string | undefined, nowMs: number, windowMs: number): boolean {
+	const t = Date.parse(String(timestamp || ""));
+	if (!Number.isFinite(t)) return true; // unknown end time → don't drop it
+	return nowMs - t <= windowMs;
 }
 
 function statusIcon(status: string | undefined): string {
@@ -188,6 +215,8 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 
 	let watcher: fs.FSWatcher | undefined;
 	let statusRefreshTimer: NodeJS.Timeout | undefined;
+	const startupDeliveryTimers = new Set<ReturnType<typeof setTimeout>>();
+	let sessionTerminated = false;
 	let cwdState = createCwdState(process.cwd());
 	let continuedRuns = new Set<string>();
 	const seen = new Set<string>();
@@ -278,6 +307,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		sessionTerminated = false;
 		ensureStore();
 		if (statusRefreshTimer) clearInterval(statusRefreshTimer);
 		statusRefreshTimer = undefined;
@@ -324,7 +354,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 			pendingContinuationRecords = loadPendingContinuationRecords({ storeDir: continuationStoreDir });
 		}
 
-		const attemptAutoContinuation = (summary: AnyEvent, runId: string, retryPending = false) => {
+		const attemptAutoContinuation = (summary: AnyEvent, runId: string, retryPending = false, opts: { startup?: boolean } = {}) => {
 			let claim;
 			try {
 				claim = persistContinuationClaim(runId, {
@@ -340,32 +370,74 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 			}
 			if (!claim.claimed || !claim.deliveryId) return;
 			const prompt = formatMarkedContinuation(formatContinuationPrompt(summary), claim.deliveryId);
-			try {
-				if (ctx.isIdle()) pi.sendUserMessage(prompt);
-				else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-			} catch (error) {
-				// The extension wrapper rarely surfaces asynchronous input failures, but
-				// any synchronous rejection still leaves the durable record pending.
-				if (ctx.hasUI) ctx.ui.notify(`Could not submit thread-phase continuation ${claim.deliveryId}; it remains pending for retry: ${error instanceof Error ? error.message : String(error)}`, "warning");
-			}
-			// Delivery is acknowledged only by message_start or persisted active-branch
-			// history. sendUserMessage() itself is fire-and-forget.
 
+			const deferBusy = () => {
+				// Never queue a continuation onto an active/resumed turn: pi routes escape
+				// and chat-tree interruption only to the bound streaming turn, so a queued
+				// (followUp/steer) continuation turn runs un-interruptibly. Instead leave
+				// the durable claim pending and unowned so a later idle moment/continue retries it.
+				try {
+					relinquishContinuationClaims({
+						storeDir: continuationStoreDir,
+						claimantId: continuationClaimantId,
+						claimantProcessStart: continuationClaimantProcessStart,
+					});
+					continuedRuns = loadContinuedRuns({ storeDir: continuationStoreDir });
+				} catch { /* best-effort */ }
+				if (ctx.hasUI) ctx.ui.notify("Thread-phase continuation deferred (agent busy); it will retry when idle.", "info");
+			};
+
+			const deliver = () => {
+				if (sessionTerminated) return;
+				if (!ctx.isIdle()) {
+					deferBusy();
+					return;
+				}
+				try {
+					pi.sendUserMessage(prompt);
+				} catch (error) {
+					// The extension wrapper rarely surfaces asynchronous input failures, but
+					// any synchronous rejection still leaves the durable record pending.
+					if (ctx.hasUI) ctx.ui.notify(`Could not submit thread-phase continuation ${claim.deliveryId}; it remains pending for retry: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				}
+				// Delivery is acknowledged only by message_start or persisted active-branch
+				// history. sendUserMessage() itself is fire-and-forget.
+			};
+
+			if (opts.startup && ctx.hasUI) {
+				// Defer past interactive initialization so pi binds the injected turn to the
+				// editor's streaming/interrupt context before it starts generating.
+				const timer = setTimeout(() => {
+					startupDeliveryTimers.delete(timer);
+					deliver();
+				}, STARTUP_DELIVERY_SETTLE_MS);
+				startupDeliveryTimers.add(timer);
+			} else {
+				deliver();
+			}
 		};
 
 		// Prime completion rendering while reclaiming durable pending deliveries.
 		// Legacy continuation ids migrate as delivered and are never replayed.
 		const startupEvents = readIndex({ limit: 5000 });
 		for (const event of startupEvents) seen.add(eventKey(event));
+		const startupNowMs = Date.now();
 		const startupRuns = new Set<string>(pendingContinuationRecords
 			.filter((record: AnyEvent) => !historyProvenRunIds.has(record.runId))
 			.map((record: AnyEvent) => record.runId));
 		for (const event of startupEvents) {
-			if (event.type === EVENT_TYPES.WORKFLOW_END && event.runId && !historyProvenRunIds.has(event.runId)) startupRuns.add(event.runId);
+			// Only pending (genuinely undelivered) work retries regardless of age; the
+			// WORKFLOW_END fallback re-scan must be freshness-gated so a completed run
+			// whose delivered marker expired is not re-injected on a later continue.
+			if (event.type === EVENT_TYPES.WORKFLOW_END && event.runId
+				&& !historyProvenRunIds.has(event.runId)
+				&& endedFreshly(event.timestamp, startupNowMs, STARTUP_CONTINUATION_FRESH_MS)) {
+				startupRuns.add(event.runId);
+			}
 		}
 		for (const runId of startupRuns) {
 			const summary = getRunSummary(runId);
-			if (belongsToSession(summary, currentSessionId, cwdState.activeCwd) && shouldAutoContinue(summary)) attemptAutoContinuation(summary, runId, true);
+			if (belongsToSession(summary, currentSessionId, cwdState.activeCwd) && shouldAutoContinue(summary)) attemptAutoContinuation(summary, runId, true, { startup: true });
 		}
 		updateStatus();
 
@@ -401,6 +473,9 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		sessionTerminated = true;
+		for (const timer of startupDeliveryTimers) clearTimeout(timer);
+		startupDeliveryTimers.clear();
 		watcher?.close();
 		watcher = undefined;
 		if (statusRefreshTimer) clearInterval(statusRefreshTimer);
