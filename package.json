@@ -2,6 +2,7 @@
   "name": "autonome-pi",
   "version": "0.17.1",
   "private": true,
+  "license": "MIT",
   "description": "Autonome's extensions, workflow tools, and skills for Pi.",
   "scripts": {
     "smoke": "node scripts/smoke-test.mjs",
