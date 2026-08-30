@@ -15,20 +15,20 @@ Autonome's Pi package for shared extensions, workflow tooling, and skills.
 ## Install
 
 ```bash
-pi install git:git@github.com:Code4me2/autonome-pi@v0.16.2
+pi install git:git@github.com:autonome-research/autonome-pi@v0.17.1
 ```
 
 For active development:
 
 ```bash
-pi install git:git@github.com:Code4me2/autonome-pi@main
+pi install git:git@github.com:autonome-research/autonome-pi@main
 ```
 
 To migrate an installation that still uses the old repository identity:
 
 ```bash
 pi remove git:git@github.com:Code4me2/pi-thread-phase-tools@v0.12.0
-pi install git:git@github.com:Code4me2/autonome-pi@v0.16.2
+pi install git:git@github.com:autonome-research/autonome-pi@v0.17.1
 ```
 
 Pi identifies git packages by repository URL, so remove the old source before installing the renamed one to avoid loading both copies.
@@ -47,7 +47,7 @@ Pi identifies git packages by repository URL, so remove the old source before in
 
 ## Current status
 
-Latest release: `v0.16.2`.
+Latest release: `v0.17.1`.
 
 Recent changes:
 
@@ -75,7 +75,7 @@ Recent changes:
 - Hardened `mission_workflow` with adversarial post-milestone validation, runner-owned handoff metadata, durable trusted checkpoints for resume, strict validation-cursor fingerprints/evidence checks, merge-blocking transient lockfile quarantine, stale `lastError` archival after successful resume/completion, cancellation-safe validation, contaminated-branch detection/reset, assertion coverage reports, generated-junk protection, transient `uv.lock` cleanup with audit artifacts, short content-addressed repair IDs, runner-provided handoff skeletons, compact result payloads, and capped repair loops.
 - The generic visualizer now deduplicates repeated artifact paths, closes phase-event-only phases when a workflow reaches a terminal status, keeps compact run/monitor summaries focused on recent or active phases, and removes stale/dead or terminal workflows from the below-editor live-status widget.
 - Thread-phase dependency is `^6.1.0`, using the built-in `node:sqlite` runtime plus authoritative lifecycle, supervised fanout, atomic terminal events, cancellation, ownership, heartbeat, defensive error normalization, and bounded cursor reconciliation.
-- Mission continuation/failure-mode notes are in `docs/mission-workflow-continuation.md`; the DX/agent-X roadmap for making missions closer to a full software production pipeline is in `docs/mission-workflow-completeness-roadmap.md`. Read `/home/velvet/droid_flows.md` first for Droid/Missions design context.
+- Mission continuation/failure-mode notes are in `docs/mission-workflow-continuation.md`; the DX/agent-X roadmap for making missions closer to a full software production pipeline is in `docs/mission-workflow-completeness-roadmap.md`.
 
 ## Remaining work
 
