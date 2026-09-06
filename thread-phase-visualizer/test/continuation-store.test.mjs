@@ -9,9 +9,12 @@ import test from "node:test";
 import {
   CONTINUATION_STATE_FILENAME,
   CONTINUATION_TIMESTAMPS_FILENAME,
+  continuationClaimIsOwned,
+  continuationEligibility,
   continuedRunsFile,
   createContinuationClaimantId,
   currentProcessStartIdentity,
+  discardPendingContinuation,
   loadContinuedRuns,
   loadPendingContinuationRecords,
   loadPendingContinuations,
@@ -19,6 +22,7 @@ import {
   persistContinuationClaim,
   persistContinuedRuns,
   releaseContinuationClaim,
+  relinquishContinuationClaim,
   relinquishContinuationClaims,
   pruneContinuedRuns,
   shouldAutoContinue,
@@ -42,6 +46,25 @@ function temporaryStore(t) {
   t.after(() => rmSync(storeDir, { recursive: true, force: true }));
   return storeDir;
 }
+
+test("discarding ineligible pending work is exact, releases capacity, and preserves active deliveries", (t) => {
+  const storeDir = temporaryStore(t);
+  const owner = createContinuationClaimantId();
+  const other = createContinuationClaimantId();
+  const claim = persistContinuationClaim("ineligible", { storeDir, claimantId: owner, maxPendingEntries: 1 });
+  const identity = { storeDir, claimantId: other, deliveryId: claim.deliveryId };
+  assert.equal(discardPendingContinuation("ineligible", identity).discarded, false, "another live delivery is protected");
+  relinquishContinuationClaim("ineligible", { ...identity, claimantId: owner });
+  assert.equal(discardPendingContinuation("ineligible", { ...identity, deliveryId: "wrong-delivery" }).discarded, false);
+  assert.equal(discardPendingContinuation("ineligible", identity).discarded, true);
+  assert.deepEqual(loadPendingContinuationRecords({ storeDir }), []);
+  assert.equal(persistContinuationClaim("replacement", { storeDir, maxPendingEntries: 1 }).claimed, true);
+  assert.throws(() => relinquishContinuationClaim("replacement", { storeDir, claimantId: owner }), /deliveryId/);
+  markContinuationDelivered("replacement", { storeDir });
+  const record = JSON.parse(readFileSync(join(storeDir, CONTINUATION_STATE_FILENAME), "utf8")).records.find((entry) => entry.runId === "replacement");
+  assert.equal(discardPendingContinuation("replacement", { ...identity, deliveryId: record.deliveryId }).discarded, false,
+    "delivered markers must remain deduplicated");
+});
 
 test("loadContinuedRuns handles a missing persistence file", (t) => {
   const storeDir = temporaryStore(t);
@@ -275,6 +298,45 @@ test("session shutdown relinquishes only its claims while the process remains al
   assert.equal(persistContinuationClaim("shutdown-run", { storeDir, retryPending: true, claimantId: other, claimantProcessStart: processStart }).claimed, true);
   assert.equal(persistContinuationClaim("other-run", { storeDir, retryPending: true, claimantId: owner, claimantProcessStart: processStart }).claimed, false,
     "shutdown must not relinquish another runtime's claim");
+});
+
+test("one deferred claim can be relinquished without releasing another in-flight delivery", (t) => {
+  const storeDir = temporaryStore(t);
+  const claimantId = createContinuationClaimantId();
+  const claimantProcessStart = currentProcessStartIdentity();
+  const first = persistContinuationClaim("specific-first", { storeDir, claimantId, claimantProcessStart });
+  const second = persistContinuationClaim("specific-second", { storeDir, claimantId, claimantProcessStart });
+
+  assert.equal(continuationClaimIsOwned("specific-first", {
+    storeDir,
+    deliveryId: first.deliveryId,
+    claimantId,
+    claimantProcessStart,
+  }), true);
+  assert.equal(relinquishContinuationClaim("specific-first", {
+    storeDir,
+    deliveryId: "wrong-delivery-id",
+    claimantId,
+    claimantProcessStart,
+  }).relinquished, false);
+  assert.equal(relinquishContinuationClaim("specific-first", {
+    storeDir,
+    deliveryId: first.deliveryId,
+    claimantId,
+    claimantProcessStart,
+  }).relinquished, true);
+  assert.equal(continuationClaimIsOwned("specific-first", {
+    storeDir,
+    deliveryId: first.deliveryId,
+    claimantId,
+    claimantProcessStart,
+  }), false);
+  assert.equal(continuationClaimIsOwned("specific-second", {
+    storeDir,
+    deliveryId: second.deliveryId,
+    claimantId,
+    claimantProcessStart,
+  }), true, "the other owned delivery must remain claimed");
 });
 
 test("startup retry does not steal a pending claim from a live concurrent claimant", async (t) => {
@@ -518,6 +580,9 @@ test("shouldAutoContinue suppresses an intermediate chain node with a committed 
     assert.equal(shouldAutoContinue(terminal), false);
     // A run with no successor still auto-continues.
     assert.equal(shouldAutoContinue({ runId: "chain-other-1", normalizedStatus: "success", metadata: { continuationMode: "terminal" } }), true);
+    // An unreadable/corrupt successor state is unknown, never permission to continue.
+    writeFileSync(reservation.file, "{not-json");
+    assert.equal(continuationEligibility(terminal), "unknown");
   } finally {
     if (previous === undefined) delete process.env.PI_THREAD_PHASE_STORE_DIR;
     else process.env.PI_THREAD_PHASE_STORE_DIR = previous;

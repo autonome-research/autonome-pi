@@ -506,6 +506,27 @@ test("sidecar verification rejects security-envelope disagreement", () => {
   assert.equal(summary.cwd, undefined);
 });
 
+test("process-journal recovery policy is bound to the immutable start envelope", () => {
+  for (const mutation of ["remove", "change"]) {
+    const run = store.createRun({
+      runId: `journal-policy-${mutation}`,
+      workflow: "Journal Policy",
+      cwd: storeDir,
+      metadata: { sessionId: "journal-owner", processJournalVersion: 1, pid: 2_147_483_647 },
+    });
+    const sidecar = JSON.parse(readFileSync(run.runFile.replace(/\.jsonl$/, ".start.json"), "utf8"));
+    assert.equal(sidecar.metadata.processJournalVersion, 1);
+    const start = JSON.parse(readFileSync(run.runFile, "utf8").trim());
+    if (mutation === "remove") delete start.metadata.processJournalVersion;
+    else start.metadata.processJournalVersion = 2;
+    writeFileSync(run.runFile, `${JSON.stringify(start)}\n`);
+    const summary = store.getRunSummary(run.runId);
+    assert.equal(summary.workflowStartResolved, false, `${mutation} must not downgrade recovery policy`);
+    assert.equal(summary.metadata, undefined);
+    assert.equal(summary.stale, undefined, "unverified owner metadata must not supply dead-PID proof");
+  }
+});
+
 test("replayed starts cannot replace authoritative full metadata", () => {
   const cwd = join(storeDir, "replayed-start-repo");
   mkdirSync(cwd, { recursive: true });

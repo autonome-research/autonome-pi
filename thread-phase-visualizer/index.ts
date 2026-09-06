@@ -19,15 +19,18 @@ import {
 import { belongsToSession, formatOwnerMetadata, formatStaleIndicator, runSessionId } from "./lib/run-display.mjs";
 import { canonicalCwd, canInspectRun, createCwdState, matchesRunCwd, mergeMonitorRuns as mergeScopedMonitorRuns, trackCwdCommand } from "./lib/session-scope.mjs";
 import {
+	continuationClaimIsOwned,
+	continuationEligibility,
 	createContinuationClaimantId,
 	currentProcessStartIdentity,
-	loadContinuedRuns,
+	discardPendingContinuation,
 	loadPendingContinuationRecords,
 	markContinuationDelivered,
 	persistContinuationClaim,
+	relinquishContinuationClaim,
 	relinquishContinuationClaims,
 	shouldAutoContinue,
-} from "./lib/continuation-store.mjs";
+} from "./lib/continuation-runtime.ts";
 import { formatMarkedContinuation, sessionHistoryHasContinuation } from "./lib/continuation-message.mjs";
 
 const MAX_MESSAGE_BYTES = 20_000;
@@ -216,9 +219,10 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	let watcher: fs.FSWatcher | undefined;
 	let statusRefreshTimer: NodeJS.Timeout | undefined;
 	const startupDeliveryTimers = new Set<ReturnType<typeof setTimeout>>();
+	let retryDeferredContinuations: (() => void) | undefined;
+	let acknowledgeContinuation: ((runId: string, deliveryId: string) => void) | undefined;
 	let sessionTerminated = false;
 	let cwdState = createCwdState(process.cwd());
-	let continuedRuns = new Set<string>();
 	const seen = new Set<string>();
 	const continuationClaimantId = createContinuationClaimantId();
 	const continuationClaimantProcessStart = currentProcessStartIdentity();
@@ -299,15 +303,23 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 			for (const pending of loadPendingContinuationRecords({ storeDir })) {
 				if (!sessionHistoryHasContinuation(branchEntries, pending.deliveryId)) continue;
 				const delivered = markContinuationDelivered(pending.runId, { storeDir, deliveryId: pending.deliveryId });
-				continuedRuns = delivered.runs;
+				if (delivered.delivered) acknowledgeContinuation?.(pending.runId, pending.deliveryId);
 			}
 		} catch (error) {
 			if (ctx.hasUI) ctx.ui.notify(`A thread-phase continuation is present in active-branch history, but delivered-state persistence failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		}
 	});
 
+	pi.on("agent_settled", (_event, ctx) => {
+		if (ctx.isIdle()) retryDeferredContinuations?.();
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		sessionTerminated = false;
+		for (const timer of startupDeliveryTimers) clearTimeout(timer);
+		startupDeliveryTimers.clear();
+		retryDeferredContinuations = undefined;
+		acknowledgeContinuation = undefined;
 		ensureStore();
 		if (statusRefreshTimer) clearInterval(statusRefreshTimer);
 		statusRefreshTimer = undefined;
@@ -321,11 +333,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 			ctx.ui.setWidget("thread-phase", widgetLines.length > 0 ? widgetLines : undefined, { placement: "belowEditor" });
 		};
 		const currentSessionId = ctx.sessionManager.getSessionId();
-		// Normalize/prune persisted history at startup. This set mirrors the durable
-		// state for diagnostics only; live delivery decisions never use it as a
-		// precondition because entries can expire while this session remains open.
 		const continuationStoreDir = path.dirname(INDEX_FILE);
-		continuedRuns = loadContinuedRuns({ storeDir: continuationStoreDir });
 		let pendingContinuationRecords = loadPendingContinuationRecords({ storeDir: continuationStoreDir });
 
 		// Only the active branch proves that a continuation is visible to the
@@ -345,7 +353,6 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				historyProvenRunIds.add(pending.runId);
 				try {
 					const reconciled = markContinuationDelivered(pending.runId, { storeDir: continuationStoreDir, deliveryId: pending.deliveryId });
-					continuedRuns = reconciled.runs;
 					if (!reconciled.delivered) throw new Error("pending continuation record changed before reconciliation");
 				} catch (error) {
 					if (ctx.hasUI) ctx.ui.notify(`Thread-phase continuation ${pending.deliveryId} is already enqueued, but delivered-state persistence failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
@@ -354,67 +361,247 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 			pendingContinuationRecords = loadPendingContinuationRecords({ storeDir: continuationStoreDir });
 		}
 
-		const attemptAutoContinuation = (summary: AnyEvent, runId: string, retryPending = false, opts: { startup?: boolean } = {}) => {
-			let claim;
+		type QueuedContinuation = { retryPending: boolean; notBefore: number };
+		const queuedContinuations = new Map<string, QueuedContinuation>();
+		// Retry budgets and deadlines outlive queue membership: duplicate terminal
+		// events and transient eligibility changes must not reset either one.
+		const submissionRetries = new Map<string, { failures: number; notBefore: number }>();
+		const retryExhausted = (runId: string) => (submissionRetries.get(runId)?.failures || 0) >= 3;
+		let inFlightContinuation: { runId: string; deliveryId: string } | undefined;
+		let deliveryTimer: ReturnType<typeof setTimeout> | undefined;
+		let deliveryTimerAt = Number.POSITIVE_INFINITY;
+
+		const clearDeliveryTimer = () => {
+			if (!deliveryTimer) return;
+			clearTimeout(deliveryTimer);
+			startupDeliveryTimers.delete(deliveryTimer);
+			deliveryTimer = undefined;
+			deliveryTimerAt = Number.POSITIVE_INFINITY;
+		};
+
+		const releaseSpecificClaim = (runId: string, deliveryId: string) => {
 			try {
-				claim = persistContinuationClaim(runId, {
+				relinquishContinuationClaim(runId, {
 					storeDir: continuationStoreDir,
-					retryPending,
+					deliveryId,
 					claimantId: continuationClaimantId,
 					claimantProcessStart: continuationClaimantProcessStart,
 				});
-				continuedRuns = claim.runs;
+			} catch { /* best-effort; the durable lease still bounds ownership */ }
+		};
+
+		const discardIneligibleContinuation = (summary: AnyEvent, runId: string) => {
+			if (inFlightContinuation?.runId === runId || !belongsToSession(summary, currentSessionId, cwdState.activeCwd)
+				|| ![STATUSES.SUCCESS, STATUSES.FAILED, STATUSES.CANCELLED].includes(summary?.normalizedStatus)
+				|| continuationEligibility(summary) !== "ineligible") return;
+			queuedContinuations.delete(runId);
+			try {
+				const record = loadPendingContinuationRecords({ storeDir: continuationStoreDir }).find((pending) => pending.runId === runId);
+				if (!record) return;
+				discardPendingContinuation(runId, {
+					storeDir: continuationStoreDir,
+					deliveryId: record.deliveryId,
+					claimantId: continuationClaimantId,
+					claimantProcessStart: continuationClaimantProcessStart,
+				});
 			} catch (error) {
-				if (ctx.hasUI) ctx.ui.notify(`Could not persist thread-phase continuation claim: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				if (ctx.hasUI) ctx.ui.notify(`Could not discard ineligible thread-phase continuation: ${error instanceof Error ? error.message : String(error)}`, "warning");
+			}
+		};
+
+		let pumpContinuations: () => void;
+		const scheduleContinuationPump = (delayMs = 0) => {
+			if (sessionTerminated || inFlightContinuation) return;
+			if (delayMs <= 0) {
+				clearDeliveryTimer();
+				pumpContinuations();
 				return;
 			}
-			if (!claim.claimed || !claim.deliveryId) return;
-			const prompt = formatMarkedContinuation(formatContinuationPrompt(summary), claim.deliveryId);
+			const target = Date.now() + delayMs;
+			if (deliveryTimer && deliveryTimerAt <= target) return;
+			clearDeliveryTimer();
+			deliveryTimerAt = target;
+			deliveryTimer = setTimeout(() => {
+				const fired = deliveryTimer;
+				deliveryTimer = undefined;
+				deliveryTimerAt = Number.POSITIVE_INFINITY;
+				if (fired) startupDeliveryTimers.delete(fired);
+				pumpContinuations();
+			}, Math.max(0, target - Date.now()));
+			deliveryTimer.unref?.();
+			startupDeliveryTimers.add(deliveryTimer);
+		};
 
-			const deferBusy = () => {
-				// Never queue a continuation onto an active/resumed turn: pi routes escape
-				// and chat-tree interruption only to the bound streaming turn, so a queued
-				// (followUp/steer) continuation turn runs un-interruptibly. Instead leave
-				// the durable claim pending and unowned so a later idle moment/continue retries it.
+		pumpContinuations = () => {
+			if (sessionTerminated || inFlightContinuation || !ctx.isIdle()) return;
+			while (queuedContinuations.size > 0) {
+				const [runId, queued] = queuedContinuations.entries().next().value as [string, QueuedContinuation];
+				if (retryExhausted(runId)) {
+					queuedContinuations.delete(runId);
+					continue;
+				}
+				const waitMs = queued.notBefore - Date.now();
+				if (waitMs > 0) {
+					scheduleContinuationPump(waitMs);
+					return;
+				}
+
+				let summary: AnyEvent;
 				try {
-					relinquishContinuationClaims({
+					summary = getRunSummary(runId);
+				} catch (error) {
+					queuedContinuations.delete(runId);
+					if (ctx.hasUI) ctx.ui.notify(`Could not revalidate thread-phase continuation ${runId}: ${error instanceof Error ? error.message : String(error)}`, "warning");
+					continue;
+				}
+				if (!belongsToSession(summary, currentSessionId, cwdState.activeCwd) || !shouldAutoContinue(summary)) {
+					discardIneligibleContinuation(summary, runId);
+					queuedContinuations.delete(runId);
+					continue;
+				}
+
+				let claim;
+				try {
+					claim = persistContinuationClaim(runId, {
 						storeDir: continuationStoreDir,
+						retryPending: queued.retryPending,
 						claimantId: continuationClaimantId,
 						claimantProcessStart: continuationClaimantProcessStart,
 					});
-					continuedRuns = loadContinuedRuns({ storeDir: continuationStoreDir });
-				} catch { /* best-effort */ }
-				if (ctx.hasUI) ctx.ui.notify("Thread-phase continuation deferred (agent busy); it will retry when idle.", "info");
-			};
+				} catch (error) {
+					queuedContinuations.delete(runId);
+					if (ctx.hasUI) ctx.ui.notify(`Could not persist thread-phase continuation claim: ${error instanceof Error ? error.message : String(error)}`, "warning");
+					continue;
+				}
+				if (!claim.claimed || !claim.deliveryId) {
+					queuedContinuations.delete(runId);
+					continue;
+				}
+				queued.retryPending = true;
 
-			const deliver = () => {
-				if (sessionTerminated) return;
+				// The startup delay and an idle transition both leave time for cancellation,
+				// session scope, successor commitment, or durable ownership to change. Read
+				// all of them again immediately before injecting the user message.
+				try {
+					summary = getRunSummary(runId);
+				} catch {
+					releaseSpecificClaim(runId, claim.deliveryId);
+					queuedContinuations.delete(runId);
+					continue;
+				}
+				if (!belongsToSession(summary, currentSessionId, cwdState.activeCwd) || !shouldAutoContinue(summary)) {
+					releaseSpecificClaim(runId, claim.deliveryId);
+					discardIneligibleContinuation(summary, runId);
+					queuedContinuations.delete(runId);
+					continue;
+				}
 				if (!ctx.isIdle()) {
-					deferBusy();
+					releaseSpecificClaim(runId, claim.deliveryId);
+					if (ctx.hasUI) ctx.ui.notify("Thread-phase continuation deferred (agent busy); it will retry when idle.", "info");
 					return;
 				}
 				try {
+					if (!continuationClaimIsOwned(runId, {
+						storeDir: continuationStoreDir,
+						deliveryId: claim.deliveryId,
+						claimantId: continuationClaimantId,
+						claimantProcessStart: continuationClaimantProcessStart,
+					})) {
+						queuedContinuations.delete(runId);
+						continue;
+					}
+				} catch (error) {
+					releaseSpecificClaim(runId, claim.deliveryId);
+					if (ctx.hasUI) ctx.ui.notify(`Could not verify thread-phase continuation ownership: ${error instanceof Error ? error.message : String(error)}`, "warning");
+					return;
+				}
+
+				queuedContinuations.delete(runId);
+				inFlightContinuation = { runId, deliveryId: claim.deliveryId };
+				const prompt = formatMarkedContinuation(formatContinuationPrompt(summary), claim.deliveryId);
+				try {
 					pi.sendUserMessage(prompt);
 				} catch (error) {
-					// The extension wrapper rarely surfaces asynchronous input failures, but
-					// any synchronous rejection still leaves the durable record pending.
-					if (ctx.hasUI) ctx.ui.notify(`Could not submit thread-phase continuation ${claim.deliveryId}; it remains pending for retry: ${error instanceof Error ? error.message : String(error)}`, "warning");
+					// A synchronous rejection did not enqueue a message. Retry at most three
+					// submissions per extension runtime with bounded backoff, without retaining an
+					// in-flight lock that would permanently block all later continuations.
+					inFlightContinuation = undefined;
+					releaseSpecificClaim(runId, claim.deliveryId);
+					const failures = (submissionRetries.get(runId)?.failures || 0) + 1;
+					const notBefore = Date.now() + 100 * (2 ** (failures - 1));
+					submissionRetries.set(runId, { failures, notBefore });
+					if (failures < 3) {
+						queued.notBefore = notBefore;
+						queuedContinuations.set(runId, queued);
+						scheduleContinuationPump(queued.notBefore - Date.now());
+					} else {
+						// The durable record stays pending for restart/operator recovery.
+						scheduleContinuationPump();
+					}
+					if (ctx.hasUI) ctx.ui.notify(`Could not submit thread-phase continuation ${claim.deliveryId} (attempt ${failures}/3); it remains pending: ${error instanceof Error ? error.message : String(error)}`, "warning");
 				}
-				// Delivery is acknowledged only by message_start or persisted active-branch
-				// history. sendUserMessage() itself is fire-and-forget.
-			};
-
-			if (opts.startup && ctx.hasUI) {
-				// Defer past interactive initialization so pi binds the injected turn to the
-				// editor's streaming/interrupt context before it starts generating.
-				const timer = setTimeout(() => {
-					startupDeliveryTimers.delete(timer);
-					deliver();
-				}, STARTUP_DELIVERY_SETTLE_MS);
-				startupDeliveryTimers.add(timer);
-			} else {
-				deliver();
+				// One message remains in flight until active-branch history acknowledges it.
+				// agent_settled schedules the next queued continuation once Pi is truly idle.
+				return;
 			}
+		};
+
+		acknowledgeContinuation = (runId, deliveryId) => {
+			if (inFlightContinuation?.runId === runId && inFlightContinuation.deliveryId === deliveryId) {
+				inFlightContinuation = undefined;
+			}
+		};
+		retryDeferredContinuations = () => {
+			// Reconsider durable records whose successor state was unreadable, or
+			// whose earlier claimant was active. Never reset a submission retry budget.
+			try {
+				for (const pending of loadPendingContinuationRecords({ storeDir: continuationStoreDir })) {
+					if (queuedContinuations.has(pending.runId) || retryExhausted(pending.runId)
+						|| inFlightContinuation?.runId === pending.runId) continue;
+					const summary = getRunSummary(pending.runId);
+					if (belongsToSession(summary, currentSessionId, cwdState.activeCwd)
+						&& [STATUSES.SUCCESS, STATUSES.FAILED].includes(summary?.normalizedStatus)
+						&& continuationEligibility(summary) !== "ineligible") {
+						attemptAutoContinuation(summary, pending.runId, true);
+					} else discardIneligibleContinuation(summary, pending.runId);
+				}
+			} catch (error) {
+				if (ctx.hasUI) ctx.ui.notify(`Could not reload pending thread-phase continuations: ${error instanceof Error ? error.message : String(error)}`, "warning");
+			}
+			scheduleContinuationPump();
+		};
+
+		const attemptAutoContinuation = (_summary: AnyEvent, runId: string, retryPending = false, opts: { startup?: boolean } = {}) => {
+			if (sessionTerminated || inFlightContinuation?.runId === runId || retryExhausted(runId)) return;
+			const existing = queuedContinuations.get(runId);
+			const notBefore = Math.max(
+				opts.startup && ctx.hasUI ? Date.now() + STARTUP_DELIVERY_SETTLE_MS : Date.now(),
+				submissionRetries.get(runId)?.notBefore || 0,
+			);
+			if (existing) {
+				existing.retryPending ||= retryPending;
+				existing.notBefore = Math.min(existing.notBefore, notBefore);
+			} else {
+				// Persist the backlog before waiting for idle/startup readiness. Otherwise
+				// a reload after the freshness window could lose a deferred completion.
+				// Only the one message being submitted should retain a delivery claim.
+				let claim;
+				try {
+					claim = persistContinuationClaim(runId, {
+						storeDir: continuationStoreDir,
+						retryPending,
+						claimantId: continuationClaimantId,
+						claimantProcessStart: continuationClaimantProcessStart,
+					});
+				} catch (error) {
+					if (ctx.hasUI) ctx.ui.notify(`Could not persist deferred thread-phase continuation: ${error instanceof Error ? error.message : String(error)}`, "warning");
+					return;
+				}
+				if (!claim.claimed || !claim.deliveryId) return;
+				releaseSpecificClaim(runId, claim.deliveryId);
+				queuedContinuations.set(runId, { retryPending: true, notBefore });
+			}
+			scheduleContinuationPump(Math.max(0, notBefore - Date.now()));
 		};
 
 		// Prime completion rendering while reclaiming durable pending deliveries.
@@ -437,7 +624,10 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		}
 		for (const runId of startupRuns) {
 			const summary = getRunSummary(runId);
-			if (belongsToSession(summary, currentSessionId, cwdState.activeCwd) && shouldAutoContinue(summary)) attemptAutoContinuation(summary, runId, true, { startup: true });
+			if (belongsToSession(summary, currentSessionId, cwdState.activeCwd)
+				&& [STATUSES.SUCCESS, STATUSES.FAILED].includes(summary?.normalizedStatus)
+				&& continuationEligibility(summary) !== "ineligible") attemptAutoContinuation(summary, runId, true, { startup: true });
+			else discardIneligibleContinuation(summary, runId);
 		}
 		updateStatus();
 
@@ -456,7 +646,9 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 						display: true,
 						details: { event, summary, events: readRun(event.runId, { readLimit: 50_000 }) },
 					});
-					if (event.runId && shouldAutoContinue(summary)) attemptAutoContinuation(summary, event.runId);
+					if (event.runId && [STATUSES.SUCCESS, STATUSES.FAILED].includes(summary?.normalizedStatus)
+						&& continuationEligibility(summary) !== "ineligible") attemptAutoContinuation(summary, event.runId);
+					else if (event.runId) discardIneligibleContinuation(summary, event.runId);
 					if (ctx.hasUI) ctx.ui.notify(`thread-phase ${event.workflow}: ${event.status || "done"}`, summary.normalizedStatus === STATUSES.FAILED ? "warning" : "info");
 				}
 			}
@@ -476,6 +668,8 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		sessionTerminated = true;
 		for (const timer of startupDeliveryTimers) clearTimeout(timer);
 		startupDeliveryTimers.clear();
+		retryDeferredContinuations = undefined;
+		acknowledgeContinuation = undefined;
 		watcher?.close();
 		watcher = undefined;
 		if (statusRefreshTimer) clearInterval(statusRefreshTimer);

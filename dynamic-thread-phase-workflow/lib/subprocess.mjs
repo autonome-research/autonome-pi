@@ -31,13 +31,32 @@ export function terminateChild(child, signal = "SIGTERM") {
  * the result so callers can report an actionable failure instead of exit 143.
  */
 export function runBoundedProcess(command, args, options = {}) {
-  return new Promise((resolve) => {
-    const timeoutMs = normalizeTimeoutMs(options.timeoutMs, "process timeoutMs");
-    const killGraceMs = normalizeTimeoutMs(options.killGraceMs ?? DEFAULT_KILL_GRACE_MS, "process killGraceMs");
+  return new Promise((resolve, reject) => {
+    let noChildProofReported = false;
+    const reportNoChild = () => {
+      if (noChildProofReported) return;
+      noChildProofReported = true;
+      options.onNoChild?.();
+    };
+
+    let timeoutMs;
+    let killGraceMs;
+    let stdoutBuffer;
+    let stderrBuffer;
+    try {
+      timeoutMs = normalizeTimeoutMs(options.timeoutMs, "process timeoutMs");
+      killGraceMs = normalizeTimeoutMs(options.killGraceMs ?? DEFAULT_KILL_GRACE_MS, "process killGraceMs");
+      stdoutBuffer = new BoundedTextBuffer(options.maxStdoutBytes ?? DEFAULT_CAPTURE_BYTES, { keep: options.stdoutKeep ?? "head" });
+      stderrBuffer = new BoundedTextBuffer(options.maxStderrBytes ?? DEFAULT_CAPTURE_BYTES, { keep: options.stderrKeep ?? "tail" });
+    } catch (error) {
+      try { reportNoChild(); } catch (proofError) { reject(proofError); return; }
+      reject(error);
+      return;
+    }
+
     const startedAt = Date.now();
-    const stdoutBuffer = new BoundedTextBuffer(options.maxStdoutBytes ?? DEFAULT_CAPTURE_BYTES, { keep: options.stdoutKeep ?? "head" });
-    const stderrBuffer = new BoundedTextBuffer(options.maxStderrBytes ?? DEFAULT_CAPTURE_BYTES, { keep: options.stderrKeep ?? "tail" });
     if (options.signal?.aborted) {
+      try { reportNoChild(); } catch (error) { reject(error); return; }
       resolve({
         ok: false,
         code: null,
@@ -63,6 +82,7 @@ export function runBoundedProcess(command, args, options = {}) {
         detached: process.platform !== "win32",
       });
     } catch (error) {
+      try { reportNoChild(); } catch (proofError) { reject(proofError); return; }
       resolve({
         ok: false,
         code: 1,
@@ -114,12 +134,15 @@ export function runBoundedProcess(command, args, options = {}) {
     }, timeoutMs);
     timeoutTimer.unref?.();
 
+    const childHasPid = Number.isSafeInteger(child.pid) && child.pid > 0;
     const cleanup = () => {
       clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
       options.signal?.removeEventListener("abort", onWorkflowAbort);
       timeoutController.signal.removeEventListener("abort", onTimeoutAbort);
-      try { options.onChildEnd?.(child); } catch { /* lifecycle cleanup must not mask the process result */ }
+      if (childHasPid) {
+        try { options.onChildEnd?.(child); } catch { /* lifecycle cleanup must not mask the process result */ }
+      }
     };
     const finish = ({ code, signal, spawnError }) => {
       if (settled) return;
@@ -181,13 +204,21 @@ export function runBoundedProcess(command, args, options = {}) {
       observeChunk(options.onStderr, chunk);
       if (options.captureStderr !== false) stderrBuffer.append(chunk);
     });
-    child.on("error", (error) => finish({ code: 1, signal: null, spawnError: error }));
+    child.on("error", (error) => {
+      if (!childHasPid) {
+        try { reportNoChild(); }
+        catch (proofError) { finish({ code: 1, signal: null, spawnError: proofError instanceof Error ? proofError : new Error(String(proofError)) }); return; }
+      }
+      finish({ code: 1, signal: null, spawnError: error });
+    });
     child.on("close", (code, signal) => finish({ code, signal }));
-    try {
-      options.onChildStart?.(child);
-    } catch (error) {
-      streamCallbackError = error instanceof Error ? error : new Error(String(error));
-      terminate("SIGTERM");
+    if (childHasPid) {
+      try {
+        options.onChildStart?.(child);
+      } catch (error) {
+        streamCallbackError = error instanceof Error ? error : new Error(String(error));
+        terminate("SIGTERM");
+      }
     }
   });
 }

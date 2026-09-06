@@ -8,6 +8,7 @@ import { pathToFileURL } from "node:url";
 import { PiJsonEventCollector } from "../lib/pi-json-stream.mjs";
 import { commitSuccessor, releaseSuccessor, reserveSuccessor } from "../../thread-phase-visualizer/lib/chain-store.mjs";
 import { normalizeTimeoutMs, runBoundedProcess, terminateChild } from "../lib/subprocess.mjs";
+import { assertProcessGroupsStopped, createProcessJournal } from "../lib/process-journal.mjs";
 import {
   ARTIFACTS_DIR,
   STATUSES,
@@ -82,6 +83,7 @@ for (const name of ["PipelineCache", "boundedFanout", "runPipeline", "withRetry"
 const { PipelineCache, boundedFanout, runPipeline, withRetry } = threadPhaseCore;
 
 const activeChildren = new Set();
+let processJournal;
 let activeRun;
 let activeAbortController;
 let cancellationRequested = false;
@@ -485,11 +487,19 @@ function normalizePiTools(tools, permissions, label) {
 }
 
 async function runProcess(command, args, options) {
+  const launchToken = processJournal.reserve();
   return await runBoundedProcess(command, args, {
     ...options,
     timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    onChildStart: (child) => activeChildren.add(child),
-    onChildEnd: (child) => activeChildren.delete(child),
+    onNoChild: () => processJournal.noChild(launchToken),
+    onChildStart: (child) => {
+      activeChildren.add(child);
+      processJournal.started(launchToken, child.pid);
+    },
+    onChildEnd: (child) => {
+      activeChildren.delete(child);
+      processJournal.ended(launchToken);
+    },
   });
 }
 
@@ -668,11 +678,42 @@ function loadResumeInvocation(runId, sessionId) {
 
 function loadResumeState(runId, { spec, cwd, model, sessionId }) {
   const sourceDir = resumeRunDirectory(runId);
-  // Do not resume a source that is still running; its uncheckpointed suffix may
-  // not be durable and concurrent resumes would duplicate it.
+  // Owner metadata must come from verified workflow_start, not the checkpoint.
+  // Projected failure is not terminal proof: an error can precede workflow_end.
+  // Without an end event, require positive dead-owner and journal evidence.
   const sourceSummary = getRunSummary(runId);
-  if (sourceSummary && sourceSummary.normalizedStatus === STATUSES.RUNNING) {
-    throw new Error(`Cannot resume workflow ${runId}: source run is still running`);
+  if (!sourceSummary || sourceSummary.runId !== runId || sourceSummary.workflowStartResolved !== true) {
+    throw new Error(`Cannot resume workflow ${runId}: authoritative source ownership is unknown`);
+  }
+  if (sourceSummary.normalizedStatus === STATUSES.CANCELLED) {
+    throw new Error("A user-cancelled workflow cannot be resumed");
+  }
+  const processJournalVersion = sourceSummary.metadata?.processJournalVersion;
+  if (processJournalVersion !== undefined && processJournalVersion !== 1) {
+    throw new Error(`Cannot resume workflow ${runId}: unsupported process journal version ${String(processJournalVersion)}`);
+  }
+  if (sourceSummary.normalizedStatus === STATUSES.UNKNOWN) {
+    throw new Error(`Cannot resume workflow ${runId}: authoritative source lifecycle is unknown`);
+  }
+  const terminalEndProven = Boolean(sourceSummary.endedAt)
+    && [STATUSES.SUCCESS, STATUSES.FAILED].includes(sourceSummary.normalizedStatus);
+  if (!terminalEndProven) {
+    const ownerPid = sourceSummary.metadata?.pid;
+    let deadOwnerProven = false;
+    if (Number.isSafeInteger(ownerPid) && ownerPid > 0) {
+      try { process.kill(ownerPid, 0); }
+      catch (error) { deadOwnerProven = error?.code === "ESRCH"; }
+    }
+    if (!deadOwnerProven) throw new Error(`Cannot resume workflow ${runId}: source run is still running or its runner state is unknown`);
+    if (processJournalVersion !== 1) {
+      throw new Error(`Cannot resume workflow ${runId}: subprocess ownership is unknown for a legacy nonterminal source`);
+    }
+    assertProcessGroupsStopped(sourceDir, runId, ownerPid);
+  } else if (processJournalVersion === 1) {
+    // Even a terminal failure can leave redirected-stdio grandchildren alive.
+    // Legacy terminal runs retain their previous resume behavior; all newly
+    // journaled sources require group inactivity, not just a terminal label.
+    assertProcessGroupsStopped(sourceDir, runId, sourceSummary.metadata?.pid);
   }
   const manifest = parseBoundedJson(join(sourceDir, "workflow-checkpoint.json"), MAX_RESUME_MANIFEST_BYTES, "workflow resume checkpoint");
   if (manifest?.schema !== "pi-dynamic-workflow-checkpoint/v1") throw new Error("Resume checkpoint has an unsupported schema");
@@ -680,12 +721,20 @@ function loadResumeState(runId, { spec, cwd, model, sessionId }) {
   if (manifest.cwd !== realpathSync(cwd)) throw new Error(`Resume checkpoint cwd does not match this invocation: ${manifest.cwd || "unknown"}`);
   const normalizedSessionId = sessionId ? String(sessionId) : undefined;
   if ((manifest.sessionId || normalizedSessionId) && manifest.sessionId !== normalizedSessionId) throw new Error("Resume checkpoint belongs to a different Pi session");
+  const ownerSessionId = sourceSummary.metadata?.sessionId ? String(sourceSummary.metadata.sessionId) : undefined;
+  if ((ownerSessionId || manifest.sessionId) && ownerSessionId !== manifest.sessionId) throw new Error("Resume checkpoint does not match the authoritative source session owner");
+  if (sourceSummary.cwd !== manifest.cwd) throw new Error("Resume checkpoint does not match the authoritative source cwd owner");
   const sourceSpec = validateSpec(parseBoundedJson(join(sourceDir, "workflow-spec.json"), MAX_RESUME_MANIFEST_BYTES, "resume source workflow spec"));
   const sourceFingerprint = workflowFingerprint(sourceSpec, cwd, manifest.model);
   const requestedFingerprint = workflowFingerprint(spec, cwd, model);
   if (manifest.specHash !== sourceFingerprint || requestedFingerprint !== sourceFingerprint) throw new Error("Resume checkpoint does not match the requested structured workflow spec, cwd, and model");
   if (!CHAIN_ID.test(String(manifest.chainId || "")) || !RESUME_RUN_ID.test(String(manifest.rootRunId || "")) || !Number.isInteger(manifest.chainStep) || manifest.chainStep < 0) {
     throw new Error("Resume checkpoint chain provenance is invalid");
+  }
+  if (sourceSummary.metadata?.chainId !== manifest.chainId
+      || sourceSummary.metadata?.rootRunId !== manifest.rootRunId
+      || sourceSummary.metadata?.chainStep !== manifest.chainStep) {
+    throw new Error("Resume checkpoint does not match the authoritative source chain provenance");
   }
   if (manifest.chainStep + 1 >= MAX_CHAIN_RUNS) throw new Error(`Workflow chain reached the ${MAX_CHAIN_RUNS}-run limit`);
   if (!Array.isArray(manifest.completed) || manifest.completed.length > spec.phases.length) throw new Error("Resume checkpoint completed-phase list is invalid");
@@ -1162,7 +1211,7 @@ async function main() {
       cwd,
       trigger: { kind: isBackground ? "background" : "manual", dynamic: true },
       input: spec,
-      metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, mode: harnessFile ? "javascript" : "spec", permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, continuationMode: isBackground ? "terminal" : "none", autoContinue: isTruthyFlag(args["auto-continue"] ?? spec.autoContinue), sessionId: args["session-id"], sessionFile: args["session-file"], ...chain, resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length },
+      metadata: { pid: process.pid, processJournalVersion: 1, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, mode: harnessFile ? "javascript" : "spec", permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, continuationMode: isBackground ? "terminal" : "none", autoContinue: isTruthyFlag(args["auto-continue"] ?? spec.autoContinue), sessionId: args["session-id"], sessionFile: args["session-file"], ...chain, resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length },
       message: `${workflow} started`,
     });
     if (successorReservation) commitSuccessor(successorReservation);
@@ -1186,6 +1235,7 @@ async function main() {
     stopWatchingCancellation = watchCancellation(visualizerRun, controller);
     const artifactsDir = join(ARTIFACTS_DIR, visualizerRun.runId);
     mkdirSync(artifactsDir, { recursive: true });
+    processJournal = createProcessJournal(artifactsDir, visualizerRun.runId);
     const specPath = join(artifactsDir, harnessFile ? "workflow-harness-manifest.json" : "workflow-spec.json");
     writeFileSync(specPath, JSON.stringify(spec, null, 2), "utf8");
     artifact(visualizerRun, { kind: "json", title: harnessFile ? "Workflow harness manifest" : "Compiled workflow spec", path: specPath });

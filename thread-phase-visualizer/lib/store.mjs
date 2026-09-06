@@ -1274,7 +1274,7 @@ function compactOwnerMetadata(metadata) {
     "sessionId", "sessionFile", "launchSource", "source", "cwdAtLaunch", "cwd",
     "pid", "ppid", "hostname", "cancellable", "cancelSignal", "autoContinue", "continuationMode",
     "dynamic", "mode", "permissions", "maxPermissions", "chainId", "rootRunId", "parentRunId", "chainStep",
-    "resumedFromRunId", "resumedPhaseCount",
+    "resumedFromRunId", "resumedPhaseCount", "processJournalVersion",
   ]) {
     const value = metadata[key];
     if (["string", "number", "boolean"].includes(typeof value)) compact[key] = value;
@@ -1614,7 +1614,7 @@ function touchRunStartCache(identity, entry) {
   runStartCache.set(identity, entry);
 }
 
-function restoreRunStartMetadata(summary, budget, { verify = false } = {}) {
+function restoreRunStartMetadata(summary, budget, { verify = false, referenceTime } = {}) {
   if (!summary?.runId) return summary;
   // Catalog records are a compact pre-filter accelerator. Visible/final
   // results bypass the catalog and verify the immutable sidecar or legacy log.
@@ -1646,6 +1646,8 @@ function restoreRunStartMetadata(summary, budget, { verify = false } = {}) {
       summary.metadata = undefined;
       summary.cwd = undefined;
       summary.trigger = undefined;
+      // Never retain PID-based evidence from an unverified projected start.
+      summary.stale = undefined;
       return summary;
     }
     // Preserve full public metadata/trigger values when a projected or bounded
@@ -1666,11 +1668,15 @@ function restoreRunStartMetadata(summary, budget, { verify = false } = {}) {
     summary.cwd = undefined;
     summary.trigger = undefined;
   }
+  // A bounded tail may not contain workflow_start. Recompute only after its
+  // authoritative PID is restored, using the same clock as the projection.
+  if (summary.normalizedStatus === STATUSES.RUNNING) summary.stale = detectStaleRun(summary, referenceTime);
   return summary;
 }
 
 export function getRunSummary(runId) {
-  return restoreRunStartMetadata(projectRun(readRun(runId)), undefined, { verify: true });
+  const referenceTime = projectionReferenceTime();
+  return restoreRunStartMetadata(projectRun(readRun(runId), { referenceTime }), undefined, { verify: true, referenceTime });
 }
 
 export function latestRunSummaries({ limit = 20, cwd, workflow, readLimit = 5000, filter, ownershipFilter, ownershipReadBudgetBytes = DEFAULT_OWNERSHIP_READ_BUDGET_BYTES, ownershipFallbackScanLimit = DEFAULT_OWNERSHIP_FALLBACK_SCAN_LIMIT, ownershipSidecarReadBudgetBytes = DEFAULT_OWNERSHIP_SIDECAR_READ_BUDGET_BYTES, ownershipSidecarScanLimit = DEFAULT_OWNERSHIP_SIDECAR_SCAN_LIMIT } = {}) {
@@ -1679,7 +1685,8 @@ export function latestRunSummaries({ limit = 20, cwd, workflow, readLimit = 5000
   // then enforce the result limit. This lets session-scoped callers fill their
   // requested limit from visible runs instead of letting newer foreign runs
   // consume a global pre-filter candidate limit.
-  const runs = projectRuns(readIndex({ limit: readLimit, cwd, workflow }));
+  const referenceTime = projectionReferenceTime();
+  const runs = projectRuns(readIndex({ limit: readLimit, cwd, workflow }), { referenceTime });
   const maxResults = positiveInteger(limit, 20);
   if (maxResults === 0) return [];
   const makeBudget = () => ({
@@ -1691,15 +1698,15 @@ export function latestRunSummaries({ limit = 20, cwd, workflow, readLimit = 5000
   const budget = makeBudget();
   const verificationBudget = makeBudget();
   if (typeof filter !== "function" && typeof ownershipFilter !== "function") {
-    return runs.slice(0, maxResults).map((run) => restoreRunStartMetadata(run, verificationBudget, { verify: true }));
+    return runs.slice(0, maxResults).map((run) => restoreRunStartMetadata(run, verificationBudget, { verify: true, referenceTime }));
   }
   const visible = [];
   for (const run of runs) {
     const provisional = typeof ownershipFilter === "function"
-      ? restoreRunStartMetadata(run, budget)
+      ? restoreRunStartMetadata(run, budget, { referenceTime })
       : run;
     if (typeof ownershipFilter === "function" && !ownershipFilter(provisional)) continue;
-    const verified = restoreRunStartMetadata(run, verificationBudget, { verify: true });
+    const verified = restoreRunStartMetadata(run, verificationBudget, { verify: true, referenceTime });
     if (typeof ownershipFilter === "function" && !verified.workflowStartResolved) continue;
     if (typeof ownershipFilter === "function" && !ownershipFilter(verified)) continue;
     // Public filters see the fully restored summary exactly once. Internal

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 
@@ -41,6 +41,11 @@ test("uncommitted successor reservation can be released after launch failure", a
   assert.equal(second.record.childRunId, "replacement-child");
 });
 
+test("a genuinely missing successor record is absent", async (t) => {
+  const { store } = await withStore(t);
+  assert.equal(store.readSuccessor("missing-parent"), undefined);
+});
+
 test("successor records reject symlinks instead of following external content", async (t) => {
   const { root, store } = await withStore(t);
   const external = join(root, "external.json");
@@ -50,6 +55,68 @@ test("successor records reject symlinks instead of following external content", 
   symlinkSync(external, join(directory, "linked-parent.json"));
   assert.throws(() => store.readSuccessor("linked-parent"), /Could not read workflow successor record/);
   assert.throws(() => store.reserveSuccessor("linked-parent", "new-child", { chainId: CHAIN_ID }), /Could not read workflow successor record/);
+});
+
+test("broken symlinks and non-directory path components are read errors, not absence", async (t) => {
+  const { root, store } = await withStore(t);
+  const directory = join(root, "chains", "successors");
+  mkdirSync(directory, { recursive: true });
+  symlinkSync(join(root, "missing-target.json"), join(directory, "broken-parent.json"));
+  assert.throws(() => store.readSuccessor("broken-parent"), /Could not read workflow successor record/);
+
+  rmSync(join(root, "chains"), { recursive: true });
+  writeFileSync(join(root, "chains"), "not a directory");
+  assert.throws(() => store.readSuccessor("not-directory-parent"), /Could not read workflow successor record/);
+});
+
+test("an unreadable successor directory is an unknown read state", async (t) => {
+  if (typeof process.getuid !== "function" || process.getuid() === 0) {
+    t.skip("directory mode bits cannot reliably deny access for this user");
+    return;
+  }
+  const { root, store } = await withStore(t);
+  const directory = join(root, "chains", "successors");
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, "private-parent.json"), "{}");
+  chmodSync(directory, 0o000);
+  try {
+    assert.throws(() => store.readSuccessor("private-parent"), /Could not read workflow successor record/);
+  } finally {
+    chmodSync(directory, 0o700);
+  }
+});
+
+test("successor reads reject FIFOs without blocking", async (t) => {
+  const { root } = await withStore(t);
+  const directory = join(root, "chains", "successors");
+  mkdirSync(directory, { recursive: true });
+  const fifo = join(directory, "fifo-parent.json");
+  const mkfifo = spawnSync("mkfifo", [fifo], { encoding: "utf8" });
+  if (mkfifo.error?.code === "ENOENT") {
+    t.skip("mkfifo is unavailable");
+    return;
+  }
+  assert.equal(mkfifo.status, 0, mkfifo.stderr || mkfifo.error?.message);
+
+  const script = `
+    const store = await import(process.argv[1]);
+    try {
+      store.readSuccessor("fifo-parent");
+      process.exitCode = 2;
+    } catch (error) {
+      if (!/bounded regular file/.test(error.message)) {
+        console.error(error);
+        process.exitCode = 3;
+      }
+    }
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script, moduleUrl], {
+    env: { ...process.env, PI_THREAD_PHASE_STORE_DIR: root },
+    encoding: "utf8",
+    timeout: 3_000,
+  });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr || `unexpected signal ${result.signal}`);
 });
 
 test("concurrent successor reservations produce one winner without timing arbitration", async (t) => {

@@ -31,10 +31,10 @@ function fsyncDirectory(directory) {
   }
 }
 
-function readRecord(file, expectedParentRunId) {
+function readRecord(file, expectedParentRunId, options = {}) {
   let descriptor;
   try {
-    descriptor = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+    descriptor = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0) | (fsConstants.O_NONBLOCK || 0));
     const info = fstatSync(descriptor);
     if (!info.isFile() || info.size > MAX_SUCCESSOR_RECORD_BYTES) throw new Error("successor record must be a bounded regular file");
     const buffer = Buffer.allocUnsafe(info.size);
@@ -59,6 +59,7 @@ function readRecord(file, expectedParentRunId) {
     }
     return value;
   } catch (error) {
+    if (options.allowMissing && error?.code === "ENOENT") return undefined;
     throw new Error(`Could not read workflow successor record: ${error?.message || error}`);
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
@@ -151,5 +152,5 @@ export function releaseSuccessor(reservation) {
 export function readSuccessor(parentRunId) {
   const parent = validateRunId(parentRunId, "parent run id");
   const file = successorFile(parent);
-  return existsSync(file) ? readRecord(file, parent) : undefined;
+  return readRecord(file, parent, { allowMissing: true });
 }

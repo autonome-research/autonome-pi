@@ -25,20 +25,27 @@ const loadedSnapshotBaselines = new WeakMap();
  * v2 public schema migration removes the old flag.
  */
 export function shouldAutoContinue(run) {
+  return continuationEligibility(run) === "eligible";
+}
+
+/** Unknown successor state is retryable, not permission to send or discard work. */
+export function continuationEligibility(run) {
   const status = run?.normalizedStatus;
-  if (status === "cancelled" || (status !== "success" && status !== "failed")) return false;
+  if (status === "cancelled") return "ineligible";
+  if (status !== "success" && status !== "failed") return "unknown";
   if (run?.metadata?.continuationMode === "terminal") {
     // An intermediate chain node with a runner-managed (committed) successor does
     // not enqueue a duplicate chat continuation; the chain's terminal run hands
     // control back to chat. Only a committed successor suppresses — a reserved
     // (pending) record means the child may never have launched.
     if (run?.runId) {
-      try { if (readSuccessor(String(run.runId))?.state === "committed") return false; } catch { /* non-chain run id: no successor */ }
+      try { if (readSuccessor(String(run.runId))?.state === "committed") return "ineligible"; }
+      catch { return "unknown"; }
     }
-    return true;
+    return "eligible";
   }
-  if (status !== "success") return false;
-  return run?.metadata?.autoContinue === true || run?.metadata?.autoContinue === "always";
+  if (status !== "success") return "ineligible";
+  return run?.metadata?.autoContinue === true || run?.metadata?.autoContinue === "always" ? "eligible" : "ineligible";
 }
 
 export function continuedRunsFile(storeDir) {
@@ -178,7 +185,7 @@ export function persistContinuationClaim(runId, { storeDir, maxEntries = DEFAULT
     const existing = records.find((record) => record.runId === runId);
     if (existing) {
       const retryable = existing.state === "pending" && retryPending
-        && (claimIsUnowned(existing) || claimantMatches(existing, claimant) || !claimantIsActive(existing));
+        && (claimIsUnowned(existing) || claimantMatches(existing, claimant) || !claimantIsActive(existing, Date.parse(claimedAt)));
       if (!retryable) {
         if (!persistedStateMatches(persisted, records)) writeContinuationState(file, storeDir, records);
         return { claimed: false, state: existing.state, deliveryId: existing.deliveryId, runs: continuationRecordSet(records) };
@@ -229,6 +236,66 @@ export function markContinuationDelivered(runId, { storeDir, maxEntries = DEFAUL
     records = pruneContinuationRecords(records, maxEntries);
     writeContinuationState(file, storeDir, records);
     return { delivered: true, runs: continuationRecordSet(records) };
+  } finally {
+    releaseLock();
+  }
+}
+
+/** Verify that a pending delivery is still durably owned by this runtime. */
+export function continuationClaimIsOwned(runId, { storeDir, deliveryId, claimantId, claimantPid = process.pid, claimantProcessStart = currentProcessStartIdentity(), maxEntries = DEFAULT_CONTINUATION_LIMIT, maxAgeMs = DEFAULT_CONTINUATION_RETENTION_MS, now } = {}) {
+  if (!isRunId(runId) || !isRunId(deliveryId) || !isRunId(claimantId)) return false;
+  const file = continuedRunsFile(storeDir);
+  const lockFile = `${file}.lock`;
+  const checkedAt = continuationNow(now);
+  mkdirSync(storeDir, { recursive: true });
+  const releaseLock = acquireContinuationLock(lockFile);
+  try {
+    const persisted = readPersistedContinuationRecords(file);
+    const records = canonicalContinuationRecords(persisted.values, { maxEntries, maxAgeMs, now: checkedAt, legacyTimestamp: persisted.legacyTimestamp });
+    if (!persistedStateMatches(persisted, records)) writeContinuationState(file, storeDir, records);
+    const record = records.find((candidate) => candidate.runId === runId && candidate.deliveryId === deliveryId);
+    return record?.state === "pending"
+      && claimantMatches(record, { claimantPid, claimantId, claimantProcessStart })
+      && claimantIsActive(record, Date.parse(checkedAt));
+  } finally {
+    releaseLock();
+  }
+}
+
+/** Relinquish one exact pending claim without disturbing this runtime's other deliveries. */
+export function relinquishContinuationClaim(runId, options = {}) {
+  const { changed, runs } = updateExactPendingClaim(runId, options, false);
+  return { relinquished: changed, runs };
+}
+
+/** Remove a permanently ineligible pending record, never another runtime's delivery. */
+export function discardPendingContinuation(runId, options = {}) {
+  const { changed, runs } = updateExactPendingClaim(runId, options, true);
+  return { discarded: changed, runs };
+}
+
+function updateExactPendingClaim(runId, { storeDir, deliveryId, claimantId, claimantPid = process.pid, claimantProcessStart = currentProcessStartIdentity(), maxEntries = DEFAULT_CONTINUATION_LIMIT, maxAgeMs = DEFAULT_CONTINUATION_RETENTION_MS, now } = {}, discard) {
+  if (!isRunId(runId) || !isRunId(deliveryId) || !isRunId(claimantId)) throw new Error("runId, deliveryId, and claimantId are required for an exact pending-claim update");
+  const file = continuedRunsFile(storeDir);
+  const lockFile = `${file}.lock`;
+  mkdirSync(storeDir, { recursive: true });
+  const releaseLock = acquireContinuationLock(lockFile);
+  try {
+    const persisted = readPersistedContinuationRecords(file);
+    let records = canonicalContinuationRecords(persisted.values, { maxEntries, maxAgeMs, now, legacyTimestamp: persisted.legacyTimestamp });
+    const record = records.find((candidate) => candidate.runId === runId);
+    const expectedClaimant = { claimantPid, claimantId, claimantProcessStart };
+    const changed = Boolean(record?.state === "pending"
+      && record.deliveryId === deliveryId
+      && (claimantMatches(record, expectedClaimant)
+        || (discard && (claimIsUnowned(record) || !claimantIsActive(record, Date.parse(continuationNow(now)))))));
+    if (changed) {
+      if (discard) records = records.filter((candidate) => candidate !== record);
+      else clearClaimant(record);
+    }
+    records = pruneContinuationRecords(records, maxEntries);
+    if (changed || !persistedStateMatches(persisted, records)) writeContinuationState(file, storeDir, records);
+    return { changed, runs: continuationRecordSet(records) };
   } finally {
     releaseLock();
   }
@@ -579,9 +646,9 @@ function claimantMatches(record, claimant) {
   return true;
 }
 
-function claimantIsActive(record) {
+function claimantIsActive(record, nowMs = Date.now()) {
   if (!record.claimantPid || !isProcessAlive(record.claimantPid)) return false;
-  if (record.claimantLeaseUntil && Date.parse(record.claimantLeaseUntil) <= Date.now()) return false;
+  if (record.claimantLeaseUntil && Date.parse(record.claimantLeaseUntil) <= nowMs) return false;
   if (!record.claimantProcessStart) return true;
   const actualStart = processStartIdentity(record.claimantPid);
   // Cross-platform fallback is lease-bounded: a platform that cannot expose

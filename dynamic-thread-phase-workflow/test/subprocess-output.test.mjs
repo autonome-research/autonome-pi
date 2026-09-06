@@ -122,45 +122,80 @@ test("runBoundedProcess terminates the child when a stream observer throws", asy
   assert.ok(result.signal === "SIGTERM" || result.signal === "SIGKILL");
 });
 
-test("runBoundedProcess reaps the child when onChildStart throws", async () => {
+test("runBoundedProcess reaps the child when onChildStart throws without reporting no-child proof", async () => {
+  let noChildProofs = 0;
   const result = await runBoundedProcess(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
     timeoutMs: 5_000,
     killGraceMs: 100,
+    onNoChild: () => { noChildProofs++; },
     onChildStart: () => { throw new Error("start hook failed"); },
   });
   assert.equal(result.ok, false);
   assert.equal(result.error, "start hook failed");
   assert.equal(result.termination.kind, "callback_error");
   assert.ok(result.signal === "SIGTERM" || result.signal === "SIGKILL");
+  assert.equal(noChildProofs, 0);
 });
 
-test("runBoundedProcess returns immediately for a pre-aborted workflow", async () => {
+test("runBoundedProcess reports positive no-child proof for a pre-aborted workflow", async () => {
   const controller = new AbortController();
+  let noChildProofs = 0;
   controller.abort("already cancelled");
   const result = await runBoundedProcess(process.execPath, ["-e", "process.exit(99)"], {
     timeoutMs: 5_000,
     signal: controller.signal,
+    onNoChild: () => { noChildProofs++; },
   });
   assert.equal(result.aborted, true);
   assert.equal(result.code, null);
   assert.equal(result.error, "already cancelled");
+  assert.equal(noChildProofs, 1);
 });
 
-test("runBoundedProcess reports spawn failures without hanging", async () => {
-  const result = await runBoundedProcess("definitely-not-a-real-dynamic-workflow-command", [], { timeoutMs: 5_000 });
-  assert.equal(result.ok, false);
-  assert.equal(result.code, 1);
-  assert.match(result.error, /ENOENT/);
+test("runBoundedProcess reports positive no-child proof for pre-spawn validation failure", async () => {
+  let noChildProofs = 0;
+  await assert.rejects(
+    runBoundedProcess(process.execPath, [], { timeoutMs: 0, onNoChild: () => { noChildProofs++; } }),
+    /process timeoutMs must be an integer/,
+  );
+  assert.equal(noChildProofs, 1);
 });
 
-test("runBoundedProcess resolves synchronous or emitted spawn setup failures consistently", async () => {
-  const result = await runBoundedProcess(process.execPath, ["-e", "process.exit(0)"], {
-    cwd: "/definitely/not/a/real/dynamic-workflow-directory",
+test("runBoundedProcess reports positive no-child proof for emitted ENOENT without a PID", async () => {
+  let noChildProofs = 0;
+  const result = await runBoundedProcess("definitely-not-a-real-dynamic-workflow-command", [], {
     timeoutMs: 5_000,
+    onNoChild: () => { noChildProofs++; },
   });
   assert.equal(result.ok, false);
   assert.equal(result.code, 1);
   assert.match(result.error, /ENOENT/);
+  assert.equal(noChildProofs, 1);
+});
+
+test("runBoundedProcess reports positive no-child proof for synchronous spawn setup failure", async () => {
+  let noChildProofs = 0;
+  const result = await runBoundedProcess(null, [], {
+    timeoutMs: 5_000,
+    onNoChild: () => { noChildProofs++; },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 1);
+  assert.match(result.error, /(?:command|file).*type string|invalid.*type/i);
+  assert.equal(noChildProofs, 1);
+});
+
+test("runBoundedProcess resolves emitted spawn setup failures consistently", async () => {
+  let noChildProofs = 0;
+  const result = await runBoundedProcess(process.execPath, ["-e", "process.exit(0)"], {
+    cwd: "/definitely/not/a/real/dynamic-workflow-directory",
+    timeoutMs: 5_000,
+    onNoChild: () => { noChildProofs++; },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 1);
+  assert.match(result.error, /ENOENT/);
+  assert.equal(noChildProofs, 1);
 });
 
 test("runBoundedProcess preserves workflow cancellation separately from timeout", async () => {

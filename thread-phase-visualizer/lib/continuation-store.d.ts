@@ -38,10 +38,13 @@ export type ContinuationRecord = {
   claimantLeaseUntil?: string;
 };
 
-export function shouldAutoContinue(run: {
+export type ContinuationRun = {
+  runId?: string;
   normalizedStatus?: string;
-  metadata?: { autoContinue?: boolean | string };
-} | undefined): boolean;
+  metadata?: { autoContinue?: boolean | string; continuationMode?: string };
+};
+export function shouldAutoContinue(run: ContinuationRun | undefined): boolean;
+export function continuationEligibility(run: ContinuationRun | undefined): "eligible" | "ineligible" | "unknown";
 export function continuedRunsFile(storeDir: string): string;
 export function pruneContinuedRuns(runs: Iterable<string> | Set<string>, maxEntries?: number): Set<string>;
 export function loadContinuedRuns(options: ContinuationStoreOptions): Set<string>;
@@ -58,6 +61,21 @@ export function persistContinuationClaim(runId: string, options: ContinuationCla
 };
 export function markContinuationDelivered(runId: string, options: ContinuationStoreOptions & { deliveryId?: string }): {
   delivered: boolean;
+  runs: Set<string>;
+};
+export type ContinuationClaimIdentityOptions = ContinuationStoreOptions & {
+  deliveryId: string;
+  claimantId: string;
+  claimantPid?: number;
+  claimantProcessStart?: string;
+};
+export function continuationClaimIsOwned(runId: string, options: ContinuationClaimIdentityOptions & { deliveryId: string; claimantId: string }): boolean;
+export function discardPendingContinuation(runId: string, options: ContinuationClaimIdentityOptions): {
+  discarded: boolean;
+  runs: Set<string>;
+};
+export function relinquishContinuationClaim(runId: string, options: ContinuationClaimIdentityOptions): {
+  relinquished: boolean;
   runs: Set<string>;
 };
 export function relinquishContinuationClaims(options: ContinuationStoreOptions & {

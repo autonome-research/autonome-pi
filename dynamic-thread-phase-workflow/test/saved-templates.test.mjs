@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import registerDynamicWorkflows from "../index.ts";
 
 function registeredTools() {
@@ -35,6 +36,27 @@ function executionContext(cwd) {
   return { cwd, sessionManager: {} };
 }
 
+async function waitForWorkflowEnd(store, runId, pid) {
+  const runFile = join(store, "runs", `${runId}.jsonl`);
+  const deadline = performance.now() + 10_000;
+  while (performance.now() < deadline) {
+    if (existsSync(runFile)) {
+      // The runner may still be appending: parse only complete JSONL records.
+      const events = readFileSync(runFile, "utf8").split("\n").slice(0, -1).filter(Boolean).map((line) => JSON.parse(line));
+      const terminal = events.find((event) => event.type === "workflow_end");
+      if (terminal) {
+        assert.equal(terminal.status, "success", JSON.stringify(terminal));
+        // workflow_end reaches the run log before the index append finishes.
+        // Let the owned test runner exit before cleanup removes its store.
+        try { process.kill(pid, 0); }
+        catch (error) { if (error.code === "ESRCH") return; else throw error; }
+      }
+    }
+    await delay(20);
+  }
+  assert.fail(`Background workflow ${runId} did not finish within 10 seconds`);
+}
+
 test("saved structured workflow executes by safe template name and records provenance", async () => {
   const testDir = mkdtempSync(join(tmpdir(), "dynamic-saved-structured-"));
   const env = withTemplateEnvironment(testDir);
@@ -55,7 +77,12 @@ test("saved structured workflow executes by safe template name and records prove
 
     assert.equal(result.details.ok, true);
     assert.equal(result.details.workflow, "saved-review-override");
+    assert.equal(result.details.ready, true);
+    assert.equal(result.details.background, true);
     const runId = result.details.runId;
+    // A background readiness acknowledgement is not a completion barrier.
+    // Wait before reading outputs or removing the runner's temporary store.
+    await waitForWorkflowEnd(env.store, runId, result.details.pid);
     const start = JSON.parse(readFileSync(join(env.store, "runs", `${runId}.start.json`), "utf8"));
     assert.equal(start.metadata.continuationMode, "terminal", "background workflows return success or failure to chat by default");
     const compiled = JSON.parse(readFileSync(join(env.store, "artifacts", runId, "workflow-spec.json"), "utf8"));
