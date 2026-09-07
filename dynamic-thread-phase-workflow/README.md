@@ -100,13 +100,12 @@ Or use an earlier phase's output as items:
   "type": "fanout",
   "name": "review-files",
   "itemsFrom": "find-files",
-  "label": "files",
   "failOnItemFailure": false,
   "prompt": "Review {{item}} (item {{index}})."
 }
 ```
 
-`itemsFrom` accepts an array directly. String output is parsed as a JSON array/object when possible, otherwise as non-empty lines with leading `-` or `*` bullets removed; numbered-list prefixes are preserved. `failOnItemFailure` defaults to true and fails only after all siblings settle. `label` customizes fanout progress events.
+`itemsFrom` accepts an array directly. String output is parsed as a JSON array/object when possible, otherwise as non-empty lines with leading `-` or `*` bullets removed; numbered-list prefixes are preserved. `failOnItemFailure` defaults to true and fails only after all siblings settle.
 
 Fanout is capped at 1,000 items and concurrency 64 in the public tool schema; operators may configure lower runtime limits.
 
@@ -132,7 +131,7 @@ Persist literal content or an earlier phase output:
 { "type": "artifact", "name": "report", "title": "Final report", "from": "review" }
 ```
 
-An artifact phase must provide exactly one of `content` or `from`.
+An artifact phase must provide exactly one of `content` or `from`. Generated artifact paths normally use the phase name; when distinct phase names normalize or truncate to the same filesystem name, the runner adds a deterministic strong digest so every output remains distinct. Fanout item artifacts always use collision-safe generated paths. A run-scoped filename registry also protects artifacts emitted by runtime-discovered harness phases and repeated emissions; ordinary unused paths remain unchanged. Explicit `fileName` values remain available only to the legacy v1 contract and retain their legacy path behavior.
 
 ## Composition
 
@@ -143,18 +142,18 @@ Phases are ordered. References must point to earlier phases.
 - `{{index}}` — current fanout index
 - `{{cwd}}` and `{{runId}}` — workflow context
 
-Retries are explicit and bounded:
+Attempts are explicit and bounded:
 
 ```json
 {
   "type": "agent",
   "name": "flaky-check",
   "prompt": "Run the bounded check.",
-  "retry": { "maxAttempts": 3, "baseDelayMs": 1000 }
+  "attempts": 3
 }
 ```
 
-Retries use exponential backoff (`baseDelayMs`, then double for each later retry) without jitter. Do not retry side-effecting work unless it is idempotent.
+`attempts` is an integer from 1 through 5 on executable phases. Retry delay uses deterministic internal exponential backoff; callers cannot tune it. Do not retry side-effecting work unless it is idempotent.
 
 ## Execution controls
 
@@ -164,10 +163,10 @@ Top-level controls:
 - `permissions` — inherited phase capability default
 - `model` — inherited agent model pattern
 - `timeoutMs` — inherited agent/shell timeout
-- `concurrency` — inherited fanout concurrency
 - `background` — detach after durable readiness and return `runId` + `pid`
 - `after` — terminal successful or failed parent run; this run becomes its single session-scoped successor
-- `metadata` — optional caller metadata retained in the compiled workflow input
+
+Fanout concurrency is phase-local. Caller descriptions, metadata, top-level concurrency, and retry-backoff controls are not part of the declarative contract.
 
 Use `background: true` for long workflows. Successful and failed background runs durably return control to the launching Pi chat. Failure continuations include failed phases, errors, checkpoints, and partial artifacts. User-cancelled runs never auto-continue and cannot launch a chained successor.
 
@@ -181,7 +180,6 @@ A structured template is a flat `dynamic_workflow` JSON object saved as `<name>.
 {
   "name": "repository-review",
   "permissions": "r",
-  "background": true,
   "phases": [
     { "type": "agent", "name": "review", "prompt": "Review {{inputs.target}} in the current repository. Do not modify files." },
     { "type": "artifact", "name": "report", "title": "Repository review", "from": "review" }
@@ -195,12 +193,11 @@ Invoke `~/.pi/agent/workflows/repository-review.json` with:
 {
   "template": "repository-review",
   "inputs": { "target": "src" },
-  "background": true,
-  "metadata": { "requestedBy": "operator" }
+  "background": true
 }
 ```
 
-Use exactly one of `template` or `phases`. `{{inputs.key}}` placeholders make structured templates reusable: an exact placeholder preserves the input's JSON type, while a placeholder embedded in text requires a scalar. Missing and unused inputs fail preflight to catch mistakes. Invocation-level workflow controls override template defaults; metadata is merged, and `metadata.savedTemplate` records the selected template. Phases cannot be replaced at invocation time. The normal schema, permission ceiling, semantic preflight, cancellation, and runtime bounds still apply after loading.
+Use exactly one of `template`, `phases`, or `resumeRunId`. `{{inputs.key}}` placeholders make structured templates reusable: an exact placeholder preserves the input's JSON type, while a placeholder embedded in text requires a scalar. Missing and unused inputs fail preflight to catch mistakes. Invocation-level workflow defaults override template defaults, including `background` (`false` explicitly overrides a saved `true`). Templates define the phases; invocations cannot replace them. `after` and `resumeRunId` are invocation-only controls and cannot be embedded in templates. Saved-template provenance is persisted as trusted checkpoint data rather than caller metadata. The normal schema, permission ceiling, semantic preflight, cancellation, and runtime bounds still apply after loading.
 
 A saved advanced harness is a self-contained `<name>.mjs` file in the same directory. Invoke it through the separate harness tool:
 
@@ -262,11 +259,11 @@ Prefer `dynamic_workflow` for normal composition. Reusable or operationally impo
 
 ## Compatibility
 
-The deprecated `dynamic_thread_phase_workflow` tool remains registered for old `{ spec: ... }` and harness calls but is inactive by default. Set `PI_DYNAMIC_WORKFLOW_ENABLE_LEGACY_ALIAS=1` only when an old session must call it. The canonical tool's `prepareArguments` upgrades ordinary legacy nested structured calls, metadata, fanout labels, old `pi`/`fanout_pi` phase names, and `timeout` to `timeoutMs`. Conflicting duplicate defaults fail clearly.
+The deprecated `dynamic_thread_phase_workflow` tool remains registered for old `{ spec: ... }` and harness calls but is inactive by default. Set `PI_DYNAMIC_WORKFLOW_ENABLE_LEGACY_ALIAS=1` only when an old session must call it. The canonical tool's `prepareArguments` upgrades phase names and timeout only when the result fits the reduced contract; removed fields fail clearly rather than leaking into v2.
 
-Legacy per-phase output-artifact configuration and control fields on artifact phases cannot be represented by the simplified schema. Convert them to an explicit `artifact` phase, or temporarily use the enabled legacy alias; argument preparation reports this case rather than silently dropping behavior.
+The compiled runner contract is `pi-dynamic-workflow/v2`. Exact v1 decoding remains available only for trusted `pi-dynamic-workflow-checkpoint/v1` resume artifacts, explicit `pi-dynamic-workflow/v1` specs, and the legacy alias. Legacy fingerprints are computed from their original normalized v1 spec and are never rewritten as v2.
 
-The runner CLI accepts both the new `agent`/`fanout` spec names and the old `pi`/`fanout_pi` names:
+The runner CLI accepts both the public `agent`/`fanout` names and compiled `pi`/`fanout_pi` names:
 
 ```bash
 ~/.pi/agent/extensions/dynamic-thread-phase-workflow/bin/dynamic-workflow.mjs --spec-file workflow.json

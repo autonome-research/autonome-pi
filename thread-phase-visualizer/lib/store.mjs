@@ -7,7 +7,7 @@ import { canonicalCwd } from "./session-scope.mjs";
 export const SCHEMA_VERSION = "thread-phase-ui/v1";
 // Bump when the projected summary shape changes (nested artifacts / traces) so a
 // monitor can surface whether the loaded store is current.
-export const STORE_BUILD = "3-artifacts-traces";
+export const STORE_BUILD = "4-terminal-projection";
 export const EVENT_TYPES = Object.freeze({
   WORKFLOW_START: "workflow_start",
   WORKFLOW_END: "workflow_end",
@@ -1034,23 +1034,18 @@ function artifactIdentity(artifact) {
 }
 
 function dedupeArtifacts(artifacts = []) {
-  const byKey = new Map();
+  const seen = new Set();
   const out = [];
-  for (const artifact of artifacts) {
+  // Scan backwards to retain each keyed artifact's last occurrence in O(n),
+  // while preserving every inline-only artifact and the final event order.
+  for (let index = artifacts.length - 1; index >= 0; index--) {
+    const artifact = artifacts[index];
     const key = artifactIdentity(artifact);
-    if (!key) {
-      out.push(artifact);
-      continue;
-    }
-    if (byKey.has(key)) {
-      const existingIndex = byKey.get(key);
-      out.splice(existingIndex, 1);
-      for (const [otherKey, index] of byKey.entries()) if (index > existingIndex) byKey.set(otherKey, index - 1);
-    }
-    byKey.set(key, out.length);
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
     out.push(artifact);
   }
-  return out;
+  return out.reverse();
 }
 
 function closeOpenPhasesForTerminalRun(summary, sawWorkflowEnd = false) {
@@ -1058,7 +1053,7 @@ function closeOpenPhasesForTerminalRun(summary, sawWorkflowEnd = false) {
   const terminal = summary.normalizedStatus || STATUSES.UNKNOWN;
   for (const phase of Object.values(summary.phaseMap || {})) {
     if (phase.normalizedStatus !== STATUSES.RUNNING || phase.endedAt) continue;
-    phase.status = terminal;
+    phase.status = summary.status ?? terminal;
     phase.normalizedStatus = terminal;
     phase.endedAt = summary.endedAt || summary.updatedAt;
   }
@@ -1274,7 +1269,7 @@ function compactOwnerMetadata(metadata) {
     "sessionId", "sessionFile", "launchSource", "source", "cwdAtLaunch", "cwd",
     "pid", "ppid", "hostname", "cancellable", "cancelSignal", "autoContinue", "continuationMode",
     "dynamic", "mode", "permissions", "maxPermissions", "chainId", "rootRunId", "parentRunId", "chainStep",
-    "resumedFromRunId", "resumedPhaseCount", "processJournalVersion",
+    "resumedFromRunId", "resumedPhaseCount", "processJournalVersion", "savedTemplate",
   ]) {
     const value = metadata[key];
     if (["string", "number", "boolean"].includes(typeof value)) compact[key] = value;

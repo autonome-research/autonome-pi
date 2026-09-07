@@ -183,7 +183,7 @@ try {
   expectExit('harness safely persists BigInt and circular partial results', ['node', cli, '--js-file', circularHarness, '--cwd', root, '--name', 'circular-harness', '--permissions', 'rwx'], 0);
 
   const shellSpec = join(tmp, 'shell-spec.json');
-  writeFileSync(shellSpec, JSON.stringify({ name: 'shell-smoke', permissions: 'rwx', phases: [{ type: 'shell', name: 'hello', command: 'printf hello', artifact: true }] }, null, 2));
+  writeFileSync(shellSpec, JSON.stringify({ name: 'shell-smoke', permissions: 'rwx', phases: [{ type: 'shell', name: 'hello', command: 'printf hello' }, { type: 'artifact', name: 'report', from: 'hello' }] }, null, 2));
   expectExit('structured shell workflow succeeds', ['node', cli, '--spec-file', shellSpec, '--cwd', root], 0);
   expectExit('dynamic CLI rejects timeout outside policy', ['node', cli, '--spec-file', shellSpec, '--cwd', root, '--timeout', '-1'], 1);
   expectExit('dynamic CLI rejects malformed environment resource policy', ['node', cli, '--spec-file', shellSpec, '--cwd', root], 1, { env: { PI_DYNAMIC_WORKFLOW_MAX_CONCURRENCY: 'NaN' } });
@@ -219,8 +219,8 @@ try {
 
   const retryMarker = join(tmp, 'dynamic-retry-marker');
   const retrySpec = join(tmp, 'retry-spec.json');
-  writeFileSync(retrySpec, JSON.stringify({ name: 'retry-smoke', permissions: 'rwx', phases: [{ type: 'shell', name: 'flaky', command: `if [ ! -f ${JSON.stringify(retryMarker)} ]; then touch ${JSON.stringify(retryMarker)}; exit 1; else printf recovered; fi`, retry: { maxAttempts: 2, baseDelayMs: 0 } }] }, null, 2));
-  expectExit('dynamic structured retry policy recovers an explicitly retryable phase', ['node', cli, '--spec-file', retrySpec, '--cwd', root], 0);
+  writeFileSync(retrySpec, JSON.stringify({ name: 'retry-smoke', permissions: 'rwx', phases: [{ type: 'shell', name: 'flaky', command: `if [ ! -f ${JSON.stringify(retryMarker)} ]; then touch ${JSON.stringify(retryMarker)}; exit 1; else printf recovered; fi`, attempts: 2 }] }, null, 2));
+  expectExit('dynamic structured attempts policy recovers an explicitly retryable phase', ['node', cli, '--spec-file', retrySpec, '--cwd', root], 0);
 
   const fakePiMultipart = join(tmp, 'fake-pi-multipart.mjs');
   writeFileSync(fakePiMultipart, `#!/usr/bin/env node\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-multipart', content: [{ type: 'text', text: 'intermediate-ignored' }] } }));\nconsole.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', model: 'fake-multipart', usage: { input: 2, output: 2, totalTokens: 4 }, content: [{ type: 'text', text: 'alpha' }, { type: 'text', text: 'beta' }] } }));\n`);

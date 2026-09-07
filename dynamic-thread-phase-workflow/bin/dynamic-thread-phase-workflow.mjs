@@ -51,6 +51,8 @@ const MAX_SPEC_BYTES = 1_000_000;
 const MAX_RESUME_MANIFEST_BYTES = 1_000_000;
 const MAX_RESUME_OUTPUT_BYTES = 4_000_000;
 const RESUME_RUN_ID = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$/;
+const SAVED_TEMPLATE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+const V2_PERMISSIONS = new Set(["r", "w", "rw", "rwx"]);
 const CHAIN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_CHAIN_RUNS = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_CHAIN_RUNS || 20);
 const DEFAULT_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_WORKFLOW_DEFAULT_PERMISSIONS || process.env.PI_DYNAMIC_THREAD_PHASE_DEFAULT_PERMISSIONS || "r", "PI_DYNAMIC_WORKFLOW_DEFAULT_PERMISSIONS");
@@ -164,9 +166,9 @@ function validateName(name, label) {
   if (!/^[a-zA-Z0-9_.:-]+$/.test(name)) throw new Error(`${label}.name may only contain letters, numbers, _, ., :, and -`);
 }
 
-function normalizePublicSpec(spec) {
+function normalizePublicSpec(spec, legacy) {
   if (!spec || typeof spec !== "object" || Array.isArray(spec) || !Array.isArray(spec.phases)) return spec;
-  return {
+  const normalized = {
     ...spec,
     phases: spec.phases.map((phase) => {
       if (!phase || typeof phase !== "object" || Array.isArray(phase)) return phase;
@@ -178,22 +180,33 @@ function normalizePublicSpec(spec) {
       return phase;
     }),
   };
+  if (!legacy && normalized.schema === undefined) normalized.schema = "pi-dynamic-workflow/v2";
+  return normalized;
 }
 
-function validateSpec(input) {
-  const spec = normalizePublicSpec(input);
-  if (!spec || typeof spec !== "object" || Array.isArray(spec)) throw new Error("spec must be an object");
-  const workflowKeys = new Set(["schema", "name", "description", "phases", "permissions", "cwd", "model", "timeoutMs", "concurrency", "autoContinue", "metadata"]);
+function validateSpec(input, options = {}) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("spec must be an object");
+  const legacy = options.legacy === true || (options.legacy === undefined && input.schema === "pi-dynamic-workflow/v1");
+  const spec = normalizePublicSpec(input, legacy);
+  const workflowKeys = legacy
+    ? new Set(["schema", "name", "description", "phases", "permissions", "cwd", "model", "timeoutMs", "concurrency", "autoContinue", "metadata"])
+    : new Set(["schema", "name", "phases", "permissions", "cwd", "model", "timeoutMs"]);
   rejectUnknownKeys(spec, workflowKeys, "spec");
-  if (spec.schema !== undefined && spec.schema !== "pi-dynamic-workflow/v1") throw new Error(`unsupported spec.schema: ${spec.schema}`);
+  const expectedSchema = legacy ? "pi-dynamic-workflow/v1" : "pi-dynamic-workflow/v2";
+  if (spec.schema !== undefined && spec.schema !== expectedSchema) throw new Error(`unsupported spec.schema: ${spec.schema}`);
   if (spec.name !== undefined) validateName(spec.name, "spec");
+  if (!legacy) {
+    validateOptionalString(spec.cwd, "spec.cwd", true);
+    validateOptionalString(spec.model, "spec.model");
+  }
   if (!Array.isArray(spec.phases) || spec.phases.length === 0) throw new Error("spec.phases must be a non-empty array");
   if (spec.phases.length > 30) throw new Error("spec.phases is capped at 30 phases");
   if (spec.permissions !== undefined) {
+    if (!legacy) validateV2Permissions(spec.permissions, "spec.permissions");
     const permissions = normalizePermissions(spec.permissions, "spec.permissions");
     assertWithinMaxPermissions(permissions, "spec.permissions");
   }
-  validatePositiveInteger(spec.concurrency, "spec.concurrency", MAX_FANOUT_CONCURRENCY);
+  if (legacy) validatePositiveInteger(spec.concurrency, "spec.concurrency", MAX_FANOUT_CONCURRENCY);
   validateTimeout(spec.timeoutMs, "spec.timeoutMs");
 
   const seen = new Set();
@@ -204,17 +217,26 @@ function validateSpec(input) {
     if (seen.has(phase.name)) throw new Error(`duplicate phase name: ${phase.name}`);
     if (!["shell", "pi", "fanout_pi", "artifact"].includes(phase.type)) throw new Error(`unsupported phase type for ${phase.name}: ${phase.type}`);
 
-    const common = ["type", "name", "description", "permissions", "timeoutMs", "artifact", "retry"];
-    const typeKeys = {
+    const common = legacy
+      ? ["type", "name", "description", "permissions", "timeoutMs", "artifact", "retry"]
+      : phase.type === "artifact" ? ["type", "name"] : ["type", "name", "permissions", "timeoutMs", "attempts"];
+    const typeKeys = legacy ? {
       shell: ["command"],
       pi: ["prompt", "tools", "model"],
       fanout_pi: ["promptTemplate", "items", "itemsFrom", "concurrency", "label", "tools", "model", "failOnItemFailure"],
       artifact: ["content", "from", "title", "fileName", "kind"],
+    }[phase.type] : {
+      shell: ["command"],
+      pi: ["prompt", "tools", "model"],
+      fanout_pi: ["promptTemplate", "items", "itemsFrom", "concurrency", "tools", "model", "failOnItemFailure"],
+      artifact: ["content", "from", "title"],
     }[phase.type];
     rejectUnknownKeys(phase, new Set([...common, ...typeKeys]), `phase ${phase.name}`);
     validateTimeout(phase.timeoutMs, `${phase.name}.timeoutMs`);
-    validateRetry(phase.retry, phase.name);
+    if (legacy) validateRetry(phase.retry, phase.name);
+    else if (phase.type !== "artifact") validatePositiveInteger(phase.attempts, `${phase.name}.attempts`, 5);
 
+    if (!legacy && phase.permissions !== undefined) validateV2Permissions(phase.permissions, `${phase.name}.permissions`);
     const effectivePermissions = normalizePermissions(phase.permissions ?? spec.permissions ?? DEFAULT_PERMISSIONS, `${phase.name}.permissions`);
     assertWithinMaxPermissions(effectivePermissions, `${phase.name}.permissions`);
 
@@ -225,6 +247,7 @@ function validateSpec(input) {
     }
     if (phase.type === "pi") {
       requireNonEmptyString(phase.prompt, `${phase.name}.prompt`);
+      if (!legacy) validateOptionalString(phase.model, `${phase.name}.model`);
       normalizePiTools(phase.tools, effectivePermissions, phase.name);
       validateTemplateReferences(phase.prompt, seen, `${phase.name}.prompt`);
     }
@@ -236,11 +259,15 @@ function validateSpec(input) {
       if (hasItems) {
         if (!Array.isArray(phase.items) || phase.items.length === 0) throw new Error(`${phase.name}.items must be a non-empty array`);
         if (phase.items.length > MAX_FANOUT_ITEMS) throw new Error(`${phase.name}.items is capped at ${MAX_FANOUT_ITEMS} items`);
-        if (!phase.items.every((item) => ["string", "number", "boolean"].includes(typeof item))) throw new Error(`${phase.name}.items may contain only strings, numbers, or booleans`);
+        if (!phase.items.every((item) => typeof item === "string" || typeof item === "boolean" || (typeof item === "number" && (legacy || Number.isFinite(item))))) throw new Error(`${phase.name}.items may contain only strings, finite numbers, or booleans`);
       } else {
         requirePriorPhase(phase.itemsFrom, seen, `${phase.name}.itemsFrom`);
       }
       if (phase.concurrency !== undefined) validatePositiveInteger(phase.concurrency, `${phase.name}.concurrency`, MAX_FANOUT_CONCURRENCY);
+      if (!legacy) {
+        validateOptionalString(phase.model, `${phase.name}.model`);
+        if (phase.failOnItemFailure !== undefined && typeof phase.failOnItemFailure !== "boolean") throw new Error(`${phase.name}.failOnItemFailure must be a boolean`);
+      }
       normalizePiTools(phase.tools, effectivePermissions, phase.name);
       validateTemplateReferences(phase.promptTemplate, seen, `${phase.name}.promptTemplate`);
     }
@@ -251,11 +278,12 @@ function validateSpec(input) {
       if (hasContent && typeof phase.content !== "string") throw new Error(`${phase.name}.content must be a string`);
       if (hasFrom) requirePriorPhase(phase.from, seen, `${phase.name}.from`);
       if (hasContent) validateTemplateReferences(phase.content, seen, `${phase.name}.content`);
-      for (const field of ["title", "fileName"]) {
+      for (const field of legacy ? ["title", "fileName"] : ["title"]) {
+        if (!legacy && phase[field] !== undefined && typeof phase[field] !== "string") throw new Error(`${phase.name}.${field} must be a string`);
         if (typeof phase[field] === "string") validateTemplateReferences(phase[field], seen, `${phase.name}.${field}`);
       }
     }
-    validateArtifactSpec(phase.artifact, phase.name);
+    if (legacy) validateArtifactSpec(phase.artifact, phase.name);
     seen.add(phase.name);
   }
   return spec;
@@ -268,6 +296,15 @@ function rejectUnknownKeys(value, allowed, label) {
 
 function requireNonEmptyString(value, label) {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must be a non-empty string`);
+}
+
+function validateOptionalString(value, label, nonEmpty = false) {
+  if (value === undefined) return;
+  if (typeof value !== "string" || (nonEmpty && !value.trim())) throw new Error(`${label} must be ${nonEmpty ? "a non-empty" : "a"} string`);
+}
+
+function validateV2Permissions(value, label) {
+  if (typeof value !== "string" || !V2_PERMISSIONS.has(value)) throw new Error(`${label} must be one of r, w, rw, or rwx`);
 }
 
 function validatePositiveInteger(value, label, max) {
@@ -365,6 +402,22 @@ function isTruthyFlag(value) {
 
 function isBooleanLiteral(value) {
   return ["1", "0", "true", "false", "yes", "no", "on", "off"].includes(String(value || "").trim().toLowerCase());
+}
+
+function validateCliBooleanFlag(value, label) {
+  if (value !== undefined && value !== true && !isBooleanLiteral(value)) throw new Error(`${label} must be a boolean flag`);
+}
+
+function validateCliString(value, label, { nonEmpty = true } = {}) {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || (nonEmpty && !value.trim())) throw new Error(`${label} must have a${nonEmpty ? " non-empty" : ""} string value`);
+  return value;
+}
+
+function validateSavedTemplateName(value, label = "savedTemplate") {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !SAVED_TEMPLATE_NAME.test(value)) throw new Error(`${label} must be a safe saved-template name`);
+  return value;
 }
 
 function stripBackgroundArgs(argv) {
@@ -562,6 +615,27 @@ async function runPi({ cwd, prompt, model, tools, timeoutMs, signal, onUsage, on
   return { ...result, ...parsed, ok: result.ok && Boolean(parsed.text), error: result.ok && parsed.text ? undefined : result.error || "pi produced no assistant text" };
 }
 
+function generatedArtifactFileName(ctx, identity, kind = "markdown", collisionIdentity) {
+  const extension = kind === "json" ? "json" : "md";
+  const candidate = safeName(`${identity}.${extension}`);
+  const candidates = asArray(ctx.spec?.phases)
+    .filter(Boolean).map((phase) => safeName(`${phase.name}.${extension}`));
+  const allocated = ctx.artifactFileNames ??= new Set();
+  const collides = allocated.has(candidate) || collisionIdentity !== undefined || candidates.filter((name) => name === candidate).length > 1;
+  if (!collides) return `${identity}.${extension}`;
+  const stem = safeName(identity).slice(0, 56);
+  const reserved = new Set([...candidates, ...allocated]);
+  // Keep ordinary paths stable, but never let a generated digest path shadow
+  // another phase's ordinary filename. Salt deterministically when necessary.
+  // Fanout supplies a structured identity so concatenated labels cannot alias.
+  const digestIdentity = collisionIdentity ?? String(identity);
+  for (let salt = 0; ; salt++) {
+    const digest = createHash("sha256").update(salt ? `${digestIdentity}\0${salt}` : digestIdentity).digest("hex").slice(0, 24);
+    const fileName = `${stem}-${digest}.${extension}`;
+    if (!reserved.has(fileName)) return fileName;
+  }
+}
+
 function makeArtifactPath(ctx, phaseName, fileName) {
   const dir = join(ARTIFACTS_DIR, ctx.visualizerRun.runId);
   mkdirSync(dir, { recursive: true });
@@ -663,17 +737,28 @@ function hashText(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function persistedSpecOptions(manifest) {
+  if (manifest?.schema === "pi-dynamic-workflow-checkpoint/v1") return { legacy: true };
+  if (manifest?.schema === "pi-dynamic-workflow-checkpoint/v2") return { legacy: false };
+  throw new Error("Resume checkpoint has an unsupported schema");
+}
+
 function loadResumeInvocation(runId, sessionId) {
   const sourceDir = resumeRunDirectory(runId);
   const manifest = parseBoundedJson(join(sourceDir, "workflow-checkpoint.json"), MAX_RESUME_MANIFEST_BYTES, "workflow resume checkpoint");
-  if (manifest?.schema !== "pi-dynamic-workflow-checkpoint/v1" || manifest.runId !== runId) throw new Error("Resume checkpoint identity is invalid");
+  const specOptions = persistedSpecOptions(manifest);
+  if (manifest.runId !== runId) throw new Error("Resume checkpoint identity is invalid");
   const requestedSessionId = sessionId ? String(sessionId) : undefined;
   if ((manifest.sessionId || requestedSessionId) && manifest.sessionId !== requestedSessionId) throw new Error("Resume checkpoint belongs to a different Pi session");
   if (typeof manifest.cwd !== "string" || !manifest.cwd || !existsSync(manifest.cwd) || !statSync(manifest.cwd).isDirectory() || realpathSync(manifest.cwd) !== manifest.cwd) {
     throw new Error("Resume checkpoint cwd is no longer an authoritative real directory");
   }
-  const spec = validateSpec(parseBoundedJson(join(sourceDir, "workflow-spec.json"), MAX_RESUME_MANIFEST_BYTES, "resume source workflow spec"));
-  return { spec, cwd: manifest.cwd, model: manifest.model };
+  const spec = validateSpec(parseBoundedJson(join(sourceDir, "workflow-spec.json"), MAX_RESUME_MANIFEST_BYTES, "resume source workflow spec"), specOptions);
+  if (!specOptions.legacy) validateOptionalString(manifest.model, "Resume checkpoint model");
+  const savedTemplate = specOptions.legacy
+    ? manifest.savedTemplate ?? spec.metadata?.savedTemplate
+    : validateSavedTemplateName(manifest.savedTemplate, "Resume checkpoint savedTemplate");
+  return { spec, cwd: manifest.cwd, model: manifest.model, savedTemplate };
 }
 
 function loadResumeState(runId, { spec, cwd, model, sessionId }) {
@@ -716,7 +801,7 @@ function loadResumeState(runId, { spec, cwd, model, sessionId }) {
     assertProcessGroupsStopped(sourceDir, runId, sourceSummary.metadata?.pid);
   }
   const manifest = parseBoundedJson(join(sourceDir, "workflow-checkpoint.json"), MAX_RESUME_MANIFEST_BYTES, "workflow resume checkpoint");
-  if (manifest?.schema !== "pi-dynamic-workflow-checkpoint/v1") throw new Error("Resume checkpoint has an unsupported schema");
+  const specOptions = persistedSpecOptions(manifest);
   if (manifest.runId !== runId) throw new Error("Resume checkpoint runId does not match its artifact directory");
   if (manifest.cwd !== realpathSync(cwd)) throw new Error(`Resume checkpoint cwd does not match this invocation: ${manifest.cwd || "unknown"}`);
   const normalizedSessionId = sessionId ? String(sessionId) : undefined;
@@ -724,7 +809,18 @@ function loadResumeState(runId, { spec, cwd, model, sessionId }) {
   const ownerSessionId = sourceSummary.metadata?.sessionId ? String(sourceSummary.metadata.sessionId) : undefined;
   if ((ownerSessionId || manifest.sessionId) && ownerSessionId !== manifest.sessionId) throw new Error("Resume checkpoint does not match the authoritative source session owner");
   if (sourceSummary.cwd !== manifest.cwd) throw new Error("Resume checkpoint does not match the authoritative source cwd owner");
-  const sourceSpec = validateSpec(parseBoundedJson(join(sourceDir, "workflow-spec.json"), MAX_RESUME_MANIFEST_BYTES, "resume source workflow spec"));
+  const sourceSpec = validateSpec(parseBoundedJson(join(sourceDir, "workflow-spec.json"), MAX_RESUME_MANIFEST_BYTES, "resume source workflow spec"), specOptions);
+  let savedTemplate;
+  if (specOptions.legacy) {
+    // Preserve the v1 decoder and its historical spec.metadata provenance.
+    savedTemplate = manifest.savedTemplate ?? sourceSpec.metadata?.savedTemplate;
+  } else {
+    validateOptionalString(manifest.model, "Resume checkpoint model");
+    const checkpointTemplate = validateSavedTemplateName(manifest.savedTemplate, "Resume checkpoint savedTemplate");
+    const ownerTemplate = validateSavedTemplateName(sourceSummary.metadata?.savedTemplate, "Authoritative workflow_start savedTemplate");
+    if (checkpointTemplate !== ownerTemplate) throw new Error("Resume checkpoint savedTemplate does not match authoritative workflow_start provenance");
+    savedTemplate = checkpointTemplate;
+  }
   const sourceFingerprint = workflowFingerprint(sourceSpec, cwd, manifest.model);
   const requestedFingerprint = workflowFingerprint(spec, cwd, model);
   if (manifest.specHash !== sourceFingerprint || requestedFingerprint !== sourceFingerprint) throw new Error("Resume checkpoint does not match the requested structured workflow spec, cwd, and model");
@@ -753,7 +849,7 @@ function loadResumeState(runId, { spec, cwd, model, sessionId }) {
     if (Buffer.byteLength(output, "utf8") !== entry.outputBytes || hashText(output) !== entry.outputSha256) throw new Error(`Resume output for phase ${phase.name} failed integrity validation`);
     return { ...entry, output };
   });
-  return { sourceRunId: runId, entries, specHash: sourceFingerprint, chainId: manifest.chainId, rootRunId: manifest.rootRunId, chainStep: manifest.chainStep };
+  return { sourceRunId: runId, entries, specHash: sourceFingerprint, chainId: manifest.chainId, rootRunId: manifest.rootRunId, chainStep: manifest.chainStep, savedTemplate };
 }
 
 function loadParentChain(runId, sessionId) {
@@ -857,9 +953,15 @@ function emitTextArtifact(ctx, phase, content, defaults = {}, metadata = {}) {
   const spec = artifactSpec && typeof artifactSpec === "object" ? artifactSpec : {};
   const kind = spec.kind || defaults.kind || "markdown";
   const title = renderTemplate(spec.title || defaults.title || phase.name, ctx);
-  const fileName = renderTemplate(spec.fileName || defaults.fileName || `${phase.name}.${kind === "json" ? "json" : "md"}`, ctx);
+  const configuredFileName = spec.fileName || defaults.fileName;
+  const fileName = configuredFileName
+    ? renderTemplate(configuredFileName, ctx)
+    : generatedArtifactFileName(ctx, defaults.identity || phase.name, kind, defaults.collisionIdentity);
   const path = makeArtifactPath(ctx, phase.name, fileName);
   writeFileSync(path, content, "utf8");
+  // Harness phases are discovered at runtime. Reserve actual filenames across
+  // all emitters so future generated paths cannot overwrite earlier artifacts.
+  (ctx.artifactFileNames ??= new Set()).add(basename(path));
   artifact(ctx.visualizerRun, { kind, title, path, metadata: { phase: phase.name, type: phase.type, ...metadata } });
   return path;
 }
@@ -926,7 +1028,7 @@ async function* runPiPhase(ctx, phase) {
   if (result.aborted) throw abortError(result.error || "cancelled");
   ctx.outputs[phase.name] = compactText(result.text || "");
   ctx.results[phase.name] = { ok: result.ok, model: result.model, stopReason: result.stopReason, code: result.code, signal: result.signal, timedOut: result.timedOut, durationMs: result.durationMs, termination: result.termination, error: result.error, piJson: result.piJson };
-  emitTextArtifact(ctx, phase, ctx.outputs[phase.name], { title: `Pi output: ${phase.name}`, fileName: `${phase.name}.md` });
+  emitTextArtifact(ctx, phase, ctx.outputs[phase.name], { title: `Pi output: ${phase.name}` });
   yield { type: "data", kind: "data", key: "model", value: result.model, message: result.ok ? "Pi agent complete" : "Pi agent failed" };
   if (!result.ok) throw new Error(result.error || "pi phase failed");
 }
@@ -967,16 +1069,17 @@ async function* runFanoutPiPhase(ctx, phase) {
         const itemHash = createHash("sha256").update(`${index}\0${item}`).digest("hex").slice(0, 10);
         const fileNameTemplate = phase.artifact && typeof phase.artifact === "object" ? phase.artifact.fileNameTemplate : undefined;
         const titleTemplate = phase.artifact && typeof phase.artifact === "object" ? phase.artifact.titleTemplate : undefined;
+        const artifactIdentity = `${phase.name}-${index}-${itemHash}-${safeName(item)}`;
         const artifactPhase = {
           ...phase,
-          name: `${phase.name}-${index}-${itemHash}-${safeName(item)}`,
+          name: artifactIdentity,
           artifact: phase.artifact === false ? false : {
             ...(typeof phase.artifact === "object" ? phase.artifact : {}),
             title: titleTemplate ? renderTemplate(titleTemplate, ctx, { item, index }) : `${phase.name}: ${item}`,
-            fileName: fileNameTemplate ? renderTemplate(fileNameTemplate, ctx, { item, index }) : `${phase.name}-${index}-${itemHash}-${safeName(item)}.md`,
+            ...(fileNameTemplate ? { fileName: renderTemplate(fileNameTemplate, ctx, { item, index }) } : {}),
           },
         };
-        emitTextArtifact(ctx, artifactPhase, text, { title: `${phase.name}: ${item}` }, { phase: phase.name, itemId: `${index}:${item}`, index });
+        emitTextArtifact(ctx, artifactPhase, text, { title: `${phase.name}: ${item}`, identity: artifactIdentity, collisionIdentity: JSON.stringify(["fanout", phase.name, index, item]) }, { phase: phase.name, itemId: `${index}:${item}`, index });
         terminal++;
         if (result.ok) successful++; else failed++;
         push({ type: "fanout", kind: "fanout_item_end", itemId: `${index}:${item}`, label: item, index, status: result.ok ? STATUSES.SUCCESS : STATUSES.FAILED, model: result.model, message: result.ok ? `Complete ${item}` : `Failed ${item}`, error: result.error });
@@ -1017,7 +1120,7 @@ async function* runArtifactPhase(ctx, phase) {
   const base = phase.from ? String(ctx.outputs[phase.from] ?? "") : phase.content;
   const content = renderTemplate(base, ctx);
   ctx.outputs[phase.name] = content;
-  emitTextArtifact(ctx, { ...phase, artifact: { kind: phase.kind || "markdown", title: phase.title || phase.name, fileName: phase.fileName || `${phase.name}.md` } }, content, { title: phase.title || phase.name });
+  emitTextArtifact(ctx, { ...phase, artifact: { kind: phase.kind || "markdown", title: phase.title || phase.name, ...(phase.fileName ? { fileName: phase.fileName } : {}) } }, content, { title: phase.title || phase.name });
   yield { type: "data", kind: "data", key: "bytes", value: Buffer.byteLength(content, "utf8"), message: "Artifact written" };
 }
 
@@ -1126,7 +1229,7 @@ async function runHarness(ctx, harnessFile) {
     async artifact(title, content, options = {}) {
       const phaseName = options.name || safeName(title || "artifact");
       const text = typeof content === "string" ? content : safeStringify(content);
-      const path = emitTextArtifact(ctx, { name: phaseName, type: "harness", artifact: { kind: options.kind || "markdown", title, fileName: options.fileName || `${phaseName}.${options.kind === "json" ? "json" : "md"}` } }, text, { title });
+      const path = emitTextArtifact(ctx, { name: phaseName, type: "harness", artifact: { kind: options.kind || "markdown", title, ...(options.fileName ? { fileName: options.fileName } : {}) } }, text, { title });
       return path;
     },
     emit(kind, data) {
@@ -1140,6 +1243,12 @@ async function main() {
   validateRunnerLimits();
   const rawArgv = process.argv.slice(2);
   const args = parseArgs(rawArgv);
+  validateCliBooleanFlag(args.background, "--background");
+  validateCliBooleanFlag(args["legacy-spec"], "--legacy-spec");
+  validateCliBooleanFlag(args["cleanup-input"], "--cleanup-input");
+  validateCliString(args.cwd, "--cwd");
+  validateCliString(args.model, "--model", { nonEmpty: false });
+  const requestedSavedTemplate = validateSavedTemplateName(args["saved-template"], "--saved-template");
   if (args.help || args.h) {
     console.log("Usage: dynamic-thread-phase-workflow.mjs --spec-file spec.json | --resume-run-id RUN | --js-file workflow.mjs [--cwd REPO] [--background] [--model MODEL]");
     return;
@@ -1158,7 +1267,8 @@ async function main() {
   if (resumeOnly && hasSpecInput) throw new Error("resumeRunId must be used without structured spec input");
   if (args.after !== undefined && resumeOnly) throw new Error("Provide only one of after or resumeRunId");
   if (!harnessFile && !hasSpecInput && !resumeOnly) throw new Error("Provide structured spec input or --resume-run-id");
-  if (resumeOnly && (args.cwd !== undefined || args.model !== undefined || args.permissions !== undefined)) throw new Error("Run-ID-only resume derives cwd, model, and permissions from the trusted source run");
+  const resumeOverrides = ["cwd", "model", "permissions", "timeout", "name", "after", "auto-continue", "saved-template"].filter((key) => args[key] !== undefined);
+  if (resumeOnly && resumeOverrides.length) throw new Error(`Run-ID-only resume derives execution configuration and template provenance from the trusted source run; remove: ${resumeOverrides.join(", ")}`);
   const resumeInvocation = resumeOnly ? loadResumeInvocation(String(args["resume-run-id"]), args["session-id"]) : undefined;
   const spec = harnessFile
     ? (() => {
@@ -1166,9 +1276,14 @@ async function main() {
         const permissions = normalizePermissions(args.permissions, "harness permissions");
         if (!permissionIncludesAll(permissions, "rwx")) throw new Error("JavaScript harness mode requires permissions=\"rwx\"");
         assertWithinMaxPermissions(permissions, "harness permissions");
-        return { name: args.name ? String(args.name) : safeName(basename(harnessFile).replace(/\.[cm]?js$/, "")), mode: "harness", permissions, harnessFile };
+        validateCliString(args.name, "--name");
+        return { name: args.name || safeName(basename(harnessFile).replace(/\.[cm]?js$/, "")), mode: "harness", permissions, harnessFile };
       })()
-    : resumeInvocation?.spec || validateSpec(loadSpec(args));
+    : resumeInvocation?.spec || validateSpec(loadSpec(args), isTruthyFlag(args["legacy-spec"]) ? { legacy: true } : {});
+  if (!harnessFile && spec.schema === "pi-dynamic-workflow/v2" && args["auto-continue"] !== undefined) {
+    throw new Error("--auto-continue is not supported by strict v2 workflows");
+  }
+  if (args["auto-continue"] !== undefined) validateCliBooleanFlag(args["auto-continue"], "--auto-continue");
   const cleanupInputFile = args["js-file"] || args["harness-file"] || args["spec-file"];
   if (isTruthyFlag(args["cleanup-input"]) && cleanupInputFile) generatedInputDirectory(cleanupInputFile);
   // Validate CLI timeout before creating a visualizer run so bad input cannot
@@ -1183,7 +1298,7 @@ async function main() {
   if (await maybeBackground(rawArgv, args)) return;
   const cwd = resolve(String(resumeInvocation?.cwd || args.cwd || spec.cwd || process.cwd()));
   if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new Error(`workflow cwd is not a directory: ${cwd}`);
-  const effectiveModel = resumeInvocation ? resumeInvocation.model : args.model ? String(args.model) : spec.model;
+  const effectiveModel = resumeInvocation ? resumeInvocation.model : args.model !== undefined ? args.model : spec.model;
   const resumeState = args["resume-run-id"] === undefined ? undefined : loadResumeState(String(args["resume-run-id"]), {
     spec,
     cwd,
@@ -1191,6 +1306,7 @@ async function main() {
     sessionId: args["session-id"],
   });
   const parentChain = args.after === undefined ? undefined : loadParentChain(String(args.after), args["session-id"]);
+  const savedTemplate = resumeState?.savedTemplate ?? resumeInvocation?.savedTemplate ?? requestedSavedTemplate;
   const workflow = spec.name || "dynamic-workflow";
   const isBackground = Boolean(process.env.PI_DYNAMIC_WORKFLOW_BACKGROUND || process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND);
   const runId = createRunId(workflow);
@@ -1211,7 +1327,7 @@ async function main() {
       cwd,
       trigger: { kind: isBackground ? "background" : "manual", dynamic: true },
       input: spec,
-      metadata: { pid: process.pid, processJournalVersion: 1, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, mode: harnessFile ? "javascript" : "spec", permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, continuationMode: isBackground ? "terminal" : "none", autoContinue: isTruthyFlag(args["auto-continue"] ?? spec.autoContinue), sessionId: args["session-id"], sessionFile: args["session-file"], ...chain, resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length },
+      metadata: { pid: process.pid, processJournalVersion: 1, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, mode: harnessFile ? "javascript" : "spec", permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, continuationMode: isBackground ? "terminal" : "none", autoContinue: isTruthyFlag(args["auto-continue"] ?? spec.autoContinue), sessionId: args["session-id"], sessionFile: args["session-file"], savedTemplate, ...chain, resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length },
       message: `${workflow} started`,
     });
     if (successorReservation) commitSuccessor(successorReservation);
@@ -1262,12 +1378,13 @@ async function main() {
       signal: controller.signal,
       chain,
       checkpoint: {
-        schema: "pi-dynamic-workflow-checkpoint/v1",
+        schema: spec.schema === "pi-dynamic-workflow/v2" ? "pi-dynamic-workflow-checkpoint/v2" : "pi-dynamic-workflow-checkpoint/v1",
         runId: visualizerRun.runId,
         workflow,
         cwd: realpathSync(cwd),
         model: effectiveModel,
         sessionId: args["session-id"] ? String(args["session-id"]) : undefined,
+        savedTemplate,
         specHash: workflowFingerprint(spec, cwd, effectiveModel),
         ...chain,
         completed: [],
@@ -1291,7 +1408,8 @@ async function main() {
       const remaining = spec.phases.slice(resumedCount).map((phase, relativeIndex) => {
         const index = resumedCount + relativeIndex;
         const base = dynamicPhase(phase);
-        const retrying = phase.retry ? withRetry(base, phase.retry) : base;
+        const retryPolicy = phase.retry || (phase.attempts > 1 ? { maxAttempts: phase.attempts, baseDelayMs: 250 } : undefined);
+        const retrying = retryPolicy ? withRetry(base, retryPolicy) : base;
         return checkpointPhase(retrying, phase, index);
       });
       const displayOptions = Object.fromEntries(spec.phases.slice(resumedCount).map((phase) => [phase.name, { input: (runCtx) => phaseDisplayInput(phase, runCtx) }]));

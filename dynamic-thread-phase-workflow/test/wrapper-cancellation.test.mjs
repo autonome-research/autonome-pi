@@ -98,10 +98,9 @@ test("legacy nested spec arguments are prepared into the flat public format", ()
     spec: {
       name: "legacy",
       permissions: "r",
-      metadata: { ticket: "PR-2" },
       phases: [
         { type: "pi", name: "one", prompt: "inspect" },
-        { type: "fanout_pi", name: "many", items: ["a"], label: "files", promptTemplate: "review {{item}}" },
+        { type: "fanout_pi", name: "many", items: ["a"], concurrency: 1, promptTemplate: "review {{item}}" },
       ],
     },
     background: true,
@@ -110,10 +109,9 @@ test("legacy nested spec arguments are prepared into the flat public format", ()
   assert.equal(prepared.name, "legacy");
   assert.equal(prepared.background, true);
   assert.equal(prepared.timeoutMs, 1234);
-  assert.deepEqual(prepared.metadata, { ticket: "PR-2" });
   assert.deepEqual(prepared.phases, [
     { type: "agent", name: "one", prompt: "inspect" },
-    { type: "fanout", name: "many", items: ["a"], label: "files", prompt: "review {{item}}" },
+    { type: "fanout", name: "many", items: ["a"], concurrency: 1, prompt: "review {{item}}" },
   ]);
 });
 
@@ -123,6 +121,11 @@ test("legacy preparation rejects conflicts and options the simplified format can
   const prepare = tools.get("dynamic_workflow").prepareArguments;
   assert.throws(() => prepare({ spec: artifactSpec("permissions-conflict"), permissions: "rw" }), /permissions conflict/);
   assert.throws(() => prepare({ spec: { ...artifactSpec("timeout-conflict"), timeoutMs: 100 }, timeout: 200 }), /timeout conflicts/);
+  assert.throws(() => prepare({ spec: { ...artifactSpec("metadata-removed"), metadata: { ticket: "PR-2" } } }), /unsupported field.*metadata/);
+  assert.throws(() => prepare({ spec: { ...artifactSpec("top-concurrency-removed"), concurrency: 2 } }), /unsupported field.*concurrency/);
+  assert.throws(() => prepare({ spec: artifactSpec("unknown-outer"), callerFlag: true }), /Legacy dynamic_workflow arguments has unsupported field.*callerFlag/);
+  assert.throws(() => prepare({ spec: { ...artifactSpec("future-schema"), schema: "pi-dynamic-workflow/v999" } }), /Unsupported legacy spec.schema.*v999/);
+  assert.throws(() => prepare({ spec: { ...artifactSpec("invalid-schema-type"), schema: 1 } }), /Unsupported legacy spec.schema/);
   assert.throws(() => prepare({
     spec: { name: "legacy-artifact", phases: [{ type: "pi", name: "review", prompt: "review", artifact: true }] },
   }), /cannot be represented by the simplified format/);

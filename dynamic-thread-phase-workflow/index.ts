@@ -132,10 +132,112 @@ function renderStructuredTemplate(value: any, inputs: Record<string, any>, used:
 	});
 }
 
+const PUBLIC_WORKFLOW_KEYS = new Set(["name", "cwd", "permissions", "model", "timeoutMs", "background", "after", "resumeRunId", "template", "inputs", "phases"]);
+const TEMPLATE_WORKFLOW_KEYS = new Set(["name", "cwd", "permissions", "model", "timeoutMs", "background", "phases"]);
+const LEGACY_OUTER_KEYS = new Set(["spec", "harness", "harnessFile", "name", "permissions", "cwd", "model", "background", "autoContinue", "after", "resumeRunId", "timeout"]);
+const EXECUTABLE_PHASE_COMMON = ["type", "name", "permissions", "timeoutMs", "attempts"];
+const WORKFLOW_NAME = /^[a-zA-Z0-9_.:-]+$/;
+const RUN_ID = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$/;
+
+function rejectUnsupportedFields(value: any, allowed: Set<string>, label: string): void {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object.`);
+	const unsupported = Object.keys(value).filter((key) => !allowed.has(key));
+	if (unsupported.length) throw new Error(`${label} has unsupported field(s): ${unsupported.join(", ")}`);
+}
+
+function validateOptionalString(value: unknown, label: string, nonEmpty = false): void {
+	if (value === undefined) return;
+	if (typeof value !== "string" || (nonEmpty && !value.trim())) throw new Error(`${label} must be ${nonEmpty ? "a non-empty" : "a"} string.`);
+}
+
+function validateBoundedInteger(value: unknown, label: string, maximum: number): void {
+	if (value !== undefined && (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > maximum)) {
+		throw new Error(`${label} must be an integer between 1 and ${maximum}.`);
+	}
+}
+
+function validatePermission(value: unknown, label: string): void {
+	if (value !== undefined && (typeof value !== "string" || !(PERMISSIONS as readonly string[]).includes(value))) {
+		throw new Error(`${label} must be one of r, w, rw, or rwx.`);
+	}
+}
+
+function validateTools(value: unknown, label: string): void {
+	if (value === undefined) return;
+	if (!Array.isArray(value) || value.length === 0 || !value.every((tool) => typeof tool === "string")) {
+		throw new Error(`${label} must be a non-empty array of strings.`);
+	}
+}
+
+function validatePublicWorkflow(params: any, label = "dynamic_workflow"): void {
+	rejectUnsupportedFields(params, PUBLIC_WORKFLOW_KEYS, label);
+	if (params.name !== undefined && (typeof params.name !== "string" || !WORKFLOW_NAME.test(params.name))) throw new Error(`${label}.name is invalid.`);
+	validateOptionalString(params.cwd, `${label}.cwd`, true);
+	validateOptionalString(params.model, `${label}.model`);
+	validatePermission(params.permissions, `${label}.permissions`);
+	validateBoundedInteger(params.timeoutMs, `${label}.timeoutMs`, 3_600_000);
+	if (params.background !== undefined && typeof params.background !== "boolean") throw new Error(`${label}.background must be a boolean.`);
+	if (params.after !== undefined && (typeof params.after !== "string" || !RUN_ID.test(params.after))) throw new Error(`${label}.after must be a safe run identifier.`);
+	if (params.resumeRunId !== undefined && (typeof params.resumeRunId !== "string" || !RUN_ID.test(params.resumeRunId))) throw new Error(`${label}.resumeRunId must be a safe run identifier.`);
+	if (params.template !== undefined && (typeof params.template !== "string" || !SAVED_TEMPLATE_NAME.test(params.template))) throw new Error(`${label}.template must be a safe saved-template name.`);
+	if (params.inputs !== undefined && (!params.inputs || typeof params.inputs !== "object" || Array.isArray(params.inputs))) throw new Error(`${label}.inputs must be an object.`);
+	if (params.phases === undefined) return;
+	if (!Array.isArray(params.phases) || params.phases.length < 1 || params.phases.length > 30) throw new Error(`${label}.phases must contain between 1 and 30 phases.`);
+	const seen = new Set<string>();
+	for (const [index, phase] of params.phases.entries()) {
+		const phaseLabel = `${label}.phases[${index}]`;
+		if (!phase || typeof phase !== "object" || Array.isArray(phase)) throw new Error(`${phaseLabel} must be an object.`);
+		if (typeof phase.name !== "string" || !WORKFLOW_NAME.test(phase.name)) throw new Error(`${phaseLabel}.name is invalid.`);
+		if (seen.has(phase.name)) throw new Error(`${label} has duplicate phase name: ${phase.name}`);
+		const byType: Record<string, string[]> = {
+			agent: ["prompt", "tools", "model"],
+			fanout: ["prompt", "items", "itemsFrom", "concurrency", "tools", "model", "failOnItemFailure"],
+			shell: ["command"],
+			artifact: ["type", "name", "content", "from", "title"],
+		};
+		if (typeof phase.type !== "string" || !Object.prototype.hasOwnProperty.call(byType, phase.type)) throw new Error(`Unsupported phase type for ${phaseLabel}: ${String(phase.type)}`);
+		const allowed = phase.type === "artifact" ? byType.artifact : [...EXECUTABLE_PHASE_COMMON, ...byType[phase.type]];
+		rejectUnsupportedFields(phase, new Set(allowed), phaseLabel);
+		if (phase.type !== "artifact") {
+			validatePermission(phase.permissions, `${phaseLabel}.permissions`);
+			validateBoundedInteger(phase.timeoutMs, `${phaseLabel}.timeoutMs`, 3_600_000);
+			validateBoundedInteger(phase.attempts, `${phaseLabel}.attempts`, 5);
+		}
+		if (phase.type === "agent") {
+			validateOptionalString(phase.prompt, `${phaseLabel}.prompt`, true);
+			validateOptionalString(phase.model, `${phaseLabel}.model`);
+			validateTools(phase.tools, `${phaseLabel}.tools`);
+		}
+		if (phase.type === "fanout") {
+			validateOptionalString(phase.prompt, `${phaseLabel}.prompt`, true);
+			validateOptionalString(phase.model, `${phaseLabel}.model`);
+			validateTools(phase.tools, `${phaseLabel}.tools`);
+			validateBoundedInteger(phase.concurrency, `${phaseLabel}.concurrency`, 64);
+			if (phase.failOnItemFailure !== undefined && typeof phase.failOnItemFailure !== "boolean") throw new Error(`${phaseLabel}.failOnItemFailure must be a boolean.`);
+			const hasItems = phase.items !== undefined;
+			const hasItemsFrom = phase.itemsFrom !== undefined;
+			if (hasItems === hasItemsFrom) throw new Error(`${phaseLabel} must provide exactly one of items or itemsFrom.`);
+			if (hasItems && (!Array.isArray(phase.items) || phase.items.length < 1 || phase.items.length > 1_000 || !phase.items.every((item: unknown) => typeof item === "string" || typeof item === "boolean" || (typeof item === "number" && Number.isFinite(item))))) throw new Error(`${phaseLabel}.items is invalid.`);
+			if (hasItemsFrom && (typeof phase.itemsFrom !== "string" || !seen.has(phase.itemsFrom))) throw new Error(`${phaseLabel}.itemsFrom must reference an earlier phase.`);
+		}
+		if (phase.type === "shell") validateOptionalString(phase.command, `${phaseLabel}.command`, true);
+		if (phase.type === "artifact") {
+			const hasContent = phase.content !== undefined;
+			const hasFrom = phase.from !== undefined;
+			if (hasContent === hasFrom) throw new Error(`${phaseLabel} must provide exactly one of content or from.`);
+			if (hasContent && typeof phase.content !== "string") throw new Error(`${phaseLabel}.content must be a string.`);
+			if (hasFrom && (typeof phase.from !== "string" || !seen.has(phase.from))) throw new Error(`${phaseLabel}.from must reference an earlier phase.`);
+			validateOptionalString(phase.title, `${phaseLabel}.title`);
+		}
+		seen.add(phase.name);
+	}
+}
+
 function resolvePublicWorkflowParams(params: any): any {
-	const hasTemplate = params?.template !== undefined;
-	const hasPhases = params?.phases !== undefined;
-	const hasResume = params?.resumeRunId !== undefined;
+	validatePublicWorkflow(params);
+	const hasTemplate = params.template !== undefined;
+	const hasPhases = params.phases !== undefined;
+	const hasResume = params.resumeRunId !== undefined;
 	if ([hasTemplate, hasPhases, hasResume].filter(Boolean).length !== 1) throw new Error("Provide exactly one of template, phases, or resumeRunId.");
 	if (hasResume) {
 		const unsupported = Object.keys(definedProperties(params)).filter((key) => !["resumeRunId", "background"].includes(key));
@@ -143,23 +245,24 @@ function resolvePublicWorkflowParams(params: any): any {
 		return params;
 	}
 	if (!hasTemplate) {
-		if (params?.inputs !== undefined) throw new Error("inputs may only be used with a saved structured workflow template.");
+		if (params.inputs !== undefined) throw new Error("inputs may only be used with a saved structured workflow template.");
 		return params;
 	}
 	const templateName = params.template;
 	const rawInputs = params.inputs ?? {};
 	if (!rawInputs || typeof rawInputs !== "object" || Array.isArray(rawInputs)) throw new Error("Saved workflow template inputs must be an object.");
+	const loadedTemplate = loadStructuredTemplate(templateName);
+	rejectUnsupportedFields(loadedTemplate, TEMPLATE_WORKFLOW_KEYS, "Saved structured workflow template");
 	const usedInputs = new Set<string>();
-	const template = renderStructuredTemplate(loadStructuredTemplate(templateName), rawInputs, usedInputs);
+	const template = renderStructuredTemplate(loadedTemplate, rawInputs, usedInputs);
+	validatePublicWorkflow(template, "Saved structured workflow template");
 	const unusedInputs = Object.keys(rawInputs).filter((key) => !usedInputs.has(key));
 	if (unusedInputs.length) throw new Error(`Saved workflow template received unused inputs: ${unusedInputs.sort().join(", ")}`);
 	const { template: _template, inputs: _inputs, phases: _phases, ...rawOverrides } = params;
 	const overrides = definedProperties(rawOverrides);
-	return {
-		...template,
-		...overrides,
-		metadata: { ...(template.metadata || {}), ...(overrides.metadata || {}), savedTemplate: templateName },
-	};
+	const resolved = { ...template, ...overrides, phases: template.phases };
+	validatePublicWorkflow(resolved);
+	return { ...resolved, systemTemplateProvenance: templateName };
 }
 
 function resolveHarnessParams(params: any): any {
@@ -266,13 +369,6 @@ function permissionSchema(optional = true) {
 	return optional ? Type.Optional(schema) : schema;
 }
 
-function retrySchema() {
-	return Type.Optional(Type.Object({
-		maxAttempts: Type.Optional(Type.Integer({ minimum: 1, maximum: 5 })),
-		baseDelayMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 60_000 })),
-	}, { additionalProperties: false }));
-}
-
 function legacyStructuredSpecSchema() {
 	const permissions = Type.Optional(Type.String({ pattern: "^[rwx]+$", description: "Capabilities accepted by the legacy format." }));
 	const retry = Type.Optional(Type.Object({
@@ -363,13 +459,11 @@ function legacyParametersSchema() {
 
 function workflowParametersSchema() {
 	const permissions = permissionSchema();
-	const retry = retrySchema();
 	const common = {
 		name: Type.String({ pattern: "^[a-zA-Z0-9_.:-]+$", description: "Unique phase name." }),
-		description: Type.Optional(Type.String()),
 		permissions,
 		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 3_600_000 })),
-		retry,
+		attempts: Type.Optional(Type.Integer({ minimum: 1, maximum: 5, description: "Total attempts. Retry delay is deterministic runner policy." })),
 	};
 	const phases = Type.Union([
 		Type.Object({
@@ -386,7 +480,6 @@ function workflowParametersSchema() {
 			items: Type.Optional(Type.Array(Type.Union([Type.String(), Type.Number(), Type.Boolean()]), { minItems: 1, maxItems: 1_000 })),
 			itemsFrom: Type.Optional(Type.String({ description: "Earlier phase whose line/array output supplies fanout items." })),
 			concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
-			label: Type.Optional(Type.String({ description: "Fanout item label used in progress events." })),
 			tools: Type.Optional(Type.Array(Type.String(), { minItems: 1 })),
 			model: Type.Optional(Type.String()),
 			failOnItemFailure: Type.Optional(Type.Boolean({ description: "Fail after all siblings settle if any item fails. Default true." })),
@@ -399,29 +492,23 @@ function workflowParametersSchema() {
 		}, { additionalProperties: false }),
 		Type.Object({
 			name: Type.String({ pattern: "^[a-zA-Z0-9_.:-]+$", description: "Unique phase name." }),
-			description: Type.Optional(Type.String()),
 			type: StringEnum(["artifact"] as const),
 			content: Type.Optional(Type.String()),
 			from: Type.Optional(Type.String({ description: "Earlier phase whose output becomes the artifact." })),
 			title: Type.Optional(Type.String()),
-			fileName: Type.Optional(Type.String()),
-			kind: Type.Optional(Type.String()),
 		}, { additionalProperties: false }),
 	]);
 	return Type.Object({
 		name: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9_.:-]+$", description: "Workflow name." })),
-		description: Type.Optional(Type.String()),
 		cwd: Type.Optional(Type.String({ description: "Workflow working directory. Defaults to Pi's current cwd." })),
 		permissions,
 		model: Type.Optional(Type.String({ description: "Default model pattern for agent/fanout phases." })),
 		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 3_600_000, description: "Default agent/shell phase timeout." })),
-		concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 64, description: "Default fanout concurrency." })),
 		background: Type.Optional(Type.Boolean({ description: "Run in the background; successful and failed terminal runs return control to this Pi session, while cancellation does not." })),
 		after: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Terminal successful or failed parent run. This workflow becomes its single chained successor." })),
-		resumeRunId: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Resume this structured run from its trusted spec, cwd, model, permissions, session, and completed phase artifacts. Use without phases or template." })),
+		resumeRunId: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Resume this structured run from its trusted spec and completed phase artifacts. Use without phases or template." })),
 		template: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", description: "Saved structured workflow name from ~/.pi/agent/workflows/<name>.json. Use instead of phases." })),
 		inputs: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Values for {{inputs.key}} placeholders in a saved structured workflow template." })),
-		metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Optional workflow metadata persisted with the compiled input." })),
 		phases: Type.Optional(Type.Array(phases, { minItems: 1, maxItems: 30, description: "Ordered phases. Use exactly one of phases or template." })),
 	}, { additionalProperties: false });
 }
@@ -442,9 +529,12 @@ function harnessParametersSchema() {
 }
 
 function legacySpecToPublic(args: any): any {
-	if (!args || typeof args !== "object" || Array.isArray(args) || !args.spec || args.harness !== undefined || args.harnessFile !== undefined) return args;
+	if (!args || typeof args !== "object" || Array.isArray(args) || !Object.prototype.hasOwnProperty.call(args, "spec")) return args;
+	rejectUnsupportedFields(args, LEGACY_OUTER_KEYS, "Legacy dynamic_workflow arguments");
+	if (!args.spec || args.harness !== undefined || args.harnessFile !== undefined) return args;
 	const spec = args.spec;
 	if (typeof spec !== "object" || Array.isArray(spec)) return args;
+	if (spec.schema !== undefined && spec.schema !== "pi-dynamic-workflow/v1") throw new Error(`Unsupported legacy spec.schema: ${String(spec.schema)}`);
 	if (args.permissions !== undefined && spec.permissions !== undefined && args.permissions !== spec.permissions) {
 		throw new Error("Top-level permissions conflict with spec.permissions.");
 	}
@@ -464,7 +554,7 @@ function legacySpecToPublic(args: any): any {
 		return phase;
 	}) : spec.phases;
 	const { schema: _schema, ...publicSpec } = spec;
-	return {
+	const prepared = {
 		...publicSpec,
 		phases,
 		...(args.permissions !== undefined ? { permissions: args.permissions } : {}),
@@ -476,11 +566,14 @@ function legacySpecToPublic(args: any): any {
 		...(args.after !== undefined ? { after: args.after } : {}),
 		...(args.resumeRunId !== undefined ? { resumeRunId: args.resumeRunId } : {}),
 	};
+	validatePublicWorkflow(prepared);
+	return prepared;
 }
 
 function publicWorkflowToLegacySpec(params: any): any {
-	const { after: _after, background: _background, template: _template, resumeRunId: _resumeRunId, ...spec } = params;
+	const { after: _after, background: _background, template: _template, resumeRunId: _resumeRunId, inputs: _inputs, systemTemplateProvenance: _provenance, ...spec } = params;
 	return {
+		schema: "pi-dynamic-workflow/v2",
 		...spec,
 		phases: spec.phases.map((phase: any) => {
 			if (phase.type === "agent") return { ...phase, type: "pi" };
@@ -494,6 +587,15 @@ function publicWorkflowToLegacySpec(params: any): any {
 }
 
 async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any, legacyName: string) {
+	if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error("Workflow arguments must be an object.");
+	validateOptionalString(params.cwd, "cwd", true);
+	validateOptionalString(params.model, "model");
+	validateOptionalString(params.name, "name");
+	if (params.background !== undefined && typeof params.background !== "boolean") throw new Error("background must be a boolean.");
+	if (params.autoContinue !== undefined && typeof params.autoContinue !== "boolean") throw new Error("autoContinue must be a boolean.");
+	if (params.after !== undefined && (typeof params.after !== "string" || !RUN_ID.test(params.after))) throw new Error("after must be a safe run identifier.");
+	if (params.resumeRunId !== undefined && (typeof params.resumeRunId !== "string" || !RUN_ID.test(params.resumeRunId))) throw new Error("resumeRunId must be a safe run identifier.");
+	if (params.systemTemplateProvenance !== undefined && (typeof params.systemTemplateProvenance !== "string" || !SAVED_TEMPLATE_NAME.test(params.systemTemplateProvenance))) throw new Error("Saved-template provenance is invalid.");
 	const hasSpec = params.spec !== undefined;
 	const hasHarness = params.harness !== undefined;
 	const hasHarnessFile = params.harnessFile !== undefined;
@@ -523,7 +625,9 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 			}
 			generatedInputFile = writeJsonFile(spec);
 			args.push("--spec-file", generatedInputFile);
+			if (legacyName) args.push("--legacy-spec");
 		}
+		if (params.systemTemplateProvenance) args.push("--saved-template", params.systemTemplateProvenance);
 		if (generatedInputFile) args.push("--cleanup-input");
 		if (params.model) args.push("--model", params.model);
 		if (params.timeout !== undefined) args.push("--timeout", String(normalizeTimeoutMs(params.timeout, "timeout")));
@@ -583,6 +687,7 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 				model: resolved.model,
 				background: resolved.background,
 				after: resolved.after,
+				systemTemplateProvenance: resolved.systemTemplateProvenance,
 			}, signal, onUpdate, ctx, "");
 		},
 	});

@@ -63,7 +63,7 @@ Recent changes:
 - Permissions are explicit phase defaults/overrides: `r`, `w`, `rw`, and `rwx`; shell and Pi `bash` execution require `rwx`.
 - Advanced unsandboxed JavaScript control flow moved to `dynamic_workflow_harness`, which requires explicit `permissions: "rwx"`.
 - `dynamic_thread_phase_workflow` remains registered for compatibility but is inactive by default, avoiding a duplicate legacy schema in normal model context.
-- Structured specs now have a strict phase schema, semantic reference/permission/resource preflight, bounded supervised fanout, explicit retries, collision-safe artifacts, multipart Pi output handling, partial failure results, and background readiness acknowledgements containing `runId` + `pid`.
+- Structured specs have a reduced v2 contract with strict phase validation, bounded `attempts` and deterministic internal backoff, phase-local fanout concurrency, collision-safe artifacts, partial failure results, and background readiness acknowledgements containing `runId` + `pid`.
 - Reusable or operationally important workflows should graduate into standalone TypeScript extensions using thread-phase directly.
 - Dynamic workflow runs carry system-generated chain provenance. A terminal successful or failed parent accepts at most one session-scoped successor through `after`; cancelled parents cannot continue a chain.
 - Reusable structured workflows and self-contained harnesses can be loaded by safe template name from `~/.pi/agent/workflows/`; template loading is bounded, rejects traversal/symlinks, preserves provenance, and still enforces normal validation and permission ceilings.

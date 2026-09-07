@@ -4,7 +4,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { showThreadPhaseMonitor } from "./components/monitor.ts";
 import { registerThreadPhaseMessageRenderers } from "./components/run-message-renderer.ts";
-import { activeRunWidgetLines, isLiveRun } from "./components/status-widget.ts";
+import { createWorkflowFooterAnimator, isLiveRun } from "./components/status-widget.ts";
 import {
 	EVENT_TYPES,
 	INDEX_FILE,
@@ -218,6 +218,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 
 	let watcher: fs.FSWatcher | undefined;
 	let statusRefreshTimer: NodeJS.Timeout | undefined;
+	let statusFooter: ReturnType<typeof createWorkflowFooterAnimator> | undefined;
 	const startupDeliveryTimers = new Set<ReturnType<typeof setTimeout>>();
 	let retryDeferredContinuations: (() => void) | undefined;
 	let acknowledgeContinuation: ((runId: string, deliveryId: string) => void) | undefined;
@@ -315,22 +316,35 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		statusFooter?.dispose();
+		statusFooter = undefined;
+		if (statusRefreshTimer) clearInterval(statusRefreshTimer);
+		statusRefreshTimer = undefined;
 		sessionTerminated = false;
 		for (const timer of startupDeliveryTimers) clearTimeout(timer);
 		startupDeliveryTimers.clear();
 		retryDeferredContinuations = undefined;
 		acknowledgeContinuation = undefined;
 		ensureStore();
-		if (statusRefreshTimer) clearInterval(statusRefreshTimer);
-		statusRefreshTimer = undefined;
 		cwdState = createCwdState(ctx.cwd);
+		// RPC also has UI support; animation belongs only in the terminal footer.
+		const sessionFooter = ctx.hasUI && ctx.mode === "tui"
+			? createWorkflowFooterAnimator({
+				setStatus: (text) => ctx.ui.setStatus("thread-phase", text),
+				clearWidget: () => ctx.ui.setWidget("thread-phase", undefined),
+			})
+			: undefined;
+		statusFooter = sessionFooter;
 		const updateStatus = () => {
-			if (!ctx.hasUI) return;
-			const runs = mergeMonitorRuns(cwdState.activeCwd, currentSessionId);
-			const running = runs.filter(isLiveRun).length;
-			ctx.ui.setStatus("thread-phase", running > 0 ? `${running} workflow(s) running` : undefined);
-			const widgetLines = activeRunWidgetLines(runs);
-			ctx.ui.setWidget("thread-phase", widgetLines.length > 0 ? widgetLines : undefined, { placement: "belowEditor" });
+			// A cleared/replaced lifecycle must never read for or update its stale ctx.
+			if (!sessionFooter || statusFooter !== sessionFooter) return;
+			try {
+				const runs = mergeMonitorRuns(cwdState.activeCwd, currentSessionId);
+				sessionFooter.setWorkflowIds(runs.filter(isLiveRun).map((run) => String(run.runId || "")).filter(Boolean));
+			} catch {
+				// Store/projection failures hide background status rather than leaving stale UI.
+				sessionFooter.setWorkflowIds([]);
+			}
 		};
 		const currentSessionId = ctx.sessionManager.getSessionId();
 		const continuationStoreDir = path.dirname(INDEX_FILE);
@@ -657,9 +671,10 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 
 		watcher?.close();
 		watcher = fs.watch(INDEX_FILE, { persistent: false }, () => processNewEvents());
-		// Index events refresh the widget immediately. This bounded poll also
-		// removes runs that become stale solely because time passes or their PID
-		// exits, neither of which necessarily appends another event.
+		// Index events refresh the cached footer identities immediately. This bounded
+		// poll also removes runs that become stale solely because time passes or
+		// their PID exits, neither of which necessarily appends another event.
+		// The 120ms animation itself performs no store or liveness reads.
 		statusRefreshTimer = setInterval(updateStatus, STATUS_REFRESH_MS);
 		statusRefreshTimer.unref?.();
 	});
@@ -674,6 +689,8 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		watcher = undefined;
 		if (statusRefreshTimer) clearInterval(statusRefreshTimer);
 		statusRefreshTimer = undefined;
+		statusFooter?.dispose();
+		statusFooter = undefined;
 		try {
 			relinquishContinuationClaims({
 				storeDir: path.dirname(INDEX_FILE),
@@ -684,9 +701,9 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 			if (ctx.hasUI) ctx.ui.notify(`Could not relinquish pending thread-phase continuation claims during shutdown: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		}
 		if (ctx.hasUI) {
-			ctx.ui.setStatus("thread-phase", undefined);
-			ctx.ui.setStatus("thread-phase-cwd", undefined);
-			ctx.ui.setWidget("thread-phase", undefined);
+			try { ctx.ui.setStatus("thread-phase", undefined); } catch { /* best-effort UI cleanup */ }
+			try { ctx.ui.setStatus("thread-phase-cwd", undefined); } catch { /* best-effort UI cleanup */ }
+			try { ctx.ui.setWidget("thread-phase", undefined); } catch { /* best-effort UI cleanup */ }
 		}
 	});
 }

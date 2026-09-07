@@ -109,7 +109,7 @@ test("cancellation-file polling cancels an active structured phase without retry
   writeFileSync(specPath, JSON.stringify({
     name: "cancel-file-race",
     permissions: "rwx",
-    phases: [{ type: "shell", name: "hold", command: helper.command, retry: { maxAttempts: 3, baseDelayMs: 1 } }],
+    phases: [{ type: "shell", name: "hold", command: helper.command, attempts: 3 }],
   }));
   const { child, completion } = spawnRunner(["--spec-file", specPath, "--cwd", temp], { env: { PI_THREAD_PHASE_STORE_DIR: store } });
   try {

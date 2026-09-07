@@ -111,7 +111,7 @@ test("structured resume reuses validated contiguous phase-output artifacts", () 
     const sourceRunId = interruptedResult.runId;
     const sourceDir = join(store, "artifacts", sourceRunId);
     const checkpoint = JSON.parse(readFileSync(join(sourceDir, "workflow-checkpoint.json"), "utf8"));
-    assert.equal(checkpoint.schema, "pi-dynamic-workflow-checkpoint/v1");
+    assert.equal(checkpoint.schema, "pi-dynamic-workflow-checkpoint/v2");
     assert.match(checkpoint.chainId, /^[0-9a-f-]{36}$/);
     assert.equal(checkpoint.rootRunId, sourceRunId);
     assert.equal(checkpoint.chainStep, 0);
@@ -376,6 +376,85 @@ test("CLI resume rejects process journal marker tampering, unknown versions, and
     assert.equal(cancelled.status, 1);
     assert.match(cancelled.stderr, /user-cancelled workflow cannot be resumed/);
     assert.equal(existsSync(join(store, "chains", "successors", `${sourceRunId}.json`)), false);
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("v2 resume rejects saved-template provenance tampering before reserving a successor", () => {
+  const temp = mkdtempSync(join(tmpdir(), "dynamic-resume-template-provenance-"));
+  const store = join(temp, "store");
+  const specPath = join(temp, "workflow.json");
+  writeFileSync(specPath, JSON.stringify({
+    name: "template-provenance",
+    permissions: "r",
+    phases: [{ type: "artifact", name: "result", content: "done" }],
+  }));
+  const env = { PI_THREAD_PHASE_STORE_DIR: store };
+
+  try {
+    const trusted = runCli(["--spec-file", specPath, "--cwd", temp, "--saved-template", "trusted-template"], env);
+    assert.equal(trusted.status, 0, trusted.stderr || trusted.stdout);
+    const trustedRunId = terminalJson(trusted.stdout).runId;
+    const trustedDir = join(store, "artifacts", trustedRunId);
+    const checkpointFile = join(trustedDir, "workflow-checkpoint.json");
+    const originalCheckpoint = JSON.parse(readFileSync(checkpointFile, "utf8"));
+    const sidecar = JSON.parse(readFileSync(join(store, "runs", `${trustedRunId}.start.json`), "utf8"));
+    assert.equal(sidecar.metadata.savedTemplate, "trusted-template");
+
+    for (const [label, mutate, pattern] of [
+      ["changed", (checkpoint) => { checkpoint.savedTemplate = "other-template"; }, /does not match authoritative/],
+      ["removed", (checkpoint) => { delete checkpoint.savedTemplate; }, /does not match authoritative/],
+      ["invalid type", (checkpoint) => { checkpoint.savedTemplate = { name: "trusted-template" }; }, /must be a safe saved-template name/],
+    ]) {
+      const checkpoint = structuredClone(originalCheckpoint);
+      mutate(checkpoint);
+      writeFileSync(checkpointFile, JSON.stringify(checkpoint));
+      const rejected = runCli(["--resume-run-id", trustedRunId], env);
+      assert.equal(rejected.status, 1, `${label}: ${rejected.stderr || rejected.stdout}`);
+      assert.match(rejected.stderr, pattern);
+      assert.equal(existsSync(join(store, "chains", "successors", `${trustedRunId}.json`)), false, `${label} must not reserve a successor`);
+    }
+    writeFileSync(checkpointFile, JSON.stringify(originalCheckpoint));
+
+    const storedSpecFile = join(trustedDir, "workflow-spec.json");
+    const originalStoredSpec = JSON.parse(readFileSync(storedSpecFile, "utf8"));
+    writeFileSync(storedSpecFile, JSON.stringify({ ...originalStoredSpec, schema: "pi-dynamic-workflow/v1" }));
+    const v2CheckpointV1Spec = runCli(["--resume-run-id", trustedRunId], env);
+    assert.equal(v2CheckpointV1Spec.status, 1);
+    assert.match(v2CheckpointV1Spec.stderr, /unsupported spec.schema/);
+    assert.equal(existsSync(join(store, "chains", "successors", `${trustedRunId}.json`)), false);
+    writeFileSync(storedSpecFile, JSON.stringify(originalStoredSpec));
+
+    writeFileSync(checkpointFile, JSON.stringify({ ...originalCheckpoint, schema: "pi-dynamic-workflow-checkpoint/v1" }));
+    const v1CheckpointV2Spec = runCli(["--resume-run-id", trustedRunId], env);
+    assert.equal(v1CheckpointV2Spec.status, 1);
+    assert.match(v1CheckpointV2Spec.stderr, /unsupported spec.schema/);
+    assert.equal(existsSync(join(store, "chains", "successors", `${trustedRunId}.json`)), false);
+    writeFileSync(checkpointFile, JSON.stringify(originalCheckpoint));
+
+    const runFile = join(store, "runs", `${trustedRunId}.jsonl`);
+    const originalLog = readFileSync(runFile, "utf8");
+    const rewritten = originalLog.trimEnd().split("\n").map(JSON.parse);
+    rewritten.find((event) => event.type === "workflow_start").metadata.savedTemplate = "rewritten-template";
+    writeFileSync(runFile, `${rewritten.map(JSON.stringify).join("\n")}\n`);
+    const rewrittenOwner = runCli(["--resume-run-id", trustedRunId], env);
+    assert.equal(rewrittenOwner.status, 1);
+    assert.match(rewrittenOwner.stderr, /authoritative source ownership is unknown/);
+    assert.equal(existsSync(join(store, "chains", "successors", `${trustedRunId}.json`)), false);
+    writeFileSync(runFile, originalLog);
+
+    const plain = runCli(["--spec-file", specPath, "--cwd", temp], env);
+    assert.equal(plain.status, 0, plain.stderr || plain.stdout);
+    const plainRunId = terminalJson(plain.stdout).runId;
+    const plainCheckpointFile = join(store, "artifacts", plainRunId, "workflow-checkpoint.json");
+    const added = JSON.parse(readFileSync(plainCheckpointFile, "utf8"));
+    added.savedTemplate = "added-template";
+    writeFileSync(plainCheckpointFile, JSON.stringify(added));
+    const addedResult = runCli(["--resume-run-id", plainRunId], env);
+    assert.equal(addedResult.status, 1);
+    assert.match(addedResult.stderr, /does not match authoritative/);
+    assert.equal(existsSync(join(store, "chains", "successors", `${plainRunId}.json`)), false, "adding provenance must not reserve a successor");
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }

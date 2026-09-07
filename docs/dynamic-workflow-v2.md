@@ -197,6 +197,6 @@ Keep the capabilities that materially change execution:
 - [x] Make resume run-ID-only and reject repeated execution configuration.
 - [ ] Add explicit repair/recovery for a successor reservation orphaned by a process crash; automatic ambiguous reclamation remains fail-closed.
 - [ ] Rename and narrow the scripted workflow tool.
-- [ ] Reduce the declarative schema and runner contract.
+- [x] Reduce the declarative schema and runner contract.
 - [ ] Group chains in the dashboard.
 - [ ] Dogfood success, failure, recovery, resume, cancellation, duplicate-delivery, and branching paths before release.

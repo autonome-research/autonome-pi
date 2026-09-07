@@ -7,7 +7,7 @@ if (nodeModule.registerHooks) nodeModule.registerHooks(await import(loaderUrl));
 else nodeModule.register(loaderUrl);
 
 const { registerThreadPhaseMessageRenderers } = await import("../components/run-message-renderer.ts");
-const { activeRunWidgetLines } = await import("../components/status-widget.ts");
+const { isLiveRun, workflowFooterText } = await import("../components/status-widget.ts");
 
 const theme = {
   bg(_color, value) { return String(value); },
@@ -59,20 +59,20 @@ test("expanded run messages display canonical owner metadata and stale reason", 
   assert.match(output, /\[STALE\] heartbeat_stale/);
 });
 
-test("active run widget lines display canonical workflow/phase for live runs", () => {
-  const live = displayRun();
-  delete live.stale;
-  const output = activeRunWidgetLines([live]).join("\n");
-  // Signal-first widget: no owner telemetry, just workflow + active phase.
-  assert.doesNotMatch(output, /sessionId: session-owner-42|launch source|cwd at launch/);
-  assert.match(output, /Owner display: compile/);
-  assert.match(output, /\/workflows open dashboard/);
+test("compact workflow footer exposes only one glyph per workflow", () => {
+  const output = workflowFooterText([0, 1, 2, 3, 4]);
+  assert.equal(output, "◐ ◓ ◑ ◒ ◐");
+  assert.doesNotMatch(output, /Owner display|compile|session-owner-42|launch source|cwd at launch|workflows|dashboard|WF|\d/);
 });
 
-test("active run widget omits stale and terminal runs", () => {
+test("footer liveness excludes stale and terminal runs", () => {
+  const live = displayRun();
+  delete live.stale;
   const stale = displayRun();
   const timedOut = { ...displayRun(), runId: "timed-out", normalizedStatus: "failed", status: "timed_out", stale: undefined };
-  assert.deepEqual(activeRunWidgetLines([stale, timedOut]), []);
+  assert.equal(isLiveRun(live), true);
+  assert.equal(isLiveRun(stale), false);
+  assert.equal(isLiveRun(timedOut), false);
 });
 
 test("inline run message nests artifacts under their phase and has no flat Artifacts section", () => {

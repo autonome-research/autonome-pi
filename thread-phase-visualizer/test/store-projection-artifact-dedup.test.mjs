@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -59,6 +60,40 @@ test("projectRun deduplicates repeated artifact paths and keeps the latest event
     eventId: latestPath.eventId,
     timestamp: latestPath.timestamp,
   });
+});
+
+test("artifact last-occurrence ordering preserves interleaved inline entries and URL identity", () => {
+  const events = [
+    { path: "/tmp/report" },
+    { content: "inline first" },
+    { url: "/tmp/report" },
+    { path: "/tmp/other" },
+    { url: "/tmp/report" },
+    { content: "inline second" },
+    { path: "/tmp/report" },
+  ].map((artifact, index) => artifactEvent(`mixed-${index}`, index, artifact));
+  const projected = store.projectRun(events);
+  assert.deepEqual(projected.artifacts.map((artifact) => artifact.eventId), ["mixed-1", "mixed-3", "mixed-4", "mixed-5", "mixed-6"]);
+});
+
+test("50,000 artifact events with repeated paths project within a bounded subprocess", () => {
+  // A child-process deadline can interrupt a synchronous quadratic regression;
+  // an ordinary node:test timeout cannot interrupt a blocked event loop.
+  const source = `
+    import assert from 'node:assert/strict';
+    import { projectRun, SCHEMA_VERSION } from ${JSON.stringify(new URL("../lib/store.mjs", import.meta.url).href)};
+    const count = 25_000;
+    const events = Array.from({ length: count * 2 }, (_, index) => ({
+      schema: SCHEMA_VERSION, runId: 'large-artifacts', workflow: 'projection-test',
+      eventId: 'load-' + index, type: 'artifact',
+      timestamp: new Date(Date.UTC(2025, 0, 1) + index).toISOString(),
+      artifact: { path: '/tmp/path-' + (index % count) },
+    }));
+    const projected = projectRun(events);
+    assert.equal(projected.artifacts.length, count);
+    assert.ok(projected.artifacts.every((artifact, index) => artifact.eventId === 'load-' + (count + index)));
+  `;
+  execFileSync(process.execPath, ["--input-type=module", "-e", source], { timeout: 15_000, encoding: "utf8" });
 });
 
 test("projectRun preserves distinct inline-only artifacts even when their content matches", () => {

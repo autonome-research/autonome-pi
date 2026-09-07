@@ -100,6 +100,22 @@ test("projectRun creates and ends a phase when lifecycle boundary events are mis
   assert.equal(ended.eventCount, 0);
 });
 
+test("synthesized phase endings preserve raw workflow status separately from normalization", () => {
+  for (const [status, normalizedStatus] of [["custom-terminal", "unknown"], ["completed", "success"], ["cancelled", "cancelled"]]) {
+    const end = event("raw-terminal", 3, store.EVENT_TYPES.WORKFLOW_END, { status });
+    const summary = store.projectRun([
+      event("implicit-phase", 1, store.EVENT_TYPES.PHASE_EVENT, { phase: "implicit" }),
+      event("explicit-end", 2, store.EVENT_TYPES.PHASE_END, { phase: "explicit", status: "failed" }),
+      end,
+    ]);
+    const implicit = summary.phases.find((phase) => phase.phase === "implicit");
+    assert.equal(implicit.status, status);
+    assert.equal(implicit.normalizedStatus, normalizedStatus);
+    assert.equal(implicit.endedAt, end.timestamp);
+    assert.equal(summary.phases.find((phase) => phase.phase === "explicit").status, "failed", "explicit phase endings must not be overwritten");
+  }
+});
+
 test("projectRun closes open phases only after observing workflow_end", () => {
   const phaseEventOnly = event("open-phase-event", 1, store.EVENT_TYPES.PHASE_EVENT, {
     phase: "implicit",

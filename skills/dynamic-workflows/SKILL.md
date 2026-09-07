@@ -65,7 +65,7 @@ Parallel Pi subagents over explicit or earlier-phase items:
 }
 ```
 
-Use `itemsFrom: "phase-name"` instead of `items` to consume an earlier output. Arrays pass through; strings are parsed as JSON arrays/objects when possible, otherwise as non-empty lines with `-`/`*` bullets removed. `failOnItemFailure` defaults to true and waits for siblings to settle; `label` customizes progress event wording.
+Use `itemsFrom: "phase-name"` instead of `items` to consume an earlier output. Arrays pass through; strings are parsed as JSON arrays/objects when possible, otherwise as non-empty lines with `-`/`*` bullets removed. `failOnItemFailure` defaults to true and waits for siblings to settle.
 
 ### `shell`
 
@@ -89,8 +89,8 @@ Artifact phases require exactly one of `content` or `from`.
 - Fanout prompts may use `{{item}}` and `{{index}}`.
 - References may not point forward.
 - `fanout` requires exactly one of `items` or `itemsFrom`.
-- Retries are explicit and bounded: `retry: { maxAttempts, baseDelayMs }`.
-- Retry delays use exponential backoff without jitter.
+- Executable phase attempts are explicit and bounded: `attempts` is an integer from 1 through 5.
+- Retry delays use deterministic internal exponential backoff and are not caller-configurable.
 - Do not retry non-idempotent side effects casually.
 
 Mixed-permission example:
@@ -111,7 +111,7 @@ Mixed-permission example:
 ## Execution policy
 
 - Set `cwd` explicitly when execution differs from the Pi session cwd.
-- Top-level `model`, `timeoutMs`, and `concurrency` provide phase defaults; `metadata` retains optional caller metadata in the compiled input.
+- Top-level `model` and `timeoutMs` provide phase defaults. Fanout concurrency is phase-local; descriptions, caller metadata, and retry backoff are not declarative fields.
 - Use `background: true` for long workflows. Success and failure durably return control to chat; user cancellation does not.
 - Use `after` with a trusted terminal successful or failed run id to launch its single chained successor. Do not chain from a cancelled run.
 - Add an artifact phase when the user expects a durable report.
@@ -125,7 +125,7 @@ Store reusable workflows under `~/.pi/agent/workflows/` (or `PI_DYNAMIC_WORKFLOW
 - `<name>.json` is a flat structured `dynamic_workflow` object. Invoke it with `{ "template": "name", "inputs": { ... } }` instead of phases. Use `{{inputs.key}}` placeholders; exact placeholders preserve JSON values, while placeholders embedded in text require scalars.
 - `<name>.mjs` is a self-contained advanced harness. Invoke it with `dynamic_workflow_harness` using `{ "template": "name", "permissions": "rwx" }`.
 
-Missing or unused structured-template inputs fail preflight. Invocation-level workflow defaults override structured-template defaults; metadata is merged and records `savedTemplate`. Do not provide both `template` and `phases`, or combine a harness template with `harness`/`harnessFile`. Template names are safe identifiers rather than paths. Symlinks, non-files, traversal, and files above 1 MB fail preflight. Templates do not bypass permission ceilings or normal validation. Authoring remains explicit and file-based; the tools do not overwrite saved templates.
+Missing or unused structured-template inputs fail preflight. Invocation-level workflow defaults override structured-template defaults; trusted saved-template provenance is stored separately from caller data. Use exactly one of `template`, `phases`, or `resumeRunId`, and do not combine a harness template with `harness`/`harnessFile`. Template names are safe identifiers rather than paths. Symlinks, non-files, traversal, and files above 1 MB fail preflight. Templates do not bypass permission ceilings or normal validation. Authoring remains explicit and file-based; the tools do not overwrite saved templates.
 
 ## Chaining
 
@@ -167,7 +167,7 @@ Prefer a standalone TypeScript extension using thread-phase directly when logic 
 
 ## Compatibility
 
-`dynamic_thread_phase_workflow` is a deprecated legacy interface and is inactive by default. Do not use it for new calls. Ordinary old `{ spec: ... }` structured arguments are upgraded by `dynamic_workflow.prepareArguments`; full legacy harness and per-phase artifact-option compatibility remains available through the alias when explicitly enabled. Unsupported legacy-only phase options fail with an actionable migration error rather than being silently discarded.
+`dynamic_thread_phase_workflow` is a deprecated legacy interface and is inactive by default. Do not use it for new calls. Ordinary old `{ spec: ... }` structured arguments are upgraded only when they fit the reduced contract; removed fields fail rather than being silently discarded. Exact v1 decoding remains internal for trusted historical checkpoints and the explicitly enabled legacy alias.
 
 ## Checklist
 

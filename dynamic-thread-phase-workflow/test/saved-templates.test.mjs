@@ -64,12 +64,12 @@ test("saved structured workflow executes by safe template name and records prove
     writeFileSync(join(env.templates, "review.json"), JSON.stringify({
       name: "saved-review",
       permissions: "r",
-      metadata: { owner: "test", targets: "{{inputs.targets}}" },
+      background: true,
       phases: [{ type: "artifact", name: "report", content: "saved workflow output: {{inputs.subject}}" }],
     }));
     const result = await registeredTools().get("dynamic_workflow").execute(
       "test",
-      { template: "review", inputs: { subject: "cancellation", targets: ["src", "tests"] }, name: "saved-review-override", metadata: { ticket: "T-1" }, background: true },
+      { template: "review", inputs: { subject: "cancellation" }, name: "saved-review-override" },
       undefined,
       undefined,
       executionContext(testDir),
@@ -84,12 +84,13 @@ test("saved structured workflow executes by safe template name and records prove
     // Wait before reading outputs or removing the runner's temporary store.
     await waitForWorkflowEnd(env.store, runId, result.details.pid);
     const start = JSON.parse(readFileSync(join(env.store, "runs", `${runId}.start.json`), "utf8"));
-    assert.equal(start.metadata.continuationMode, "terminal", "background workflows return success or failure to chat by default");
+    assert.equal(start.metadata.continuationMode, "terminal", "a saved-template background default remains an effective launch control");
+    assert.equal(start.metadata.savedTemplate, "review", "saved-template provenance is bound into immutable run ownership");
     const compiled = JSON.parse(readFileSync(join(env.store, "artifacts", runId, "workflow-spec.json"), "utf8"));
-    assert.equal(compiled.metadata.owner, "test");
-    assert.equal(compiled.metadata.ticket, "T-1");
-    assert.deepEqual(compiled.metadata.targets, ["src", "tests"]);
-    assert.equal(compiled.metadata.savedTemplate, "review");
+    assert.equal(compiled.schema, "pi-dynamic-workflow/v2");
+    assert.equal(compiled.metadata, undefined, "caller metadata must not enter the v2 compiled contract");
+    const checkpoint = JSON.parse(readFileSync(join(env.store, "artifacts", runId, "workflow-checkpoint.json"), "utf8"));
+    assert.equal(checkpoint.savedTemplate, "review", "saved-template provenance is system-owned checkpoint data");
     assert.equal(compiled.phases[0].content, "saved workflow output: cancellation");
     assert.equal(readFileSync(join(env.store, "artifacts", runId, "report.md"), "utf8"), "saved workflow output: cancellation");
   } finally {
@@ -155,6 +156,13 @@ test("saved templates reject ambiguous modes, traversal, symlinks, invalid JSON,
     writeFileSync(join(env.templates, "valid.json"), JSON.stringify({ permissions: "r", phases: direct }));
     writeFileSync(join(env.templates, "invalid.json"), "{");
     writeFileSync(join(env.templates, "wrong-kind.json"), JSON.stringify({ harnessFile: "workflow.mjs", phases: direct }));
+    writeFileSync(join(env.templates, "removed-metadata.json"), JSON.stringify({ metadata: { owner: "caller" }, phases: direct }));
+    writeFileSync(join(env.templates, "removed-phase-field.json"), JSON.stringify({ phases: [{ ...direct[0], fileName: "caller.md" }] }));
+    writeFileSync(join(env.templates, "bad-workflow-types.json"), JSON.stringify({ model: false, phases: direct }));
+    writeFileSync(join(env.templates, "bad-background.json"), JSON.stringify({ background: "false", phases: direct }));
+    writeFileSync(join(env.templates, "bad-phase-model.json"), JSON.stringify({ phases: [{ type: "agent", name: "agent", prompt: "x", model: 7 }] }));
+    writeFileSync(join(env.templates, "bad-fanout-boolean.json"), JSON.stringify({ phases: [{ type: "fanout", name: "many", prompt: "{{item}}", items: ["x"], failOnItemFailure: "false" }] }));
+    writeFileSync(join(env.templates, "bad-artifact-title.json"), JSON.stringify({ phases: [{ ...direct[0], title: false }] }));
     writeFileSync(join(env.templates, "needs-input.json"), JSON.stringify({ permissions: "r", phases: [{ type: "artifact", name: "result", content: "{{inputs.message}}" }] }));
     writeFileSync(join(env.templates, "embedded-input.json"), JSON.stringify({ permissions: "r", phases: [{ type: "artifact", name: "result", content: "value={{inputs.message}}" }] }));
     writeFileSync(join(testDir, "outside.json"), JSON.stringify({ permissions: "r", phases: direct }));
@@ -163,15 +171,33 @@ test("saved templates reject ambiguous modes, traversal, symlinks, invalid JSON,
     await assert.rejects(workflow("test", { template: "valid", phases: direct }, undefined, undefined, ctx), /exactly one of template, phases, or resumeRunId/);
     await assert.rejects(workflow("test", {}, undefined, undefined, ctx), /exactly one of template, phases, or resumeRunId/);
     await assert.rejects(workflow("test", { resumeRunId: "source-run", name: "do-not-override" }, undefined, undefined, ctx), /accepts only resumeRunId and background/);
-    await assert.rejects(workflow("test", { template: "../outside" }, undefined, undefined, ctx), /paths are not accepted/);
+    await assert.rejects(workflow("test", { resumeRunId: "source-run", after: "parent-run" }, undefined, undefined, ctx), /accepts only resumeRunId and background/);
+    await assert.rejects(workflow("test", { template: "valid", resumeRunId: "source-run" }, undefined, undefined, ctx), /exactly one of template, phases, or resumeRunId/);
+    for (const removed of [
+      { description: "caller" }, { metadata: { caller: true } }, { concurrency: 2 },
+    ]) await assert.rejects(workflow("test", { phases: direct, ...removed }, undefined, undefined, ctx), /unsupported field/);
+    for (const removedPhase of [
+      { type: "agent", name: "agent", prompt: "x", description: "caller" },
+      { type: "shell", name: "shell", command: "true", retry: { maxAttempts: 2 } },
+      { type: "fanout", name: "fanout", items: ["x"], prompt: "{{item}}", label: "items" },
+      { ...direct[0], fileName: "caller.md" },
+      { ...direct[0], kind: "json" },
+    ]) await assert.rejects(workflow("test", { phases: [removedPhase] }, undefined, undefined, ctx), /unsupported field/);
+    await assert.rejects(workflow("test", { template: "../outside" }, undefined, undefined, ctx), /(?:paths are not accepted|safe saved-template name)/);
     await assert.rejects(workflow("test", { template: "linked" }, undefined, undefined, ctx), /must not be a symbolic link/);
     await assert.rejects(workflow("test", { template: "invalid" }, undefined, undefined, ctx), /Could not parse saved workflow template/);
-    await assert.rejects(workflow("test", { template: "wrong-kind" }, undefined, undefined, ctx), /may contain only flat dynamic_workflow arguments/);
+    await assert.rejects(workflow("test", { template: "wrong-kind" }, undefined, undefined, ctx), /(?:may contain only flat dynamic_workflow arguments|unsupported field)/);
+    await assert.rejects(workflow("test", { template: "removed-metadata" }, undefined, undefined, ctx), /unsupported field.*metadata/);
+    await assert.rejects(workflow("test", { template: "removed-phase-field" }, undefined, undefined, ctx), /unsupported field.*fileName/);
+    await assert.rejects(workflow("test", { phases: direct, background: "false" }, undefined, undefined, ctx), /background must be a boolean/);
+    for (const malformed of ["bad-workflow-types", "bad-background", "bad-phase-model", "bad-fanout-boolean", "bad-artifact-title"]) {
+      await assert.rejects(workflow("test", { template: malformed }, undefined, undefined, ctx), /must be|invalid/);
+    }
     await assert.rejects(workflow("test", { template: "needs-input" }, undefined, undefined, ctx), /requires input: message/);
     await assert.rejects(workflow("test", { template: "needs-input", inputs: { message: "x", typo: "y" } }, undefined, undefined, ctx), /unused inputs: typo/);
     await assert.rejects(workflow("test", { template: "embedded-input", inputs: { message: { nested: true } } }, undefined, undefined, ctx), /must be a scalar when embedded in text/);
     await assert.rejects(workflow("test", { phases: direct, inputs: { message: "x" } }, undefined, undefined, ctx), /inputs may only be used/);
-    await assert.rejects(workflow("test", { template: "missing" }, undefined, undefined, ctx), /Available: embedded-input, invalid, needs-input, valid, wrong-kind/);
+    await assert.rejects(workflow("test", { template: "missing" }, undefined, undefined, ctx), /Available: .*valid/);
     await assert.rejects(harness("test", { template: "harness-report", harness: "export default async()=>{}", permissions: "rwx" }, undefined, undefined, ctx), /exactly one of template, harness, or harnessFile/);
     await assert.rejects(harness("test", { template: "harness-report", inputs: { message: "x" }, permissions: "rwx" }, undefined, undefined, ctx), /only by saved structured workflow templates/);
     await assert.rejects(harness("test", { harness: "export default async()=>{}", permissions: "rwx", resumeRunId: "source-run" }, undefined, undefined, ctx), /supported only for structured workflows/);
