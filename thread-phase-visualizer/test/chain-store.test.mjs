@@ -6,6 +6,9 @@ import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 
+process.env.PI_DYNAMIC_WORKFLOW_BACKGROUND = "";
+process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND = "";
+
 const moduleUrl = new URL("../lib/chain-store.mjs", import.meta.url).href;
 const CHAIN_ID = "12345678-1234-4123-8123-123456789abc";
 
