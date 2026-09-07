@@ -80,15 +80,44 @@ test("startup SIGTERM is observed before the CLI can detach a background run", a
   }
 });
 
-test("advanced harness tool rejects ambiguous and empty inputs", async () => {
+test("scripted workflow rejects ambiguous and empty sources", async () => {
   const tools = new Map();
   registerDynamicWorkflows({ registerTool: (definition) => tools.set(definition.name, definition) });
-  const execute = tools.get("dynamic_workflow_harness").execute;
+  const execute = tools.get("scripted_workflow").execute;
   const ctx = { cwd: root, sessionManager: {} };
-  await assert.rejects(execute("test", { harness: "export default async function workflow() {}", harnessFile: "/tmp/workflow.mjs", permissions: "rwx" }, undefined, undefined, ctx), /exactly one of template, harness, or harnessFile/);
-  await assert.rejects(execute("test", { harness: "", permissions: "rwx" }, undefined, undefined, ctx), /harness must be a non-empty string/);
-  await assert.rejects(execute("test", { harness: "   ", permissions: "rwx" }, undefined, undefined, ctx), /harness must be a non-empty string/);
-  await assert.rejects(execute("test", { harnessFile: "", permissions: "rwx" }, undefined, undefined, ctx), /harnessFile must be a non-empty path/);
+  await assert.rejects(execute("test", { script: "export default async function workflow() {}", scriptFile: "/tmp/workflow.mjs", permissions: "rwx" }, undefined, undefined, ctx), /exactly one of template, script, or scriptFile/);
+  await assert.rejects(execute("test", { script: "", permissions: "rwx" }, undefined, undefined, ctx), /script must be a non-empty string/);
+  await assert.rejects(execute("test", { script: "   ", permissions: "rwx" }, undefined, undefined, ctx), /script must be a non-empty string/);
+  await assert.rejects(execute("test", { scriptFile: "", permissions: "rwx" }, undefined, undefined, ctx), /scriptFile must be a non-empty path/);
+});
+
+test("pre-aborted inline scripted workflow cleans its temporary input without creating a run", async () => {
+  const testDir = mkdtempSync(join(tmpdir(), "scripted-pre-abort-"));
+  const previousStore = process.env.PI_THREAD_PHASE_STORE_DIR;
+  process.env.PI_THREAD_PHASE_STORE_DIR = join(testDir, "store");
+  try {
+    const tools = new Map();
+    registerDynamicWorkflows({ registerTool: (definition) => tools.set(definition.name, definition) });
+    const before = new Set(readdirSync(tmpdir()).filter((entry) => entry.startsWith("pi-dynamic-workflow-")));
+    const controller = new AbortController();
+    controller.abort("request already cancelled");
+    await assert.rejects(
+      tools.get("scripted_workflow").execute("test", {
+        script: "export default async function workflow() {}",
+        permissions: "rwx",
+        background: true,
+      }, controller.signal, undefined, { cwd: root, sessionManager: {} }),
+      /scripted workflow runner cancelled/,
+    );
+    await wait(100);
+    assert.equal(existsSync(join(testDir, "store")), false);
+    const after = readdirSync(tmpdir()).filter((entry) => entry.startsWith("pi-dynamic-workflow-") && !before.has(entry));
+    assert.deepEqual(after, [], `temporary scripted inputs leaked: ${after.join(", ")}`);
+  } finally {
+    if (previousStore === undefined) delete process.env.PI_THREAD_PHASE_STORE_DIR;
+    else process.env.PI_THREAD_PHASE_STORE_DIR = previousStore;
+    rmSync(testDir, { recursive: true, force: true });
+  }
 });
 
 test("legacy nested spec arguments are prepared into the flat public format", () => {
@@ -131,17 +160,18 @@ test("legacy preparation rejects conflicts and options the simplified format can
   }), /cannot be represented by the simplified format/);
 });
 
-test("legacy alias is registered but removed from the default active tool set", () => {
+test("scripted tool replaces the old public harness name and the legacy alias remains inactive", () => {
   const tools = new Map();
   const handlers = new Map();
-  let active = ["read", "dynamic_workflow", "dynamic_workflow_harness", "dynamic_thread_phase_workflow"];
+  let active = ["read", "dynamic_workflow", "scripted_workflow", "dynamic_thread_phase_workflow"];
   registerDynamicWorkflows({
     registerTool: (definition) => tools.set(definition.name, definition),
     on: (name, handler) => handlers.set(name, handler),
     getActiveTools: () => active,
     setActiveTools: (next) => { active = next; },
   });
-  assert.deepEqual([...tools.keys()], ["dynamic_workflow", "dynamic_workflow_harness", "dynamic_thread_phase_workflow"]);
+  assert.deepEqual([...tools.keys()], ["dynamic_workflow", "scripted_workflow", "dynamic_thread_phase_workflow"]);
+  assert.equal(tools.has("dynamic_workflow_harness"), false);
   handlers.get("session_start")();
-  assert.deepEqual(active, ["read", "dynamic_workflow", "dynamic_workflow_harness"]);
+  assert.deepEqual(active, ["read", "dynamic_workflow", "scripted_workflow"]);
 });

@@ -8,7 +8,7 @@ Autonome's Pi package for shared extensions, workflow tooling, and skills.
 - `detach` — `/detach` and `/detach-status` commands for handing an interactive Pi session off to tmux so it can survive an SSH logout.
 - `codebase-exploration-workflow` — fanout codebase exploration workflow using Pi subagents.
 - `code-review-workflow` — git diff/commit code review workflow using Pi subagents.
-- `dynamic-workflows` — simple validated composer for ordered `agent`, `fanout`, `shell`, and `artifact` phases, plus a separate advanced JavaScript harness tool.
+- `dynamic-workflows` — simple validated composer for ordered `agent`, `fanout`, `shell`, and `artifact` phases, plus a separate advanced scripted JavaScript tool.
 - `mission-workflow` — Droid/Missions-style long-running software mission extension with plan approval, validation contracts, strict handoffs, per-feature worktrees/commits, command + adversarial validators, durable registry/resume, coverage artifacts, and repair loops.
 - `skills/dynamic-workflows` and `skills/mission-workflow` — on-demand Pi skills that teach other sessions/configurations how to use these workflow tools safely.
 
@@ -40,10 +40,10 @@ Pi identifies git packages by repository URL, so remove the old source before in
 - Background dynamic workflows durably return control to the launching Pi session after success or failure; failed continuations identify failed phases/errors/partial artifacts, while user-cancelled runs never auto-continue.
 - `/codebase-explore` starts codebase exploration in the background by default.
 - `/code-review` runs code review workflows.
-- `dynamic_workflow` composes validated subagent workflows directly from flat `agent`, `fanout`, `shell`, and `artifact` phases. `dynamic_workflow_harness` is the separate advanced JavaScript interface; `dynamic_thread_phase_workflow` is an inactive deprecated compatibility alias.
+- `dynamic_workflow` composes validated subagent workflows directly from flat `agent`, `fanout`, `shell`, and `artifact` phases. `scripted_workflow` is the separate advanced unsandboxed JavaScript interface; `dynamic_thread_phase_workflow` is an inactive deprecated compatibility alias.
 - `mission_workflow` plans and activates approved Droid/Missions-style software missions. Always run `action: "plan"` and get user approval before `action: "activate"`.
 - Tool/API inspection remains available through `thread_phase_runs`.
-- Workflow skills are included in the package and should load automatically when tasks ask for dynamic workflows, mission workflows, structured workflow specs, JS harness workflows, or multi-phase dynamic execution.
+- Workflow skills are included in the package and should load automatically when tasks ask for dynamic workflows, mission workflows, structured workflow specs, scripted JavaScript workflows, or multi-phase dynamic execution.
 
 ## Current status
 
@@ -61,12 +61,12 @@ Recent changes:
 - Cooperative cancellation uses cancel request files under `~/.pi/agent/thread-phase/cancel/<runId>.json` instead of direct monitor PID killing.
 - `dynamic_workflow` now accepts the workflow directly—no outer `spec` wrapper—and uses the clearer `agent`, `fanout`, `shell`, and `artifact` phase names.
 - Permissions are explicit phase defaults/overrides: `r`, `w`, `rw`, and `rwx`; shell and Pi `bash` execution require `rwx`.
-- Advanced unsandboxed JavaScript control flow moved to `dynamic_workflow_harness`, which requires explicit `permissions: "rwx"`.
+- Advanced unsandboxed JavaScript control flow uses `scripted_workflow`, which requires explicit `permissions: "rwx"`. Migrate `dynamic_workflow_harness` calls from `{ harness, harnessFile }` to `{ script, scriptFile }`; the old public tool name is no longer registered.
 - `dynamic_thread_phase_workflow` remains registered for compatibility but is inactive by default, avoiding a duplicate legacy schema in normal model context.
 - Structured specs have a reduced v2 contract with strict phase validation, bounded `attempts` and deterministic internal backoff, phase-local fanout concurrency, collision-safe artifacts, partial failure results, and background readiness acknowledgements containing `runId` + `pid`.
 - Reusable or operationally important workflows should graduate into standalone TypeScript extensions using thread-phase directly.
 - Dynamic workflow runs carry system-generated chain provenance. A terminal successful or failed parent accepts at most one session-scoped successor through `after`; cancelled parents cannot continue a chain.
-- Reusable structured workflows and self-contained harnesses can be loaded by safe template name from `~/.pi/agent/workflows/`; template loading is bounded, rejects traversal/symlinks, preserves provenance, and still enforces normal validation and permission ceilings.
+- Reusable structured workflows and self-contained scripted workflows can be loaded by safe template name from `~/.pi/agent/workflows/`; template loading is bounded, rejects traversal/symlinks, preserves provenance, and still enforces normal validation and permission ceilings.
 - Structured workflows support fail-closed `resumeRunId` recovery through atomic checkpoint manifests and bounded, hashed phase-output artifacts; spec, cwd, model, session, phase identity, containment, size, and integrity must verify before reuse.
 - The workflow dashboard is available through selectable `/workflows` and `ctrl+shift+t` entry points, shows compact elapsed-time and aggregate-token metrics, and labels phase/fanout rows with observed inference models instead of redundant worded statuses.
 - Usage events are aggregated into run, phase, and fanout-item summaries and rendered in tools/monitor/completion cards.

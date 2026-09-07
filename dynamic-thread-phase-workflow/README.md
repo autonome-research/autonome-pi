@@ -131,7 +131,7 @@ Persist literal content or an earlier phase output:
 { "type": "artifact", "name": "report", "title": "Final report", "from": "review" }
 ```
 
-An artifact phase must provide exactly one of `content` or `from`. Generated artifact paths normally use the phase name; when distinct phase names normalize or truncate to the same filesystem name, the runner adds a deterministic strong digest so every output remains distinct. Fanout item artifacts always use collision-safe generated paths. A run-scoped filename registry also protects artifacts emitted by runtime-discovered harness phases and repeated emissions; ordinary unused paths remain unchanged.
+An artifact phase must provide exactly one of `content` or `from`. Generated artifact paths normally use the phase name; when distinct phase names normalize or truncate to the same filesystem name, the runner adds a deterministic strong digest so every output remains distinct. Fanout item artifacts always use collision-safe generated paths. A run-scoped filename registry also protects artifacts emitted by runtime-discovered scripted phases and repeated emissions; ordinary unused paths remain unchanged.
 
 The run artifact directory reserves its complete internal layout in every emission mode, including entries not used by the current mode: `workflow-spec.json`, `workflow-checkpoint.json`, `workflow-result.json`, `workflow-processes.json`, `workflow-harness-manifest.json`, `workflow-harness.mjs`, and the `phase-outputs/` directory. Atomic persistence also owns temporary siblings named `<target>.<token>.tmp` for the checkpoint, result, and process journal; phase-output temporary files stay inside the reserved directory. Generated artifacts that would use any reserved name receive a deterministic digest suffix.
 
@@ -203,13 +203,13 @@ Invoke `~/.pi/agent/workflows/repository-review.json` with:
 
 Use exactly one of `template`, `phases`, or `resumeRunId`. `{{inputs.key}}` placeholders make structured templates reusable: an exact placeholder preserves the input's JSON type, while a placeholder embedded in text requires a scalar. Missing and unused inputs fail preflight to catch mistakes. Invocation-level workflow defaults override template defaults, including `background` (`false` explicitly overrides a saved `true`). Templates define the phases; invocations cannot replace them. `after` and `resumeRunId` are invocation-only controls and cannot be embedded in templates. Saved-template provenance is persisted as trusted checkpoint data rather than caller metadata. The normal schema, permission ceiling, semantic preflight, cancellation, and runtime bounds still apply after loading.
 
-A saved advanced harness is a self-contained `<name>.mjs` file in the same directory. Invoke it through the separate harness tool:
+A saved scripted workflow is a self-contained `<name>.mjs` file in the same directory. Invoke it through the separate `scripted_workflow` tool:
 
 ```json
 { "template": "custom-tournament", "permissions": "rwx", "background": true }
 ```
 
-Use exactly one of `template`, `harness`, or `harnessFile`. Saved harnesses remain arbitrary unsandboxed JavaScript and still require explicit `rwx`. They must be self-contained because the runner executes a durable copy from the run artifact directory.
+Use exactly one of `template`, `script`, or `scriptFile`. Saved scripts remain arbitrary unsandboxed JavaScript and still require explicit `permissions: "rwx"`, including template mode. They must be self-contained because the runner executes a durable copy from the run artifact directory.
 
 Template names are identifiers, not paths. Traversal and symlinked files are rejected, files must be regular files no larger than 1 MB, and parse/preflight failures occur before a visualizer run is created. Template authoring is intentionally file-based; this tool does not silently create or overwrite persistent templates.
 
@@ -221,7 +221,7 @@ After every successfully completed structured phase, the runner atomically write
 { "resumeRunId": "review-and-fix-..." }
 ```
 
-The trusted source run supplies the compiled spec, real cwd, effective model, permissions, template provenance, Pi session, and prior outputs. Repeating or overriding them is rejected. Resume validates contiguous phase identities, artifact containment, output size, and SHA-256 hash before creating the new run. Validated outputs are copied into the new run's checkpoint chain, completed phases are represented in its lifecycle without re-execution, and execution starts at the first uncheckpointed phase. Any mismatch fails preflight. JavaScript harnesses cannot be resumed this way.
+The trusted source run supplies the compiled spec, real cwd, effective model, permissions, template provenance, Pi session, and prior outputs. Repeating or overriding them is rejected. Resume validates contiguous phase identities, artifact containment, output size, and SHA-256 hash before creating the new run. Validated outputs are copied into the new run's checkpoint chain, completed phases are represented in its lifecycle without re-execution, and execution starts at the first uncheckpointed phase. Any mismatch fails preflight. Scripted JavaScript workflows cannot be resumed this way.
 
 Cancelled sources cannot be resumed. A source without a recorded `workflow_end` (including a failure inferred only from error events) can be resumed only when verified owner metadata proves its runner PID is gone **and** its same-host `workflow-processes.json` journal proves all supervised subprocess groups are gone. Newly journaled terminal sources must pass the same group check: even a failed shell can leave grandchildren running. Launch intent is persisted before spawning, so a crash before the child PID is recorded fails closed. Only positive proof that no child was created can clear an unstarted launch intent. The supported journal-policy version is bound to the immutable start envelope, preventing downgrade to legacy recovery by editing the event log. Live groups, unresolved ownership, heartbeat staleness alone, and legacy nonterminal sources without a process journal are rejected. Recovery does not kill possibly reused PIDs. Checkpoint session, cwd, and chain identity must match the authoritative source run; concurrent or repeated resumes cannot create multiple successors. Process-group recovery is POSIX-only for runs that spawned children, and cannot supervise programs that deliberately detach into separate groups. Legacy terminal sources retain their previous resume behavior without descendant-inactivity proof; legacy sources without a recorded `workflow_end` remain blocked.
 
@@ -242,9 +242,11 @@ Every run receives system-generated `chainId`, `rootRunId`, and `chainStep` prov
 
 The child receives a new system-generated run id, inherits the parent's chain identity, and records `parentRunId`. Parent ownership and Pi session identity fail closed. A parent can commit only one child, chain length is operator-bounded by `PI_DYNAMIC_WORKFLOW_MAX_CHAIN_RUNS` (default 20), and a user-cancelled parent cannot continue. Use `resumeRunId` for the same interrupted structured workflow; use `after` for a different recovery or successor workflow. Parallel work belongs inside a `fanout` phase.
 
-## Advanced JavaScript harnesses
+## Advanced scripted workflows
 
-`dynamic_workflow_harness` is a separate advanced tool for loops, branching, tournaments, custom scoring, or other control flow that structured phases cannot express. Harness code is arbitrary unsandboxed Node.js and requires explicit `permissions: "rwx"`.
+`scripted_workflow` is a separate advanced tool for loops, branching, tournaments, custom scoring, or other control flow that declarative phases cannot express. Script code is arbitrary unsandboxed Node.js and requires explicit `permissions: "rwx"`. Prefer `dynamic_workflow` for ordinary composition.
+
+Inline mode accepts a self-contained ES module in `script`; file mode accepts its path in `scriptFile`; saved mode accepts a safe `template` name for `<name>.mjs`. These source modes are mutually exclusive. The remaining controls are only `name`, `cwd`, `model`, `timeoutMs`, `background`, and `after`.
 
 ```js
 export default async function workflow(ctx) {
@@ -259,11 +261,13 @@ export default async function workflow(ctx) {
 }
 ```
 
-Prefer `dynamic_workflow` for normal composition. Reusable or operationally important logic should graduate into a standalone TypeScript extension using thread-phase directly.
+Reusable or operationally important logic should graduate into a standalone TypeScript extension using thread-phase directly.
 
 ## Compatibility
 
-The deprecated `dynamic_thread_phase_workflow` tool remains registered for old `{ spec: ... }` and harness calls but is inactive by default. Set `PI_DYNAMIC_WORKFLOW_ENABLE_LEGACY_ALIAS=1` only when an old session must call it. The canonical tool's `prepareArguments` upgrades phase names and timeout only when the result fits the reduced contract; removed fields fail clearly rather than leaking into v2.
+The old public `dynamic_workflow_harness` registration has been replaced: migrate `dynamic_workflow_harness { harness, harnessFile }` to `scripted_workflow { script, scriptFile }`. Saved `.mjs` template calls keep `template` but must still pass explicit `permissions: "rwx"`.
+
+The deprecated `dynamic_thread_phase_workflow` tool remains registered for explicitly opted-in old `{ spec: ... }` and harness calls but is inactive by default. Set `PI_DYNAMIC_WORKFLOW_ENABLE_LEGACY_ALIAS=1` only when an old session must call it. The canonical declarative tool's `prepareArguments` upgrades phase names and timeout only when the result fits the reduced contract; removed fields fail clearly rather than leaking into v2.
 
 The compiled runner contract is `pi-dynamic-workflow/v2`. Exact v1 decoding remains available only for trusted `pi-dynamic-workflow-checkpoint/v1` resume artifacts, explicit `pi-dynamic-workflow/v1` specs, and the legacy alias. Legacy fingerprints are computed from their original normalized v1 spec and are never rewritten as v2.
 
@@ -281,7 +285,7 @@ Advanced harness CLI:
 
 ## Runtime bounds
 
-- Saved structured/harness template file: 1 MB
+- Saved structured/scripted template file: 1 MB
 - Resumable phase output artifact: 4 MB
 - Resume checkpoint manifest: 1 MB
 - Workflow phase count: 30

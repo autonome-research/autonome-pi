@@ -1,6 +1,6 @@
 ---
 name: dynamic-workflows
-description: Use when composing or running bounded Pi subagent workflows with dynamic_workflow, agent/fanout/shell/artifact phases, workflow permissions, monitoring, or advanced JavaScript harnesses.
+description: Use when composing or running bounded Pi subagent workflows with dynamic_workflow, agent/fanout/shell/artifact phases, workflow permissions, monitoring, or advanced scripted JavaScript workflows.
 ---
 
 # Dynamic Workflows
@@ -123,9 +123,9 @@ Mixed-permission example:
 Store reusable workflows under `~/.pi/agent/workflows/` (or `PI_DYNAMIC_WORKFLOW_TEMPLATE_DIR`):
 
 - `<name>.json` is a flat structured `dynamic_workflow` object. Invoke it with `{ "template": "name", "inputs": { ... } }` instead of phases. Use `{{inputs.key}}` placeholders; exact placeholders preserve JSON values, while placeholders embedded in text require scalars.
-- `<name>.mjs` is a self-contained advanced harness. Invoke it with `dynamic_workflow_harness` using `{ "template": "name", "permissions": "rwx" }`.
+- `<name>.mjs` is a self-contained advanced script. Invoke it with `scripted_workflow` using `{ "template": "name", "permissions": "rwx" }`.
 
-Missing or unused structured-template inputs fail preflight. Invocation-level workflow defaults override structured-template defaults; trusted saved-template provenance is stored separately from caller data. Use exactly one of `template`, `phases`, or `resumeRunId`, and do not combine a harness template with `harness`/`harnessFile`. Template names are safe identifiers rather than paths. Symlinks, non-files, traversal, and files above 1 MB fail preflight. Templates do not bypass permission ceilings or normal validation. Authoring remains explicit and file-based; the tools do not overwrite saved templates.
+Missing or unused structured-template inputs fail preflight. Invocation-level workflow defaults override structured-template defaults; trusted saved-template provenance is stored separately from caller data. For `dynamic_workflow`, use exactly one of `template`, `phases`, or `resumeRunId`. For `scripted_workflow`, use exactly one of `template`, `script`, or `scriptFile`. Template names are safe identifiers rather than paths. Symlinks, non-files, traversal, and files above 1 MB fail preflight. Templates do not bypass permission ceilings or normal validation. Authoring remains explicit and file-based; the tools do not overwrite saved templates.
 
 ## Chaining
 
@@ -145,15 +145,17 @@ Structured workflows write an atomic `workflow-checkpoint.json` plus hashed per-
 { "resumeRunId": "review-src-..." }
 ```
 
-Resume is fail-closed. The trusted run supplies the compiled spec, real working directory, effective model, permissions, template provenance, and Pi session; repeating or overriding them is rejected. Checkpoints must contain a contiguous prefix of matching phases, output files must remain inside the source run's artifact directory, and their sizes and SHA-256 hashes must verify. Validated outputs are copied into the new run's own checkpoint chain; completed phases are not re-executed, and execution continues at the first uncheckpointed phase. Harness workflows cannot use `resumeRunId`. A single resumable phase output is capped at 4 MB.
+Resume is fail-closed. The trusted run supplies the compiled spec, real working directory, effective model, permissions, template provenance, and Pi session; repeating or overriding them is rejected. Checkpoints must contain a contiguous prefix of matching phases, output files must remain inside the source run's artifact directory, and their sizes and SHA-256 hashes must verify. Validated outputs are copied into the new run's own checkpoint chain; completed phases are not re-executed, and execution continues at the first uncheckpointed phase. Scripted workflows cannot use `resumeRunId`. A single resumable phase output is capped at 4 MB.
 
 Resume proves that the earlier phase completed and that its output artifact is intact. It cannot make an interrupted, non-checkpointed side effect idempotent; design shell/write phases accordingly.
 
-## Advanced harnesses
+## Advanced scripted workflows
 
-Use the separate `dynamic_workflow_harness` tool only for loops, branching, tournaments, custom scoring, or control flow that structured phases cannot represent. It requires explicit `permissions: "rwx"` and executes arbitrary unsandboxed JavaScript.
+Use the separate `scripted_workflow` tool only for loops, branching, tournaments, custom scoring, or control flow that declarative phases cannot represent. Prefer `dynamic_workflow` for ordinary composition. `scripted_workflow` requires explicit `permissions: "rwx"` in every source mode and executes arbitrary unsandboxed JavaScript.
 
-Harness helpers:
+Provide exactly one source: inline self-contained ES module text in `script`, a module path in `scriptFile`, or a saved self-contained `.mjs` `template`. Its execution controls are `name`, `cwd`, `model`, `timeoutMs`, `background`, and `after`; structured, resume, metadata, legacy harness, and unknown fields are rejected.
+
+Script helpers:
 
 - `ctx.phase(name, fn)`
 - `ctx.shell(command, options)`
@@ -166,6 +168,8 @@ Harness helpers:
 Prefer a standalone TypeScript extension using thread-phase directly when logic becomes reusable, domain-specific, operationally important, or recovery-heavy.
 
 ## Compatibility
+
+`dynamic_workflow_harness` is no longer registered. Migrate `{ harness, harnessFile }` to `scripted_workflow` fields `{ script, scriptFile }`; saved `.mjs` template calls keep `template` and explicit `permissions: "rwx"`.
 
 `dynamic_thread_phase_workflow` is a deprecated legacy interface and is inactive by default. Do not use it for new calls. Ordinary old `{ spec: ... }` structured arguments are upgraded only when they fit the reduced contract; removed fields fail rather than being silently discarded. Exact v1 decoding remains internal for trusted historical checkpoints and the explicitly enabled legacy alias.
 
@@ -183,4 +187,4 @@ Prefer a standalone TypeScript extension using thread-phase directly when logic 
 10. Use a saved template for repeated workflows; use direct phases for one-off composition.
 11. Use `after` for one different successor and `resumeRunId` for the same interrupted workflow.
 12. Invoke `resumeRunId` alone; the trusted source run supplies its structured workflow, cwd, model, permissions, and session.
-13. Use `dynamic_workflow_harness` only for genuinely advanced control flow.
+13. Use `scripted_workflow` only for genuinely advanced control flow, with exactly one script source and explicit `permissions: "rwx"`.

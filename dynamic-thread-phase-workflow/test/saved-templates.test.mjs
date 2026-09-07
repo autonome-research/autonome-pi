@@ -121,12 +121,13 @@ test("dynamic_workflow resumes from runId alone without repeating the structured
   }
 });
 
-test("saved self-contained harness executes by safe template name", async () => {
-  const testDir = mkdtempSync(join(tmpdir(), "dynamic-saved-harness-"));
+test("saved self-contained scripted workflow executes by safe template name", async () => {
+  const testDir = mkdtempSync(join(tmpdir(), "dynamic-saved-script-"));
   const env = withTemplateEnvironment(testDir);
   try {
-    writeFileSync(join(env.templates, "harness-report.mjs"), `export default async function workflow(ctx) {\n  await ctx.artifact("Saved harness report", "saved harness output", { name: "saved-harness-report" });\n}\n`);
-    const result = await registeredTools().get("dynamic_workflow_harness").execute(
+    const source = `export default async function workflow(ctx) {\n  await ctx.artifact("Saved harness report", "saved harness output", { name: "saved-harness-report" });\n}\n`;
+    writeFileSync(join(env.templates, "harness-report.mjs"), source);
+    const result = await registeredTools().get("scripted_workflow").execute(
       "test",
       { template: "harness-report", permissions: "rwx" },
       undefined,
@@ -137,6 +138,7 @@ test("saved self-contained harness executes by safe template name", async () => 
     assert.equal(result.details.ok, true);
     assert.equal(result.details.workflow, "harness-report");
     assert.equal(readFileSync(join(env.store, "artifacts", result.details.runId, "saved-harness-report.md"), "utf8"), "saved harness output");
+    assert.equal(readFileSync(join(env.store, "artifacts", result.details.runId, "workflow-harness.mjs"), "utf8"), source, "saved scripts execute from a durable self-contained copy");
   } finally {
     env.restore();
     rmSync(testDir, { recursive: true, force: true });
@@ -149,7 +151,7 @@ test("saved templates reject ambiguous modes, traversal, symlinks, invalid JSON,
   try {
     const tools = registeredTools();
     const workflow = tools.get("dynamic_workflow").execute;
-    const harness = tools.get("dynamic_workflow_harness").execute;
+    const scripted = tools.get("scripted_workflow").execute;
     const ctx = executionContext(testDir);
     const direct = [{ type: "artifact", name: "result", content: "x" }];
 
@@ -166,7 +168,9 @@ test("saved templates reject ambiguous modes, traversal, symlinks, invalid JSON,
     writeFileSync(join(env.templates, "needs-input.json"), JSON.stringify({ permissions: "r", phases: [{ type: "artifact", name: "result", content: "{{inputs.message}}" }] }));
     writeFileSync(join(env.templates, "embedded-input.json"), JSON.stringify({ permissions: "r", phases: [{ type: "artifact", name: "result", content: "value={{inputs.message}}" }] }));
     writeFileSync(join(testDir, "outside.json"), JSON.stringify({ permissions: "r", phases: direct }));
+    writeFileSync(join(testDir, "outside.mjs"), "export default async function workflow() {}\n");
     symlinkSync(join(testDir, "outside.json"), join(env.templates, "linked.json"));
+    symlinkSync(join(testDir, "outside.mjs"), join(env.templates, "linked-script.mjs"));
 
     await assert.rejects(workflow("test", { template: "valid", phases: direct }, undefined, undefined, ctx), /exactly one of template, phases, or resumeRunId/);
     await assert.rejects(workflow("test", {}, undefined, undefined, ctx), /exactly one of template, phases, or resumeRunId/);
@@ -198,9 +202,12 @@ test("saved templates reject ambiguous modes, traversal, symlinks, invalid JSON,
     await assert.rejects(workflow("test", { template: "embedded-input", inputs: { message: { nested: true } } }, undefined, undefined, ctx), /must be a scalar when embedded in text/);
     await assert.rejects(workflow("test", { phases: direct, inputs: { message: "x" } }, undefined, undefined, ctx), /inputs may only be used/);
     await assert.rejects(workflow("test", { template: "missing" }, undefined, undefined, ctx), /Available: .*valid/);
-    await assert.rejects(harness("test", { template: "harness-report", harness: "export default async()=>{}", permissions: "rwx" }, undefined, undefined, ctx), /exactly one of template, harness, or harnessFile/);
-    await assert.rejects(harness("test", { template: "harness-report", inputs: { message: "x" }, permissions: "rwx" }, undefined, undefined, ctx), /only by saved structured workflow templates/);
-    await assert.rejects(harness("test", { harness: "export default async()=>{}", permissions: "rwx", resumeRunId: "source-run" }, undefined, undefined, ctx), /supported only for structured workflows/);
+    await assert.rejects(scripted("test", { template: "harness-report", script: "export default async()=>{}", permissions: "rwx" }, undefined, undefined, ctx), /exactly one of template, script, or scriptFile/);
+    await assert.rejects(scripted("test", { template: "../outside", permissions: "rwx" }, undefined, undefined, ctx), /safe saved-template name/);
+    await assert.rejects(scripted("test", { template: "linked-script", permissions: "rwx" }, undefined, undefined, ctx), /must not be a symbolic link/);
+    await assert.rejects(scripted("test", { template: "does-not-exist" }, undefined, undefined, ctx), /requires explicit permissions/, "permissions must be validated before reading a saved script");
+    await assert.rejects(scripted("test", { template: "harness-report", inputs: { message: "x" }, permissions: "rwx" }, undefined, undefined, ctx), /unsupported field.*inputs/);
+    await assert.rejects(scripted("test", { script: "export default async()=>{}", permissions: "rwx", resumeRunId: "source-run" }, undefined, undefined, ctx), /unsupported field.*resumeRunId/);
     assert.equal(existsSync(env.store), false, "template preflight failures must not create visualizer runs");
   } finally {
     env.restore();
@@ -208,13 +215,19 @@ test("saved templates reject ambiguous modes, traversal, symlinks, invalid JSON,
   }
 });
 
-test("saved template files are bounded before parsing or execution", async () => {
+test("saved structured and scripted template files are bounded before parsing or execution", async () => {
   const testDir = mkdtempSync(join(tmpdir(), "dynamic-saved-template-size-"));
   const env = withTemplateEnvironment(testDir);
   try {
     writeFileSync(join(env.templates, "oversized.json"), " ".repeat(1_000_001));
+    writeFileSync(join(env.templates, "oversized.mjs"), " ".repeat(1_000_001));
+    const registered = registeredTools();
     await assert.rejects(
-      registeredTools().get("dynamic_workflow").execute("test", { template: "oversized" }, undefined, undefined, executionContext(testDir)),
+      registered.get("dynamic_workflow").execute("test", { template: "oversized" }, undefined, undefined, executionContext(testDir)),
+      /exceeds the 1000000-byte limit/,
+    );
+    await assert.rejects(
+      registered.get("scripted_workflow").execute("test", { template: "oversized", permissions: "rwx" }, undefined, undefined, executionContext(testDir)),
       /exceeds the 1000000-byte limit/,
     );
     assert.deepEqual(existsSync(join(env.store, "runs")) ? readdirSync(join(env.store, "runs")) : [], []);

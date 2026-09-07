@@ -105,9 +105,11 @@ No general JSONPath or expression language will be added. Declarative phase topo
 
 The normal tool remains `dynamic_workflow` and is described as a declarative workflow.
 
-The advanced tool will become `scripted_workflow`. It executes arbitrary unsandboxed JavaScript and remains a distinct security boundary requiring explicit acknowledgement of `rwx`. The old harness-facing name may be removed rather than preserved indefinitely.
+The advanced tool is `scripted_workflow`. It executes arbitrary unsandboxed JavaScript and remains a distinct security boundary requiring explicit acknowledgement of `rwx`. It accepts exactly one of inline self-contained ES-module `script`, `scriptFile`, or a saved self-contained `.mjs` `template`, plus only `name`, `cwd`, `model`, `timeoutMs`, `background`, and `after` execution controls. Structured, resume, metadata, legacy harness, and unknown fields fail runtime preflight as well as schema validation.
 
 Both tools use the same runner integration, thread-phase event contract, artifacts, dashboard, cancellation, and continuation service.
+
+Migration is intentionally concise: `dynamic_workflow_harness { harness, harnessFile }` becomes `scripted_workflow { script, scriptFile }`. Saved `.mjs` calls retain `template`; all three modes require literal `permissions: "rwx"`. The old public harness-facing tool is not registered. The inactive, explicitly opted-in `dynamic_thread_phase_workflow` alias retains its old contract for legacy sessions.
 
 ## Simplified declarative API
 
@@ -196,7 +198,7 @@ Keep the capabilities that materially change execution:
 - [x] Add the model-facing `after` launch field.
 - [x] Make resume run-ID-only and reject repeated execution configuration.
 - [ ] Add explicit repair/recovery for a successor reservation orphaned by a process crash; automatic ambiguous reclamation remains fail-closed.
-- [ ] Rename and narrow the scripted workflow tool.
+- [x] Rename and narrow the scripted workflow tool.
 - [x] Reduce the declarative schema and runner contract.
 - [ ] Group chains in the dashboard.
 - [ ] Dogfood success, failure, recovery, resume, cancellation, duplicate-delivery, and branching paths before release.

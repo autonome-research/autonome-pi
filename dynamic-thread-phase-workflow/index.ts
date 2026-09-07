@@ -133,6 +133,7 @@ function renderStructuredTemplate(value: any, inputs: Record<string, any>, used:
 }
 
 const PUBLIC_WORKFLOW_KEYS = new Set(["name", "cwd", "permissions", "model", "timeoutMs", "background", "after", "resumeRunId", "template", "inputs", "phases"]);
+const SCRIPTED_WORKFLOW_KEYS = new Set(["script", "scriptFile", "template", "name", "cwd", "model", "timeoutMs", "background", "after", "permissions"]);
 const TEMPLATE_WORKFLOW_KEYS = new Set(["name", "cwd", "permissions", "model", "timeoutMs", "background", "phases"]);
 const LEGACY_OUTER_KEYS = new Set(["spec", "harness", "harnessFile", "name", "permissions", "cwd", "model", "background", "autoContinue", "after", "resumeRunId", "timeout"]);
 const EXECUTABLE_PHASE_COMMON = ["type", "name", "permissions", "timeoutMs", "attempts"];
@@ -265,15 +266,28 @@ function resolvePublicWorkflowParams(params: any): any {
 	return { ...resolved, systemTemplateProvenance: templateName };
 }
 
-function resolveHarnessParams(params: any): any {
-	if (params?.inputs !== undefined) throw new Error("inputs are supported only by saved structured workflow templates, not harnesses.");
-	const modes = [params?.template !== undefined, params?.harness !== undefined, params?.harnessFile !== undefined].filter(Boolean).length;
-	if (modes !== 1) throw new Error("Provide exactly one of template, harness, or harnessFile.");
-	if (params.template === undefined) return params;
-	const templateName = params.template;
-	const { template: _template, ...overrides } = params;
-	const { source } = readSavedTemplate(templateName, ".mjs");
-	return { ...overrides, harness: source, name: params.name || templateName };
+function resolveScriptedWorkflowParams(params: any): any {
+	rejectUnsupportedFields(params, SCRIPTED_WORKFLOW_KEYS, "scripted_workflow");
+	if (params.name !== undefined && (typeof params.name !== "string" || params.name.length > 200 || !WORKFLOW_NAME.test(params.name))) throw new Error("scripted_workflow.name must be a safe workflow name of at most 200 characters.");
+	validateOptionalString(params.cwd, "scripted_workflow.cwd", true);
+	validateOptionalString(params.model, "scripted_workflow.model", true);
+	validateBoundedInteger(params.timeoutMs, "scripted_workflow.timeoutMs", MAX_TIMEOUT_MS);
+	if (params.background !== undefined && typeof params.background !== "boolean") throw new Error("scripted_workflow.background must be a boolean.");
+	if (params.after !== undefined && (typeof params.after !== "string" || !RUN_ID.test(params.after))) throw new Error("scripted_workflow.after must be a safe run identifier.");
+	if (params.permissions !== "rwx") throw new Error('scripted_workflow requires explicit permissions: "rwx".');
+	if (params.template !== undefined && (typeof params.template !== "string" || params.template.length > 200 || !SAVED_TEMPLATE_NAME.test(params.template))) throw new Error("scripted_workflow.template must be a safe saved-template name of at most 200 characters.");
+	if (params.script !== undefined && (typeof params.script !== "string" || !params.script.trim())) throw new Error("scripted_workflow.script must be a non-empty string.");
+	if (params.scriptFile !== undefined && (typeof params.scriptFile !== "string" || !params.scriptFile.trim())) throw new Error("scripted_workflow.scriptFile must be a non-empty path.");
+	const modes = [params.template !== undefined, params.script !== undefined, params.scriptFile !== undefined].filter(Boolean).length;
+	if (modes !== 1) throw new Error("Provide exactly one of template, script, or scriptFile.");
+	if (params.template === undefined) {
+		const { script, scriptFile, ...controls } = params;
+		return { ...controls, ...(script !== undefined ? { harness: script } : { harnessFile: scriptFile }) };
+	}
+	// All caller-controlled fields are validated before opening an operator-managed template.
+	const { source } = readSavedTemplate(params.template, ".mjs");
+	const { template, ...controls } = params;
+	return { ...controls, harness: source, name: params.name || template };
 }
 
 function truncate(text: string, max = MAX_TOOL_TEXT): string {
@@ -352,12 +366,12 @@ function parseJsonObject(stdout: string): any {
 	return JSON.parse(trimmed);
 }
 
-function runnerFailure(result: { code: number; signal: NodeJS.Signals | null; stdout: string; stderr: string; aborted: boolean }): string {
+function runnerFailure(result: { code: number; signal: NodeJS.Signals | null; stdout: string; stderr: string; aborted: boolean }, runnerName = "dynamic workflow runner"): string {
 	const status = result.aborted
-		? `dynamic workflow runner cancelled${result.signal ? ` with ${result.signal}` : ""}`
+		? `${runnerName} cancelled${result.signal ? ` with ${result.signal}` : ""}`
 		: result.signal
-			? `dynamic workflow runner terminated with ${result.signal}`
-			: `dynamic workflow runner exited ${result.code}`;
+			? `${runnerName} terminated with ${result.signal}`
+			: `${runnerName} exited ${result.code}`;
 	const output = result.stderr || result.stdout;
 	return output ? `${status}\n${output}` : status;
 }
@@ -513,18 +527,18 @@ function workflowParametersSchema() {
 	}, { additionalProperties: false });
 }
 
-function harnessParametersSchema() {
+function scriptedWorkflowParametersSchema() {
 	return Type.Object({
-		template: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", description: "Saved harness name from ~/.pi/agent/workflows/<name>.mjs. Use instead of harness/harnessFile." })),
-		harness: Type.Optional(Type.String({ description: "JavaScript module source exporting default async function(ctx)." })),
-		harnessFile: Type.Optional(Type.String({ description: "Path to a JavaScript harness module." })),
-		name: Type.Optional(Type.String()),
-		permissions: StringEnum(["rwx"] as const, { description: "Harness code is unsandboxed and requires rwx." }),
-		cwd: Type.Optional(Type.String()),
-		model: Type.Optional(Type.String()),
+		script: Type.Optional(Type.String({ minLength: 1, description: "Self-contained ES module exporting default async function(ctx)." })),
+		scriptFile: Type.Optional(Type.String({ minLength: 1 })),
+		template: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", maxLength: 200, description: "Saved ~/.pi/agent/workflows/<name>.mjs; replaces script/scriptFile." })),
+		name: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9_.:-]+$", maxLength: 200 })),
+		cwd: Type.Optional(Type.String({ minLength: 1 })),
+		model: Type.Optional(Type.String({ minLength: 1 })),
 		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_TIMEOUT_MS })),
-		background: Type.Optional(Type.Boolean({ description: "Run in the background and return to chat after success or failure, but not cancellation." })),
+		background: Type.Optional(Type.Boolean({ description: "Return to chat after success/failure, not cancellation." })),
 		after: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$" })),
+		permissions: StringEnum(["rwx"] as const, { description: "Required: unsandboxed read/write/execute access." }),
 	}, { additionalProperties: false });
 }
 
@@ -586,7 +600,7 @@ function publicWorkflowToLegacySpec(params: any): any {
 	};
 }
 
-async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any, legacyName: string) {
+async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any, legacyName: string, publicKind: "dynamic" | "scripted" = "dynamic") {
 	if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error("Workflow arguments must be an object.");
 	validateOptionalString(params.cwd, "cwd", true);
 	validateOptionalString(params.model, "model");
@@ -636,16 +650,18 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 		if (params.after) args.push("--after", params.after);
 		if (params.resumeRunId) args.push("--resume-run-id", params.resumeRunId);
 		addSessionArgs(args, ctx);
-		onUpdate?.({ content: [{ type: "text", text: `Starting ${legacyName ? "dynamic thread-phase" : "dynamic"} workflow in ${cwd}...` }] });
+		const displayKind = publicKind === "scripted" ? "scripted" : legacyName ? "dynamic thread-phase" : "dynamic";
+		onUpdate?.({ content: [{ type: "text", text: `Starting ${displayKind} workflow in ${cwd}...` }] });
 		const result = await runScript(args, cwd, signal);
 		let details: any;
 		try { details = parseJsonObject(result.stdout); } catch { details = { stdout: result.stdout, stderr: result.stderr }; }
-		if (params.background && !(result.code === 0 && details?.ok === true && details?.ready === true && details?.background === true && details?.runId && details?.pid)) throw new Error(runnerFailure(result));
-		if (result.code !== 0 && !params.background) throw new Error(runnerFailure(result));
+		const failureName = publicKind === "scripted" ? "scripted workflow runner" : "dynamic workflow runner";
+		if (params.background && !(result.code === 0 && details?.ok === true && details?.ready === true && details?.background === true && details?.runId && details?.pid)) throw new Error(runnerFailure(result, failureName));
+		if (result.code !== 0 && !params.background) throw new Error(runnerFailure(result, failureName));
 		retainGeneratedInput = Boolean(params.background && details?.background);
 		const text = details?.background
-			? `Started dynamic workflow ${details.runId} in background (pid ${details.pid}). Open ctrl+shift+t to monitor it.`
-			: result.stdout || "Dynamic workflow started.";
+			? `Started ${displayKind} workflow ${details.runId} in background (pid ${details.pid}). Open ctrl+shift+t to monitor it.`
+			: result.stdout || `${displayKind[0].toUpperCase()}${displayKind.slice(1)} workflow started.`;
 		return { content: [{ type: "text", text: truncate(text) }], details };
 	} finally {
 		// Detached runs may not have opened their input yet when the launcher
@@ -693,19 +709,20 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "dynamic_workflow_harness",
-		label: "Dynamic Workflow Harness",
-		description: "Advanced unsandboxed JavaScript workflow harness for loops, branching, tournaments, custom control flow, or a saved harness template. Prefer dynamic_workflow for normal subagent composition.",
+		name: "scripted_workflow",
+		label: "Scripted Workflow",
+		description: "Execute an advanced unsandboxed JavaScript workflow for loops, branching, tournaments, or custom control flow. Prefer dynamic_workflow for ordinary composition.",
+		promptSnippet: "Run advanced unsandboxed JavaScript workflows when declarative dynamic_workflow phases are insufficient",
 		promptGuidelines: [
-			"Use dynamic_workflow_harness only when structured dynamic_workflow phases cannot express the required control flow.",
-			"dynamic_workflow_harness executes arbitrary unsandboxed Node.js and always requires explicit permissions=rwx.",
-			"dynamic_workflow_harness provides ctx.phase, ctx.shell, ctx.pi, ctx.fanout, ctx.artifact, ctx.emit, ctx.cancelled(), and ctx.signal.",
-			"Reusable self-contained harnesses may be loaded by template name from ~/.pi/agent/workflows/<name>.mjs.",
+			"Use scripted_workflow only when declarative dynamic_workflow phases cannot express the required control flow; prefer dynamic_workflow for ordinary composition.",
+			"scripted_workflow executes arbitrary unsandboxed Node.js and always requires explicit permissions=rwx.",
+			"scripted_workflow accepts exactly one of inline script, scriptFile, or a saved self-contained .mjs template.",
+			"scripted_workflow provides ctx.phase, ctx.shell, ctx.pi, ctx.fanout, ctx.artifact, ctx.emit, ctx.cancelled(), and ctx.signal.",
 		],
-		parameters: harnessParametersSchema(),
+		parameters: scriptedWorkflowParametersSchema(),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const resolved = resolveHarnessParams(params);
-			return executeDynamicWorkflow({ ...resolved, timeout: resolved.timeoutMs }, signal, onUpdate, ctx, "");
+			const resolved = resolveScriptedWorkflowParams(params);
+			return executeDynamicWorkflow({ ...resolved, timeout: resolved.timeoutMs }, signal, onUpdate, ctx, "", "scripted");
 		},
 	});
 
