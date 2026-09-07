@@ -2,9 +2,9 @@ import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, renameS
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
+import { WORKFLOW_ARTIFACT_LAYOUT, atomicArtifactTemporaryPath } from "./artifact-layout.mjs";
 
 const SCHEMA = "pi-dynamic-workflow-processes/v1";
-const FILE_NAME = "workflow-processes.json";
 const MAX_GROUPS = 1024;
 const MAX_BYTES = 1_000_000;
 const LAUNCH_TOKEN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -22,7 +22,7 @@ function groupIsGone(pid) {
 }
 
 function persist(file, journal) {
-  const temporary = `${file}.${randomUUID()}.tmp`;
+  const temporary = atomicArtifactTemporaryPath(file, randomUUID());
   let fd;
   try {
     fd = openSync(temporary, "wx", 0o600);
@@ -46,7 +46,7 @@ function persist(file, journal) {
  * Keep groups after child exit: grandchildren with redirected stdio may outlive it.
  */
 export function createProcessJournal(directory, runId) {
-  const file = join(directory, FILE_NAME);
+  const file = join(directory, WORKFLOW_ARTIFACT_LAYOUT.processJournal);
   const journal = { schema: SCHEMA, runId, runnerPid: process.pid, hostname: hostname(), hasSubprocesses: false, groups: [] };
   const durablyStarted = new Set();
   persist(file, journal);
@@ -99,7 +99,7 @@ export function createProcessJournal(directory, runId) {
 export function assertProcessGroupsStopped(directory, runId, runnerPid) {
   let journal;
   try {
-    const file = join(directory, FILE_NAME);
+    const file = join(directory, WORKFLOW_ARTIFACT_LAYOUT.processJournal);
     const fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
     try {
       const info = fstatSync(fd);

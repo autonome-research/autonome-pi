@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { RUNNER_OWNED_ARTIFACT_NAMES, WORKFLOW_ARTIFACT_LAYOUT } from "../lib/artifact-layout.mjs";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const cli = join(root, "dynamic-thread-phase-workflow/bin/dynamic-thread-phase-workflow.mjs");
@@ -40,7 +41,21 @@ function runWorkflow(temp, spec, options = {}) {
   const emittedTextPaths = events
     .filter((event) => event.type === "artifact" && event.artifact?.metadata?.phase)
     .map((event) => event.artifact.path);
-  return { artifactDir, emittedTextPaths };
+  return { artifactDir, emittedTextPaths, events, runId, store };
+}
+
+function runRaw(temp, input, store = join(temp, "store"), { includeCwd = true } = {}) {
+  return spawnSync(process.execPath, [cli, ...input, ...(includeCwd ? ["--cwd", temp] : [])], {
+    cwd: root,
+    env: {
+      ...process.env,
+      PI_THREAD_PHASE_STORE_DIR: store,
+      PI_DYNAMIC_WORKFLOW_BACKGROUND: "",
+      PI_DYNAMIC_THREAD_PHASE_BACKGROUND: "",
+    },
+    encoding: "utf8",
+    timeout: 15_000,
+  });
 }
 
 function assertDistinctContents(paths, expected) {
@@ -208,6 +223,149 @@ test("runtime harness artifacts preserve colliding, repeated and generated-looki
     assertDistinctContents(emittedTextPaths, expected);
     assert.ok(emittedTextPaths.some((path) => basename(path) === "plain.md"), "ordinary unused paths remain stable");
     assert.ok(emittedTextPaths.some((path) => basename(path) === "custom.md"), "explicit filenames retain their path behavior");
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("legacy JSON artifacts cannot replace internal JSON and remain trusted for resume", () => {
+  const temp = mkdtempSync(join(tmpdir(), "dynamic-internal-json-collision-"));
+  try {
+    const internalJsonNames = RUNNER_OWNED_ARTIFACT_NAMES.filter((name) => name.endsWith(".json"));
+    const internalBasenames = internalJsonNames.map((name) => name.slice(0, -".json".length));
+    const expected = internalBasenames.map((name) => `retained legacy JSON artifact: ${name}`);
+    const spec = {
+      schema: "pi-dynamic-workflow/v1",
+      name: "internal-json-collisions",
+      permissions: "r",
+      phases: internalBasenames.map((name, index) => ({ type: "artifact", name, kind: "json", content: expected[index] })),
+    };
+    const { artifactDir, emittedTextPaths, runId, store } = runWorkflow(temp, spec, { legacy: true });
+
+    assertDistinctContents(emittedTextPaths, expected);
+    for (const path of emittedTextPaths) {
+      assert.equal(internalJsonNames.includes(basename(path)), false, `${basename(path)} must be digest-suffixed away from internal state`);
+      assert.match(basename(path), /-[0-9a-f]{24}\.json$/);
+    }
+    assert.deepEqual(JSON.parse(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.spec), "utf8")), spec);
+    const checkpoint = JSON.parse(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.checkpoint), "utf8"));
+    assert.equal(checkpoint.schema, "pi-dynamic-workflow-checkpoint/v1");
+    assert.deepEqual(checkpoint.completed.map((entry) => entry.name), internalBasenames);
+    assert.deepEqual(checkpoint.completed.map((entry) => readFileSync(join(artifactDir, entry.outputFile), "utf8")), expected);
+    const journal = JSON.parse(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.processJournal), "utf8"));
+    assert.equal(journal.schema, "pi-dynamic-workflow-processes/v1");
+    assert.equal(journal.runId, runId);
+    const workflowResult = JSON.parse(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.result), "utf8"));
+    assert.equal(workflowResult.status, "success");
+    assert.deepEqual(internalBasenames.map((name) => workflowResult.outputs[name]), expected);
+    assert.equal(readdirSync(artifactDir).some((name) => name.endsWith(".tmp")), false);
+
+    const resumed = runRaw(temp, ["--resume-run-id", runId], store, { includeCwd: false });
+    assert.equal(resumed.status, 0, resumed.stderr || resumed.stdout);
+    const resumedTerminal = terminalJson(resumed.stdout);
+    assert.equal(resumedTerminal.resumedFromRunId, runId);
+    assert.equal(resumedTerminal.resumedPhaseCount, internalBasenames.length);
+    assertDistinctContents(emittedTextPaths, expected);
+    assert.deepEqual(JSON.parse(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.spec), "utf8")), spec, "resume must still read the runner-owned spec");
+    assert.equal(JSON.parse(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.result), "utf8")).status, "success", "resume must not alter the source terminal result");
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("harness JSON artifacts cannot replace any internal JSON basename", () => {
+  const temp = mkdtempSync(join(tmpdir(), "dynamic-harness-internal-json-"));
+  try {
+    const internalJsonNames = RUNNER_OWNED_ARTIFACT_NAMES.filter((name) => name.endsWith(".json"));
+    const internalBasenames = internalJsonNames.map((name) => name.slice(0, -".json".length));
+    const expected = internalBasenames.map((name) => `retained harness JSON artifact: ${name}`);
+    const harness = join(temp, "internal-json-harness.mjs");
+    const source = `export default async function(ctx) {
+  const names = ${JSON.stringify(internalBasenames)};
+  const contents = ${JSON.stringify(expected)};
+  for (let i = 0; i < names.length; i++) await ctx.artifact(names[i], contents[i], { name: names[i], kind: "json" });
+}
+`;
+    writeFileSync(harness, source);
+    const { artifactDir, emittedTextPaths, runId } = runWorkflow(temp, undefined, { harness });
+
+    assertDistinctContents(emittedTextPaths, expected);
+    for (const path of emittedTextPaths) {
+      assert.equal(internalJsonNames.includes(basename(path)), false);
+      assert.match(basename(path), /-[0-9a-f]{24}\.json$/);
+    }
+    const manifest = JSON.parse(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.harnessManifest), "utf8"));
+    assert.equal(manifest.mode, "harness");
+    assert.equal(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.harnessSource), "utf8"), source);
+    const journal = JSON.parse(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.processJournal), "utf8"));
+    assert.equal(journal.runId, runId);
+    assert.equal(journal.schema, "pi-dynamic-workflow-processes/v1");
+    const workflowResult = JSON.parse(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.result), "utf8"));
+    assert.equal(workflowResult.status, "success");
+    assertDistinctContents(emittedTextPaths, expected);
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("explicit filenames cannot target fixed or transient runner-owned paths", () => {
+  const temp = mkdtempSync(join(tmpdir(), "dynamic-explicit-internal-path-"));
+  try {
+    const targets = [
+      ...RUNNER_OWNED_ARTIFACT_NAMES,
+      `${WORKFLOW_ARTIFACT_LAYOUT.checkpoint}.123.tmp`,
+      `${WORKFLOW_ARTIFACT_LAYOUT.result}.123.tmp`,
+      `${WORKFLOW_ARTIFACT_LAYOUT.processJournal}.12345678-1234-4123-8123-123456789abc.tmp`,
+    ];
+    const harness = join(temp, "explicit-internal-harness.mjs");
+    const source = `export default async function(ctx) {
+  const targets = ${JSON.stringify(targets)};
+  const errors = [];
+  for (const fileName of targets) {
+    try { await ctx.artifact("unsafe", "must not be written", { name: "unsafe", fileName }); }
+    catch (error) { errors.push({ fileName, message: error.message }); }
+  }
+  await ctx.artifact("safety-report", JSON.stringify(errors), { name: "safety-report", fileName: "ordinary-explicit.json", kind: "json" });
+}
+`;
+    writeFileSync(harness, source);
+    const { artifactDir, emittedTextPaths, runId } = runWorkflow(temp, undefined, { harness });
+    assert.equal(emittedTextPaths.length, 1);
+    assert.equal(basename(emittedTextPaths[0]), "ordinary-explicit.json", "ordinary explicit legacy paths remain unchanged");
+    const errors = JSON.parse(readFileSync(emittedTextPaths[0], "utf8"));
+    assert.deepEqual(errors.map((entry) => entry.fileName), targets);
+    for (const entry of errors) assert.match(entry.message, /reserved for workflow runner internal state/);
+    assert.equal(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.harnessSource), "utf8"), source, "explicit workflow-harness.mjs must not overwrite harness source");
+    assert.equal(existsSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.phaseOutputsDirectory)), false, "explicit phase-outputs must not create or replace the internal directory");
+    assert.equal(JSON.parse(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.processJournal), "utf8")).runId, runId);
+    assert.equal(JSON.parse(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.result), "utf8")).status, "success");
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("legacy explicit phase-outputs fails clearly without damaging checkpoint state", () => {
+  const temp = mkdtempSync(join(tmpdir(), "dynamic-explicit-phase-outputs-"));
+  try {
+    const specFile = join(temp, "phase-outputs-spec.json");
+    const store = join(temp, "store");
+    writeFileSync(specFile, JSON.stringify({
+      schema: "pi-dynamic-workflow/v1",
+      name: "explicit-phase-outputs",
+      permissions: "r",
+      phases: [{ type: "artifact", name: "unsafe", content: "must not be written", fileName: WORKFLOW_ARTIFACT_LAYOUT.phaseOutputsDirectory }],
+    }));
+    const failed = runRaw(temp, ["--spec-file", specFile, "--legacy-spec"], store);
+    assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+    const terminal = terminalJson(failed.stdout);
+    assert.match(terminal.error, /reserved for workflow runner internal state/);
+    const artifactDir = join(store, "artifacts", terminal.runId);
+    assert.equal(existsSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.phaseOutputsDirectory)), false);
+    assert.equal(JSON.parse(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.checkpoint), "utf8")).completed.length, 0);
+    assert.equal(JSON.parse(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.processJournal), "utf8")).runId, terminal.runId);
+    const result = JSON.parse(readFileSync(join(artifactDir, WORKFLOW_ARTIFACT_LAYOUT.result), "utf8"));
+    assert.equal(result.status, "failed");
+    assert.match(result.error.message, /reserved for workflow runner internal state/);
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }

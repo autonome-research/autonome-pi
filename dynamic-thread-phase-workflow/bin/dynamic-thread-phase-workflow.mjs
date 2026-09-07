@@ -10,6 +10,12 @@ import { commitSuccessor, releaseSuccessor, reserveSuccessor } from "../../threa
 import { normalizeTimeoutMs, runBoundedProcess, terminateChild } from "../lib/subprocess.mjs";
 import { assertProcessGroupsStopped, createProcessJournal } from "../lib/process-journal.mjs";
 import {
+  RUNNER_OWNED_ARTIFACT_NAMES,
+  WORKFLOW_ARTIFACT_LAYOUT,
+  atomicArtifactTemporaryPath,
+  isRunnerOwnedArtifactName,
+} from "../lib/artifact-layout.mjs";
+import {
   ARTIFACTS_DIR,
   STATUSES,
   artifact,
@@ -359,7 +365,7 @@ function generatedInputDirectory(inputFile) {
   const directory = dirname(file);
   const tempRoot = realpathSync(tmpdir());
   const directoryStats = lstatSync(directory);
-  const allowedFiles = new Set(["workflow-spec.json", "workflow-harness.mjs"]);
+  const allowedFiles = new Set([WORKFLOW_ARTIFACT_LAYOUT.spec, WORKFLOW_ARTIFACT_LAYOUT.harnessSource]);
   // --cleanup-input is an internal handshake with the Pi extension. Validate
   // the real filesystem objects, not only a lexical /tmp prefix: a symlinked
   // matching directory must never redirect deletion into unrelated data.
@@ -620,19 +626,21 @@ function generatedArtifactFileName(ctx, identity, kind = "markdown", collisionId
   const candidate = safeName(`${identity}.${extension}`);
   const candidates = asArray(ctx.spec?.phases)
     .filter(Boolean).map((phase) => safeName(`${phase.name}.${extension}`));
-  const allocated = ctx.artifactFileNames ??= new Set();
-  const collides = allocated.has(candidate) || collisionIdentity !== undefined || candidates.filter((name) => name === candidate).length > 1;
+  const allocated = ctx.artifactFileNames ??= new Set(RUNNER_OWNED_ARTIFACT_NAMES);
+  const collides = isRunnerOwnedArtifactName(candidate) || allocated.has(candidate)
+    || collisionIdentity !== undefined || candidates.filter((name) => name === candidate).length > 1;
   if (!collides) return `${identity}.${extension}`;
   const stem = safeName(identity).slice(0, 56);
   const reserved = new Set([...candidates, ...allocated]);
   // Keep ordinary paths stable, but never let a generated digest path shadow
-  // another phase's ordinary filename. Salt deterministically when necessary.
-  // Fanout supplies a structured identity so concatenated labels cannot alias.
+  // another phase's ordinary filename or runner-owned state. Salt
+  // deterministically when necessary. Fanout supplies a structured identity so
+  // concatenated labels cannot alias.
   const digestIdentity = collisionIdentity ?? String(identity);
   for (let salt = 0; ; salt++) {
     const digest = createHash("sha256").update(salt ? `${digestIdentity}\0${salt}` : digestIdentity).digest("hex").slice(0, 24);
     const fileName = `${stem}-${digest}.${extension}`;
-    if (!reserved.has(fileName)) return fileName;
+    if (!reserved.has(fileName) && !isRunnerOwnedArtifactName(fileName)) return fileName;
   }
 }
 
@@ -645,8 +653,8 @@ function makeArtifactPath(ctx, phaseName, fileName) {
 function writeWorkflowResult(ctx, status, error) {
   const dir = join(ARTIFACTS_DIR, ctx.visualizerRun.runId);
   mkdirSync(dir, { recursive: true });
-  const resultPath = join(dir, "workflow-result.json");
-  const temporary = `${resultPath}.${process.pid}.tmp`;
+  const resultPath = join(dir, WORKFLOW_ARTIFACT_LAYOUT.result);
+  const temporary = atomicArtifactTemporaryPath(resultPath, process.pid);
   const payload = {
     schema: "pi-dynamic-workflow-result/v1",
     runId: ctx.visualizerRun.runId,
@@ -745,7 +753,7 @@ function persistedSpecOptions(manifest) {
 
 function loadResumeInvocation(runId, sessionId) {
   const sourceDir = resumeRunDirectory(runId);
-  const manifest = parseBoundedJson(join(sourceDir, "workflow-checkpoint.json"), MAX_RESUME_MANIFEST_BYTES, "workflow resume checkpoint");
+  const manifest = parseBoundedJson(join(sourceDir, WORKFLOW_ARTIFACT_LAYOUT.checkpoint), MAX_RESUME_MANIFEST_BYTES, "workflow resume checkpoint");
   const specOptions = persistedSpecOptions(manifest);
   if (manifest.runId !== runId) throw new Error("Resume checkpoint identity is invalid");
   const requestedSessionId = sessionId ? String(sessionId) : undefined;
@@ -753,7 +761,7 @@ function loadResumeInvocation(runId, sessionId) {
   if (typeof manifest.cwd !== "string" || !manifest.cwd || !existsSync(manifest.cwd) || !statSync(manifest.cwd).isDirectory() || realpathSync(manifest.cwd) !== manifest.cwd) {
     throw new Error("Resume checkpoint cwd is no longer an authoritative real directory");
   }
-  const spec = validateSpec(parseBoundedJson(join(sourceDir, "workflow-spec.json"), MAX_RESUME_MANIFEST_BYTES, "resume source workflow spec"), specOptions);
+  const spec = validateSpec(parseBoundedJson(join(sourceDir, WORKFLOW_ARTIFACT_LAYOUT.spec), MAX_RESUME_MANIFEST_BYTES, "resume source workflow spec"), specOptions);
   if (!specOptions.legacy) validateOptionalString(manifest.model, "Resume checkpoint model");
   const savedTemplate = specOptions.legacy
     ? manifest.savedTemplate ?? spec.metadata?.savedTemplate
@@ -800,7 +808,7 @@ function loadResumeState(runId, { spec, cwd, model, sessionId }) {
     // journaled sources require group inactivity, not just a terminal label.
     assertProcessGroupsStopped(sourceDir, runId, sourceSummary.metadata?.pid);
   }
-  const manifest = parseBoundedJson(join(sourceDir, "workflow-checkpoint.json"), MAX_RESUME_MANIFEST_BYTES, "workflow resume checkpoint");
+  const manifest = parseBoundedJson(join(sourceDir, WORKFLOW_ARTIFACT_LAYOUT.checkpoint), MAX_RESUME_MANIFEST_BYTES, "workflow resume checkpoint");
   const specOptions = persistedSpecOptions(manifest);
   if (manifest.runId !== runId) throw new Error("Resume checkpoint runId does not match its artifact directory");
   if (manifest.cwd !== realpathSync(cwd)) throw new Error(`Resume checkpoint cwd does not match this invocation: ${manifest.cwd || "unknown"}`);
@@ -809,7 +817,7 @@ function loadResumeState(runId, { spec, cwd, model, sessionId }) {
   const ownerSessionId = sourceSummary.metadata?.sessionId ? String(sourceSummary.metadata.sessionId) : undefined;
   if ((ownerSessionId || manifest.sessionId) && ownerSessionId !== manifest.sessionId) throw new Error("Resume checkpoint does not match the authoritative source session owner");
   if (sourceSummary.cwd !== manifest.cwd) throw new Error("Resume checkpoint does not match the authoritative source cwd owner");
-  const sourceSpec = validateSpec(parseBoundedJson(join(sourceDir, "workflow-spec.json"), MAX_RESUME_MANIFEST_BYTES, "resume source workflow spec"), specOptions);
+  const sourceSpec = validateSpec(parseBoundedJson(join(sourceDir, WORKFLOW_ARTIFACT_LAYOUT.spec), MAX_RESUME_MANIFEST_BYTES, "resume source workflow spec"), specOptions);
   let savedTemplate;
   if (specOptions.legacy) {
     // Preserve the v1 decoder and its historical spec.metadata provenance.
@@ -835,7 +843,7 @@ function loadResumeState(runId, { spec, cwd, model, sessionId }) {
   if (manifest.chainStep + 1 >= MAX_CHAIN_RUNS) throw new Error(`Workflow chain reached the ${MAX_CHAIN_RUNS}-run limit`);
   if (!Array.isArray(manifest.completed) || manifest.completed.length > spec.phases.length) throw new Error("Resume checkpoint completed-phase list is invalid");
 
-  const outputDir = join(sourceDir, "phase-outputs");
+  const outputDir = join(sourceDir, WORKFLOW_ARTIFACT_LAYOUT.phaseOutputsDirectory);
   if (manifest.completed.length) {
     const outputDirInfo = lstatSync(outputDir);
     if (outputDirInfo.isSymbolicLink() || !outputDirInfo.isDirectory() || dirname(realpathSync(outputDir)) !== sourceDir) throw new Error("Resume phase-output directory failed containment validation");
@@ -844,7 +852,7 @@ function loadResumeState(runId, { spec, cwd, model, sessionId }) {
     const phase = spec.phases[index];
     if (!entry || entry.index !== index || entry.name !== phase?.name || entry.type !== phase?.type) throw new Error(`Resume checkpoint phase ${index} does not match the requested workflow`);
     const expectedFile = phaseOutputFileName(index, phase.name);
-    if (entry.outputFile !== `phase-outputs/${expectedFile}`) throw new Error(`Resume checkpoint phase ${phase.name} has an invalid output artifact path`);
+    if (entry.outputFile !== `${WORKFLOW_ARTIFACT_LAYOUT.phaseOutputsDirectory}/${expectedFile}`) throw new Error(`Resume checkpoint phase ${phase.name} has an invalid output artifact path`);
     const output = readBoundedRegularFile(join(outputDir, expectedFile), MAX_RESUME_OUTPUT_BYTES, `resume output for phase ${phase.name}`).toString("utf8");
     if (Buffer.byteLength(output, "utf8") !== entry.outputBytes || hashText(output) !== entry.outputSha256) throw new Error(`Resume output for phase ${phase.name} failed integrity validation`);
     return { ...entry, output };
@@ -879,8 +887,8 @@ function phaseModel(ctx, phase) {
 function persistResumeCheckpoint(ctx) {
   const runDir = join(ARTIFACTS_DIR, ctx.visualizerRun.runId);
   ctx.checkpoint.updatedAt = new Date().toISOString();
-  const checkpointPath = join(runDir, "workflow-checkpoint.json");
-  const checkpointTemporary = `${checkpointPath}.${process.pid}.tmp`;
+  const checkpointPath = join(runDir, WORKFLOW_ARTIFACT_LAYOUT.checkpoint);
+  const checkpointTemporary = atomicArtifactTemporaryPath(checkpointPath, process.pid);
   writeFileSync(checkpointTemporary, safeStringify(ctx.checkpoint), { encoding: "utf8", flag: "wx" });
   renameSync(checkpointTemporary, checkpointPath);
   artifact(ctx.visualizerRun, { kind: "json", title: "Workflow resume checkpoint", path: checkpointPath, metadata: { resumablePhases: ctx.checkpoint.completed.length } });
@@ -893,18 +901,18 @@ function writeResumeCheckpoint(ctx, phase, index, resume = {}) {
   const outputBytes = Buffer.byteLength(output, "utf8");
   if (outputBytes > MAX_RESUME_OUTPUT_BYTES) throw new Error(`Phase ${phase.name} output exceeds the ${MAX_RESUME_OUTPUT_BYTES}-byte resume artifact limit`);
   const runDir = join(ARTIFACTS_DIR, ctx.visualizerRun.runId);
-  const outputDir = join(runDir, "phase-outputs");
+  const outputDir = join(runDir, WORKFLOW_ARTIFACT_LAYOUT.phaseOutputsDirectory);
   mkdirSync(outputDir, { recursive: true });
   const outputFileName = phaseOutputFileName(index, phase.name);
   const outputPath = join(outputDir, outputFileName);
-  const outputTemporary = `${outputPath}.${process.pid}.tmp`;
+  const outputTemporary = atomicArtifactTemporaryPath(outputPath, process.pid);
   writeFileSync(outputTemporary, output, { encoding: "utf8", flag: "wx" });
   renameSync(outputTemporary, outputPath);
   const entry = {
     index,
     name: phase.name,
     type: phase.type,
-    outputFile: `phase-outputs/${outputFileName}`,
+    outputFile: `${WORKFLOW_ARTIFACT_LAYOUT.phaseOutputsDirectory}/${outputFileName}`,
     outputBytes,
     outputSha256: hashText(output),
     model: phaseModel(ctx, phase),
@@ -957,11 +965,15 @@ function emitTextArtifact(ctx, phase, content, defaults = {}, metadata = {}) {
   const fileName = configuredFileName
     ? renderTemplate(configuredFileName, ctx)
     : generatedArtifactFileName(ctx, defaults.identity || phase.name, kind, defaults.collisionIdentity);
-  const path = makeArtifactPath(ctx, phase.name, fileName);
+  const normalizedFileName = safeName(fileName || `${phase.name}.md`);
+  if (configuredFileName && isRunnerOwnedArtifactName(normalizedFileName)) {
+    throw new Error(`Artifact filename "${fileName}" is reserved for workflow runner internal state; choose a different filename`);
+  }
+  const path = makeArtifactPath(ctx, phase.name, normalizedFileName);
   writeFileSync(path, content, "utf8");
   // Harness phases are discovered at runtime. Reserve actual filenames across
   // all emitters so future generated paths cannot overwrite earlier artifacts.
-  (ctx.artifactFileNames ??= new Set()).add(basename(path));
+  (ctx.artifactFileNames ??= new Set(RUNNER_OWNED_ARTIFACT_NAMES)).add(basename(path));
   artifact(ctx.visualizerRun, { kind, title, path, metadata: { phase: phase.name, type: phase.type, ...metadata } });
   return path;
 }
@@ -1352,14 +1364,14 @@ async function main() {
     const artifactsDir = join(ARTIFACTS_DIR, visualizerRun.runId);
     mkdirSync(artifactsDir, { recursive: true });
     processJournal = createProcessJournal(artifactsDir, visualizerRun.runId);
-    const specPath = join(artifactsDir, harnessFile ? "workflow-harness-manifest.json" : "workflow-spec.json");
+    const specPath = join(artifactsDir, harnessFile ? WORKFLOW_ARTIFACT_LAYOUT.harnessManifest : WORKFLOW_ARTIFACT_LAYOUT.spec);
     writeFileSync(specPath, JSON.stringify(spec, null, 2), "utf8");
     artifact(visualizerRun, { kind: "json", title: harnessFile ? "Workflow harness manifest" : "Compiled workflow spec", path: specPath });
     if (harnessFile) {
       // Artifacts must be durable copies, not references to temporary/user files.
       // Execute the copy as well so generated input can be securely removed once
       // this detached or foreground runner has taken ownership of it.
-      const harnessArtifactPath = join(artifactsDir, "workflow-harness.mjs");
+      const harnessArtifactPath = join(artifactsDir, WORKFLOW_ARTIFACT_LAYOUT.harnessSource);
       copyFileSync(harnessFile, harnessArtifactPath);
       artifact(visualizerRun, { kind: "file", title: "Workflow harness source", path: harnessArtifactPath });
       harnessFile = harnessArtifactPath;

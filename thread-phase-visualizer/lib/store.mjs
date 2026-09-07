@@ -1229,15 +1229,19 @@ export function projectRun(events = [], options = {}) {
     }
   }
 
+  // Deduplicate once across the whole run. Nested lists contain the same record
+  // objects as the run list, so object identity precisely selects the surviving
+  // occurrences without relying on optional or non-unique event IDs.
+  summary.artifacts = dedupeArtifacts(summary.artifacts);
+  const retainedArtifacts = new Set(summary.artifacts);
   for (const phase of Object.values(summary.phaseMap)) {
     finalizeFanout(phase);
-    if (phase.artifacts) phase.artifacts = dedupeArtifacts(phase.artifacts);
+    if (phase.artifacts) phase.artifacts = phase.artifacts.filter((artifact) => retainedArtifacts.has(artifact));
     for (const item of phase.fanout?.items || []) {
-      if (item.artifacts) item.artifacts = dedupeArtifacts(item.artifacts);
+      if (item.artifacts) item.artifacts = item.artifacts.filter((artifact) => retainedArtifacts.has(artifact));
     }
   }
   closeOpenPhasesForTerminalRun(summary, sawWorkflowEnd);
-  summary.artifacts = dedupeArtifacts(summary.artifacts);
   summary.phases = Object.values(summary.phaseMap).sort((a, b) => String(a.startedAt || "").localeCompare(String(b.startedAt || "")));
   delete summary.phaseMap;
   if (summary.normalizedStatus !== STATUSES.FAILED && summary.errors.length > 0 && !sorted.some((e) => e.type === EVENT_TYPES.WORKFLOW_END)) {

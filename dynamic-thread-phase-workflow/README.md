@@ -131,7 +131,11 @@ Persist literal content or an earlier phase output:
 { "type": "artifact", "name": "report", "title": "Final report", "from": "review" }
 ```
 
-An artifact phase must provide exactly one of `content` or `from`. Generated artifact paths normally use the phase name; when distinct phase names normalize or truncate to the same filesystem name, the runner adds a deterministic strong digest so every output remains distinct. Fanout item artifacts always use collision-safe generated paths. A run-scoped filename registry also protects artifacts emitted by runtime-discovered harness phases and repeated emissions; ordinary unused paths remain unchanged. Explicit `fileName` values remain available only to the legacy v1 contract and retain their legacy path behavior.
+An artifact phase must provide exactly one of `content` or `from`. Generated artifact paths normally use the phase name; when distinct phase names normalize or truncate to the same filesystem name, the runner adds a deterministic strong digest so every output remains distinct. Fanout item artifacts always use collision-safe generated paths. A run-scoped filename registry also protects artifacts emitted by runtime-discovered harness phases and repeated emissions; ordinary unused paths remain unchanged.
+
+The run artifact directory reserves its complete internal layout in every emission mode, including entries not used by the current mode: `workflow-spec.json`, `workflow-checkpoint.json`, `workflow-result.json`, `workflow-processes.json`, `workflow-harness-manifest.json`, `workflow-harness.mjs`, and the `phase-outputs/` directory. Atomic persistence also owns temporary siblings named `<target>.<token>.tmp` for the checkpoint, result, and process journal; phase-output temporary files stay inside the reserved directory. Generated artifacts that would use any reserved name receive a deterministic digest suffix.
+
+Explicit `fileName` values remain available only to the legacy v1 and advanced harness contracts and ordinarily retain their legacy path behavior. The narrow safety exception is that an explicit filename which normalizes to runner-owned state (including an atomic temporary name) is rejected with a clear error instead of overwriting internal state. Choose a different filename; internal names are reserved even before their corresponding files or directories have been written.
 
 ## Composition
 
