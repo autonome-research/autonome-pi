@@ -2,7 +2,7 @@
 
 Status: experimental but usable.
 
-`dynamic_workflow` is a small, validated workflow composer for bounded subagents. The tool input is the workflow: provide defaults plus an ordered list of `agent`, `fanout`, `shell`, and `artifact` phases. Structured workflows compile onto thread-phase and emit generic `thread-phase-ui/v1` events for `thread_phase_runs` and the `ctrl+shift+t` monitor.
+`dynamic_workflow` is a small, validated workflow composer for supervised subagents. The tool input is the workflow: provide defaults plus an ordered list of `agent`, `fanout`, `shell`, and `artifact` phases. Structured workflows compile onto thread-phase and emit generic `thread-phase-ui/v1` events for `thread_phase_runs` and the `ctrl+shift+t` monitor.
 
 ## Basic workflow
 
@@ -66,7 +66,7 @@ The top-level permission is a default, not a security ceiling. Operator policy i
 
 ### `agent`
 
-Run one bounded Pi subagent:
+Run one Pi subagent. Foreground and compatibility launches are bounded; new hosted background launches use the supervision policy described below:
 
 ```json
 {
@@ -166,13 +166,19 @@ Top-level controls:
 - `cwd` — workflow working directory; defaults to the current Pi cwd
 - `permissions` — inherited phase capability default
 - `model` — inherited agent model pattern
-- `timeoutMs` — inherited agent/shell timeout
+- `timeoutMs` — explicit inherited hard deadline for agent and shell subprocesses
 - `background` — detach after durable readiness and return `runId` + `pid`
 - `after` — terminal successful or failed parent run; this run becomes its single session-scoped successor
 
 Fanout concurrency is phase-local. Caller descriptions, metadata, top-level concurrency, and retry-backoff controls are not part of the declarative contract.
 
-Use `background: true` for long workflows. Successful and failed background runs durably return control to the launching Pi chat. Failure continuations include failed phases, errors, checkpoints, and partial artifacts. User-cancelled runs never auto-continue and cannot launch a chained successor.
+Use `background: true` for long or open-ended agent workflows. New public background `dynamic_workflow` and `scripted_workflow` calls launched from a Pi session are privately marked for main-agent supervision; this does not add a model-facing field. For their Pi agent, fanout-agent, and scripted `ctx.pi` subprocesses, an omitted phase/helper/workflow timeout means no wall-clock kill deadline. An explicit phase or scripted-helper `timeoutMs` wins over an explicit workflow `timeoutMs`, and every explicit deadline remains a hard limit.
+
+Shell subprocesses always retain the default bound when no explicit deadline is supplied. Foreground workflows, the deprecated alias, explicit v1 CLI workflows, historical prepared calls, unowned launches, and source runs without verified supervision metadata retain the previous default bound (10 minutes). The internal operator setting `PI_DYNAMIC_WORKFLOW_DEFAULT_TIMEOUT_MS` can change that fallback without changing the tool schema. Prefer background mode for legitimately open-ended agent work.
+
+The durable progress-review timer asks the main agent to inspect current state and use existing tools to report, wait, or intervene. It does **not** infer that a workflow is busy or stuck, and it never kills, retries, resumes, or launches work. Activity is evidence only. Readiness remains bounded to five seconds, cancellation remains cooperative with SIGTERM-to-SIGKILL escalation, and process-journal ownership remains enforced. See [Workflow supervision](../docs/workflow-supervision.md).
+
+Successful and failed background runs still use the existing terminal continuation behavior. Failure continuations include failed phases, errors, checkpoints, and partial artifacts. Progress reviews are distinct from completion, while user-cancelled runs never auto-continue and cannot launch a chained successor.
 
 ## Saved workflow templates
 
@@ -221,7 +227,7 @@ After every successfully completed structured phase, the runner atomically write
 { "resumeRunId": "review-and-fix-..." }
 ```
 
-The trusted source run supplies the compiled spec, real cwd, effective model, permissions, template provenance, Pi session, and prior outputs. Repeating or overriding them is rejected. Resume validates contiguous phase identities, artifact containment, output size, and SHA-256 hash before creating the new run. Validated outputs are copied into the new run's checkpoint chain, completed phases are represented in its lifecycle without re-execution, and execution starts at the first uncheckpointed phase. Any mismatch fails preflight. Scripted JavaScript workflows cannot be resumed this way.
+The trusted source run supplies the compiled spec, real cwd, effective model, permissions, template provenance, Pi session, supervision policy, and prior outputs. Repeating or overriding them is rejected. A background resume inherits main-agent supervision only from the source's verified immutable `workflow_start` ownership marker; a source without that marker keeps the historical bounded policy, and a foreground resume is always bounded. Resume validates contiguous phase identities, artifact containment, output size, and SHA-256 hash before creating the new run. Validated outputs are copied into the new run's checkpoint chain, completed phases are represented in its lifecycle without re-execution, and execution starts at the first uncheckpointed phase. Any mismatch fails preflight. Scripted JavaScript workflows cannot be resumed this way.
 
 Cancelled sources cannot be resumed. A source without a recorded `workflow_end` (including a failure inferred only from error events) can be resumed only when verified owner metadata proves its runner PID is gone **and** its same-host `workflow-processes.json` journal proves all supervised subprocess groups are gone. Newly journaled terminal sources must pass the same group check: even a failed shell can leave grandchildren running. Launch intent is persisted before spawning, so a crash before the child PID is recorded fails closed. Only positive proof that no child was created can clear an unstarted launch intent. The supported journal-policy version is bound to the immutable start envelope, preventing downgrade to legacy recovery by editing the event log. Live groups, unresolved ownership, heartbeat staleness alone, and legacy nonterminal sources without a process journal are rejected. Recovery does not kill possibly reused PIDs. Checkpoint session, cwd, and chain identity must match the authoritative source run; concurrent or repeated resumes cannot create multiple successors. Process-group recovery is POSIX-only for runs that spawned children, and cannot supervise programs that deliberately detach into separate groups. Legacy terminal sources retain their previous resume behavior without descendant-inactivity proof; legacy sources without a recorded `workflow_end` remain blocked.
 
@@ -295,6 +301,7 @@ Advanced harness CLI:
 - Generic subprocess stdout/stderr retention: 1 MB per stream
 - Pi NDJSON record limit: 4 MB
 - Tool response text is truncated; complete run data remains available through `thread_phase_runs`
-- Timeout and cancellation terminate subprocess groups with a bounded grace period
+- Explicit timeout and cancellation terminate subprocess groups with a bounded grace period
+- Supervised no-deadline mode applies only to Pi subprocesses in verified new hosted background runs; it creates no timeout timer
 
 Successful, failed, and cancelled runs write `workflow-result.json`; non-success results are marked partial.

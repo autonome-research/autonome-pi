@@ -37,7 +37,7 @@ Pi identifies git packages by repository URL, so remove the old source before in
 
 - `/detach [--name <tmux-name>] [--now|--wait] [prompt]` hands the current session off to tmux; `/detach-status` reports the latest handoff. See [`detach/README.md`](detach/README.md).
 - Select `/workflows` from the slash-command menu under the editor, or press `ctrl+shift+t`, to open the interactive thread-phase dashboard; select a run for details or request cooperative cancellation via `x`.
-- Background dynamic workflows durably return control to the launching Pi session after success or failure; failed continuations identify failed phases/errors/partial artifacts, while user-cancelled runs never auto-continue.
+- Background dynamic workflows durably return control to the launching Pi session after success or failure; failed continuations identify failed phases/errors/partial artifacts, while user-cancelled runs never auto-continue. New hosted background agent work uses periodic main-agent progress reviews instead of an implicit wall-clock kill deadline; explicit timeouts remain hard limits. See [`docs/workflow-supervision.md`](docs/workflow-supervision.md).
 - `/codebase-explore` starts codebase exploration in the background by default.
 - `/code-review` runs code review workflows.
 - `dynamic_workflow` composes validated subagent workflows directly from flat `agent`, `fanout`, `shell`, and `artifact` phases. `scripted_workflow` is the separate advanced unsandboxed JavaScript interface; `dynamic_thread_phase_workflow` is an inactive deprecated compatibility alias.
@@ -64,6 +64,7 @@ Recent changes:
 - Advanced unsandboxed JavaScript control flow uses `scripted_workflow`, which requires explicit `permissions: "rwx"`. Migrate `dynamic_workflow_harness` calls from `{ harness, harnessFile }` to `{ script, scriptFile }`; the old public tool name is no longer registered.
 - `dynamic_thread_phase_workflow` remains registered for compatibility but is inactive by default, avoiding a duplicate legacy schema in normal model context.
 - Structured specs have a reduced v2 contract with strict phase validation, bounded `attempts` and deterministic internal backoff, phase-local fanout concurrency, collision-safe artifacts, partial failure results, and background readiness acknowledgements containing `runId` + `pid`.
+- New public hosted background dynamic/scripted launches carry immutable `supervisionMode: "main-agent"` ownership metadata. Their Pi agent subprocesses have no implicit wall-clock timer when no explicit phase/helper/workflow timeout exists; shells, foreground work, legacy/historical runs, and explicit deadlines retain bounded behavior.
 - Reusable or operationally important workflows should graduate into standalone TypeScript extensions using thread-phase directly.
 - Dynamic workflow runs carry system-generated chain provenance. A terminal successful or failed parent accepts at most one session-scoped successor through `after`; cancelled parents cannot continue a chain.
 - Reusable structured workflows and self-contained scripted workflows can be loaded by safe template name from `~/.pi/agent/workflows/`; template loading is bounded, rejects traversal/symlinks, preserves provenance, and still enforces normal validation and permission ceilings.
@@ -75,7 +76,7 @@ Recent changes:
 - Hardened `mission_workflow` with adversarial post-milestone validation, runner-owned handoff metadata, durable trusted checkpoints for resume, strict validation-cursor fingerprints/evidence checks, merge-blocking transient lockfile quarantine, stale `lastError` archival after successful resume/completion, cancellation-safe validation, contaminated-branch detection/reset, assertion coverage reports, generated-junk protection, transient `uv.lock` cleanup with audit artifacts, short content-addressed repair IDs, runner-provided handoff skeletons, compact result payloads, and capped repair loops.
 - The generic visualizer now deduplicates repeated artifact paths, closes phase-event-only phases when a workflow reaches a terminal status, keeps compact run/monitor summaries focused on recent or active phases, and removes stale/dead or terminal workflows from the below-editor live-status widget.
 - Thread-phase dependency is `^6.1.0`, using the built-in `node:sqlite` runtime plus authoritative lifecycle, supervised fanout, atomic terminal events, cancellation, ownership, heartbeat, defensive error normalization, and bounded cursor reconciliation.
-- Mission continuation/failure-mode notes are in `docs/mission-workflow-continuation.md`; the DX/agent-X roadmap for making missions closer to a full software production pipeline is in `docs/mission-workflow-completeness-roadmap.md`.
+- Workflow progress-review and timeout semantics are in `docs/workflow-supervision.md`. Mission continuation/failure-mode notes are in `docs/mission-workflow-continuation.md`; the DX/agent-X roadmap for making missions closer to a full software production pipeline is in `docs/mission-workflow-completeness-roadmap.md`.
 
 ## Remaining work
 

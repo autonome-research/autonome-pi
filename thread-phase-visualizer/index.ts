@@ -9,12 +9,14 @@ import {
 	EVENT_TYPES,
 	INDEX_FILE,
 	STATUSES,
+	cancelFileFor,
 	ensureStore,
 	formatUsageSummary,
 	getRunSummary,
 	latestRunSummaries,
 	readIndex,
 	readRun,
+	runFileFor,
 } from "./lib/store.mjs";
 import { belongsToSession, formatOwnerMetadata, formatStaleIndicator, runSessionId } from "./lib/run-display.mjs";
 import { canonicalCwd, canInspectRun, createCwdState, matchesRunCwd, mergeMonitorRuns as mergeScopedMonitorRuns, trackCwdCommand } from "./lib/session-scope.mjs";
@@ -32,12 +34,37 @@ import {
 	shouldAutoContinue,
 } from "./lib/continuation-runtime.ts";
 import { formatMarkedContinuation, sessionHistoryHasContinuation } from "./lib/continuation-message.mjs";
+import {
+	DEFAULT_PROGRESS_REVIEW_CADENCE_MS,
+	acknowledgeProgressReview,
+	claimProgressReview,
+	createProgressReviewClaimantId,
+	deferProgressReview,
+	discardProgressReview,
+	ensureProgressReview,
+	formatProgressReviewPrompt,
+	loadProgressReviewRecords,
+	progressReviewClaimIsOwned,
+	relinquishProgressReviewClaim,
+	relinquishProgressReviewClaims,
+	sessionHistoryHasProgressReview,
+} from "./lib/supervision-runtime.ts";
 
 const MAX_MESSAGE_BYTES = 20_000;
 const requestedStatusRefreshMs = Number(process.env.PI_THREAD_PHASE_STATUS_REFRESH_MS || 5_000);
 const STATUS_REFRESH_MS = Number.isFinite(requestedStatusRefreshMs) && requestedStatusRefreshMs >= 10
 	? Math.floor(requestedStatusRefreshMs)
 	: 5_000;
+const requestedSupervisionCadenceMs = Number(process.env.PI_THREAD_PHASE_SUPERVISION_CHECK_MS || DEFAULT_PROGRESS_REVIEW_CADENCE_MS);
+// This is an operator-only deployment setting, not a workflow/tool knob. Keep a
+// production safety floor; tests exercise clocks through the store API instead.
+const SUPERVISION_CADENCE_MS = Number.isFinite(requestedSupervisionCadenceMs) && requestedSupervisionCadenceMs >= 60_000
+	? Math.floor(requestedSupervisionCadenceMs)
+	: DEFAULT_PROGRESS_REVIEW_CADENCE_MS;
+const MAX_PROGRESS_REVIEW_BATCH = 8;
+const MAX_PROGRESS_REVALIDATIONS = 32;
+const PROGRESS_REVIEW_ACK_WATCHDOG_MS = 10 * 60 * 1000;
+const SUPERVISION_RETRY_FLOOR_MS = 5_000;
 
 // Continuations for workflow runs that ended longer ago than this window are not
 // auto-injected on a fresh session continue. Delivered continuation records are
@@ -220,13 +247,16 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	let statusRefreshTimer: NodeJS.Timeout | undefined;
 	let statusFooter: ReturnType<typeof createWorkflowFooterAnimator> | undefined;
 	const startupDeliveryTimers = new Set<ReturnType<typeof setTimeout>>();
-	let retryDeferredContinuations: (() => void) | undefined;
+	let retryDeferredSubmissions: (() => void) | undefined;
 	let acknowledgeContinuation: ((runId: string, deliveryId: string) => void) | undefined;
+	let acknowledgeReview: ((runId: string, checkId: string) => void) | undefined;
+	let reconcileSupervisionRunIds: ((runIds: Iterable<string>) => void) | undefined;
 	let sessionTerminated = false;
 	let cwdState = createCwdState(process.cwd());
 	const seen = new Set<string>();
 	const continuationClaimantId = createContinuationClaimantId();
 	const continuationClaimantProcessStart = currentProcessStartIdentity();
+	const progressReviewClaimantId = createProgressReviewClaimantId();
 
 	pi.registerTool({
 		name: "thread_phase_runs",
@@ -306,13 +336,23 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				const delivered = markContinuationDelivered(pending.runId, { storeDir, deliveryId: pending.deliveryId });
 				if (delivered.delivered) acknowledgeContinuation?.(pending.runId, pending.deliveryId);
 			}
+			for (const pending of loadProgressReviewRecords({ storeDir }).filter((record: AnyEvent) => record.state === "pending")) {
+				if (!sessionHistoryHasProgressReview(branchEntries, pending.checkId)) continue;
+				const acknowledged = acknowledgeProgressReview(pending.runId, { storeDir, checkId: pending.checkId });
+				if (acknowledged.acknowledged) acknowledgeReview?.(pending.runId, pending.checkId);
+			}
 		} catch (error) {
-			if (ctx.hasUI) ctx.ui.notify(`A thread-phase continuation is present in active-branch history, but delivered-state persistence failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+			if (ctx.hasUI) ctx.ui.notify(`A thread-phase submission is present in active-branch history, but acknowledgement persistence failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		}
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
-		if (ctx.isIdle()) retryDeferredContinuations?.();
+		if (ctx.isIdle()) retryDeferredSubmissions?.();
+	});
+
+	pi.on("tool_result", (event) => {
+		const runId = event.details?.runId;
+		if (typeof runId === "string" && runId) reconcileSupervisionRunIds?.([runId]);
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -323,8 +363,10 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		sessionTerminated = false;
 		for (const timer of startupDeliveryTimers) clearTimeout(timer);
 		startupDeliveryTimers.clear();
-		retryDeferredContinuations = undefined;
+		retryDeferredSubmissions = undefined;
 		acknowledgeContinuation = undefined;
+		acknowledgeReview = undefined;
+		reconcileSupervisionRunIds = undefined;
 		ensureStore();
 		cwdState = createCwdState(ctx.cwd);
 		// RPC also has UI support; animation belongs only in the terminal footer.
@@ -348,6 +390,9 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		};
 		const currentSessionId = ctx.sessionManager.getSessionId();
 		const continuationStoreDir = path.dirname(INDEX_FILE);
+		// Print/JSON worker invocations may load extensions recursively but do not
+		// own the interactive main-agent supervisor. TUI and RPC hosts do.
+		const supervisionHost = ctx.mode === "tui" || ctx.mode === "rpc";
 		let pendingContinuationRecords = loadPendingContinuationRecords({ storeDir: continuationStoreDir });
 
 		// Only the active branch proves that a continuation is visible to the
@@ -382,7 +427,11 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		const submissionRetries = new Map<string, { failures: number; notBefore: number }>();
 		const retryExhausted = (runId: string) => (submissionRetries.get(runId)?.failures || 0) >= 3;
 		let inFlightContinuation: { runId: string; deliveryId: string } | undefined;
+		let inFlightReview: { checks: Array<{ runId: string; checkId: string }> } | undefined;
 		let deliveryTimer: ReturnType<typeof setTimeout> | undefined;
+		let supervisionTimer: ReturnType<typeof setTimeout> | undefined;
+		let supervisionSweepTimer: ReturnType<typeof setTimeout> | undefined;
+		let reviewAckTimer: ReturnType<typeof setTimeout> | undefined;
 		let deliveryTimerAt = Number.POSITIVE_INFINITY;
 
 		const clearDeliveryTimer = () => {
@@ -424,11 +473,14 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		};
 
 		let pumpContinuations: () => void;
+		let pumpProgressReviews: () => void = () => {};
+		let pumpSubmissions: () => void;
+		let submissionGateActive = false;
 		const scheduleContinuationPump = (delayMs = 0) => {
-			if (sessionTerminated || inFlightContinuation) return;
+			if (sessionTerminated || inFlightContinuation || inFlightReview) return;
 			if (delayMs <= 0) {
 				clearDeliveryTimer();
-				pumpContinuations();
+				pumpSubmissions();
 				return;
 			}
 			const target = Date.now() + delayMs;
@@ -440,14 +492,14 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				deliveryTimer = undefined;
 				deliveryTimerAt = Number.POSITIVE_INFINITY;
 				if (fired) startupDeliveryTimers.delete(fired);
-				pumpContinuations();
+				pumpSubmissions();
 			}, Math.max(0, target - Date.now()));
 			deliveryTimer.unref?.();
 			startupDeliveryTimers.add(deliveryTimer);
 		};
 
 		pumpContinuations = () => {
-			if (sessionTerminated || inFlightContinuation || !ctx.isIdle()) return;
+			if (sessionTerminated || inFlightContinuation || inFlightReview || !ctx.isIdle()) return;
 			while (queuedContinuations.size > 0) {
 				const [runId, queued] = queuedContinuations.entries().next().value as [string, QueuedContinuation];
 				if (retryExhausted(runId)) {
@@ -565,7 +617,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				inFlightContinuation = undefined;
 			}
 		};
-		retryDeferredContinuations = () => {
+		const retryContinuations = () => {
 			// Reconsider durable records whose successor state was unreadable, or
 			// whose earlier claimant was active. Never reset a submission retry budget.
 			try {
@@ -618,10 +670,333 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 			scheduleContinuationPump(Math.max(0, notBefore - Date.now()));
 		};
 
+		const currentReviewRunIds = new Set<string>();
+		let reviewRevalidationCursor = 0;
+
+		const clearReviewAckTimer = () => {
+			if (!reviewAckTimer) return;
+			clearTimeout(reviewAckTimer);
+			startupDeliveryTimers.delete(reviewAckTimer);
+			reviewAckTimer = undefined;
+		};
+
+		const clearSupervisionTimer = () => {
+			if (!supervisionTimer) return;
+			clearTimeout(supervisionTimer);
+			startupDeliveryTimers.delete(supervisionTimer);
+			supervisionTimer = undefined;
+		};
+
+		const cancellationDisposition = (runId: string): "absent" | "present" | "unknown" => {
+			let descriptor: number | undefined;
+			try {
+				const file = cancelFileFor(runId);
+				const directory = path.dirname(file);
+				fs.accessSync(directory, fs.constants.R_OK | fs.constants.X_OK);
+				if (!fs.lstatSync(directory).isDirectory()) return "unknown";
+				try {
+					descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+				} catch (error: any) {
+					return error?.code === "ENOENT" ? "absent" : "unknown";
+				}
+				const before = fs.fstatSync(descriptor);
+				if (!before.isFile() || before.size > 16_384) return "unknown";
+				const bytes = Buffer.alloc(before.size);
+				if (fs.readSync(descriptor, bytes, 0, bytes.length, 0) !== bytes.length) return "unknown";
+				const after = fs.fstatSync(descriptor);
+				if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) return "unknown";
+				const request = JSON.parse(bytes.toString("utf8"));
+				return request?.runId === runId && typeof request.requestedAt === "string"
+					&& Number.isFinite(Date.parse(request.requestedAt)) ? "present" : "unknown";
+			} catch {
+				return "unknown";
+			} finally {
+				if (descriptor !== undefined) fs.closeSync(descriptor);
+			}
+		};
+
+		const reviewDisposition = (summary: AnyEvent): "active" | "superseded" | "unknown" => {
+			if (!summary?.workflowStartResolved || summary?.metadata?.supervisionMode !== "main-agent"
+				|| summary.trigger?.kind !== "background"
+				|| runSessionId(summary) !== currentSessionId
+				|| !belongsToSession(summary, currentSessionId, cwdState.activeCwd)
+				|| !matchesRunCwd(summary, cwdState.activeCwd)) return "unknown";
+			// A projected error can normalize the run to failed without workflow_end.
+			// Only a real terminal envelope supersedes progress review.
+			if (summary.endedAt || summary.events?.some((event: AnyEvent) => event.type === EVENT_TYPES.WORKFLOW_END)) return "superseded";
+			const cancellation = cancellationDisposition(summary.runId);
+			if (cancellation === "present") return "superseded";
+			if (cancellation === "unknown") return "unknown";
+			return "active";
+		};
+
+		const revalidateReview = (runId: string) => {
+			try {
+				const summary: AnyEvent = getRunSummary(runId);
+				return { disposition: reviewDisposition(summary), summary };
+			} catch {
+				return { disposition: "unknown" as const, summary: undefined };
+			}
+		};
+
+		const scheduleProgressPump = (delayMs?: number) => {
+			if (!supervisionHost || sessionTerminated || inFlightReview) return;
+			clearSupervisionTimer();
+			let delay = delayMs;
+			if (delay === undefined) {
+				try {
+					const now = Date.now();
+					const due = loadProgressReviewRecords({ storeDir: continuationStoreDir })
+						.filter((record: AnyEvent) => currentReviewRunIds.has(record.runId))
+						.map((record: AnyEvent) => Date.parse(record.state === "pending" ? record.notBefore || record.dueAt : record.dueAt))
+						.filter(Number.isFinite);
+					if (!due.length) return;
+					delay = Math.max(0, Math.min(...due) - now);
+				} catch {
+					return; // unreadable scheduler state fails closed
+				}
+			}
+			if (delay <= 0) delay = SUPERVISION_RETRY_FLOOR_MS;
+			supervisionTimer = setTimeout(() => {
+				const fired = supervisionTimer;
+				supervisionTimer = undefined;
+				if (fired) startupDeliveryTimers.delete(fired);
+				pumpSubmissions();
+			}, Math.max(0, delay));
+			supervisionTimer.unref?.();
+			startupDeliveryTimers.add(supervisionTimer);
+		};
+
+		const reconcileReviewSchedules = (candidateRunIds: Iterable<string> = []) => {
+			if (!supervisionHost) return;
+			const ids = new Set<string>(candidateRunIds);
+			try {
+				for (const record of loadProgressReviewRecords({ storeDir: continuationStoreDir })) ids.add(record.runId);
+			} catch {
+				return;
+			}
+			const orderedIds = [...ids];
+			const inspected = Math.min(orderedIds.length, MAX_PROGRESS_REVALIDATIONS);
+			const start = orderedIds.length ? reviewRevalidationCursor % orderedIds.length : 0;
+			for (let offset = 0; offset < inspected; offset++) {
+				const runId = orderedIds[(start + offset) % orderedIds.length];
+				const { disposition, summary } = revalidateReview(runId);
+				try {
+					if (disposition === "superseded") {
+						currentReviewRunIds.delete(runId);
+						discardProgressReview(runId, { storeDir: continuationStoreDir });
+					} else if (disposition === "active" && summary?.startedAt) {
+						currentReviewRunIds.add(runId);
+						ensureProgressReview(runId, {
+						storeDir: continuationStoreDir,
+						startedAt: summary.startedAt,
+						cadenceMs: SUPERVISION_CADENCE_MS,
+						});
+					} else currentReviewRunIds.delete(runId);
+				} catch {
+					// Unknown ownership, cancellation, or durable I/O suppresses delivery.
+				}
+			}
+			reviewRevalidationCursor = orderedIds.length ? (start + inspected) % orderedIds.length : 0;
+			if (orderedIds.length > inspected && !supervisionSweepTimer && !sessionTerminated) {
+				supervisionSweepTimer = setTimeout(() => {
+					const fired = supervisionSweepTimer;
+					supervisionSweepTimer = undefined;
+					if (fired) startupDeliveryTimers.delete(fired);
+					reconcileReviewSchedules();
+				}, 100);
+				supervisionSweepTimer.unref?.();
+				startupDeliveryTimers.add(supervisionSweepTimer);
+			}
+			scheduleProgressPump();
+			if (ctx.isIdle()) pumpSubmissions();
+		};
+
+		pumpProgressReviews = () => {
+			if (!supervisionHost || sessionTerminated || inFlightContinuation || inFlightReview
+				|| queuedContinuations.size > 0 || !ctx.isIdle()) return;
+			let due: AnyEvent[];
+			try {
+				const now = Date.now();
+				due = loadProgressReviewRecords({ storeDir: continuationStoreDir })
+					.filter((record: AnyEvent) => currentReviewRunIds.has(record.runId)
+						&& Date.parse(record.state === "pending" ? record.notBefore || record.dueAt : record.dueAt) <= now)
+					.slice(0, MAX_PROGRESS_REVALIDATIONS);
+			} catch {
+				return;
+			}
+			const items: Array<{ run: AnyEvent; checkId: string }> = [];
+			for (const record of due) {
+				const current = revalidateReview(record.runId);
+				if (current.disposition === "superseded") {
+					try { discardProgressReview(record.runId, { storeDir: continuationStoreDir }); } catch { /* fail closed */ }
+					continue;
+				}
+				if (current.disposition !== "active") continue;
+				let claim: AnyEvent;
+				try {
+					claim = claimProgressReview(record.runId, { storeDir: continuationStoreDir, claimantId: progressReviewClaimantId });
+				} catch { continue; }
+				if (!claim.claimed || !claim.checkId) continue;
+
+				// Claiming and formatting can take time. Re-read immutable ownership,
+				// terminal/cancellation state, and exact claim immediately before send.
+				const final = revalidateReview(record.runId);
+				let owned = false;
+				try {
+					owned = final.disposition === "active" && progressReviewClaimIsOwned(record.runId, {
+						storeDir: continuationStoreDir,
+						checkId: claim.checkId,
+						claimantId: progressReviewClaimantId,
+					});
+				} catch { owned = false; }
+				if (!owned) {
+					try {
+						if (final.disposition === "superseded") discardProgressReview(record.runId, { storeDir: continuationStoreDir });
+						else relinquishProgressReviewClaim(record.runId, { storeDir: continuationStoreDir, checkId: claim.checkId, claimantId: progressReviewClaimantId });
+					} catch { /* lease bounds an ambiguous claim */ }
+					continue;
+				}
+				items.push({ run: { ...final.summary, runFile: runFileFor(record.runId) }, checkId: claim.checkId });
+				if (items.length >= MAX_PROGRESS_REVIEW_BATCH) break;
+			}
+			if (!items.length) {
+				scheduleProgressPump();
+				return;
+			}
+			const deliverable: Array<{ run: AnyEvent; checkId: string }> = [];
+			for (const item of items) {
+				const final = revalidateReview(item.run.runId);
+				let owned = false;
+				try {
+					owned = final.disposition === "active" && progressReviewClaimIsOwned(item.run.runId, {
+						storeDir: continuationStoreDir,
+						checkId: item.checkId,
+						claimantId: progressReviewClaimantId,
+					});
+				} catch { owned = false; }
+				if (owned) deliverable.push({ run: { ...final.summary, runFile: runFileFor(item.run.runId) }, checkId: item.checkId });
+				else {
+					try {
+						if (final.disposition === "superseded") discardProgressReview(item.run.runId, { storeDir: continuationStoreDir });
+						else relinquishProgressReviewClaim(item.run.runId, { storeDir: continuationStoreDir, checkId: item.checkId, claimantId: progressReviewClaimantId });
+					} catch { /* fail closed */ }
+				}
+			}
+			if (!deliverable.length) {
+				scheduleProgressPump();
+				return;
+			}
+			const checks = deliverable.map(({ run, checkId }) => ({ runId: run.runId, checkId }));
+			inFlightReview = { checks };
+			try {
+				pi.sendUserMessage(formatProgressReviewPrompt(deliverable));
+				// sendUserMessage is fire-and-forget. Active-branch history normally
+				// acknowledges at assistant message_start/agent_settled. A watchdog at
+				// the durable claim lease prevents an ambiguous host rejection from
+				// blocking this runtime forever without interrupting an active turn.
+				clearReviewAckTimer();
+				reviewAckTimer = setTimeout(() => {
+					const fired = reviewAckTimer;
+					reviewAckTimer = undefined;
+					if (fired) startupDeliveryTimers.delete(fired);
+					if (sessionTerminated || !inFlightReview) return;
+					try {
+						const branch = ctx.sessionManager.getBranch();
+						for (const check of [...inFlightReview.checks]) {
+							if (!sessionHistoryHasProgressReview(branch, check.checkId)) continue;
+							const ack = acknowledgeProgressReview(check.runId, { storeDir: continuationStoreDir, checkId: check.checkId });
+							if (ack.acknowledged) acknowledgeReview?.(check.runId, check.checkId);
+						}
+					} catch { /* preserve unknown delivery as pending */ }
+					if (!inFlightReview) return;
+					for (const check of inFlightReview.checks) {
+						try { relinquishProgressReviewClaim(check.runId, { storeDir: continuationStoreDir, checkId: check.checkId, claimantId: progressReviewClaimantId }); }
+						catch { /* expired lease is recoverable on restart */ }
+					}
+					inFlightReview = undefined;
+					pumpSubmissions();
+				}, PROGRESS_REVIEW_ACK_WATCHDOG_MS);
+				reviewAckTimer.unref?.();
+				startupDeliveryTimers.add(reviewAckTimer);
+			} catch (error) {
+				inFlightReview = undefined;
+				let nextAttempt = Number.POSITIVE_INFINITY;
+				for (const check of checks) {
+					try {
+						const deferred = deferProgressReview(check.runId, { storeDir: continuationStoreDir, checkId: check.checkId, claimantId: progressReviewClaimantId });
+						if (deferred.notBefore) nextAttempt = Math.min(nextAttempt, Date.parse(deferred.notBefore));
+					} catch { /* durable claim lease still prevents an immediate duplicate */ }
+				}
+				if (ctx.hasUI) ctx.ui.notify(`Could not submit workflow progress review; it remains pending: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				scheduleProgressPump(Number.isFinite(nextAttempt) ? Math.max(0, nextAttempt - Date.now()) : undefined);
+			}
+		};
+
+		pumpSubmissions = () => {
+			if (submissionGateActive || sessionTerminated) return;
+			submissionGateActive = true;
+			try {
+				// Terminal continuation always gets the first chance at the one shared
+				// sendUserMessage gate; reviews cannot race a second submission loop.
+				pumpContinuations();
+				if (!inFlightContinuation && queuedContinuations.size === 0) pumpProgressReviews();
+			} finally {
+				submissionGateActive = false;
+			}
+		};
+
+		acknowledgeReview = (runId, checkId) => {
+			if (!inFlightReview) return;
+			inFlightReview.checks = inFlightReview.checks.filter((check) => check.runId !== runId || check.checkId !== checkId);
+			if (!inFlightReview.checks.length) {
+				inFlightReview = undefined;
+				clearReviewAckTimer();
+				scheduleProgressPump();
+			}
+		};
+		retryDeferredSubmissions = () => {
+			retryContinuations();
+			if (supervisionHost) {
+				// agent_settled also reconciles fire-and-forget acceptance if no
+				// assistant message_start was observed by this extension instance.
+				try {
+					const branch = ctx.sessionManager.getBranch();
+					for (const record of loadProgressReviewRecords({ storeDir: continuationStoreDir }).filter((entry: AnyEvent) => entry.state === "pending")) {
+						if (!sessionHistoryHasProgressReview(branch, record.checkId)) continue;
+						const acknowledged = acknowledgeProgressReview(record.runId, { storeDir: continuationStoreDir, checkId: record.checkId });
+						if (acknowledged.acknowledged) acknowledgeReview?.(record.runId, record.checkId);
+					}
+				} catch { /* unknown branch/store state suppresses replay */ }
+				reconcileReviewSchedules();
+				pumpSubmissions();
+			}
+		};
+
 		// Prime completion rendering while reclaiming durable pending deliveries.
 		// Legacy continuation ids migrate as delivered and are never replayed.
 		const startupEvents = readIndex({ limit: 5000 });
 		for (const event of startupEvents) seen.add(eventKey(event));
+		if (supervisionHost && branchEntries) {
+			try {
+				for (const pending of loadProgressReviewRecords({ storeDir: continuationStoreDir }).filter((record: AnyEvent) => record.state === "pending")) {
+					if (!sessionHistoryHasProgressReview(branchEntries, pending.checkId)) continue;
+					acknowledgeProgressReview(pending.runId, { storeDir: continuationStoreDir, checkId: pending.checkId });
+				}
+			} catch {
+				// Unknown history or durable state never grants permission to deliver.
+			}
+		}
+		const startupSupervisedRunIds = new Set<string>(startupEvents
+			.filter((event: AnyEvent) => event.type === EVENT_TYPES.WORKFLOW_START && event.metadata?.supervisionMode === "main-agent")
+			.map((event: AnyEvent) => event.runId));
+		// A durable active-branch tool result closes the tiny crash window between
+		// background launch readiness and the index watcher callback. Run IDs are
+		// only candidates; immutable start verification still decides eligibility.
+		for (const entry of (branchEntries || []).slice(-200)) {
+			const runId = entry?.type === "message" && entry.message?.role === "toolResult" ? entry.message.details?.runId : undefined;
+			if (typeof runId === "string" && runId) startupSupervisedRunIds.add(runId);
+		}
 		const startupNowMs = Date.now();
 		const startupRuns = new Set<string>(pendingContinuationRecords
 			.filter((record: AnyEvent) => !historyProvenRunIds.has(record.runId))
@@ -643,17 +1018,22 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				&& continuationEligibility(summary) !== "ineligible") attemptAutoContinuation(summary, runId, true, { startup: true });
 			else discardIneligibleContinuation(summary, runId);
 		}
+		reconcileSupervisionRunIds = reconcileReviewSchedules;
+		reconcileReviewSchedules(startupSupervisedRunIds);
 		updateStatus();
 
 		const processNewEvents = () => {
 			const events = readIndex({ limit: 500 });
+			const supervisionCandidates = new Set<string>();
 			for (const event of events) {
 				const key = eventKey(event);
 				if (seen.has(key)) continue;
 				seen.add(key);
+				if (event.type === EVENT_TYPES.WORKFLOW_START && event.metadata?.supervisionMode === "main-agent" && event.runId) supervisionCandidates.add(event.runId);
 				if (event.type === EVENT_TYPES.WORKFLOW_END) {
 					const summary = getRunSummary(event.runId);
 					if (!belongsToSession(summary, currentSessionId, cwdState.activeCwd)) continue;
+					try { discardProgressReview(event.runId, { storeDir: continuationStoreDir }); } catch { /* terminal delivery still proceeds */ }
 					pi.sendMessage({
 						customType: "thread-phase-run",
 						content: formatCompletion(event),
@@ -666,6 +1046,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 					if (ctx.hasUI) ctx.ui.notify(`thread-phase ${event.workflow}: ${event.status || "done"}`, summary.normalizedStatus === STATUSES.FAILED ? "warning" : "info");
 				}
 			}
+			reconcileReviewSchedules(supervisionCandidates);
 			updateStatus();
 		};
 
@@ -683,8 +1064,10 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		sessionTerminated = true;
 		for (const timer of startupDeliveryTimers) clearTimeout(timer);
 		startupDeliveryTimers.clear();
-		retryDeferredContinuations = undefined;
+		retryDeferredSubmissions = undefined;
 		acknowledgeContinuation = undefined;
+		acknowledgeReview = undefined;
+		reconcileSupervisionRunIds = undefined;
 		watcher?.close();
 		watcher = undefined;
 		if (statusRefreshTimer) clearInterval(statusRefreshTimer);
@@ -697,8 +1080,12 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				claimantId: continuationClaimantId,
 				claimantProcessStart: continuationClaimantProcessStart,
 			});
+			relinquishProgressReviewClaims({
+				storeDir: path.dirname(INDEX_FILE),
+				claimantId: progressReviewClaimantId,
+			});
 		} catch (error) {
-			if (ctx.hasUI) ctx.ui.notify(`Could not relinquish pending thread-phase continuation claims during shutdown: ${error instanceof Error ? error.message : String(error)}`, "warning");
+			if (ctx.hasUI) ctx.ui.notify(`Could not relinquish pending thread-phase submission claims during shutdown: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		}
 		if (ctx.hasUI) {
 			try { ctx.ui.setStatus("thread-phase", undefined); } catch { /* best-effort UI cleanup */ }

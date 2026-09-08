@@ -7,6 +7,19 @@ import { spawn } from "node:child_process";
 import test from "node:test";
 import registerDynamicWorkflows from "../index.ts";
 
+// Observe only this test process's temporary workflow inputs. Parallel test
+// files legitimately create similarly named directories in the system tmpdir.
+const isolatedTmp = mkdtempSync(join(tmpdir(), "wrapper-cancellation-tmp-"));
+const tempEnvironment = Object.fromEntries(["TMPDIR", "TMP", "TEMP"].map((key) => [key, process.env[key]]));
+for (const key of Object.keys(tempEnvironment)) process.env[key] = isolatedTmp;
+test.after(() => {
+  for (const [key, value] of Object.entries(tempEnvironment)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  rmSync(isolatedTmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+});
+
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../..");
 const cli = join(root, "dynamic-thread-phase-workflow/bin/dynamic-thread-phase-workflow.mjs");

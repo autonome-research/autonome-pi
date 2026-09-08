@@ -24,6 +24,16 @@ test("createRun records canonical launch source and cwd-at-launch metadata", () 
   assert.deepEqual(store.getRunSummary(run.runId).metadata, run.metadata);
 });
 
+test("immutable compact ownership preserves only the supervision marker value", () => {
+  const run = store.createRun({
+    runId: "owner-supervision-marker",
+    workflow: "owner-supervision-marker",
+    cwd: "/repo",
+    metadata: { sessionId: "session-supervised", supervisionMode: "main-agent" },
+  });
+  assert.equal(store.getRunSummary(run.runId).metadata.supervisionMode, "main-agent");
+});
+
 test("createRun canonicalizes launch cwd from the runner origin, not owner metadata", (t) => {
   const root = mkdtempSync(join(tmpdir(), "thread-phase-owner-cwd-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));

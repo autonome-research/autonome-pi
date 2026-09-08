@@ -7,7 +7,7 @@ import { canonicalCwd } from "./session-scope.mjs";
 export const SCHEMA_VERSION = "thread-phase-ui/v1";
 // Bump when the projected summary shape changes (nested artifacts / traces) so a
 // monitor can surface whether the loaded store is current.
-export const STORE_BUILD = "4-terminal-projection";
+export const STORE_BUILD = "5-supervision-ownership";
 export const EVENT_TYPES = Object.freeze({
   WORKFLOW_START: "workflow_start",
   WORKFLOW_END: "workflow_end",
@@ -1271,7 +1271,7 @@ function compactOwnerMetadata(metadata) {
   const compact = {};
   for (const key of [
     "sessionId", "sessionFile", "launchSource", "source", "cwdAtLaunch", "cwd",
-    "pid", "ppid", "hostname", "cancellable", "cancelSignal", "autoContinue", "continuationMode",
+    "pid", "ppid", "hostname", "cancellable", "cancelSignal", "autoContinue", "continuationMode", "supervisionMode",
     "dynamic", "mode", "permissions", "maxPermissions", "chainId", "rootRunId", "parentRunId", "chainStep",
     "resumedFromRunId", "resumedPhaseCount", "processJournalVersion", "savedTemplate",
   ]) {

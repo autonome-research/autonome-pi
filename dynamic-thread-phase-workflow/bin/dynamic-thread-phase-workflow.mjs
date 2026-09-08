@@ -7,7 +7,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { PiJsonEventCollector } from "../lib/pi-json-stream.mjs";
 import { commitSuccessor, releaseSuccessor, reserveSuccessor } from "../../thread-phase-visualizer/lib/chain-store.mjs";
-import { normalizeTimeoutMs, runBoundedProcess, terminateChild } from "../lib/subprocess.mjs";
+import { MAX_TIMEOUT_MS, normalizeTimeoutMs, runBoundedProcess, terminateChild } from "../lib/subprocess.mjs";
 import { assertProcessGroupsStopped, createProcessJournal } from "../lib/process-journal.mjs";
 import {
   RUNNER_OWNED_ARTIFACT_NAMES,
@@ -47,7 +47,9 @@ const PI_TOOL_REQUIREMENTS = Object.freeze({
   write: "w",
   bash: "rwx",
 });
-const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_TIMEOUT_MS = process.env.PI_DYNAMIC_WORKFLOW_DEFAULT_TIMEOUT_MS === undefined
+  ? 10 * 60 * 1000
+  : Number(process.env.PI_DYNAMIC_WORKFLOW_DEFAULT_TIMEOUT_MS);
 const DEFAULT_FANOUT_CONCURRENCY = 3;
 const MAX_FANOUT_CONCURRENCY = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_CONCURRENCY || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_CONCURRENCY || 64);
 const MAX_FANOUT_ITEMS = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_FANOUT_ITEMS || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_FANOUT_ITEMS || 1_000);
@@ -492,6 +494,7 @@ function validateRunnerLimits() {
     ["PI_DYNAMIC_WORKFLOW_MAX_CONCURRENCY", MAX_FANOUT_CONCURRENCY, 1, 64],
     ["PI_DYNAMIC_WORKFLOW_MAX_FANOUT_ITEMS", MAX_FANOUT_ITEMS, 1, 10_000],
     ["PI_DYNAMIC_WORKFLOW_MAX_PHASE_TIMEOUT_MS", MAX_PHASE_TIMEOUT_MS, 100, 24 * 60 * 60 * 1000],
+    ["PI_DYNAMIC_WORKFLOW_DEFAULT_TIMEOUT_MS", DEFAULT_TIMEOUT_MS, 1, MAX_TIMEOUT_MS],
     ["PI_DYNAMIC_WORKFLOW_MAX_CHAIN_RUNS", MAX_CHAIN_RUNS, 1, 1000],
   ]) {
     if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error(`${label} must be an integer from ${min} to ${max}`);
@@ -545,11 +548,17 @@ function normalizePiTools(tools, permissions, label) {
   return requested;
 }
 
+function executionDeadline(ctx, kind, explicitTimeoutMs) {
+  if (explicitTimeoutMs !== undefined) return { timeoutMs: explicitTimeoutMs };
+  if (ctx.workflowTimeoutMs !== undefined) return { timeoutMs: ctx.workflowTimeoutMs };
+  if (kind === "pi" && ctx.supervisionMode === "main-agent") return { noDeadline: true };
+  return { timeoutMs: DEFAULT_TIMEOUT_MS };
+}
+
 async function runProcess(command, args, options) {
   const launchToken = processJournal.reserve();
   return await runBoundedProcess(command, args, {
     ...options,
-    timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     onNoChild: () => processJournal.noChild(launchToken),
     onChildStart: (child) => {
       activeChildren.add(child);
@@ -595,7 +604,7 @@ function throttledTraceEmitter(run, phaseName, identity = {}) {
   return emitter;
 }
 
-async function runPi({ cwd, prompt, model, tools, timeoutMs, signal, onUsage, onTrace }) {
+async function runPi({ cwd, prompt, model, tools, timeoutMs, noDeadline, signal, onUsage, onTrace }) {
   const args = [
     // Note: --no-extensions is intentionally omitted so that extensions
     // like local-vllm.ts can register dynamically-discovered local providers
@@ -613,6 +622,7 @@ async function runPi({ cwd, prompt, model, tools, timeoutMs, signal, onUsage, on
   const result = await runProcess(DEFAULT_PI, args, {
     cwd,
     timeoutMs,
+    noDeadline,
     signal,
     captureStdout: false,
     onStdout: (chunk) => collector.push(chunk),
@@ -766,15 +776,31 @@ function loadResumeInvocation(runId, sessionId) {
   const savedTemplate = specOptions.legacy
     ? manifest.savedTemplate ?? spec.metadata?.savedTemplate
     : validateSavedTemplateName(manifest.savedTemplate, "Resume checkpoint savedTemplate");
-  return { spec, cwd: manifest.cwd, model: manifest.model, savedTemplate };
+  // Supervision policy is ownership metadata, not checkpoint or caller data.
+  // getRunSummary verifies the immutable workflow_start sidecar/log projection;
+  // only an exact source/session/cwd match may carry the marker into a resume.
+  const sourceSummary = getRunSummary(runId);
+  if (!sourceSummary || sourceSummary.runId !== runId || sourceSummary.workflowStartResolved !== true) {
+    throw new Error(`Cannot resume workflow ${runId}: authoritative source ownership is unknown`);
+  }
+  const ownerSessionId = sourceSummary.metadata?.sessionId ? String(sourceSummary.metadata.sessionId) : undefined;
+  if ((ownerSessionId || manifest.sessionId) && ownerSessionId !== manifest.sessionId) {
+    throw new Error("Resume checkpoint does not match the authoritative source session owner");
+  }
+  if (sourceSummary.cwd !== manifest.cwd) throw new Error("Resume checkpoint does not match the authoritative source cwd owner");
+  const supervisionMode = sourceSummary.metadata?.supervisionMode === "main-agent"
+    && sourceSummary.trigger?.kind === "background"
+    ? "main-agent"
+    : undefined;
+  return { spec, cwd: manifest.cwd, model: manifest.model, savedTemplate, supervisionMode, sourceSummary };
 }
 
-function loadResumeState(runId, { spec, cwd, model, sessionId }) {
+function loadResumeState(runId, { spec, cwd, model, sessionId, sourceSummary: verifiedSourceSummary }) {
   const sourceDir = resumeRunDirectory(runId);
   // Owner metadata must come from verified workflow_start, not the checkpoint.
   // Projected failure is not terminal proof: an error can precede workflow_end.
   // Without an end event, require positive dead-owner and journal evidence.
-  const sourceSummary = getRunSummary(runId);
+  const sourceSummary = verifiedSourceSummary || getRunSummary(runId);
   if (!sourceSummary || sourceSummary.runId !== runId || sourceSummary.workflowStartResolved !== true) {
     throw new Error(`Cannot resume workflow ${runId}: authoritative source ownership is unknown`);
   }
@@ -1010,7 +1036,7 @@ async function* runShellPhase(ctx, phase) {
   yield { type: "data", kind: "data", key: "permissions", value: permissions, message: `Running shell command with ${permissions} permissions` };
   yield { type: "data", kind: "data", key: "command", value: command, message: `Running shell command` };
   if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
-  const result = await runProcess(command, [], { cwd: ctx.cwd, shell: true, timeoutMs: phase.timeoutMs ?? ctx.timeoutMs, signal: ctx.signal });
+  const result = await runProcess(command, [], { cwd: ctx.cwd, shell: true, ...executionDeadline(ctx, "shell", phase.timeoutMs), signal: ctx.signal });
   if (result.aborted) throw abortError(result.error || "cancelled");
   const output = compactText(result.stdout || "");
   ctx.outputs[phase.name] = output;
@@ -1032,7 +1058,7 @@ async function* runPiPhase(ctx, phase) {
   // flush() in finally so the final reasoning tail is never dropped even when the
   // subprocess throws (spawn error / early abort) rather than returning cleanly.
   try {
-    result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs ?? ctx.timeoutMs, signal: ctx.signal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
+    result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, ...executionDeadline(ctx, "pi", phase.timeoutMs), signal: ctx.signal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
         phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage, model: usedModel || phase.model || ctx.model }) });
   } finally {
     traceEmitter.flush();
@@ -1071,7 +1097,7 @@ async function* runFanoutPiPhase(ctx, phase) {
         const traceEmitter = throttledTraceEmitter(ctx.visualizerRun, phase.name, { itemId: `${index}:${item}`, item, index });
         let result;
         try {
-          result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, timeoutMs: phase.timeoutMs || ctx.timeoutMs, signal: itemSignal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
+          result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, ...executionDeadline(ctx, "pi", phase.timeoutMs), signal: itemSignal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
               phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", itemId: `${index}:${item}`, item, index, usage, model: usedModel || phase.model || ctx.model }) });
         } finally {
           traceEmitter.flush();
@@ -1174,7 +1200,7 @@ async function runHarness(ctx, harnessFile) {
         const permissions = permissionsForPhase(ctx, phase);
         if (!permissionIncludesAll(permissions, "rwx")) throw new Error(`shell helper requires rwx permissions because command execution is not sandboxed`);
         phaseEvent(ctx.visualizerRun, phase.name, { kind: "data", key: "command", value: command, message: "Running shell command" });
-        const result = await runProcess(command, [], { cwd: options.cwd || ctx.cwd, shell: true, timeoutMs: options.timeoutMs || ctx.timeoutMs, signal: options.signal || ctx.signal });
+        const result = await runProcess(command, [], { cwd: options.cwd || ctx.cwd, shell: true, ...executionDeadline(ctx, "shell", options.timeoutMs), signal: options.signal || ctx.signal });
         if (result.aborted) throw abortError(result.error || "cancelled");
         if (!result.ok && options.reject !== false) throw new Error(result.error || `shell command exited ${result.code}`);
         return compactText(result.stdout || "");
@@ -1188,7 +1214,7 @@ async function runHarness(ctx, harnessFile) {
         const traceEmitter = throttledTraceEmitter(ctx.visualizerRun, phase.name);
         let result;
         try {
-          result = await runPi({ cwd: options.cwd || ctx.cwd, prompt, model: options.model || ctx.model, tools, timeoutMs: options.timeoutMs || ctx.timeoutMs, signal: options.signal || ctx.signal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
+          result = await runPi({ cwd: options.cwd || ctx.cwd, prompt, model: options.model || ctx.model, tools, ...executionDeadline(ctx, "pi", options.timeoutMs), signal: options.signal || ctx.signal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
               phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage, model: usedModel || options.model || ctx.model }) });
         } finally {
           traceEmitter.flush();
@@ -1258,6 +1284,7 @@ async function main() {
   validateCliBooleanFlag(args.background, "--background");
   validateCliBooleanFlag(args["legacy-spec"], "--legacy-spec");
   validateCliBooleanFlag(args["cleanup-input"], "--cleanup-input");
+  validateCliBooleanFlag(args["supervise-agents"], "--supervise-agents");
   validateCliString(args.cwd, "--cwd");
   validateCliString(args.model, "--model", { nonEmpty: false });
   const requestedSavedTemplate = validateSavedTemplateName(args["saved-template"], "--saved-template");
@@ -1281,6 +1308,9 @@ async function main() {
   if (!harnessFile && !hasSpecInput && !resumeOnly) throw new Error("Provide structured spec input or --resume-run-id");
   const resumeOverrides = ["cwd", "model", "permissions", "timeout", "name", "after", "auto-continue", "saved-template"].filter((key) => args[key] !== undefined);
   if (resumeOnly && resumeOverrides.length) throw new Error(`Run-ID-only resume derives execution configuration and template provenance from the trusted source run; remove: ${resumeOverrides.join(", ")}`);
+  if (resumeOnly && args["supervise-agents"] !== undefined) {
+    throw new Error("Run-ID-only resume derives supervision policy from trusted source ownership; remove: supervise-agents");
+  }
   const resumeInvocation = resumeOnly ? loadResumeInvocation(String(args["resume-run-id"]), args["session-id"]) : undefined;
   const spec = harnessFile
     ? (() => {
@@ -1296,12 +1326,28 @@ async function main() {
     throw new Error("--auto-continue is not supported by strict v2 workflows");
   }
   if (args["auto-continue"] !== undefined) validateCliBooleanFlag(args["auto-continue"], "--auto-continue");
+  const backgroundMode = isTruthyFlag(args.background)
+    || Boolean(process.env.PI_DYNAMIC_WORKFLOW_BACKGROUND || process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND);
+  const requestedAgentSupervision = isTruthyFlag(args["supervise-agents"]);
+  if (requestedAgentSupervision && !backgroundMode) throw new Error("--supervise-agents requires a background workflow");
+  if (requestedAgentSupervision && !args["session-id"]) throw new Error("--supervise-agents requires an originating Pi session");
+  if (requestedAgentSupervision && (isTruthyFlag(args["legacy-spec"]) || spec.schema === "pi-dynamic-workflow/v1")) {
+    throw new Error("--supervise-agents is not supported for legacy workflow execution");
+  }
+  const supervisionMode = backgroundMode
+    && (resumeOnly ? resumeInvocation?.supervisionMode === "main-agent" : requestedAgentSupervision)
+    ? "main-agent"
+    : undefined;
   const cleanupInputFile = args["js-file"] || args["harness-file"] || args["spec-file"];
   if (isTruthyFlag(args["cleanup-input"]) && cleanupInputFile) generatedInputDirectory(cleanupInputFile);
   // Validate CLI timeout before creating a visualizer run so bad input cannot
   // leave a setup-stage run that needs terminal-state repair.
-  const timeoutMs = normalizeTimeoutMs(args.timeout ?? spec.timeoutMs ?? DEFAULT_TIMEOUT_MS, args.timeout !== undefined ? "--timeout" : "workflow timeoutMs");
-  validateTimeout(timeoutMs, "workflow timeout");
+  const explicitWorkflowTimeout = args.timeout !== undefined
+    ? normalizeTimeoutMs(args.timeout, "--timeout")
+    : spec.timeoutMs !== undefined
+      ? normalizeTimeoutMs(spec.timeoutMs, "workflow timeoutMs")
+      : undefined;
+  if (explicitWorkflowTimeout !== undefined) validateTimeout(explicitWorkflowTimeout, "workflow timeout");
   // Yield once so a SIGTERM delivered during startup is observed before the
   // launcher can detach a background child. The wrapper also guards signals
   // that were already aborted before spawn.
@@ -1316,6 +1362,7 @@ async function main() {
     cwd,
     model: effectiveModel,
     sessionId: args["session-id"],
+    sourceSummary: resumeInvocation?.sourceSummary,
   });
   const parentChain = args.after === undefined ? undefined : loadParentChain(String(args.after), args["session-id"]);
   const savedTemplate = resumeState?.savedTemplate ?? resumeInvocation?.savedTemplate ?? requestedSavedTemplate;
@@ -1339,7 +1386,7 @@ async function main() {
       cwd,
       trigger: { kind: isBackground ? "background" : "manual", dynamic: true },
       input: spec,
-      metadata: { pid: process.pid, processJournalVersion: 1, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, mode: harnessFile ? "javascript" : "spec", permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, continuationMode: isBackground ? "terminal" : "none", autoContinue: isTruthyFlag(args["auto-continue"] ?? spec.autoContinue), sessionId: args["session-id"], sessionFile: args["session-file"], savedTemplate, ...chain, resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length },
+      metadata: { pid: process.pid, processJournalVersion: 1, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, mode: harnessFile ? "javascript" : "spec", permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, continuationMode: isBackground ? "terminal" : "none", ...(supervisionMode ? { supervisionMode } : {}), autoContinue: isTruthyFlag(args["auto-continue"] ?? spec.autoContinue), sessionId: args["session-id"], sessionFile: args["session-file"], savedTemplate, ...chain, resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length },
       message: `${workflow} started`,
     });
     if (successorReservation) commitSuccessor(successorReservation);
@@ -1384,7 +1431,8 @@ async function main() {
       spec,
       cwd,
       model: effectiveModel,
-      timeoutMs,
+      workflowTimeoutMs: explicitWorkflowTimeout,
+      supervisionMode,
       outputs: {},
       results: {},
       signal: controller.signal,

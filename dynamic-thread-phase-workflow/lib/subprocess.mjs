@@ -40,11 +40,19 @@ export function runBoundedProcess(command, args, options = {}) {
     };
 
     let timeoutMs;
+    let noDeadline;
     let killGraceMs;
     let stdoutBuffer;
     let stderrBuffer;
     try {
-      timeoutMs = normalizeTimeoutMs(options.timeoutMs, "process timeoutMs");
+      if (options.noDeadline !== undefined && typeof options.noDeadline !== "boolean") {
+        throw new Error("process noDeadline must be a boolean");
+      }
+      noDeadline = options.noDeadline === true;
+      if (noDeadline && options.timeoutMs !== undefined) {
+        throw new Error("process timeoutMs and noDeadline are mutually exclusive");
+      }
+      timeoutMs = noDeadline ? undefined : normalizeTimeoutMs(options.timeoutMs, "process timeoutMs");
       killGraceMs = normalizeTimeoutMs(options.killGraceMs ?? DEFAULT_KILL_GRACE_MS, "process killGraceMs");
       stdoutBuffer = new BoundedTextBuffer(options.maxStdoutBytes ?? DEFAULT_CAPTURE_BYTES, { keep: options.stdoutKeep ?? "head" });
       stderrBuffer = new BoundedTextBuffer(options.maxStderrBytes ?? DEFAULT_CAPTURE_BYTES, { keep: options.stderrKeep ?? "tail" });
@@ -97,7 +105,10 @@ export function runBoundedProcess(command, args, options = {}) {
       return;
     }
 
-    const timeoutController = new AbortController();
+    // noDeadline is an explicit runner-internal policy. Ordinary callers must
+    // continue to provide a valid numeric timeout; a missing or malformed value
+    // never turns into permission to run forever.
+    const timeoutController = noDeadline ? undefined : new AbortController();
     let timedOut = false;
     let aborted = false;
     let settled = false;
@@ -127,19 +138,19 @@ export function runBoundedProcess(command, args, options = {}) {
       terminate("SIGTERM");
     };
     options.signal?.addEventListener("abort", onWorkflowAbort, { once: true });
-    timeoutController.signal.addEventListener("abort", onTimeoutAbort, { once: true });
+    timeoutController?.signal.addEventListener("abort", onTimeoutAbort, { once: true });
     if (options.signal?.aborted) onWorkflowAbort();
-    const timeoutTimer = setTimeout(() => {
+    const timeoutTimer = timeoutController ? setTimeout(() => {
       timeoutController.abort(new Error(`${command} timed out after ${timeoutMs} ms`));
-    }, timeoutMs);
-    timeoutTimer.unref?.();
+    }, timeoutMs) : undefined;
+    timeoutTimer?.unref?.();
 
     const childHasPid = Number.isSafeInteger(child.pid) && child.pid > 0;
     const cleanup = () => {
-      clearTimeout(timeoutTimer);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
       options.signal?.removeEventListener("abort", onWorkflowAbort);
-      timeoutController.signal.removeEventListener("abort", onTimeoutAbort);
+      timeoutController?.signal.removeEventListener("abort", onTimeoutAbort);
       if (childHasPid) {
         try { options.onChildEnd?.(child); } catch { /* lifecycle cleanup must not mask the process result */ }
       }

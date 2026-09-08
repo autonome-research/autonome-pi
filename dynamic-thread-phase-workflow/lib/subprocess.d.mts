@@ -4,12 +4,11 @@ export const DEFAULT_CAPTURE_BYTES: number;
 export const DEFAULT_KILL_GRACE_MS: number;
 export const MAX_TIMEOUT_MS: number;
 
-export interface BoundedProcessOptions {
+export interface BoundedProcessCommonOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   shell?: boolean;
   signal?: AbortSignal;
-  timeoutMs: number;
   killGraceMs?: number;
   maxStdoutBytes?: number;
   maxStderrBytes?: number;
@@ -19,9 +18,15 @@ export interface BoundedProcessOptions {
   captureStderr?: boolean;
   onStdout?: (chunk: string) => void;
   onStderr?: (chunk: string) => void;
+  onNoChild?: () => void;
   onChildStart?: (child: ChildProcess) => void;
   onChildEnd?: (child: ChildProcess) => void;
 }
+
+export type BoundedProcessOptions = BoundedProcessCommonOptions & (
+  | { timeoutMs: number; noDeadline?: false }
+  | { timeoutMs?: never; noDeadline: true }
+);
 
 export interface BoundedProcessResult {
   ok: boolean;

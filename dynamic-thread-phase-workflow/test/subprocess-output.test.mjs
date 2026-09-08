@@ -82,6 +82,43 @@ test("runBoundedProcess can stream stdout without retaining a raw copy", async (
   assert.equal(result.stdout, "");
 });
 
+test("runBoundedProcess requires an explicit deadline policy", async () => {
+  await assert.rejects(
+    runBoundedProcess(process.execPath, ["-e", "process.exit(0)"], {}),
+    /process timeoutMs must be an integer/,
+  );
+  await assert.rejects(
+    runBoundedProcess(process.execPath, ["-e", "process.exit(0)"], { noDeadline: "yes" }),
+    /process noDeadline must be a boolean/,
+  );
+  await assert.rejects(
+    runBoundedProcess(process.execPath, ["-e", "process.exit(0)"], { noDeadline: true, timeoutMs: 100 }),
+    /mutually exclusive/,
+  );
+});
+
+test("explicit no-deadline mode runs without a wall-clock timer and remains cancellable", async () => {
+  const completed = await runBoundedProcess(process.execPath, ["-e", "setTimeout(() => process.stdout.write('done'), 120)"], {
+    noDeadline: true,
+  });
+  assert.equal(completed.ok, true);
+  assert.equal(completed.stdout, "done");
+  assert.equal(completed.timedOut, false);
+
+  const controller = new AbortController();
+  setTimeout(() => controller.abort("operator cancelled no-deadline process"), 80);
+  const cancelled = await runBoundedProcess(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    noDeadline: true,
+    killGraceMs: 100,
+    signal: controller.signal,
+  });
+  assert.equal(cancelled.ok, false);
+  assert.equal(cancelled.timedOut, false);
+  assert.equal(cancelled.aborted, true);
+  assert.equal(cancelled.termination.kind, "cancelled");
+  assert.equal(cancelled.error, "operator cancelled no-deadline process");
+});
+
 test("runBoundedProcess reports timeout separately from process exit", async () => {
   const result = await runBoundedProcess(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], {
     timeoutMs: 40,

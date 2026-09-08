@@ -19,6 +19,7 @@ const MAX_RUNNER_CAPTURE_BYTES = 1_000_000;
 const RUNNER_KILL_GRACE_MS = 8_000;
 const MAX_SAVED_TEMPLATE_BYTES = 1_000_000;
 const SAVED_TEMPLATE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+const LEGACY_PREPARED_CALL = Symbol("legacy-prepared-dynamic-workflow-call");
 
 function savedWorkflowDirectory(): string {
 	return path.resolve(process.env.PI_DYNAMIC_WORKFLOW_TEMPLATE_DIR || path.join(homedir(), ".pi", "agent", "workflows"));
@@ -581,6 +582,10 @@ function legacySpecToPublic(args: any): any {
 		...(args.resumeRunId !== undefined ? { resumeRunId: args.resumeRunId } : {}),
 	};
 	validatePublicWorkflow(prepared);
+	// prepareArguments exists for replaying historical stored tool calls. Keep
+	// those calls on their prior bounded execution policy without adding a public
+	// compatibility field to the current schema.
+	Object.defineProperty(prepared, LEGACY_PREPARED_CALL, { value: true, enumerable: false });
 	return prepared;
 }
 
@@ -600,7 +605,9 @@ function publicWorkflowToLegacySpec(params: any): any {
 	};
 }
 
-async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any, legacyName: string, publicKind: "dynamic" | "scripted" = "dynamic") {
+async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any, legacyName: string, publicKind: "dynamic" | "scripted" = "dynamic", internal: { superviseAgents?: boolean } = {}) {
+	if (!internal || typeof internal !== "object" || Array.isArray(internal) || Object.keys(internal).some((key) => key !== "superviseAgents")) throw new Error("Invalid internal workflow launch policy.");
+	if (internal.superviseAgents !== undefined && typeof internal.superviseAgents !== "boolean") throw new Error("Internal superviseAgents policy must be a boolean.");
 	if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error("Workflow arguments must be an object.");
 	validateOptionalString(params.cwd, "cwd", true);
 	validateOptionalString(params.model, "model");
@@ -618,6 +625,8 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 	if (inputModes !== 1) throw new Error("Provide exactly one of spec, resumeRunId, harness, or harnessFile.");
 	if ((hasHarness || hasHarnessFile) && params.resumeRunId !== undefined) throw new Error("resumeRunId is supported only for structured workflows, not harnesses.");
 	if (params.after !== undefined && params.resumeRunId !== undefined) throw new Error("Provide only one of after or resumeRunId.");
+	if (internal.superviseAgents && (!params.background || legacyName || hasResumeOnly)) throw new Error("Internal main-agent supervision is only valid for new public background launches.");
+	if (internal.superviseAgents && !ctx.sessionManager?.getSessionId?.()) throw new Error("Main-agent supervision requires an originating Pi session.");
 	if (hasSpec && (!params.spec || typeof params.spec !== "object" || Array.isArray(params.spec))) throw new Error("spec must be a non-null object.");
 	if (hasHarness && (typeof params.harness !== "string" || !params.harness.trim())) throw new Error("harness must be a non-empty string.");
 	if (hasHarnessFile && (typeof params.harnessFile !== "string" || !params.harnessFile.trim())) throw new Error("harnessFile must be a non-empty path.");
@@ -646,6 +655,7 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 		if (params.model) args.push("--model", params.model);
 		if (params.timeout !== undefined) args.push("--timeout", String(normalizeTimeoutMs(params.timeout, "timeout")));
 		if (params.background) args.push("--background");
+		if (internal.superviseAgents) args.push("--supervise-agents");
 		if (params.autoContinue) args.push("--auto-continue");
 		if (params.after) args.push("--after", params.after);
 		if (params.resumeRunId) args.push("--resume-run-id", params.resumeRunId);
@@ -673,11 +683,11 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 
 export default function dynamicWorkflows(pi: ExtensionAPI) {
 	const guidelines = [
-		"Use dynamic_workflow to compose bounded subagent workflows directly from ordered agent, fanout, shell, and artifact phases.",
+		"Use dynamic_workflow to compose supervised subagent workflows directly from ordered agent, fanout, shell, and artifact phases.",
 		"Set dynamic_workflow permissions to r, w, rw, or rwx; phases inherit that default and may override it within operator policy.",
 		"Use dynamic_workflow agent phases for one subagent and fanout phases for parallel subagents. Shell phases require rwx.",
 		"Use {{outputs.phase-name}} only to reference earlier phase outputs; fanout prompts may also use {{item}} and {{index}}.",
-		"Use background=true for long workflows. Successful and failed background runs return control to chat; user-cancelled runs do not.",
+		"Use background=true for long or open-ended agent workflows. Explicit timeoutMs values remain hard limits; successful and failed background runs return control to chat, while user-cancelled runs do not.",
 		"Reusable structured workflows may be loaded by template name from ~/.pi/agent/workflows/<name>.json instead of supplying phases.",
 		"Use after with a terminal successful or failed run id to create its single model-selected chained successor; Pi generates the child run and chain identities.",
 		"Use resumeRunId by itself to continue the same structured workflow from its trusted stored spec and validated completed phase-output artifacts.",
@@ -687,11 +697,12 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 		name: "dynamic_workflow",
 		label: "Dynamic Workflow",
 		description: "Compose and execute a validated workflow of ordered agent, fanout, shell, and artifact phases, or run a saved structured workflow template.",
-		promptSnippet: "Compose bounded subagent workflows with agent, fanout, shell, and artifact phases",
+		promptSnippet: "Compose supervised subagent workflows with agent, fanout, shell, and artifact phases",
 		promptGuidelines: guidelines,
 		parameters: workflowParametersSchema(),
 		prepareArguments: legacySpecToPublic,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const legacyPreparedCall = params?.[LEGACY_PREPARED_CALL] === true;
 			const resolved = resolvePublicWorkflowParams(params);
 			if (resolved.resumeRunId !== undefined) {
 				return executeDynamicWorkflow({ resumeRunId: resolved.resumeRunId, background: resolved.background }, signal, onUpdate, ctx, "");
@@ -704,7 +715,7 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 				background: resolved.background,
 				after: resolved.after,
 				systemTemplateProvenance: resolved.systemTemplateProvenance,
-			}, signal, onUpdate, ctx, "");
+			}, signal, onUpdate, ctx, "", "dynamic", { superviseAgents: resolved.background === true && !legacyPreparedCall && Boolean(ctx.sessionManager?.getSessionId?.()) });
 		},
 	});
 
@@ -722,7 +733,7 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 		parameters: scriptedWorkflowParametersSchema(),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const resolved = resolveScriptedWorkflowParams(params);
-			return executeDynamicWorkflow({ ...resolved, timeout: resolved.timeoutMs }, signal, onUpdate, ctx, "", "scripted");
+			return executeDynamicWorkflow({ ...resolved, timeout: resolved.timeoutMs }, signal, onUpdate, ctx, "", "scripted", { superviseAgents: resolved.background === true && Boolean(ctx.sessionManager?.getSessionId?.()) });
 		},
 	});
 

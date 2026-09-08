@@ -111,8 +111,9 @@ Mixed-permission example:
 ## Execution policy
 
 - Set `cwd` explicitly when execution differs from the Pi session cwd.
-- Top-level `model` and `timeoutMs` provide phase defaults. Fanout concurrency is phase-local; descriptions, caller metadata, and retry backoff are not declarative fields.
-- Use `background: true` for long workflows. Success and failure durably return control to chat; user cancellation does not.
+- Top-level `model` and `timeoutMs` provide phase defaults. An explicit `timeoutMs` is always a hard limit. Fanout concurrency is phase-local; descriptions, caller metadata, retry backoff, and supervision cadence are not declarative fields.
+- Use `background: true` for long or open-ended agent work. New background dynamic/scripted launches are privately marked for main-agent supervision: a durable five-minute timer asks the main agent to inspect logs and decide whether to wait, report, or intervene. The timer does not detect a stall and never kills, retries, resumes, or launches work. Success and failure still durably return control to chat; progress reviews are distinct from completion and user cancellation does not auto-continue.
+- Foreground calls remain bounded because they occupy their own supervisor. Shell phases retain their normal default bound. Do not use foreground mode for intentionally open-ended agent work.
 - Use `after` with a trusted terminal successful or failed run id to launch its single chained successor. Do not chain from a cancelled run.
 - Add an artifact phase when the user expects a durable report.
 - Keep fanout item count and concurrency minimal.
@@ -165,6 +166,8 @@ Script helpers:
 - `ctx.emit(kind, data)`
 - `ctx.cancelled()` / `ctx.signal`
 
+In a supervised background scripted run, `ctx.pi` and `ctx.fanout` may run without an implicit wall-clock deadline only when neither helper nor workflow has an explicit timeout; explicit helper/workflow deadlines still win. `ctx.shell` remains bounded. There is no script helper or workflow field for changing check cadence or steering the supervisor in this initial release.
+
 Prefer a standalone TypeScript extension using thread-phase directly when logic becomes reusable, domain-specific, operationally important, or recovery-heavy.
 
 ## Compatibility
@@ -181,7 +184,7 @@ Prefer a standalone TypeScript extension using thread-phase directly when logic 
 4. Use phase overrides only where needed.
 5. Use `shell` only with `rwx`.
 6. Reference only earlier phases with `{{outputs.name}}`.
-7. Use background mode for long runs.
+7. Use background mode for long or open-ended agent runs; treat periodic main-agent reviews as judgment requests, never stall detection.
 8. Include a durable artifact when appropriate.
 9. Keep retries and fanout bounded.
 10. Use a saved template for repeated workflows; use direct phases for one-off composition.

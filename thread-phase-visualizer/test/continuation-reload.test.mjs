@@ -12,6 +12,7 @@ const { loadExtensions } = await import(new URL("./core/extensions/loader.js", s
 function context(cwd) {
   return {
     cwd,
+    mode: "tui",
     hasUI: false,
     isIdle: () => true,
     sessionManager: { getSessionId: () => "reload-session", getBranch: () => [] },
@@ -22,7 +23,7 @@ async function emit(extension, event, ctx) {
   for (const handler of extension.handlers.get(event) || []) await handler({}, ctx);
 }
 
-test("same-process Pi reload replaces a cached continuation API before session_start", async (t) => {
+test("same-process Pi reload replaces cached continuation and supervision APIs before session_start", async (t) => {
   const temp = mkdtempSync(join(tmpdir(), "pi-continuation-reload-"));
   const fixture = join(temp, "visualizer");
   const storeDir = join(temp, "store");
@@ -39,14 +40,20 @@ test("same-process Pi reload replaces a cached continuation API before session_s
   });
   const entry = join(fixture, "index.ts");
   const storeFile = join(fixture, "lib", "continuation-store.mjs");
+  const supervisionStoreFile = join(fixture, "lib", "supervision-store.mjs");
   const currentEntry = readFileSync(entry, "utf8");
   const currentStore = readFileSync(storeFile, "utf8");
+  const currentSupervisionStore = readFileSync(supervisionStoreFile, "utf8");
   const oldStore = currentStore.replace("export function continuationEligibility(", "function continuationEligibility(");
+  const oldSupervisionStore = currentSupervisionStore.replace("export function ensureProgressReview(", "function ensureProgressReview(");
   assert.notEqual(oldStore, currentStore);
+  assert.notEqual(oldSupervisionStore, currentSupervisionStore);
   writeFileSync(storeFile, oldStore);
+  writeFileSync(supervisionStoreFile, oldSupervisionStore);
   writeFileSync(entry, `import * as store from "./lib/continuation-store.mjs";
+import * as supervision from "./lib/supervision-store.mjs";
 export default function () {
-  if (store.continuationEligibility !== undefined) throw new Error("old API was not loaded");
+  if (store.continuationEligibility !== undefined || supervision.ensureProgressReview !== undefined) throw new Error("old APIs were not loaded");
 }
 `);
   const first = await loadExtensions([entry], temp);
@@ -55,16 +62,18 @@ export default function () {
 
   // Upgrade on disk without restarting Node: the unversioned native module stays old.
   writeFileSync(storeFile, currentStore);
+  writeFileSync(supervisionStoreFile, currentSupervisionStore);
   writeFileSync(entry, currentEntry);
   const cached = await import(pathToFileURL(storeFile).href);
-  assert.equal(cached.continuationEligibility, undefined, "fixture must reproduce the stale native module");
+  const cachedSupervision = await import(pathToFileURL(supervisionStoreFile).href);
+  assert.equal(cached.continuationEligibility, undefined, "fixture must reproduce the stale continuation module");
+  assert.equal(cachedSupervision.ensureProgressReview, undefined, "fixture must reproduce the stale supervision module");
 
   const runStore = await import(pathToFileURL(join(fixture, "lib", "store.mjs")).href);
   const run = runStore.createRun({
     workflow: "reload-test", cwd: temp,
-    metadata: { sessionId: "reload-session", continuationMode: "none" },
+    metadata: { sessionId: "reload-session", continuationMode: "none", supervisionMode: "main-agent" },
   });
-  runStore.completeRun(run);
 
   for (let reload = 0; reload < 2; reload++) {
     const loaded = await loadExtensions([entry], temp);
