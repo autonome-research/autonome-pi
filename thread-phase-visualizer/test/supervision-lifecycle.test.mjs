@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import * as nodeModule from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +14,7 @@ const loaderUrl = new URL("./support/pi-peer-loader.mjs", import.meta.url);
 if (nodeModule.registerHooks) nodeModule.registerHooks(await import(loaderUrl));
 else nodeModule.register(loaderUrl);
 const { default: registerVisualizer } = await import("../index.ts");
+const { default: registerDynamicWorkflows } = await import("../../dynamic-thread-phase-workflow/index.ts");
 const store = await import("../lib/store.mjs");
 const supervision = await import("../lib/supervision-store.mjs");
 
@@ -32,9 +33,9 @@ function harness() {
   };
 }
 
-function context(sessionId, idleState, branch = [], mode = "tui") {
+function context(sessionId, idleState, branch = [], mode = "tui", cwd = storeDir) {
   return {
-    cwd: storeDir,
+    cwd,
     mode,
     hasUI: false,
     isIdle: () => idleState.idle,
@@ -51,9 +52,31 @@ function oldStart(runId, sessionId, extra = {}, cwd = storeDir, trigger = { kind
   return store.emit({ runId, workflow: runId, cwd, trigger }, {
     type: store.EVENT_TYPES.WORKFLOW_START,
     status: store.STATUSES.RUNNING,
-    timestamp: new Date(Date.now() - 6 * 60_000).toISOString(),
+    timestamp: new Date(Date.now() - supervision.DEFAULT_PROGRESS_REVIEW_CADENCE_MS - 60_000).toISOString(),
     metadata: { sessionId, supervisionMode: "main-agent", ...extra },
   });
+}
+
+function contradictLaunchCwd(runId, claimedCwd) {
+  const runFile = store.runFileFor(runId);
+  const events = readFileSync(runFile, "utf8").trim().split("\n").map(JSON.parse);
+  events[0].metadata.cwdAtLaunch = claimedCwd;
+  writeFileSync(runFile, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+  const sidecarFile = join(storeDir, "runs", `${runId}.start.json`);
+  const sidecar = JSON.parse(readFileSync(sidecarFile, "utf8"));
+  sidecar.metadata.cwdAtLaunch = claimedCwd;
+  writeFileSync(sidecarFile, JSON.stringify(sidecar));
+}
+
+async function waitFor(predicate, message, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if (predicate()) return;
+    } catch { /* state may not be published yet */ }
+    await delay(20);
+  }
+  assert.fail(message);
 }
 
 test("overdue reviews persist while busy, batch once, acknowledge only on active branch, then schedule the next period", async (t) => {
@@ -113,11 +136,13 @@ test("generated IDs longer than 200 characters can be reviewed and acknowledged"
   assert.equal(record.state, "scheduled", "acknowledgement advances the long-ID run to its next check");
 });
 
-test("verified session/cwd ownership is required; cancellation and real terminal completion supersede checks", async (t) => {
+test("verified owned cross-directory work is eligible while contradictory claims, foreign work, cancellation, and terminal completion are denied", async (t) => {
   oldStart("supervision-foreign", "another-session");
   oldStart("supervision-manual", "supervision-scope-session", {}, storeDir, { kind: "manual" });
   oldStart("supervision-no-trigger", "supervision-scope-session", {}, storeDir, null);
-  oldStart("supervision-wrong-cwd", "supervision-scope-session", {}, join(storeDir, "other-cwd"));
+  oldStart("supervision-cross-cwd", "supervision-scope-session", {}, join(storeDir, "other-cwd"));
+  oldStart("supervision-contradictory-cwd", "supervision-scope-session");
+  contradictLaunchCwd("supervision-contradictory-cwd", join(storeDir, "claimed-elsewhere"));
   oldStart("supervision-cancelled", "supervision-scope-session");
   store.requestCancellation("supervision-cancelled", { reason: "test cancellation" });
   oldStart("supervision-terminal", "supervision-scope-session");
@@ -130,14 +155,117 @@ test("verified session/cwd ownership is required; cancellation and real terminal
   await app.handlers.get("session_start")({}, ctx);
   t.after(() => app.handlers.get("session_shutdown")({}, ctx));
   app.handlers.get("agent_settled")({}, ctx);
-  assert.equal(app.userMessages.length, 0);
+  assert.equal(app.userMessages.length, 1);
+  assert.match(app.userMessages[0], /supervision-cross-cwd/);
+  assert.doesNotMatch(app.userMessages[0], /supervision-contradictory-cwd/);
   const ids = supervision.loadProgressReviewRecords({ storeDir }).map((record) => record.runId);
+  assert.equal(ids.includes("supervision-cross-cwd"), true);
   assert.equal(ids.includes("supervision-foreign"), false);
   assert.equal(ids.includes("supervision-manual"), false);
   assert.equal(ids.includes("supervision-no-trigger"), false);
-  assert.equal(ids.includes("supervision-wrong-cwd"), false);
+  assert.equal(ids.includes("supervision-contradictory-cwd"), false);
   assert.equal(ids.includes("supervision-cancelled"), false);
   assert.equal(ids.includes("supervision-terminal"), false);
+});
+
+test("tool_result reconciliation schedules verified owned work across cwd scope changes", async (t) => {
+  const sessionId = "supervision-tool-result-session";
+  const idle = { idle: false };
+  const app = harness();
+  registerVisualizer(app.api);
+  const ctx = context(sessionId, idle);
+  await app.handlers.get("session_start")({}, ctx);
+  t.after(() => app.handlers.get("session_shutdown")({}, ctx));
+
+  const runId = "supervision-tool-result-cross-cwd";
+  oldStart(runId, sessionId, {}, join(storeDir, "tool-result-cwd"));
+  app.handlers.get("tool_result")({ details: { runId } }, ctx);
+  assert.equal(supervision.loadProgressReviewRecords({ storeDir }).some((record) => record.runId === runId), true);
+
+  app.handlers.get("user_bash")({ command: `cd ${JSON.stringify(tmpdir())}`, cwd: storeDir }, ctx);
+  app.handlers.get("agent_settled")({}, ctx);
+  assert.equal(supervision.loadProgressReviewRecords({ storeDir }).some((record) => record.runId === runId), true,
+    "changing the session cwd must not revoke owned supervision");
+});
+
+test("a supported cross-directory tool launch survives restart and scope changes, then terminal index discovery removes supervision", { timeout: 20_000 }, async (t) => {
+  const sessionId = "supervision-real-cross-directory-session";
+  const launchCwd = mkdtempSync(join(tmpdir(), "supervision-real-launch-"));
+  const laterSessionCwd = mkdtempSync(join(tmpdir(), "supervision-real-host-"));
+  const releaseFile = join(launchCwd, "release");
+  const fakePi = join(launchCwd, "fake-pi.mjs");
+  writeFileSync(fakePi, `#!/usr/bin/env node\nimport { existsSync, watch } from "node:fs";\nimport { dirname } from "node:path";\nconst release = process.env.PI_TEST_SUPERVISION_RELEASE;\nconst complete = () => { console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", model: "fake", content: [{ type: "text", text: "released" }] } })); };\nif (existsSync(release)) complete();\nelse {\n  const watcher = watch(dirname(release), () => { if (existsSync(release)) { watcher.close(); complete(); } });\n}\n`);
+  chmodSync(fakePi, 0o755);
+  const previousPi = process.env.PI_DYNAMIC_WORKFLOW_PI_BIN;
+  const previousRelease = process.env.PI_TEST_SUPERVISION_RELEASE;
+  process.env.PI_DYNAMIC_WORKFLOW_PI_BIN = fakePi;
+  process.env.PI_TEST_SUPERVISION_RELEASE = releaseFile;
+
+  const idle = { idle: false };
+  const first = harness();
+  registerVisualizer(first.api);
+  const firstCtx = context(sessionId, idle);
+  let replacement;
+  let replacementCtx;
+  let runId;
+  try {
+    await first.handlers.get("session_start")({}, firstCtx);
+    const tools = new Map();
+    registerDynamicWorkflows({ registerTool: (definition) => tools.set(definition.name, definition) });
+    const launched = await tools.get("dynamic_workflow").execute("cross-directory-call", {
+      name: "supervision-real-cross-directory",
+      cwd: launchCwd,
+      permissions: "r",
+      background: true,
+      timeoutMs: 8_000,
+      phases: [{ type: "agent", name: "worker", prompt: "wait for the test release" }],
+    }, undefined, undefined, { cwd: storeDir, sessionManager: { getSessionId: () => sessionId } });
+    runId = launched.details.runId;
+    assert.equal(launched.details.background, true);
+
+    await waitFor(
+      () => supervision.loadProgressReviewRecords({ storeDir }).some((record) => record.runId === runId),
+      "the live index path did not schedule the supported cross-directory launch",
+    );
+    const summary = store.getRunSummary(runId);
+    assert.equal(summary.cwd, launchCwd);
+    assert.equal(summary.metadata.cwdAtLaunch, launchCwd);
+    assert.equal(summary.metadata.sessionId, sessionId);
+
+    first.handlers.get("user_bash")({ command: `cd ${JSON.stringify(laterSessionCwd)}`, cwd: storeDir }, firstCtx);
+    first.handlers.get("agent_settled")({}, firstCtx);
+    assert.equal(supervision.loadProgressReviewRecords({ storeDir }).some((record) => record.runId === runId), true);
+    first.handlers.get("session_shutdown")({}, firstCtx);
+
+    supervision.discardProgressReview(runId, { storeDir });
+    replacement = harness();
+    registerVisualizer(replacement.api);
+    replacementCtx = context(sessionId, idle, [], "tui", laterSessionCwd);
+    await replacement.handlers.get("session_start")({}, replacementCtx);
+    assert.equal(supervision.loadProgressReviewRecords({ storeDir }).some((record) => record.runId === runId), true,
+      "startup discovery must recreate the schedule without matching the new session cwd");
+
+    replacement.handlers.get("user_bash")({ command: `cd ${JSON.stringify(storeDir)}`, cwd: laterSessionCwd }, replacementCtx);
+    replacement.handlers.get("agent_settled")({}, replacementCtx);
+    assert.equal(supervision.loadProgressReviewRecords({ storeDir }).some((record) => record.runId === runId), true);
+
+    writeFileSync(releaseFile, "release");
+    await waitFor(() => Boolean(store.getRunSummary(runId).endedAt), "the supported workflow did not finish", 10_000);
+    await waitFor(
+      () => !supervision.loadProgressReviewRecords({ storeDir }).some((record) => record.runId === runId),
+      "terminal index discovery did not remove the supervision record",
+    );
+  } finally {
+    if (!existsSync(releaseFile)) writeFileSync(releaseFile, "release");
+    if (replacement && replacementCtx) replacement.handlers.get("session_shutdown")({}, replacementCtx);
+    else first.handlers.get("session_shutdown")({}, firstCtx);
+    if (previousPi === undefined) delete process.env.PI_DYNAMIC_WORKFLOW_PI_BIN;
+    else process.env.PI_DYNAMIC_WORKFLOW_PI_BIN = previousPi;
+    if (previousRelease === undefined) delete process.env.PI_TEST_SUPERVISION_RELEASE;
+    else process.env.PI_TEST_SUPERVISION_RELEASE = previousRelease;
+    rmSync(launchCwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(laterSessionCwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
 });
 
 test("ambiguous cancellation markers suppress reviews without blocking the host", (t) => {
@@ -155,7 +283,7 @@ test("ambiguous cancellation markers suppress reviews without blocking the host"
     const store = await import(${JSON.stringify(new URL("../lib/store.mjs", import.meta.url).href)});
     for (const runId of ['broken-json', 'dangling-link', 'fifo-marker']) {
       store.emit({ runId, workflow: runId, cwd: process.env.PI_THREAD_PHASE_STORE_DIR, trigger: { kind: 'background' } }, {
-        type: 'workflow_start', status: 'running', timestamp: new Date(Date.now() - 360000).toISOString(),
+        type: 'workflow_start', status: 'running', timestamp: new Date(Date.now() - ${supervision.DEFAULT_PROGRESS_REVIEW_CADENCE_MS + 60_000}).toISOString(),
         metadata: { sessionId: 'cancel-markers', supervisionMode: 'main-agent' },
       });
     }

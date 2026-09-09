@@ -19,7 +19,7 @@ import {
 	runFileFor,
 } from "./lib/store.mjs";
 import { belongsToSession, formatOwnerMetadata, formatStaleIndicator, runSessionId } from "./lib/run-display.mjs";
-import { canonicalCwd, canInspectRun, createCwdState, matchesRunCwd, mergeMonitorRuns as mergeScopedMonitorRuns, trackCwdCommand } from "./lib/session-scope.mjs";
+import { canonicalCwd, canInspectRun, createCwdState, hasVerifiedLaunchCwd, matchesRunCwd, mergeMonitorRuns as mergeScopedMonitorRuns, trackCwdCommand } from "./lib/session-scope.mjs";
 import {
 	continuationClaimIsOwned,
 	continuationEligibility,
@@ -720,7 +720,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				|| summary.trigger?.kind !== "background"
 				|| runSessionId(summary) !== currentSessionId
 				|| !belongsToSession(summary, currentSessionId, cwdState.activeCwd)
-				|| !matchesRunCwd(summary, cwdState.activeCwd)) return "unknown";
+				|| !hasVerifiedLaunchCwd(summary)) return "unknown";
 			// A projected error can normalize the run to failed without workflow_end.
 			// Only a real terminal envelope supersedes progress review.
 			if (summary.endedAt || summary.events?.some((event: AnyEvent) => event.type === EVENT_TYPES.WORKFLOW_END)) return "superseded";

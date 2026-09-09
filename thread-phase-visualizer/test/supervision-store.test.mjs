@@ -39,6 +39,40 @@ test("reviews are anchored to trusted start, become overdue across restart, and 
   assert.notEqual(acknowledged.nextCheckId, claim.checkId);
 });
 
+test("ten-minute default and explicit reschedule preserve identity, anchor, and subsequent cadence", (t) => {
+  const storeDir = temporaryStore(t);
+  const start = Date.parse("2026-01-01T00:00:00.000Z");
+  assert.equal(supervision.DEFAULT_PROGRESS_REVIEW_CADENCE_MS, 600_000);
+  const initial = supervision.ensureProgressReview("new-default", { storeDir, startedAt: start, now: start });
+  assert.equal(Date.parse(initial.dueAt), start + 600_000);
+  const old = supervision.ensureProgressReview("change-cadence", { storeDir, startedAt: start, cadenceMs: 300_000, now: start + 2_700_000 });
+  const ack = supervision.acknowledgeProgressReview(old.runId, { storeDir, checkId: old.checkId, now: start + 2_700_000 });
+  const changed = supervision.rescheduleProgressReview(old.runId, { storeDir, checkId: ack.nextCheckId, cadenceMs: 600_000, now: start + 2_700_001 });
+  assert.equal(changed.rescheduled, true);
+  assert.equal(changed.record.checkId, ack.nextCheckId);
+  assert.equal(changed.record.startedAt, old.startedAt);
+  assert.equal(changed.record.sequence, 5, "period index rebases instead of doubling the next acknowledgement delay");
+  assert.equal(Date.parse(changed.record.dueAt), start + 3_000_000);
+  const reconciled = supervision.ensureProgressReview(old.runId, { storeDir, startedAt: start, cadenceMs: 300_000, now: start + 3_000_000 });
+  assert.equal(reconciled.cadenceMs, 600_000, "an already-loaded host cannot silently restore the old cadence");
+  const next = supervision.acknowledgeProgressReview(old.runId, { storeDir, checkId: ack.nextCheckId, now: start + 3_000_000 });
+  assert.equal(Date.parse(next.dueAt), start + 3_600_000);
+});
+
+test("reschedule cannot rewrite pending/in-flight checks or a replaced identity", (t) => {
+  const storeDir = temporaryStore(t);
+  const initial = supervision.ensureProgressReview("pending-cadence", { storeDir, startedAt: 1_000, cadenceMs: 1_000, now: 2_001 });
+  const claimantId = supervision.createProgressReviewClaimantId();
+  supervision.claimProgressReview(initial.runId, { storeDir, claimantId, now: 2_001 });
+  const before = supervision.loadProgressReviewRecords({ storeDir });
+  assert.equal(supervision.rescheduleProgressReview(initial.runId, { storeDir, checkId: initial.checkId, cadenceMs: 2_000, now: 2_002 }).rescheduled, false);
+  assert.deepEqual(supervision.loadProgressReviewRecords({ storeDir }), before);
+  const ack = supervision.acknowledgeProgressReview(initial.runId, { storeDir, checkId: initial.checkId, now: 2_003 });
+  assert.equal(supervision.rescheduleProgressReview(initial.runId, { storeDir, checkId: initial.checkId, cadenceMs: 2_000, now: 2_004 }).rescheduled, false);
+  assert.equal(supervision.loadProgressReviewRecords({ storeDir })[0].checkId, ack.nextCheckId);
+  assert.throws(() => supervision.rescheduleProgressReview(initial.runId, { storeDir, checkId: ack.nextCheckId, cadenceMs: 0 }), /positive/);
+});
+
 test("claims deduplicate, survive reload, back off failed submission, and can be relinquished", (t) => {
   const storeDir = temporaryStore(t);
   const start = Date.parse("2026-01-01T00:00:00.000Z");

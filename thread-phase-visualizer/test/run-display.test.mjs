@@ -5,7 +5,10 @@ import {
   formatElapsedDuration,
   formatOwnerMetadata,
   formatStaleIndicator,
+  formatTokenBreakdown,
+  formatTokenSummary,
   formatTotalTokens,
+  processedTokenTotal,
   runSessionId,
 } from "../lib/run-display.mjs";
 
@@ -28,11 +31,35 @@ test("dashboard duration uses compact aggregate hours, minutes, and seconds", ()
   assert.equal(formatElapsedDuration("invalid", start), "?");
 });
 
-test("dashboard tokens use one compact aggregate total", () => {
-  assert.equal(formatTotalTokens({ totalTokens: 8750, inputTokens: 8000, outputTokens: 750 }), "8.8K tok");
-  assert.equal(formatTotalTokens({ inputTokens: 1_000_000, outputTokens: 250_000 }), "1.3M tok");
-  assert.equal(formatTotalTokens({ totalTokens: 42 }), "42 tok");
+test("dashboard token labels distinguish output from cumulative processed traffic", () => {
+  const cacheHeavy = {
+    inputTokens: 527_373,
+    outputTokens: 87_266,
+    reasoningTokens: 30_791,
+    cachedInputTokens: 18_404_224,
+    cacheCreationInputTokens: 0,
+    totalTokens: 19_018_863,
+  };
+  assert.equal(formatTokenSummary(cacheHeavy), "87.3K output · 19M cumulative processed tokens");
+  assert.deepEqual(formatTokenBreakdown(cacheHeavy), [
+    "527,373 uncached input · 18,404,224 cache-read input · 0 cache-write input",
+    "87,266 output (30,791 reasoning included) · 19,018,863 cumulative processed tokens",
+  ]);
+  assert.equal(formatTotalTokens({ totalTokens: 42 }), "42 cumulative processed tokens");
   assert.equal(formatTotalTokens(undefined), "");
+});
+
+test("canonical projected fallback includes cache traffic without readding reasoning", () => {
+  const usage = {
+    inputTokens: 100,
+    cachedInputTokens: 40,
+    cacheCreationInputTokens: 5,
+    outputTokens: 30,
+    reasoningTokens: 12,
+  };
+  assert.equal(processedTokenTotal(usage), 175);
+  assert.equal(formatTokenSummary(usage), "30 output · 175 cumulative processed tokens");
+  assert.match(formatTokenBreakdown(usage)[1], /^30 output \(12 reasoning included\) · 175 /);
 });
 
 test("owner and stale display use one canonical representation", () => {

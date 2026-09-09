@@ -3,11 +3,12 @@ import { basename, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { canonicalCwd } from "./session-scope.mjs";
+import { applyCommandLedgerEvent, createCommandLedger, finalizeCommandLedger, isCommandLedgerEvent } from "./command-ledger.mjs";
 
 export const SCHEMA_VERSION = "thread-phase-ui/v1";
 // Bump when the projected summary shape changes (nested artifacts / traces) so a
 // monitor can surface whether the loaded store is current.
-export const STORE_BUILD = "5-supervision-ownership";
+export const STORE_BUILD = "6-command-ledger";
 export const EVENT_TYPES = Object.freeze({
   WORKFLOW_START: "workflow_start",
   WORKFLOW_END: "workflow_end",
@@ -1234,14 +1235,20 @@ export function projectRun(events = [], options = {}) {
   // occurrences without relying on optional or non-unique event IDs.
   summary.artifacts = dedupeArtifacts(summary.artifacts);
   const retainedArtifacts = new Set(summary.artifacts);
+  closeOpenPhasesForTerminalRun(summary, sawWorkflowEnd);
   for (const phase of Object.values(summary.phaseMap)) {
     finalizeFanout(phase);
+    phase.commandLedger = finalizeCommandLedger(phase._commandLedger, {
+      terminal: phase.normalizedStatus !== STATUSES.RUNNING,
+      at: phase.endedAt || phase.updatedAt,
+    });
+    delete phase._commandLedger;
+    if (!phase.commandLedger?.retainedCommands) delete phase.commandLedger;
     if (phase.artifacts) phase.artifacts = phase.artifacts.filter((artifact) => retainedArtifacts.has(artifact));
     for (const item of phase.fanout?.items || []) {
       if (item.artifacts) item.artifacts = item.artifacts.filter((artifact) => retainedArtifacts.has(artifact));
     }
   }
-  closeOpenPhasesForTerminalRun(summary, sawWorkflowEnd);
   summary.phases = Object.values(summary.phaseMap).sort((a, b) => String(a.startedAt || "").localeCompare(String(b.startedAt || "")));
   delete summary.phaseMap;
   if (summary.normalizedStatus !== STATUSES.FAILED && summary.errors.length > 0 && !sorted.some((e) => e.type === EVENT_TYPES.WORKFLOW_END)) {
@@ -1724,15 +1731,19 @@ export function latestRuns(options = {}) {
 
 export function formatUsageSummary(usage) {
   if (!usage || typeof usage !== "object" || !usage.entries) return "";
+  const output = Number(usage.outputTokens) || 0;
+  const declaredTotal = Number(usage.totalTokens) || 0;
+  const derivedTotal = (Number(usage.inputTokens) || 0)
+    + (Number(usage.cachedInputTokens) || 0)
+    + (Number(usage.cacheCreationInputTokens) || 0)
+    + output;
+  const total = declaredTotal > 0 ? declaredTotal : derivedTotal;
   const parts = [];
-  if (typeof usage.inputTokens === "number" && usage.inputTokens > 0) parts.push(`${formatNumber(usage.inputTokens)} in`);
-  if (typeof usage.outputTokens === "number" && usage.outputTokens > 0) parts.push(`${formatNumber(usage.outputTokens)} out`);
-  if (typeof usage.totalTokens === "number" && usage.totalTokens > 0 && parts.length === 0) parts.push(`${formatNumber(usage.totalTokens)} tok`);
-  if (typeof usage.reasoningTokens === "number" && usage.reasoningTokens > 0) parts.push(`${formatNumber(usage.reasoningTokens)} reasoning`);
-  if (typeof usage.cachedInputTokens === "number" && usage.cachedInputTokens > 0) parts.push(`${formatNumber(usage.cachedInputTokens)} cached`);
+  if (output > 0) parts.push(`${formatNumber(output)} output`);
+  if (total > 0) parts.push(`${formatNumber(total)} cumulative processed tokens`);
   const models = usage.models && typeof usage.models === "object" ? Object.keys(usage.models).filter(Boolean) : [];
   const modelPart = models.length === 1 ? ` · ${models[0]}` : models.length > 1 ? ` · ${models.length} models` : "";
-  return parts.length ? `${parts.join(" / ")}${modelPart}` : `${usage.entries} usage event${usage.entries === 1 ? "" : "s"}${modelPart}`;
+  return parts.length ? `${parts.join(" · ")}${modelPart}` : `usage observed${modelPart}`;
 }
 
 export function readArtifactContent(artifact, { maxBytes = 500_000 } = {}) {
@@ -1959,11 +1970,23 @@ function addUsage(target, usage, model) {
   target.entries += 1;
   // Accept provider/Pi-native token keys (input/output/reasoning/cacheRead/cacheWrite)
   // alongside the snake/camel *_tokens aliases so token totals are never dropped.
-  const input = numberFrom(usage.input_tokens, usage.inputTokens, usage.prompt_tokens, usage.promptTokens, usage.input);
+  const selectedInput = numberEntry(
+    ["input_tokens", usage.input_tokens],
+    ["inputTokens", usage.inputTokens],
+    ["prompt_tokens", usage.prompt_tokens],
+    ["promptTokens", usage.promptTokens],
+    ["input", usage.input],
+  );
+  const input = selectedInput?.value;
   const output = numberFrom(usage.output_tokens, usage.outputTokens, usage.completion_tokens, usage.completionTokens, usage.output);
-  const total = numberFrom(usage.total_tokens, usage.totalTokens, usage.total) ?? ((input || 0) + (output || 0) || undefined);
   const cached = numberFrom(usage.cache_read_input_tokens, usage.cached_input_tokens, usage.cachedInputTokens, usage.input_token_details?.cached_tokens, usage.prompt_tokens_details?.cached_tokens, usage.cacheRead);
   const cacheCreation = numberFrom(usage.cache_creation_input_tokens, usage.cacheCreationInputTokens, usage.cacheWrite);
+  const declaredTotal = numberFrom(usage.total_tokens, usage.totalTokens, usage.total);
+  // Canonical Pi `input` excludes cache traffic. Legacy prompt/input aliases are
+  // provider-ambiguous and may already include cached tokens, so their fallback
+  // remains input + output rather than blindly adding cache a second time.
+  const canonicalPi = selectedInput?.key === "input";
+  const total = declaredTotal ?? ((input || 0) + (output || 0) + (canonicalPi ? (cached || 0) + (cacheCreation || 0) : 0) || undefined);
   const reasoning = numberFrom(usage.output_token_details?.reasoning_tokens, usage.completion_tokens_details?.reasoning_tokens, usage.reasoning_tokens, usage.reasoningTokens, usage.reasoning);
   if (input) target.inputTokens += input;
   if (output) target.outputTokens += output;
@@ -1996,6 +2019,13 @@ function addNumericFields(fields, value, prefix = "") {
     if (typeof nested === "number" && Number.isFinite(nested)) fields[name] = (fields[name] || 0) + nested;
     else if (nested && typeof nested === "object" && !Array.isArray(nested)) addNumericFields(fields, nested, name);
   }
+}
+
+function numberEntry(...entries) {
+  for (const [key, value] of entries) {
+    if (typeof value === "number" && Number.isFinite(value)) return { key, value };
+  }
+  return undefined;
 }
 
 function numberFrom(...values) {
@@ -2033,13 +2063,39 @@ function pushBounded(list, item, cap) {
   while (list.length > cap) list.shift();
 }
 
-// Project an AGENT_EVENT record into a bounded per-phase (and per-stage, when it
-// carries itemId identity) recentItems window, adopting thread-phase's
-// AgentStreamEvent shape (content_delta reasoning, tool_call_started/completed).
+function ensureFanoutItem(phase, data, timestamp) {
+  const itemId = String(data.itemId ?? data.id);
+  phase.fanout ||= { total: undefined, completed: 0, failed: 0, running: 0, items: [] };
+  phase._fanoutItemMap ||= {};
+  const item = phase._fanoutItemMap[itemId] || {
+    itemId,
+    label: data.item || data.label || itemId,
+    index: data.index,
+    startedAt: timestamp,
+    updatedAt: timestamp,
+    status: STATUSES.RUNNING,
+    normalizedStatus: STATUSES.RUNNING,
+  };
+  phase._fanoutItemMap[itemId] = item;
+  return item;
+}
+
+// Project AGENT_EVENT records into legacy recentItems plus the bounded command
+// ledger. Fanout commands belong only to their item ledger, never the phase
+// ledger, preventing one observed command from appearing twice as unattributed.
 function applyAgentTraceEvent(phase, data, timestamp) {
   if (!data || typeof data !== "object") return;
   const type = data.type;
   if (!type) return;
+  const itemId = data.itemId ?? data.id;
+  const item = itemId === undefined ? undefined : ensureFanoutItem(phase, data, timestamp);
+
+  if (isCommandLedgerEvent(data)) {
+    const owner = item || phase;
+    owner._commandLedger ||= createCommandLedger();
+    applyCommandLedgerEvent(owner._commandLedger, data, timestamp);
+  }
+
   let trace;
   if (type === "content_delta") {
     trace = { type, agent: data.agent, contentType: data.contentType, contentIndex: data.contentIndex, at: timestamp, delta: traceTextBounds(data.delta, MAX_TRACE_TEXT_BYTES) };
@@ -2048,15 +2104,14 @@ function applyAgentTraceEvent(phase, data, timestamp) {
   } else if (type === "tool_call_completed") {
     trace = { type, agent: data.agent, toolCallId: data.toolCallId, toolName: data.toolName, contentIndex: data.contentIndex, at: timestamp, args: traceTextBounds(data.args, MAX_TRACE_TEXT_BYTES) };
   } else {
-    return; // only adopt the AgentStreamEvent shapes
+    return;
   }
-  const itemId = data.itemId ?? data.id;
-  if (itemId !== undefined) {
-    const item = phase._fanoutItemMap?.[String(itemId)];
-    if (item) {
-      item.recentItems ||= [];
-      pushBounded(item.recentItems, trace, MAX_RECENT_ITEMS);
-    }
+  if (item) {
+    item.recentItems ||= [];
+    pushBounded(item.recentItems, trace, MAX_RECENT_ITEMS);
+    // Fanout command traces are not duplicated into the phase-wide legacy
+    // window. Prose remains phase-visible for v1 compatibility.
+    if (type !== "content_delta") return;
   }
   phase.recentItems ||= [];
   pushBounded(phase.recentItems, trace, MAX_RECENT_ITEMS);
@@ -2111,6 +2166,14 @@ function finalizeFanout(phase) {
     if (typeof a.index === "number" && typeof b.index === "number") return a.index - b.index;
     return String(a.startedAt || "").localeCompare(String(b.startedAt || ""));
   });
+  for (const item of items) {
+    item.commandLedger = finalizeCommandLedger(item._commandLedger, {
+      terminal: item.normalizedStatus !== STATUSES.RUNNING || phase.normalizedStatus !== STATUSES.RUNNING,
+      at: item.endedAt || phase.endedAt || item.updatedAt || phase.updatedAt,
+    });
+    delete item._commandLedger;
+    if (!item.commandLedger?.retainedCommands) delete item.commandLedger;
+  }
   const completed = items.filter((item) => item.normalizedStatus === STATUSES.SUCCESS || item.normalizedStatus === STATUSES.SKIPPED).length;
   const failed = items.filter((item) => item.normalizedStatus === STATUSES.FAILED).length;
   const running = items.filter((item) => item.normalizedStatus === STATUSES.RUNNING).length;

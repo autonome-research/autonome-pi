@@ -82,13 +82,13 @@ test("monitor detail renders canonical owner metadata and stale reason", () => {
   assert.doesNotMatch(detail, /sessionId: session-42|cwd at launch|launch source/);
 });
 
-test("dashboard detail shows aggregate duration and total tokens without timestamp or token breakdown noise", () => {
+test("dashboard shows output prominently and an accurate expanded cumulative-token breakdown", () => {
   const monitor = component([run({
     normalizedStatus: "success",
     status: "success",
     startedAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T01:02:03.000Z",
-    usage: { entries: 2, inputTokens: 8000, outputTokens: 750, totalTokens: 8750, cachedInputTokens: 4000, models: { "test/model": {} } },
+    usage: { entries: 2, inputTokens: 8000, outputTokens: 750, totalTokens: 12750, cachedInputTokens: 4000, cacheCreationInputTokens: 0, models: { "test/model": {} } },
     phases: [{
       phase: "compile",
       normalizedStatus: "success",
@@ -103,17 +103,20 @@ test("dashboard detail shows aggregate duration and total tokens without timesta
   })]);
 
   const list = text(monitor.render(100));
-  assert.match(list, /1h 2m · 8\.8K tok/);
+  assert.match(list, /1h 2m · 750 output · 12\.8K cumulative processed tokens/);
 
   monitor.handleInput("\r");
   monitor.handleInput("\r");
   const detail = text(monitor.render(100));
   assert.match(detail, /duration: 1h 2m /);
-  assert.match(detail, /tokens: 8\.8K tok/);
+  assert.match(detail, /tokens: 750 output · 12\.8K cumulative processed tokens/);
+  assert.match(detail, /8,000 uncached input · 4,000 cache-read input · 0 cache-write input/);
+  assert.match(detail, /750 output · 12,750 cumulative processed tokens/);
   assert.match(detail, /duration: 2m 3s/);
-  assert.match(detail, /tokens: 1\.3K tok/);
+  assert.match(detail, /tokens: 250 output · 1\.3K cumulative processed tokens/);
+  assert.match(detail, /250 output \(100 reasoning included\) · 1,250 cumulative processed tokens/);
   assert.match(detail, /compile — provider\/inference-model/);
-  assert.doesNotMatch(detail, /compile success|started:|ended:|updated:|8K in|750 out|cached|reasoning|test\/model/);
+  assert.doesNotMatch(detail, /compile success|started:|ended:|updated:|test\/model|responses|cost/);
 });
 
 test("dashboard prefers observed inference models over a configured model pattern", () => {
@@ -254,7 +257,7 @@ test("inline-only artifact c action is a no-op and renders no actionable hint", 
   assert.match(text(monitor.render(100)), /inline body/);
 });
 
-test("live trace pane renders for a running phase and degrades without recentItems", () => {
+test("optional agent text keeps thinking distinct and does not render legacy tool calls", () => {
   const monitor = component([run({
     normalizedStatus: "running",
     status: "running",
@@ -275,10 +278,10 @@ test("live trace pane renders for a running phase and degrades without recentIte
   monitor.handleInput("\r");
   monitor.handleInput("\r"); // expand the running phase
   const trace = text(monitor.render(100));
-  assert.match(trace, /trace:/);
-  assert.match(trace, /deep reasoning/);
-  assert.match(trace, /bash/);
-  assert.doesNotMatch(trace, /review running/); // live reasoning shown, not stale message alone
+  assert.match(trace, /agent text \(bounded, optional\):/);
+  assert.match(trace, /thinking: deep reasoning/);
+  assert.doesNotMatch(trace, /bash|live reasoning|tool calls/);
+  assert.doesNotMatch(trace, /review running/);
 
   // A running phase with no recentItems degrades gracefully to status/lastMessage.
   const empty = component([run({

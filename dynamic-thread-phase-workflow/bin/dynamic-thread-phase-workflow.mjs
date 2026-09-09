@@ -572,39 +572,96 @@ async function runProcess(command, args, options) {
 }
 
 const TRACE_THROTTLE_MS = 250;
+const MAX_PENDING_TOOL_UPDATES = 64;
+const commandAttemptsByContext = new WeakMap();
 
-// Throttled bridge from the collector's live trace stream (onTrace) to the
-// store's AGENT_EVENT bridge (emitAgentEvent). Reasoning content deltas are
-// buffered and flushed on a fixed cadence (or via flush()) so a chatty reasoning
-// stream cannot emit an unbounded number of events; tool-call start/completed
-// events forward immediately. identity carries optional fanout item linkage so
-// the store can project per-stage traces.
+function nextCommandInvocation(ctx, phaseName, itemId) {
+  let attempts = commandAttemptsByContext.get(ctx);
+  if (!attempts) { attempts = new Map(); commandAttemptsByContext.set(ctx, attempts); }
+  const key = `${phaseName}\0${itemId ?? ""}`;
+  const attempt = (attempts.get(key) || 0) + 1;
+  attempts.set(key, attempt);
+  return { invocationId: randomUUID(), attempt };
+}
+
+// Content is coalesced only within an exact content type/index stream. Tool
+// updates are latest-snapshot throttled independently per real command identity;
+// a boundary for one command never consumes or combines another command's data.
 function throttledTraceEmitter(run, phaseName, identity = {}) {
-  let lastFlush = 0;
-  let pendingDelta = "";
-  let pendingMeta = {};
-  const flush = () => {
-    if (!pendingDelta) return;
-    lastFlush = Date.now();
-    emitAgentEvent(run, phaseName, { type: "content_delta", agent: "assistant", ...pendingMeta, delta: pendingDelta, ...identity });
-    pendingDelta = "";
-    pendingMeta = {};
+  let pendingContent;
+  let lastContentFlush = 0;
+  const updateSlots = new Map();
+  const emitTrace = (trace) => emitAgentEvent(run, phaseName, { ...trace, ...identity });
+  const flushContent = () => {
+    if (!pendingContent?.delta) { pendingContent = undefined; return; }
+    lastContentFlush = Date.now();
+    const { _key, ...trace } = pendingContent;
+    emitTrace(trace);
+    pendingContent = undefined;
+  };
+  const commandKey = (trace) => `${trace?.invocationId || ""}\0${trace?.attempt || ""}\0${trace?.turn || ""}\0${trace?.occurrence || ""}\0${trace?.toolCallId || trace?.syntheticId || trace?.commandEventId || ""}`;
+  const flushUpdate = (key) => {
+    const slot = updateSlots.get(key);
+    if (!slot?.pending) return;
+    emitTrace(slot.pending);
+    slot.pending = undefined;
+    slot.lastFlush = Date.now();
   };
   const emitter = (trace) => {
-    if (trace && trace.type === "content_delta") {
-      pendingDelta += trace.delta || "";
-      pendingMeta = { contentType: trace.contentType, contentIndex: trace.contentIndex };
-      if (Date.now() - lastFlush >= TRACE_THROTTLE_MS) flush();
+    if (!trace || typeof trace !== "object") return;
+    if (trace.type === "content_delta") {
+      const key = `${trace.contentType || ""}\0${trace.contentIndex ?? ""}`;
+      if (pendingContent && pendingContent._key !== key) flushContent();
+      pendingContent ||= { type: "content_delta", agent: "assistant", contentType: trace.contentType, contentIndex: trace.contentIndex, delta: "", _key: key };
+      pendingContent.delta += trace.delta || "";
+      if (Date.now() - lastContentFlush >= TRACE_THROTTLE_MS) {
+        delete pendingContent._key;
+        flushContent();
+      }
       return;
     }
-    flush();
-    emitAgentEvent(run, phaseName, { ...trace, ...identity });
+    flushContent();
+    if (trace.type === "tool_execution_update") {
+      const key = commandKey(trace);
+      let slot = updateSlots.get(key);
+      if (!slot) {
+        if (updateSlots.size >= MAX_PENDING_TOOL_UPDATES) {
+          const oldest = updateSlots.keys().next().value;
+          flushUpdate(oldest);
+          updateSlots.delete(oldest);
+        }
+        slot = { lastFlush: 0, pending: undefined };
+        updateSlots.set(key, slot);
+      }
+      if (Date.now() - slot.lastFlush >= TRACE_THROTTLE_MS) {
+        emitTrace(trace);
+        slot.lastFlush = Date.now();
+      } else {
+        slot.pending = trace;
+      }
+      return;
+    }
+    const key = commandKey(trace);
+    if (trace.type === "agent_execution_scope_end") {
+      for (const pendingKey of updateSlots.keys()) flushUpdate(pendingKey);
+    } else {
+      // Any lifecycle boundary for this exact command flushes its pending
+      // snapshot first; boundaries for other commands leave it untouched.
+      flushUpdate(key);
+    }
+    emitTrace(trace);
+    if (trace.type === "tool_execution_end") updateSlots.delete(key);
   };
-  emitter.flush = flush;
+  emitter.flush = () => {
+    if (pendingContent?._key) delete pendingContent._key;
+    flushContent();
+    for (const key of updateSlots.keys()) flushUpdate(key);
+    updateSlots.clear();
+  };
   return emitter;
 }
 
-async function runPi({ cwd, prompt, model, tools, timeoutMs, noDeadline, signal, onUsage, onTrace }) {
+async function runPi({ cwd, prompt, model, tools, timeoutMs, noDeadline, signal, onUsage, onTrace, invocationId = randomUUID(), attempt = 1 }) {
   const args = [
     // Note: --no-extensions is intentionally omitted so that extensions
     // like local-vllm.ts can register dynamically-discovered local providers
@@ -618,7 +675,7 @@ async function runPi({ cwd, prompt, model, tools, timeoutMs, noDeadline, signal,
   // Parse Pi's NDJSON incrementally and do not retain raw message_update
   // records. Those records contain cumulative tool-call arguments and can make
   // a large generated file produce quadratic stdout volume in memory.
-  const collector = new PiJsonEventCollector({ onUsage, onTrace });
+  const collector = new PiJsonEventCollector({ onUsage, onTrace, invocationId, attempt });
   const result = await runProcess(DEFAULT_PI, args, {
     cwd,
     timeoutMs,
@@ -1054,11 +1111,12 @@ async function* runPiPhase(ctx, phase) {
   yield { type: "data", kind: "data", key: "tools", value: tools, message: `Running pi agent` };
   if (ctx.signal?.aborted) throw abortError(ctx.signal.reason || "cancelled");
   const traceEmitter = throttledTraceEmitter(ctx.visualizerRun, phase.name);
+  const commandInvocation = nextCommandInvocation(ctx, phase.name);
   let result;
   // flush() in finally so the final reasoning tail is never dropped even when the
   // subprocess throws (spawn error / early abort) rather than returning cleanly.
   try {
-    result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, ...executionDeadline(ctx, "pi", phase.timeoutMs), signal: ctx.signal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
+    result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, ...commandInvocation, ...executionDeadline(ctx, "pi", phase.timeoutMs), signal: ctx.signal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
         phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage, model: usedModel || phase.model || ctx.model }) });
   } finally {
     traceEmitter.flush();
@@ -1094,10 +1152,12 @@ async function* runFanoutPiPhase(ctx, phase) {
       try {
         if (itemSignal?.aborted) throw abortError(itemSignal.reason || "cancelled");
         const prompt = renderTemplate(phase.promptTemplate, ctx, { item, index });
-        const traceEmitter = throttledTraceEmitter(ctx.visualizerRun, phase.name, { itemId: `${index}:${item}`, item, index });
+        const itemId = `${index}:${item}`;
+        const traceEmitter = throttledTraceEmitter(ctx.visualizerRun, phase.name, { itemId, item, index });
+        const commandInvocation = nextCommandInvocation(ctx, phase.name, itemId);
         let result;
         try {
-          result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, ...executionDeadline(ctx, "pi", phase.timeoutMs), signal: itemSignal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
+          result = await runPi({ cwd: ctx.cwd, prompt, model: phase.model || ctx.model, tools, ...commandInvocation, ...executionDeadline(ctx, "pi", phase.timeoutMs), signal: itemSignal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
               phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", itemId: `${index}:${item}`, item, index, usage, model: usedModel || phase.model || ctx.model }) });
         } finally {
           traceEmitter.flush();
@@ -1169,6 +1229,10 @@ async function runHarness(ctx, harnessFile) {
   const entry = mod.default || mod.workflow || mod.run;
   if (typeof entry !== "function") throw new Error("Harness module must export default async function(ctx), workflow(ctx), or run(ctx)");
   let autoPhase = 0;
+  // Private execution attribution for helper calls made through an item
+  // context. This does not alter the public harness API and a WeakMap keeps
+  // concurrent/repeated/nested fanouts isolated without leaking item state.
+  const harnessItemAttribution = new WeakMap();
   const harnessCtx = {
     cwd: ctx.cwd,
     runId: ctx.visualizerRun.runId,
@@ -1207,15 +1271,19 @@ async function runHarness(ctx, harnessFile) {
       });
     },
     async pi(prompt, options = {}) {
+      const itemAttribution = harnessItemAttribution.get(this);
       return await harnessCtx.phase(options.name || `pi-${++autoPhase}`, async () => {
         const phase = { name: options.name || `pi-${autoPhase}`, permissions: options.permissions || ctx.spec.permissions || DEFAULT_PERMISSIONS };
         const permissions = permissionsForPhase(ctx, phase);
         const tools = normalizePiTools(options.tools, permissions, phase.name);
-        const traceEmitter = throttledTraceEmitter(ctx.visualizerRun, phase.name);
+        const ledgerPhase = itemAttribution?.phaseName || phase.name;
+        const ledgerIdentity = itemAttribution?.identity || {};
+        const traceEmitter = throttledTraceEmitter(ctx.visualizerRun, ledgerPhase, ledgerIdentity);
+        const commandInvocation = nextCommandInvocation(ctx, ledgerPhase, ledgerIdentity.itemId);
         let result;
         try {
-          result = await runPi({ cwd: options.cwd || ctx.cwd, prompt, model: options.model || ctx.model, tools, ...executionDeadline(ctx, "pi", options.timeoutMs), signal: options.signal || ctx.signal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
-              phaseEvent(ctx.visualizerRun, phase.name, { kind: "usage", usage, model: usedModel || options.model || ctx.model }) });
+          result = await runPi({ cwd: options.cwd || ctx.cwd, prompt, model: options.model || ctx.model, tools, ...commandInvocation, ...executionDeadline(ctx, "pi", options.timeoutMs), signal: options.signal || ctx.signal, onTrace: traceEmitter, onUsage: ({ usage, model: usedModel }) =>
+              phaseEvent(ctx.visualizerRun, ledgerPhase, { kind: "usage", ...ledgerIdentity, usage, model: usedModel || options.model || ctx.model }) });
         } finally {
           traceEmitter.flush();
         }
@@ -1243,10 +1311,11 @@ async function runHarness(ctx, harnessFile) {
               const itemCtx = Object.create(harnessCtx);
               itemCtx.signal = itemSignal;
               itemCtx.cancelled = () => Boolean(itemSignal?.aborted);
+              harnessItemAttribution.set(itemCtx, { phaseName: name, identity: { itemId, item: String(item), index } });
               const itemHash = createHash("sha256").update(`${index}\0${String(item)}`).digest("hex").slice(0, 10);
               const result = options.run
                 ? await options.run(item, index, itemCtx)
-                : await harnessCtx.pi(
+                : await itemCtx.pi(
                     String(options.promptTemplate || options.prompt || "").replace(/\{\{\s*item\s*\}\}/g, String(item)),
                     { ...(options.pi || {}), name: `${name}-${index}-${itemHash}-${safeName(item)}`, signal: itemSignal },
                   );

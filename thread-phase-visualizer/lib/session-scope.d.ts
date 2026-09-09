@@ -5,6 +5,7 @@ type RunLike = Partial<ThreadPhaseRunSummary> & Record<string, any>;
 export function canonicalCwd(value?: string, base?: string): string | undefined;
 export function sameCanonicalCwd(left?: string, right?: string, base?: string): boolean;
 export function matchesRunCwd(run: RunLike, cwd?: string, base?: string): boolean;
+export function hasVerifiedLaunchCwd(run: RunLike): boolean;
 export function runSessionId(run?: RunLike): string | undefined;
 export function isRunningRun(run?: RunLike, runningStatus?: string): boolean;
 export function canInspectRun(run: RunLike, sessionId?: string, fallbackCwd?: string, runningStatus?: string): boolean;

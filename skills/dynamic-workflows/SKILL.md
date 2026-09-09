@@ -112,7 +112,7 @@ Mixed-permission example:
 
 - Set `cwd` explicitly when execution differs from the Pi session cwd.
 - Top-level `model` and `timeoutMs` provide phase defaults. An explicit `timeoutMs` is always a hard limit. Fanout concurrency is phase-local; descriptions, caller metadata, retry backoff, and supervision cadence are not declarative fields.
-- Use `background: true` for long or open-ended agent work. New background dynamic/scripted launches are privately marked for main-agent supervision: a durable five-minute timer asks the main agent to inspect logs and decide whether to wait, report, or intervene. The timer does not detect a stall and never kills, retries, resumes, or launches work. Success and failure still durably return control to chat; progress reviews are distinct from completion and user cancellation does not auto-continue.
+- Use `background: true` for long or open-ended agent work. New background dynamic/scripted launches are privately marked for main-agent supervision: a durable ten-minute timer asks the main agent to inspect logs and decide whether to wait, report, or intervene. The timer does not detect a stall and never kills, retries, resumes, or launches work. Success and failure still durably return control to chat; progress reviews are distinct from completion and user cancellation does not auto-continue.
 - Foreground calls remain bounded because they occupy their own supervisor. Shell phases retain their normal default bound. Do not use foreground mode for intentionally open-ended agent work.
 - Use `after` with a trusted terminal successful or failed run id to launch its single chained successor. Do not chain from a cancelled run.
 - Add an artifact phase when the user expects a durable report.

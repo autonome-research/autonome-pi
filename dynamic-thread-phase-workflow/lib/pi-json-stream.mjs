@@ -1,10 +1,24 @@
+import { randomUUID } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
+
 const DEFAULT_MAX_LINE_BYTES = 4_000_000;
+const DEFAULT_MAX_EXECUTION_EVENT_PARSE_BYTES = 256_000;
+const DEFAULT_MAX_RESULT_PREVIEW_BYTES = 4_096;
 
 // Bounded trace retention budgets. These mirror the usage-summation discipline:
 // never retain an unbounded amount of reasoning/tool-call data from a long phase.
 const DEFAULT_MAX_TRACE_WINDOW = 256;      // max records retained in the trace window
 const DEFAULT_MAX_REASONING_CHARS = 4_096; // cap on accumulated reasoning text
 const DEFAULT_MAX_TOOLCALL_ARG_CHARS = 1_024; // cap on a completed tool-call args snapshot
+const MAX_CORRELATION_RECORDS_PER_TURN = 512;
+const MAX_COMMAND_METADATA_BYTES = 256;
+
+// Reject rather than truncate identity fields: shared prefixes must never
+// alias separate commands. Enforce bounds before any correlation retention.
+function boundedCommandString(value, maxBytes = MAX_COMMAND_METADATA_BYTES) {
+  return typeof value === "string" && value.length > 0 && value.length <= maxBytes
+    && Buffer.byteLength(value, "utf8") <= maxBytes ? value : undefined;
+}
 
 function positiveSafeInteger(value, fallback, label) {
   if (value === undefined) return fallback;
@@ -19,21 +33,23 @@ function positiveSafeInteger(value, fallback, label) {
  * assistant message. Retaining the complete stream therefore grows roughly
  * quadratically for large tool calls. This collector discards the cumulative
  * update payloads and retains only the final message metadata used by
- * workflows, plus a bounded, throttled window of live reasoning deltas and
- * tool-call start/completed records.
- *
- * Reasoning deltas are mapped onto thread-phase's AgentStreamEvent
- * `content_delta` shape; tool-call lifecycle maps onto `tool_call_started` /
- * `tool_call_completed`. See package `@autonome-research/thread-phase`
- * `AgentStreamEvent` (src/agent/types.ts).
+ * workflows, plus a bounded window of distinct thinking/text deltas and
+ * command lifecycle evidence. Argument generation emits preparing/ready only;
+ * actual execution start/update/end is captured from Pi's top-level events.
+ * Result objects are reduced immediately to bounded textual previews and are
+ * never retained raw. The runner separately rate-limits live update snapshots.
  */
 export class PiJsonEventCollector {
-  constructor({ maxLineBytes = DEFAULT_MAX_LINE_BYTES, onUsage, onTrace, maxTraceWindow, maxReasoningChars, maxToolCallArgChars } = {}) {
+  constructor({ maxLineBytes = DEFAULT_MAX_LINE_BYTES, onUsage, onTrace, maxTraceWindow, maxReasoningChars, maxToolCallArgChars, maxExecutionEventParseBytes, maxResultPreviewBytes, invocationId, attempt } = {}) {
     if (!Number.isSafeInteger(maxLineBytes) || maxLineBytes <= 0) throw new Error("maxLineBytes must be a positive safe integer");
     this.maxLineBytes = maxLineBytes;
     this.maxTraceWindow = positiveSafeInteger(maxTraceWindow, DEFAULT_MAX_TRACE_WINDOW, "maxTraceWindow");
     this.maxReasoningChars = positiveSafeInteger(maxReasoningChars, DEFAULT_MAX_REASONING_CHARS, "maxReasoningChars");
     this.maxToolCallArgChars = positiveSafeInteger(maxToolCallArgChars, DEFAULT_MAX_TOOLCALL_ARG_CHARS, "maxToolCallArgChars");
+    this.maxExecutionEventParseBytes = positiveSafeInteger(maxExecutionEventParseBytes, DEFAULT_MAX_EXECUTION_EVENT_PARSE_BYTES, "maxExecutionEventParseBytes");
+    this.maxResultPreviewBytes = positiveSafeInteger(maxResultPreviewBytes, DEFAULT_MAX_RESULT_PREVIEW_BYTES, "maxResultPreviewBytes");
+    this.invocationId = typeof invocationId === "string" && invocationId ? invocationId.slice(0, 256) : randomUUID();
+    this.attempt = Number.isSafeInteger(attempt) && attempt > 0 ? attempt : 1;
     // Optional live callback invoked for each non-empty per-turn usage as it is
     // observed, before the run finishes. Lets callers stream token counts to the
     // visualizer during a phase instead of only after it completes.
@@ -42,6 +58,7 @@ export class PiJsonEventCollector {
     // deltas, tool-call lifecycle) as it is observed, before the run finishes.
     this.onTrace = typeof onTrace === "function" ? onTrace : undefined;
     this.pending = "";
+    this.decoder = new StringDecoder("utf8");
     this.droppingLine = false;
     this.droppedEvents = 0;
     this.malformedEvents = 0;
@@ -56,14 +73,50 @@ export class PiJsonEventCollector {
     this.traceEvents = 0;          // trace records observed (delivered + retained)
     this.traceDropped = 0;         // trace records dropped because the window was full
     this.traceExcluded = 0;        // update content deliberately not retained
-    this.reasoning = "";           // bounded accumulated reasoning text (never grows past maxReasoningChars)
+    this.reasoning = "";           // bounded thinking only (never includes assistant prose)
+    this.assistantText = "";       // separately bounded assistant prose
     this.reasoningDeltas = 0;
+    this.textDeltas = 0;
     this.toolCallStarted = 0;
     this.toolCallCompleted = 0;
+    this.toolExecutionStarted = 0;
+    this.toolExecutionUpdated = 0;
+    this.toolExecutionEnded = 0;
+    this.commandEvents = 0;
+    // Pi emits one turn_start before the initial user message and one before
+    // each later model request. Tool execution and tool-result messages remain
+    // inside that turn, so only turn_start advances this scope.
+    this.turnSequence = 0;
+    this.currentTurn = undefined;
+    this.occurrenceSequence = 0;
+    this.declarationsById = new Map();
+    this.declarationsByContent = new Map();
+    this.activeExecutions = new Map();
+    this.correlationRecords = 0;
   }
 
   push(value) {
-    let input = String(value ?? "");
+    if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+      const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+      // Keep decoder output chunks bounded even if a caller supplies one giant
+      // Buffer. String inputs are already decoded by the runner and are passed
+      // through without re-encoding.
+      const chunkBytes = Math.min(this.maxLineBytes, 64 * 1024);
+      for (let offset = 0; offset < bytes.length; offset += chunkBytes) {
+        this.pushDecoded(this.decoder.write(bytes.subarray(offset, offset + chunkBytes)));
+      }
+      return;
+    }
+    // A string cannot complete bytes buffered inside StringDecoder. Flush an
+    // incomplete sequence (as U+FFFD) before accepting the already-decoded
+    // string, preserving input order instead of reordering it behind a later
+    // Buffer. Complete Buffer boundaries produce an empty tail here.
+    this.pushDecoded(this.decoder.end());
+    this.pushDecoded(String(value ?? ""));
+  }
+
+  pushDecoded(value) {
+    let input = value;
     while (input) {
       if (this.droppingLine) {
         const newline = input.indexOf("\n");
@@ -108,6 +161,7 @@ export class PiJsonEventCollector {
   }
 
   finish() {
+    this.pushDecoded(this.decoder.end());
     if (this.pending.trim()) this.consumeLine(this.pending.replace(/\r$/, ""));
     this.pending = "";
     return this.result();
@@ -123,6 +177,7 @@ export class PiJsonEventCollector {
         schema: "pi-agent-trace/v1",
         window: this.traceWindow,
         reasoning: this.reasoning,
+        text: this.assistantText,
       },
       piJson: {
         droppedEvents: this.droppedEvents,
@@ -133,8 +188,15 @@ export class PiJsonEventCollector {
         traceDropped: this.traceDropped,
         traceExcluded: this.traceExcluded,
         reasoningDeltas: this.reasoningDeltas,
+        textDeltas: this.textDeltas,
         toolCallStarted: this.toolCallStarted,
         toolCallCompleted: this.toolCallCompleted,
+        toolExecutionStarted: this.toolExecutionStarted,
+        toolExecutionUpdated: this.toolExecutionUpdated,
+        toolExecutionEnded: this.toolExecutionEnded,
+        commandEvents: this.commandEvents,
+        invocationId: this.invocationId,
+        attempt: this.attempt,
         bufferedBytes: Buffer.byteLength(this.pending, "utf8"),
       },
     };
@@ -153,6 +215,21 @@ export class PiJsonEventCollector {
     const type = eventTypeFromPrefix(line);
     if (type === "message_update") {
       this.consumeUpdate(line);
+      return;
+    }
+    if (type === "turn_start") {
+      this.beginTurn();
+      this.droppedEvents++;
+      return;
+    }
+    if (type === "tool_execution_start" || type === "tool_execution_update" || type === "tool_execution_end") {
+      this.consumeToolExecution(line, type);
+      return;
+    }
+    if (type === "agent_end") {
+      // Do not parse/retain agent_end.messages. The scope boundary alone is
+      // enough to mark executions lacking a real execution end as interrupted.
+      this.captureCommandEvent("agent_execution_scope_end", {});
       return;
     }
     if (type && type !== "message_end") {
@@ -200,6 +277,30 @@ export class PiJsonEventCollector {
     if (!ameRaw) {
       // No nestable assistantMessageEvent discriminator -> treat as dropped.
       this.droppedEvents++;
+      return;
+    }
+    if (Buffer.byteLength(ameRaw, "utf8") > this.maxExecutionEventParseBytes) {
+      this.traceExcluded++;
+      const kind = parseJsonRaw(findTopLevelValueRaw(ameRaw, "type"));
+      const contentIndex = parseJsonRaw(findTopLevelValueRaw(ameRaw, "contentIndex"));
+      if (kind === "toolcall_start") {
+        this.captureToolCallStarted({
+          id: findObjectString(ameRaw, "id"),
+          toolName: findObjectString(ameRaw, "toolName"),
+          contentIndex,
+        });
+      } else if (kind === "toolcall_end") {
+        // Prefer exact start metadata for this content block. If the start was
+        // unavailable, structurally scan only direct toolCall scalar fields;
+        // never regex through user arguments or parse the oversized object.
+        const established = this.establishedDeclaration(contentIndex);
+        this.captureToolCallCompletedFields({
+          toolCallId: established?.toolCallId ?? findNestedObjectString(ameRaw, "toolCall", "id"),
+          toolName: established?.toolName ?? findNestedObjectString(ameRaw, "toolCall", "name"),
+          contentIndex,
+          argsPreview: omittedPreview(Buffer.byteLength(ameRaw, "utf8"), "event_input_limit"),
+        });
+      }
       return;
     }
     let ame;
@@ -251,20 +352,23 @@ export class PiJsonEventCollector {
     const safeDelta = redactSecrets(delta);
     if (!safeDelta) return;
     this.traceEvents++;
-    this.reasoningDeltas++;
+    if (contentType === "thinking") this.reasoningDeltas++;
+    else this.textDeltas++;
 
-    // Throttled retention: accumulate reasoning up to a fixed cap, never the
+    // Bounded retention: accumulate each content class up to a fixed cap, never the
     // full stream, so an unbounded number of tiny deltas cannot grow heap.
-    // Every retained content_delta record must honor the reasoning char budget
-    // (maxReasoningChars). When the accumulation is already at budget there is
+    // Every retained content_delta record honors a UTF-8 byte budget (exposed
+    // under the legacy maxReasoningChars option). When accumulation is at budget there is
     // no room left, so `keep` stays empty and the whole delta is excluded —
     // never leave `keep` as the full uncapped safeDelta, which would let a
     // single record carry up to maxLineBytes of text into the window for
     // non-coalescing content streams.
+    const accumulator = contentType === "thinking" ? "reasoning" : "assistantText";
     let keep = "";
-    if (this.reasoning.length < this.maxReasoningChars) {
-      const added = safeDelta.slice(0, this.maxReasoningChars - this.reasoning.length);
-      this.reasoning += added;
+    const accumulatedBytes = Buffer.byteLength(this[accumulator], "utf8");
+    if (accumulatedBytes < this.maxReasoningChars) {
+      const added = truncateUtf8(safeDelta, this.maxReasoningChars - accumulatedBytes);
+      this[accumulator] += added;
       keep = added;
     }
     // Align traceExcluded with what was truly not retained: any portion of the
@@ -278,36 +382,235 @@ export class PiJsonEventCollector {
     this.retainTrace(record, true);
   }
 
-  captureToolCallStarted(ame) {
-    this.traceEvents++;
-    this.toolCallStarted++;
+  beginTurn() {
+    this.turnSequence++;
+    this.currentTurn = this.turnSequence;
+    this.declarationsById.clear();
+    this.declarationsByContent.clear();
+    this.activeExecutions.clear();
+    this.correlationRecords = 0;
+  }
+
+  correlationKey(toolCallId) {
+    return `${this.currentTurn ?? "unknown"}\0${toolCallId}`;
+  }
+
+  newCorrelationRecord(toolCallId, toolName, contentIndex) {
+    toolCallId = boundedCommandString(toolCallId);
+    toolName = boundedCommandString(toolName);
+    if (!toolCallId || this.correlationRecords >= MAX_CORRELATION_RECORDS_PER_TURN) return undefined;
     const record = {
-      type: "tool_call_started",
-      agent: "assistant",
-      toolCallId: toolCallIdFor(ame.contentIndex),
-      contentIndex: ame.contentIndex,
+      toolCallId,
+      toolName,
+      contentIndex: Number.isSafeInteger(contentIndex) ? contentIndex : undefined,
+      occurrence: ++this.occurrenceSequence,
+      ready: false,
+      executionStarted: false,
+      executionEnded: false,
     };
-    if (this.onTrace) safeCall(this.onTrace, { ...record });
-    this.retainTrace(record, false);
+    this.correlationRecords++;
+    const idKey = this.correlationKey(toolCallId);
+    const byId = this.declarationsById.get(idKey) || [];
+    byId.push(record);
+    this.declarationsById.set(idKey, byId);
+    if (record.contentIndex !== undefined) {
+      const byContent = this.declarationsByContent.get(record.contentIndex) || [];
+      byContent.push(record);
+      this.declarationsByContent.set(record.contentIndex, byContent);
+    }
+    return record;
+  }
+
+  establishedDeclaration(contentIndex) {
+    if (!Number.isSafeInteger(contentIndex)) return undefined;
+    const candidates = (this.declarationsByContent.get(contentIndex) || []).filter((record) => !record.ready);
+    return candidates.length === 1 ? candidates[0] : undefined;
+  }
+
+  declarationIdentity(toolCallId, toolName, contentIndex, completing = false) {
+    toolCallId = boundedCommandString(toolCallId);
+    toolName = boundedCommandString(toolName);
+    if (!toolCallId) return {};
+    let record;
+    let ambiguous = false;
+    if (completing) {
+      const byContent = Number.isSafeInteger(contentIndex)
+        ? (this.declarationsByContent.get(contentIndex) || []).filter((candidate) => !candidate.ready && candidate.toolCallId === toolCallId)
+        : [];
+      if (byContent.length === 1) record = byContent[0];
+      else if (byContent.length > 1) ambiguous = true;
+      if (!record && !ambiguous) {
+        const byId = (this.declarationsById.get(this.correlationKey(toolCallId)) || []).filter((candidate) => !candidate.ready);
+        if (byId.length === 1) record = byId[0];
+        else if (byId.length > 1) ambiguous = true;
+      }
+    } else {
+      record = this.newCorrelationRecord(toolCallId, toolName, contentIndex);
+    }
+    if (!record && !ambiguous) record = this.newCorrelationRecord(toolCallId, toolName, contentIndex);
+    if (!record) return { turn: this.currentTurn, identitySource: "synthetic" };
+    if (completing) record.ready = true;
+    record.toolName ||= toolName;
+    return { turn: this.currentTurn, occurrence: record.occurrence };
+  }
+
+  executionIdentity(type, toolCallId) {
+    toolCallId = boundedCommandString(toolCallId);
+    if (!toolCallId) return {};
+    const key = this.correlationKey(toolCallId);
+    let record;
+    let ambiguous = false;
+    if (type === "tool_execution_start") {
+      if (this.activeExecutions.has(key)) {
+        ambiguous = true;
+      } else {
+        const candidates = (this.declarationsById.get(key) || []).filter((candidate) => !candidate.executionStarted);
+        if (candidates.length === 1) record = candidates[0];
+        else if (candidates.length > 1) ambiguous = true;
+        else record = this.newCorrelationRecord(toolCallId, undefined, undefined);
+      }
+      if (record) record.executionStarted = true;
+      else ambiguous = true;
+      // Unknown overflow must not retain another key. Ambiguity sentinels are
+      // allowed only for IDs already charged to the bounded turn budget.
+      if (this.declarationsById.has(key)
+        && (this.activeExecutions.has(key) || this.activeExecutions.size < MAX_CORRELATION_RECORDS_PER_TURN)) {
+        this.activeExecutions.set(key, record || null);
+      }
+    } else if (this.activeExecutions.has(key)) {
+      record = this.activeExecutions.get(key) || undefined;
+      ambiguous = !record;
+    } else {
+      const candidates = (this.declarationsById.get(key) || []).filter((candidate) => !candidate.executionEnded);
+      if (candidates.length === 1) record = candidates[0];
+      else if (candidates.length > 1) ambiguous = true;
+      else record = this.newCorrelationRecord(toolCallId, undefined, undefined);
+      if (!record) ambiguous = true;
+    }
+    if (type === "tool_execution_end") {
+      if (record) record.executionEnded = true;
+      this.activeExecutions.delete(key);
+    }
+    return ambiguous
+      ? { turn: this.currentTurn, identitySource: "synthetic" }
+      : { turn: this.currentTurn, occurrence: record?.occurrence };
+  }
+
+  captureToolCallStarted(ame) {
+    this.toolCallStarted++;
+    const toolCallId = boundedCommandString(ame.id);
+    const toolName = boundedCommandString(ame.toolName);
+    this.captureCommandEvent("tool_call_preparing", {
+      toolCallId,
+      toolName,
+      contentIndex: ame.contentIndex,
+      ...this.declarationIdentity(toolCallId, toolName, ame.contentIndex),
+    });
   }
 
   captureToolCallCompleted(ame) {
-    this.traceEvents++;
-    this.toolCallCompleted++;
     const toolCall = ame.toolCall && typeof ame.toolCall === "object" ? ame.toolCall : {};
-    const argsJson = typeof toolCall.arguments === "string"
-      ? toolCall.arguments
-      : JSON.stringify(toolCall.arguments ?? {});
-    const record = {
-      type: "tool_call_completed",
-      agent: "assistant",
-      toolCallId: toolCallIdFor(ame.contentIndex),
+    this.captureToolCallCompletedFields({
+      toolCallId: typeof toolCall.id === "string" ? toolCall.id : undefined,
       toolName: typeof toolCall.name === "string" ? toolCall.name : undefined,
       contentIndex: ame.contentIndex,
-      args: truncateUtf8(redactSecrets(argsJson), this.maxToolCallArgChars),
+      argsPreview: previewArguments(toolCall.arguments ?? {}, this.maxToolCallArgChars),
+    });
+  }
+
+  captureToolCallCompletedFields(fields) {
+    fields = { ...fields, toolCallId: boundedCommandString(fields.toolCallId), toolName: boundedCommandString(fields.toolName) };
+    this.toolCallCompleted++;
+    this.captureCommandEvent("tool_call_ready", {
+      ...fields,
+      ...this.declarationIdentity(fields.toolCallId, fields.toolName, fields.contentIndex, true),
+    });
+  }
+
+  consumeToolExecution(line, type) {
+    const lineBytes = Buffer.byteLength(line, "utf8");
+    let event;
+    if (lineBytes <= this.maxExecutionEventParseBytes) {
+      try { event = JSON.parse(line); }
+      catch { this.malformedEvents++; return; }
+    } else {
+      // Preserve lifecycle truth and authoritative isError without materializing
+      // a potentially multi-megabyte args/result object.
+      event = {
+        toolCallId: findObjectString(line, "toolCallId"),
+        toolName: findObjectString(line, "toolName"),
+        isError: parseJsonRaw(findTopLevelValueRaw(line, "isError")),
+        _inputOmitted: true,
+      };
+      this.traceExcluded++;
+    }
+
+    const hasArgs = Object.prototype.hasOwnProperty.call(event, "args");
+    const toolCallId = boundedCommandString(event.toolCallId);
+    const common = {
+      toolCallId,
+      toolName: boundedCommandString(event.toolName),
+      ...this.executionIdentity(type, toolCallId),
+      argsPreview: event._inputOmitted
+        ? type === "tool_execution_end" ? undefined : omittedPreview(lineBytes, "event_input_limit")
+        : hasArgs ? previewArguments(event.args, this.maxToolCallArgChars) : undefined,
     };
-    if (this.onTrace) safeCall(this.onTrace, { ...record });
-    this.retainTrace(record, false);
+    if (type === "tool_execution_start") {
+      this.toolExecutionStarted++;
+      this.captureCommandEvent(type, common);
+      return;
+    }
+    if (type === "tool_execution_update") {
+      this.toolExecutionUpdated++;
+      this.captureCommandEvent(type, {
+        ...common,
+        outputPreview: event._inputOmitted
+          ? omittedPreview(lineBytes, "event_input_limit")
+          : previewToolResult(event.partialResult, event.toolName, false, this.maxResultPreviewBytes),
+      });
+      return;
+    }
+    this.toolExecutionEnded++;
+    this.captureCommandEvent(type, {
+      ...common,
+      // Pi's boolean isError is the sole authority for command success/failure.
+      // No exit status is inferred from result text.
+      isError: typeof event.isError === "boolean" ? event.isError : undefined,
+      resultPreview: event._inputOmitted
+        ? omittedPreview(lineBytes, "event_input_limit")
+        : previewToolResult(event.result, event.toolName, event.isError === true, this.maxResultPreviewBytes),
+    });
+  }
+
+  captureCommandEvent(type, fields) {
+    this.traceEvents++;
+    this.commandEvents++;
+    const sequence = this.commandEvents;
+    const realId = boundedCommandString(fields.toolCallId);
+    const identitySource = realId && fields.identitySource !== "synthetic" ? "pi" : "synthetic";
+    const syntheticId = identitySource === "synthetic" ? `${this.invocationId}:missing:${sequence}` : undefined;
+    const record = {
+      schema: "pi-command-event/v1",
+      type,
+      agent: "assistant",
+      commandEventId: `${this.invocationId}:${sequence}`,
+      invocationId: this.invocationId,
+      attempt: this.attempt,
+      turn: Number.isSafeInteger(fields.turn) && fields.turn > 0 ? fields.turn : undefined,
+      occurrence: Number.isSafeInteger(fields.occurrence) && fields.occurrence > 0 ? fields.occurrence : undefined,
+      identitySource,
+      toolCallId: realId,
+      syntheticId,
+      toolName: boundedCommandString(fields.toolName),
+      contentIndex: Number.isSafeInteger(fields.contentIndex) ? fields.contentIndex : undefined,
+      argsPreview: fields.argsPreview,
+      outputPreview: fields.outputPreview,
+      resultPreview: fields.resultPreview,
+      isError: fields.isError,
+    };
+    const clean = Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined));
+    if (this.onTrace) safeCall(this.onTrace, { ...clean });
+    this.retainTrace(clean, false);
   }
 
   /**
@@ -340,16 +643,109 @@ function safeCall(fn, arg) {
   try { return fn(arg); } catch { /* a throwing observer must not break the pipeline */ return undefined; }
 }
 
-function toolCallIdFor(contentIndex) {
-  return typeof contentIndex === "number" ? `tc-${contentIndex}` : `tc-${String(contentIndex ?? 0)}`;
-}
-
 function truncateUtf8(text, maxBytes) {
   const value = String(text ?? "");
   if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
   let out = value.slice(0, maxBytes);
   while (Buffer.byteLength(out, "utf8") > maxBytes) out = out.slice(0, -1);
   return out;
+}
+
+function textPreview(text, maxBytes, extras = {}) {
+  const source = String(text ?? "");
+  const bytes = Buffer.byteLength(source, "utf8");
+  const redacted = redactSecrets(source);
+  const retained = truncateUtf8(redacted, maxBytes);
+  return {
+    text: retained,
+    bytes: extras.bytes ?? bytes,
+    retainedBytes: Buffer.byteLength(retained, "utf8"),
+    truncated: extras.truncated ?? (bytes > maxBytes || Buffer.byteLength(redacted, "utf8") > maxBytes),
+    ...(redacted !== source ? { redacted: true } : {}),
+    ...extras,
+  };
+}
+
+function omittedPreview(bytes, omitted) {
+  return textPreview(`[${omitted === "read_output" ? "read output omitted by policy" : omitted === "non_text" ? "non-text result omitted" : "event content omitted at ingestion limit"}]`, DEFAULT_MAX_RESULT_PREVIEW_BYTES, {
+    bytes: Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : 0,
+    truncated: true,
+    omitted,
+  });
+}
+
+const SENSITIVE_FIELD = /(?:authorization|proxy-authorization|cookie|set-cookie|token|secret|api[-_]?key|password|passwd|credential|bearer)/i;
+const BLOB_FIELD = /(?:headers?|base64|image|attachment|binary)/i;
+const PROBABLE_BLOB = /^[A-Za-z0-9+/=_-]{512,}$/;
+
+function sanitizeStructured(value, state, depth = 0, key = "") {
+  if (SENSITIVE_FIELD.test(key)) { state.redacted = true; return "[redacted]"; }
+  if (BLOB_FIELD.test(key)) { state.omitted = true; return "[omitted blob]"; }
+  if (value === null || typeof value === "boolean" || typeof value === "number") return value;
+  if (typeof value === "string") {
+    if (PROBABLE_BLOB.test(value)) { state.omitted = true; return `[omitted probable encoded blob: ${Buffer.byteLength(value, "utf8")} bytes]`; }
+    const safe = redactSecrets(value);
+    if (safe !== value) state.redacted = true;
+    const remaining = Math.max(0, state.charBudget);
+    const kept = safe.slice(0, Math.min(remaining, 2_048));
+    state.charBudget -= kept.length;
+    if (kept.length < safe.length) state.omitted = true;
+    return kept;
+  }
+  if (depth >= 6 || state.nodes >= 160) { state.omitted = true; return "[omitted nested value]"; }
+  state.nodes++;
+  if (Array.isArray(value)) {
+    const out = value.slice(0, 24).map((entry) => sanitizeStructured(entry, state, depth + 1));
+    if (value.length > out.length) { state.omitted = true; out.push(`[${value.length - out.length} more items omitted]`); }
+    return out;
+  }
+  if (!value || typeof value !== "object") return String(value);
+  const out = {};
+  const allEntries = Object.entries(value);
+  const entries = allEntries.slice(0, 48);
+  for (const [nestedKey, nested] of entries) out[String(nestedKey).slice(0, 128)] = sanitizeStructured(nested, state, depth + 1, nestedKey);
+  if (allEntries.length > entries.length) { state.omitted = true; out["[omitted]"] = `${allEntries.length - entries.length} more fields`; }
+  return out;
+}
+
+function previewArguments(args, maxBytes) {
+  const state = { nodes: 0, charBudget: maxBytes * 2, redacted: false, omitted: false };
+  let serialized;
+  try { serialized = typeof args === "string" ? redactSecrets(args) : JSON.stringify(sanitizeStructured(args, state)); }
+  catch { serialized = "[unserializable arguments omitted]"; state.omitted = true; }
+  const preview = textPreview(serialized, maxBytes);
+  if (state.redacted || (typeof args === "string" && serialized !== args)) preview.redacted = true;
+  if (state.omitted) preview.truncated = true;
+  return preview;
+}
+
+function resultText(result) {
+  if (typeof result === "string") return { text: result, hasNonText: false };
+  if (!result || typeof result !== "object") return { text: "", hasNonText: result !== undefined };
+  const content = Array.isArray(result.content) ? result.content : [];
+  let text = "";
+  let hasNonText = false;
+  for (const part of content) {
+    if (part?.type === "text" && typeof part.text === "string") text += `${text ? "\n" : ""}${part.text}`;
+    else if (part !== undefined) hasNonText = true;
+  }
+  return { text, hasNonText };
+}
+
+function previewToolResult(result, toolName, isError, maxBytes) {
+  const extracted = resultText(result);
+  const bytes = Buffer.byteLength(extracted.text, "utf8");
+  if (String(toolName || "").toLowerCase() === "read" && !isError) return omittedPreview(bytes, "read_output");
+  if (!extracted.text && extracted.hasNonText) return omittedPreview(0, "non_text");
+  if (!extracted.text) return undefined;
+  return textPreview(extracted.text, maxBytes);
+}
+
+function parseJsonRaw(raw) {
+  // Only small discriminator/index/boolean scalars use this path. An oversized
+  // or malformed metadata object must not bypass the event parse budget.
+  if (raw === undefined || raw.length > 64) return undefined;
+  try { return JSON.parse(raw); } catch { return undefined; }
 }
 
 const NUMERIC_USAGE_KEYS = new Set([
@@ -423,69 +819,86 @@ function eventTypeFromPrefix(line) {
   return undefined;
 }
 
-/**
- * Extract the raw JSON text of a named top-level object-valued member from a
- * single NDJSON line, without parsing the whole record. Used to pull out the
- * nested `assistantMessageEvent` discriminator while never materializing the
- * cumulative assistant `message` payload (the quadratic-memory fix).
- */
-function findTopLevelValueRaw(line, key) {
+/** Extract one direct object value without materializing sibling payloads. */
+function findObjectValueRange(line, key, objectStart = 0, objectEnd = line.length) {
   let depth = 0;
-  let index = 0;
-  while (index < line.length) {
+  let index = objectStart;
+  while (index < objectEnd) {
     const char = line[index];
     if (char === "{") { depth++; index++; continue; }
     if (char === "}") { depth--; index++; continue; }
     if (char !== '"') { index++; continue; }
-
     const start = index;
-    index++;
-    let escaped = false;
-    while (index < line.length) {
-      const current = line[index];
-      if (escaped) escaped = false;
-      else if (current === "\\") escaped = true;
-      else if (current === '"') break;
-      index++;
-    }
-    let strKey;
-    try { strKey = JSON.parse(line.slice(start, index + 1)); } catch { continue; }
+    index = jsonStringEnd(line, index);
     let cursor = index + 1;
     while (/\s/.test(line[cursor] || "")) cursor++;
-    if (line[cursor] !== ":") continue;
-    if (strKey !== key || depth !== 1) continue;
+    // Values can themselves be very large strings. Check structural key
+    // position before JSON.parse so only small property names are decoded.
+    if (line[cursor] !== ":" || depth !== 1) { index++; continue; }
+    if (index - start + 1 > key.length * 6 + 2) { index++; continue; }
+    let parsedKey;
+    try { parsedKey = JSON.parse(line.slice(start, index + 1)); } catch { index++; continue; }
+    if (parsedKey !== key) { index++; continue; }
     cursor++;
     while (/\s/.test(line[cursor] || "")) cursor++;
-    if (line[cursor] !== "{") return undefined; // only object values supported
-    const valueStart = cursor;
-    // Match the closing brace with string-awareness so braces/quotes inside
-    // nested string values (e.g. tool-call argument deltas) are not miscounted.
-    let valueDepth = 0;
-    let end = cursor;
-    while (end < line.length) {
-      const c = line[end];
-      if (c === "\"") {
-        // Skip the entire string literal (handling escapes) as one unit.
-        end++;
-        let escaped = false;
-        while (end < line.length) {
-          const current = line[end];
-          if (escaped) escaped = false;
-          else if (current === "\\") escaped = true;
-          else if (current === "\"") break;
-          end++;
-        }
-        end++;
-        continue;
-      }
-      if (c === "{") valueDepth++;
-      else if (c === "}") { valueDepth--; if (valueDepth === 0) break; }
-      end++;
-    }
-    if (valueDepth !== 0) return undefined;
-    return line.slice(valueStart, end + 1);
+    const end = jsonValueEnd(line, cursor);
+    return end === undefined || end > objectEnd ? undefined : [cursor, end];
   }
   return undefined;
+}
+
+function findTopLevelValueRaw(line, key) {
+  const range = findObjectValueRange(line, key);
+  return range ? line.slice(range[0], range[1]) : undefined;
+}
+
+function boundedStringFromRange(line, range, maxBytes = MAX_COMMAND_METADATA_BYTES) {
+  // A JSON string character can occupy six source characters as a \uXXXX
+  // escape. Reject a larger scalar before slicing/parsing it, then check the
+  // decoded UTF-8 bound without shortening an identifier into a shared prefix.
+  if (!range || range[1] - range[0] > maxBytes * 6 + 2) return undefined;
+  let value;
+  try { value = JSON.parse(line.slice(range[0], range[1])); } catch { return undefined; }
+  return boundedCommandString(value, maxBytes);
+}
+
+function findObjectString(line, key) {
+  return boundedStringFromRange(line, findObjectValueRange(line, key));
+}
+
+/** Extract only a bounded direct string child from a named top-level object. */
+function findNestedObjectString(line, objectKey, key) {
+  const objectRange = findObjectValueRange(line, objectKey);
+  if (!objectRange || line[objectRange[0]] !== "{") return undefined;
+  return boundedStringFromRange(line, findObjectValueRange(line, key, objectRange[0], objectRange[1]));
+}
+
+function jsonStringEnd(text, start) {
+  let escaped = false;
+  for (let index = start + 1; index < text.length; index++) {
+    if (escaped) escaped = false;
+    else if (text[index] === "\\") escaped = true;
+    else if (text[index] === '"') return index;
+  }
+  return text.length - 1;
+}
+
+function jsonValueEnd(text, start) {
+  if (text[start] === '"') return jsonStringEnd(text, start) + 1;
+  if (text[start] === "{" || text[start] === "[") {
+    const open = text[start];
+    const close = open === "{" ? "}" : "]";
+    let depth = 0;
+    for (let index = start; index < text.length; index++) {
+      if (text[index] === '"') { index = jsonStringEnd(text, index); continue; }
+      if (text[index] === open) depth++;
+      else if (text[index] === close && --depth === 0) return index + 1;
+    }
+    return undefined;
+  }
+  let end = start;
+  while (end < text.length && text[end] !== "," && text[end] !== "}") end++;
+  return end;
 }
 
 /**

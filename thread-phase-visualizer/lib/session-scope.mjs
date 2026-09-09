@@ -60,6 +60,22 @@ export function matchesRunCwd(run, cwd, base = process.cwd()) {
   return sameCanonicalCwd(runCwd(run), cwd, base);
 }
 
+/**
+ * Supervision may follow an owned run outside the session's current directory,
+ * but only when the verified start carries a complete, self-consistent launch
+ * cwd. Current hosted launches record both the primary cwd and cwdAtLaunch;
+ * neither a metadata-only fallback nor contradictory metadata is sufficient.
+ */
+export function hasVerifiedLaunchCwd(run) {
+  if (run?.workflowStartResolved !== true || run?.workflowStartCwdPresent !== true) return false;
+  const authoritativeCwd = runCwd(run);
+  const claimedCwd = run?.metadata?.cwdAtLaunch;
+  return Boolean(authoritativeCwd
+    && typeof claimedCwd === "string"
+    && path.isAbsolute(claimedCwd)
+    && sameCanonicalCwd(authoritativeCwd, claimedCwd));
+}
+
 export function sameCanonicalCwd(left, right, base = process.cwd()) {
   // A legacy relative launch path has no trustworthy base. In particular, do
   // not reinterpret it relative to whichever directory happens to be viewing

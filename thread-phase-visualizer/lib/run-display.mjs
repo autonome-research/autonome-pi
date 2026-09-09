@@ -42,13 +42,54 @@ export function formatElapsedDuration(startedAt, endedAt) {
   return [minutes ? `${minutes}m` : undefined, `${seconds}s`].filter(Boolean).join(" ");
 }
 
+function tokenValue(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+export function processedTokenTotal(usage) {
+  if (!usage || typeof usage !== "object") return 0;
+  const declaredTotal = tokenValue(usage.totalTokens);
+  if (declaredTotal) return declaredTotal;
+  // ThreadPhaseUsageSummary is canonical Pi-normalized data: inputTokens is
+  // uncached input, so cache read/write traffic belongs in processed total.
+  return tokenValue(usage.inputTokens)
+    + tokenValue(usage.cachedInputTokens)
+    + tokenValue(usage.cacheCreationInputTokens)
+    + tokenValue(usage.outputTokens);
+}
+
 export function formatTotalTokens(usage) {
-  if (!usage || typeof usage !== "object") return "";
-  const declaredTotal = Number(usage.totalTokens);
-  const derivedTotal = Number(usage.inputTokens || 0) + Number(usage.outputTokens || 0);
-  const total = Number.isFinite(declaredTotal) && declaredTotal > 0 ? declaredTotal : derivedTotal;
-  if (!Number.isFinite(total) || total <= 0) return "";
-  return `${compactNumber(total)} tok`;
+  const total = processedTokenTotal(usage);
+  return total ? `${compactNumber(total)} cumulative processed tokens` : "";
+}
+
+export function formatOutputTokens(usage) {
+  const output = tokenValue(usage?.outputTokens);
+  return output ? `${compactNumber(output)} output` : "";
+}
+
+export function formatTokenSummary(usage) {
+  return [formatOutputTokens(usage), formatTotalTokens(usage)].filter(Boolean).join(" · ");
+}
+
+export function formatTokenBreakdown(usage) {
+  if (!usage || typeof usage !== "object") return [];
+  const input = tokenValue(usage.inputTokens);
+  const cacheRead = tokenValue(usage.cachedInputTokens);
+  const cacheWrite = tokenValue(usage.cacheCreationInputTokens);
+  const output = tokenValue(usage.outputTokens);
+  const reasoning = Math.min(output, tokenValue(usage.reasoningTokens));
+  const total = processedTokenTotal(usage);
+  if (!input && !cacheRead && !cacheWrite && !output && !total) return [];
+  return [
+    `${formatInteger(input)} uncached input · ${formatInteger(cacheRead)} cache-read input · ${formatInteger(cacheWrite)} cache-write input`,
+    `${formatInteger(output)} output${reasoning ? ` (${formatInteger(reasoning)} reasoning included)` : ""} · ${formatInteger(total)} cumulative processed tokens`,
+  ];
+}
+
+function formatInteger(value) {
+  return Math.round(value).toLocaleString("en-US");
 }
 
 function compactNumber(value) {

@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 export const PROGRESS_REVIEW_SCHEMA = "thread-phase-progress-reviews/v1";
 export const PROGRESS_REVIEW_FILENAME = "progress-reviews.json";
-export const DEFAULT_PROGRESS_REVIEW_CADENCE_MS = 5 * 60 * 1000;
+export const DEFAULT_PROGRESS_REVIEW_CADENCE_MS = 10 * 60 * 1000;
 export const DEFAULT_PROGRESS_REVIEW_LIMIT = 500;
 export const DEFAULT_PROGRESS_REVIEW_CLAIM_LEASE_MS = 10 * 60 * 1000;
 const MAX_STATE_BYTES = 512 * 1024;
@@ -58,6 +58,31 @@ export function ensureProgressReview(runId, { storeDir, startedAt, cadenceMs = D
     records.push(record);
     return { result: { ...record }, records };
   });
+}
+
+/** Explicit operator adjustment only; never rewrite a pending/in-flight review.
+ * The check identity and trusted start survive. sequence is the cadence-period
+ * index, not an acknowledgement count, so rebase it along with dueAt.
+ */
+export function rescheduleProgressReview(runId, { storeDir, checkId, cadenceMs, maxEntries = DEFAULT_PROGRESS_REVIEW_LIMIT, now } = {}) {
+  validateId(runId, "run id");
+  validateId(checkId, "expected check id");
+  const cadence = positiveDuration(cadenceMs, "progress review cadence");
+  const nowMs = clock(now);
+  return withState(storeDir, maxEntries, (records) => {
+    const record = records.find((candidate) => candidate.runId === runId && candidate.checkId === checkId);
+    if (!record || record.state !== "scheduled" || record.claimantId || record.claimantPid) {
+      return { result: { rescheduled: false }, records };
+    }
+    if (record.cadenceMs === cadence) return { result: { rescheduled: true, record: { ...record } }, records };
+    const startMs = Date.parse(record.startedAt);
+    record.sequence = Math.max(1, Math.floor((nowMs - startMs) / cadence) + 1);
+    record.dueAt = iso(startMs + record.sequence * cadence);
+    record.cadenceMs = cadence;
+    record.updatedAt = iso(nowMs);
+    return { result: { rescheduled: true, record: { ...record } }, records };
+  });
+
 }
 
 /** Atomically claim a due review. A scheduled record is promoted to pending at its anchored due time. */

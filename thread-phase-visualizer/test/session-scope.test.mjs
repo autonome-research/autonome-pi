@@ -7,6 +7,7 @@ import {
   canInspectRun,
   canonicalCwd,
   createCwdState,
+  hasVerifiedLaunchCwd,
   isRunningRun,
   mergeMonitorRuns,
   parseCdTargets,
@@ -138,6 +139,25 @@ test("absolute run cwd overrides conflicting local legacy metadata for inspectio
   assert.equal(canInspectRun(remote, undefined, paths.sibling), true);
   assert.deepEqual(mergeMonitorRuns([remote], paths.repo, undefined), []);
   assert.deepEqual(mergeMonitorRuns([remote], paths.sibling, undefined).map((run) => run.runId), [remote.runId]);
+});
+
+test("supervision launch cwd must be verified, complete, and internally consistent", (t) => {
+  const paths = fixture();
+  t.after(() => rmSync(paths.root, { recursive: true, force: true }));
+  const verified = {
+    workflowStartResolved: true,
+    workflowStartCwdPresent: true,
+    cwd: paths.link,
+    metadata: { sessionId: "session-a", cwdAtLaunch: paths.repo },
+  };
+
+  assert.equal(hasVerifiedLaunchCwd(verified), true, "canonical aliases are consistent");
+  assert.equal(hasVerifiedLaunchCwd({ ...verified, metadata: { ...verified.metadata, cwdAtLaunch: paths.sibling } }), false);
+  assert.equal(hasVerifiedLaunchCwd({ ...verified, metadata: { ...verified.metadata, cwdAtLaunch: "repo" } }), false);
+  assert.equal(hasVerifiedLaunchCwd({ ...verified, metadata: { sessionId: "session-a" } }), false);
+  assert.equal(hasVerifiedLaunchCwd({ ...verified, cwd: undefined }), false);
+  assert.equal(hasVerifiedLaunchCwd({ ...verified, workflowStartCwdPresent: false }), false);
+  assert.equal(hasVerifiedLaunchCwd({ ...verified, workflowStartResolved: false }), false);
 });
 
 test("matching session-owned runs are visible in inspection and monitor results", (t) => {

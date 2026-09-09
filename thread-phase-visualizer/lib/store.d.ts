@@ -1,3 +1,6 @@
+import type { CommandLedgerProjection } from "./command-ledger.mjs";
+export type { CommandLedgerProjection, CommandLedgerRow, CommandOutcome, CommandPreview, CommandState } from "./command-ledger.mjs";
+
 export type ThreadPhaseUiStatus = "running" | "success" | "failed" | "cancelled" | "skipped" | "unknown" | string;
 export type ThreadPhaseNormalizedStatus = "running" | "success" | "failed" | "cancelled" | "skipped" | "unknown";
 
@@ -59,12 +62,19 @@ export type ThreadPhaseUiEvent = {
 };
 
 export type ThreadPhaseUsageSummary = {
+  /** Observed usage records; not guaranteed to equal model responses for legacy data. */
   entries: number;
+  /** Pi-normalized uncached input. */
   inputTokens: number;
+  /** Model output; reasoningTokens is an included subset. */
   outputTokens: number;
+  /** Cumulative processed tokens, not context length or unique input. */
   totalTokens: number;
+  /** Cumulative cache-read input. */
   cachedInputTokens: number;
+  /** Cumulative cache-write input. */
   cacheCreationInputTokens: number;
+  /** Provider-reported subset of outputTokens. */
   reasoningTokens: number;
   fields: Record<string, number>;
   models: Record<string, ThreadPhaseUsageSummary>;
@@ -83,6 +93,8 @@ export type ThreadPhaseFanoutItemSummary = {
   error?: unknown;
   model?: string;
   usage?: ThreadPhaseUsageSummary;
+  /** Commands attributed to this item only; not duplicated on the parent phase. */
+  commandLedger?: CommandLedgerProjection;
 };
 
 export type ThreadPhaseFanoutSummary = {
@@ -154,6 +166,8 @@ export type ThreadPhasePhaseSummary = {
   usage?: ThreadPhaseUsageSummary;
   heartbeat?: ThreadPhaseHeartbeatSummary;
   activeIo?: ThreadPhaseActiveIoSnapshot;
+  /** Non-fanout commands directly attributed to this phase. */
+  commandLedger?: CommandLedgerProjection;
 };
 
 export type ThreadPhaseRunSummary = {
@@ -185,6 +199,7 @@ export type ThreadPhaseRunSummary = {
 };
 
 export const SCHEMA_VERSION: "thread-phase-ui/v1";
+export const STORE_BUILD: string;
 export const EVENT_TYPES: Readonly<{
   WORKFLOW_START: "workflow_start";
   WORKFLOW_END: "workflow_end";

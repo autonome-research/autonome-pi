@@ -8,4 +8,8 @@ export function runOwnerMetadata(run?: RunLike): { sessionId?: string; launchSou
 export function formatOwnerMetadata(run?: RunLike): string;
 export function formatStaleIndicator(run?: RunLike): string;
 export function formatElapsedDuration(startedAt?: string | number | Date, endedAt?: string | number | Date): string;
+export function processedTokenTotal(usage?: Record<string, any>): number;
 export function formatTotalTokens(usage?: Record<string, any>): string;
+export function formatOutputTokens(usage?: Record<string, any>): string;
+export function formatTokenSummary(usage?: Record<string, any>): string;
+export function formatTokenBreakdown(usage?: Record<string, any>): string[];

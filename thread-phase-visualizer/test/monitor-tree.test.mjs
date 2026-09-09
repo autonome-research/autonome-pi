@@ -105,7 +105,7 @@ test("a completed phase hands off to its nested artifacts", () => {
   assert.match(text(monitor.render(90)), /review-body/);
 });
 
-test("live trace pane renders for a running phase and degrades without recentItems", () => {
+test("expanded running phase shows optional bounded agent text and degrades without it", () => {
   const monitor = component([run({
     normalizedStatus: "running", status: "running",
     phases: [{
@@ -121,9 +121,9 @@ test("live trace pane renders for a running phase and degrades without recentIte
   monitor.handleInput("\r");
   monitor.handleInput("\r"); // expand running phase -> trace pane
   const trace = text(monitor.render(100));
-  assert.match(trace, /trace:/);
-  assert.match(trace, /deep reasoning/);
-  assert.match(trace, /bash/);
+  assert.match(trace, /agent text \(bounded, optional\):/);
+  assert.match(trace, /thinking: deep reasoning/);
+  assert.doesNotMatch(trace, /bash|live reasoning/);
 
   const empty = component([run({
     normalizedStatus: "running", status: "running",
@@ -136,7 +136,7 @@ test("live trace pane renders for a running phase and degrades without recentIte
   assert.match(text(empty.render(100)), /solo/);
 });
 
-test("live trace pane coalesces reasoning content deltas into one assembled line", () => {
+test("optional agent text coalesces adjacent thinking without relabeling prose", () => {
   const monitor = component([run({
     normalizedStatus: "running",
     status: "running",
@@ -155,9 +155,8 @@ test("live trace pane coalesces reasoning content deltas into one assembled line
   monitor.handleInput("\r");
   monitor.handleInput("\r"); // expand running phase -> trace pane
   const out = text(monitor.render(100));
-  // Consecutive reasoning fragments are joined into a single line (signal dedup).
-  assert.match(out, /step one then step two/);
-  const reasoningRows = out.split("\n").filter((line) => line.includes("⎙")).length;
-  assert.equal(reasoningRows, 1);
-  assert.match(out, /bash/);
+  assert.match(out, /thinking: step one then step two/);
+  const thinkingRows = out.split("\n").filter((line) => line.includes("thinking:")).length;
+  assert.equal(thinkingRows, 1);
+  assert.doesNotMatch(out, /bash|live reasoning/);
 });

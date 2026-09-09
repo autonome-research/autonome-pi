@@ -1,13 +1,14 @@
 import { getMarkdownTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Key, Markdown, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Key, Markdown, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { basename } from "node:path";
 import { STATUSES, latestRunSummaries, readArtifactContent, requestCancellation, STORE_BUILD } from "../lib/store.mjs";
 import { artifactEditorActionHint, artifactEditorTarget } from "../lib/artifact-action.mjs";
 import { DEFAULT_MONITOR_SORT, MONITOR_SORTS, MONITOR_STATUS_FILTERS, cycleMonitorOption, filterAndSortMonitorRuns } from "../lib/monitor-state.mjs";
 import { detailViewportHeight, windowLineRange } from "../lib/monitor-pagination.mjs";
-import { formatElapsedDuration, formatStaleIndicator, formatTotalTokens } from "../lib/run-display.mjs";
+import { formatElapsedDuration, formatStaleIndicator, formatTokenBreakdown, formatTokenSummary } from "../lib/run-display.mjs";
 import { canInspectRun, mergeMonitorRuns } from "../lib/session-scope.mjs";
 import { framePanel } from "./bordered-panel.ts";
+import { commandElapsed, commandStatePresentation, compactCommandStateLabel, conciseCommand, previewNotices, visibleCommandRows } from "./command-ledger.ts";
 import { formatFanout, formatProgress, statusColor, statusIcon } from "./phase-timeline.ts";
 
 type RunSummary = Record<string, any>;
@@ -18,7 +19,9 @@ type FanoutStageSummary = Record<string, any>;
 type DetailRow =
 	| { kind: "phase"; key: string; phase: PhaseSummary }
 	| { kind: "stage"; key: string; phase: PhaseSummary; stage: FanoutStageSummary }
-	| { kind: "artifact"; key: string; artifact: ArtifactSummary };
+	| { kind: "command"; key: string; ownerKey: string; phase: PhaseSummary; stage?: FanoutStageSummary; command: Record<string, any> }
+	| { kind: "commandHistory"; key: string; ownerKey: string; phase: PhaseSummary; stage?: FanoutStageSummary; ledger: Record<string, any>; hiddenCount: number }
+	| { kind: "artifact"; key: string; artifact: ArtifactSummary; stage?: FanoutStageSummary };
 type DetailLineRange = { start: number; end: number };
 
 const MAX_VISIBLE_RUNS = 12;
@@ -27,7 +30,7 @@ const LIVE_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "�
 
 // Bump this so a reloaded session's monitor title shows the current build and you
 // can tell the running extension has the latest viewer code.
-export const MONITOR_BUILD = "3-tree";
+export const MONITOR_BUILD = "4-command-ledger";
 
 function shortRunId(runId: string | undefined): string {
 	if (!runId) return "unknown";
@@ -151,6 +154,20 @@ function sanitizeIoText(value: any): string {
 		.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "�");
 }
 
+function wrapPlainText(value: string, width: number): string[] {
+	const safeWidth = Math.max(1, Math.floor(width));
+	const lines: string[] = [];
+	let current = "";
+	for (const character of Array.from(value || " ")) {
+		if (current && visibleWidth(current + character) > safeWidth) {
+			lines.push(current);
+			current = character;
+		} else current += character;
+	}
+	if (current || !lines.length) lines.push(current);
+	return lines;
+}
+
 function ioIdentity(io: any): string | undefined {
 	return io?.componentId || io?.component || io?.role || io?.command;
 }
@@ -170,23 +187,66 @@ function stageKey(phase: PhaseSummary, stage: FanoutStageSummary): string {
 function artifactKey(artifact: ArtifactSummary): string {
 	return `artifact:${artifact?.eventId || artifact?.path || artifact?.title || "artifact"}`;
 }
+function commandKey(ownerKey: string, command: Record<string, any>): string {
+	// The backend key is opaque. It is carried whole and never decoded by the UI.
+	return `command:${ownerKey}:${String(command?.key || "unknown")}`;
+}
+function commandHistoryKey(ownerKey: string): string {
+	return `command-history:${ownerKey}`;
+}
 function isRunningNode(node: Record<string, any> | undefined): boolean {
 	return node?.normalizedStatus === STATUSES.RUNNING || node?.status === STATUSES.RUNNING;
 }
 
 function traceItemsForRow(row: DetailRow | undefined, expandedPhases: Set<string>, expandedStages: Set<string>): any[] | undefined {
 	if (!row) return undefined;
-	if (row.kind === "phase" && expandedPhases.has(row.key) && isRunningNode(row.phase) && row.phase.recentItems?.length) return row.phase.recentItems;
-	if (row.kind === "stage" && expandedStages.has(row.key) && isRunningNode(row.stage) && row.stage.recentItems?.length) return row.stage.recentItems;
-	return undefined;
+	const items = row.kind === "phase" && expandedPhases.has(row.key) && isRunningNode(row.phase)
+		? row.phase.recentItems
+		: row.kind === "stage" && expandedStages.has(row.key) && isRunningNode(row.stage)
+			? row.stage.recentItems
+			: undefined;
+	const content = Array.isArray(items) ? items.filter((item) => item?.type === "content_delta") : [];
+	return content.length ? content : undefined;
+}
+
+function appendCommandRows(
+	rows: DetailRow[],
+	ownerKey: string,
+	phase: PhaseSummary,
+	stage: FanoutStageSummary | undefined,
+	owner: Record<string, any>,
+	showAllCommands: Set<string>,
+): void {
+	const ledger = owner?.commandLedger;
+	if (!ledger?.rows?.length) return;
+	const visible = visibleCommandRows(ledger, {
+		ownerRunning: isRunningNode(owner),
+		showAll: showAllCommands.has(ownerKey),
+	});
+	for (const command of visible.rows) {
+		rows.push({ kind: "command", key: commandKey(ownerKey, command), ownerKey, phase, stage, command });
+	}
+	if (visible.hiddenCount || showAllCommands.has(ownerKey) || ledger.truncated || ledger.droppedCommands) {
+		rows.push({
+			kind: "commandHistory",
+			key: commandHistoryKey(ownerKey),
+			ownerKey,
+			phase,
+			stage,
+			ledger,
+			hiddenCount: visible.hiddenCount,
+		});
+	}
 }
 
 // Build the ordered list of selectable tree rows for a run. Selection is keyed by
-// stable row identity (phase name, stage itemId, artifact key) so that expending
-// or collapsing a fanout phase never silently remaps the cursor onto a different
-// node (the previous positional-index bug). Row composition is derived from the
-// current expansion state on every call.
-function buildDetailRows(run: RunSummary | undefined, expandedPhases: Set<string>, expandedStages: Set<string>): DetailRow[] {
+// stable phase/item identity and the backend's whole opaque command row key.
+function buildDetailRows(
+	run: RunSummary | undefined,
+	expandedPhases: Set<string>,
+	expandedStages: Set<string>,
+	showAllCommands: Set<string>,
+): DetailRow[] {
 	if (!run) return [];
 	const rows: DetailRow[] = [];
 	for (const phase of run.phases || []) {
@@ -194,18 +254,21 @@ function buildDetailRows(run: RunSummary | undefined, expandedPhases: Set<string
 		rows.push({ kind: "phase", key: pkey, phase });
 		if (!expandedPhases.has(pkey)) continue;
 		if (phase.fanout?.items?.length) {
-			// Fanout phase: reveal stages; a completed stage reveals its artifacts and a
-			// running stage shows a live trace pane instead.
+			// Fanout commands are rendered only under their attributed item lane.
 			for (const stage of phase.fanout.items) {
 				const skey = stageKey(phase, stage);
 				rows.push({ kind: "stage", key: skey, phase, stage });
-				if (expandedStages.has(skey) && !isRunningNode(stage) && stage.artifacts?.length) {
-					for (const artifact of stage.artifacts) rows.push({ kind: "artifact", key: artifactKey(artifact), artifact });
+				if (!expandedStages.has(skey)) continue;
+				appendCommandRows(rows, skey, phase, stage, stage, showAllCommands);
+				if (!isRunningNode(stage) && stage.artifacts?.length) {
+					for (const artifact of stage.artifacts) rows.push({ kind: "artifact", key: artifactKey(artifact), artifact, stage });
 				}
 			}
-		} else if (!isRunningNode(phase) && phase.artifacts?.length) {
-			// Deterministic / completed phase: reveal its generated artifacts.
-			for (const artifact of phase.artifacts) rows.push({ kind: "artifact", key: artifactKey(artifact), artifact });
+		} else {
+			appendCommandRows(rows, pkey, phase, undefined, phase, showAllCommands);
+			if (!isRunningNode(phase) && phase.artifacts?.length) {
+				for (const artifact of phase.artifacts) rows.push({ kind: "artifact", key: artifactKey(artifact), artifact });
+			}
 		}
 	}
 	return rows;
@@ -240,6 +303,9 @@ export class ThreadPhaseMonitorComponent {
 	private selectedArtifactKey?: string;
 	private expandedPhases = new Set<string>();
 	private expandedStages = new Set<string>();
+	private expandedCommands = new Set<string>();
+	private showAllCommands = new Set<string>();
+	private detailScrollKey?: string;
 	private scroll = 0;
 	private viewportHeight = 24;
 	private searchMode = false;
@@ -392,6 +458,9 @@ export class ThreadPhaseMonitorComponent {
 				this.selectedArtifactKey = undefined;
 				this.expandedPhases.clear();
 				this.expandedStages.clear();
+				this.expandedCommands.clear();
+				this.showAllCommands.clear();
+				this.detailScrollKey = undefined;
 				this.scroll = 0;
 			}
 			this.selected = Math.max(0, Math.min(this.selected, Math.max(0, runs.length - 1)));
@@ -440,6 +509,9 @@ export class ThreadPhaseMonitorComponent {
 		this.selectedArtifactKey = undefined;
 		this.expandedPhases.clear();
 		this.expandedStages.clear();
+		this.expandedCommands.clear();
+		this.showAllCommands.clear();
+		this.detailScrollKey = undefined;
 		this.scroll = 0;
 		this.invalidate();
 	}
@@ -451,12 +523,13 @@ export class ThreadPhaseMonitorComponent {
 			this.selectedRunId = runs[this.selected]?.runId ? String(runs[this.selected].runId) : undefined;
 		} else if (this.mode === "detail") {
 			if (!run) return;
-			const rows = buildDetailRows(run, this.expandedPhases, this.expandedStages);
+			const rows = buildDetailRows(run, this.expandedPhases, this.expandedStages, this.showAllCommands);
 			const current = Math.max(0, rows.findIndex((row) => row.key === this.selectedKey));
 			const next = Math.max(0, Math.min(current + delta, Math.max(0, rows.length - 1)));
 			const row = rows[current] ?? rows[0];
 			if (current !== -1 && row) this.selectedKey = row.key;
 			if (rows[next]) this.selectedKey = rows[next].key;
+			this.detailScrollKey = undefined;
 		} else {
 			this.scroll = Math.max(0, this.scroll + delta);
 		}
@@ -468,10 +541,17 @@ export class ThreadPhaseMonitorComponent {
 			this.scroll = Math.max(0, this.scroll + delta * Math.max(1, this.viewportHeight - 1));
 		} else if (this.mode === "detail") {
 			if (!run) return;
-			const rows = buildDetailRows(run, this.expandedPhases, this.expandedStages);
+			const rows = buildDetailRows(run, this.expandedPhases, this.expandedStages, this.showAllCommands);
 			const current = Math.max(0, rows.findIndex((row) => row.key === this.selectedKey));
-			// When the selected row is an expanded running node with a live trace, ctrl+u/d
-			// scrolls the trace window instead of moving the selection (interactive trace).
+			const selectedRow = rows[current];
+			if (selectedRow?.kind === "command" && this.expandedCommands.has(selectedRow.key)) {
+				this.detailScrollKey = selectedRow.key;
+				this.scroll = Math.max(0, this.scroll + delta * Math.max(1, this.viewportHeight - 1));
+				this.invalidate();
+				return;
+			}
+			// When the selected row is an expanded running node with bounded agent text,
+			// ctrl+u/d scrolls that optional pane instead of moving the selection.
 			const row = rows[current];
 			const traceItems = traceItemsForRow(row, this.expandedPhases, this.expandedStages);
 			if (traceItems) {
@@ -496,19 +576,39 @@ export class ThreadPhaseMonitorComponent {
 			this.scroll = 0;
 		} else if (this.mode === "detail") {
 			if (!run) return;
-			const rows = buildDetailRows(run, this.expandedPhases, this.expandedStages);
+			const rows = buildDetailRows(run, this.expandedPhases, this.expandedStages, this.showAllCommands);
 			const row = rows.find((candidate) => candidate.key === this.selectedKey) || rows[0];
 			if (!row) return;
 			this.selectedKey = row.key;
+			this.detailScrollKey = undefined;
 			if (row.kind === "phase") {
 				const key = row.key;
 				if (this.expandedPhases.has(key)) {
 					this.expandedPhases.delete(key);
-					for (const stage of row.phase.fanout?.items || []) this.expandedStages.delete(stageKey(row.phase, stage));
+					for (const candidate of rows) {
+						if (candidate.kind === "command" && candidate.phase === row.phase) this.expandedCommands.delete(candidate.key);
+					}
+					this.showAllCommands.delete(key);
+					for (const stage of row.phase.fanout?.items || []) {
+						const skey = stageKey(row.phase, stage);
+						this.expandedStages.delete(skey);
+						this.showAllCommands.delete(skey);
+					}
 				} else this.expandedPhases.add(key);
 			} else if (row.kind === "stage") {
-				if (this.expandedStages.has(row.key)) this.expandedStages.delete(row.key);
-				else this.expandedStages.add(row.key);
+				if (this.expandedStages.has(row.key)) {
+					this.expandedStages.delete(row.key);
+					for (const candidate of rows) {
+						if (candidate.kind === "command" && candidate.stage === row.stage) this.expandedCommands.delete(candidate.key);
+					}
+					this.showAllCommands.delete(row.key);
+				} else this.expandedStages.add(row.key);
+			} else if (row.kind === "command") {
+				if (this.expandedCommands.has(row.key)) this.expandedCommands.delete(row.key);
+				else this.expandedCommands.add(row.key);
+			} else if (row.kind === "commandHistory") {
+				if (this.showAllCommands.has(row.ownerKey)) this.showAllCommands.delete(row.ownerKey);
+				else this.showAllCommands.add(row.ownerKey);
 			} else if (row.kind === "artifact") {
 				this.selectedArtifactKey = row.key;
 				this.mode = "artifact";
@@ -562,7 +662,7 @@ export class ThreadPhaseMonitorComponent {
 			const current = status === STATUSES.RUNNING ? currentPhaseText(run) : "";
 			const cwd = this.searchQuery ? String(run.cwd || "") : cwdLabel(run.cwd);
 			const location = run.cwd ? t.fg("dim", ` @ ${highlightMatch(cwd, this.searchQuery, t)}`) : "";
-			const metrics = [elapsedForRun(run), formatTotalTokens(run.usage)].filter((value) => value && value !== "?").join(" · ");
+			const metrics = [elapsedForRun(run), formatTokenSummary(run.usage)].filter((value) => value && value !== "?").join(" · ");
 			lines.push(truncateToWidth(`${head}${location}${metrics ? t.fg("muted", ` · ${metrics}`) : ""}${current ? t.fg("muted", ` — ${current}`) : ""}`, width));
 			if (status === STATUSES.RUNNING && (run.phases || []).filter((p) => p.normalizedStatus === STATUSES.RUNNING || p.status === STATUSES.RUNNING).length > 1) {
 				lines.push(truncateToWidth(`  ${deterministicPhaseLine(run, t)}`, width));
@@ -577,7 +677,7 @@ export class ThreadPhaseMonitorComponent {
 		const t = this.theme;
 		const run = runs[this.selected];
 		if (!run) return this.renderList(width, runs);
-		const rows = buildDetailRows(run, this.expandedPhases, this.expandedStages);
+		const rows = buildDetailRows(run, this.expandedPhases, this.expandedStages, this.showAllCommands);
 		let selectedIndex = rows.findIndex((row) => row.key === this.selectedKey);
 		if (selectedIndex < 0) selectedIndex = rows.length ? 0 : -1;
 		const selectedKey = rows[selectedIndex]?.key;
@@ -599,12 +699,15 @@ export class ThreadPhaseMonitorComponent {
 		};
 
 		const cancelHint = isRunningCancellable(run) ? " • x cancel" : "";
-		add(t.fg("dim", `← back • ↑↓ select • enter explore${cancelHint} • q close`));
+		add(t.fg("dim", `← back • ↑↓ select • enter expand/open • ctrl+u/d page${cancelHint} • q close`));
 		add(t.fg("accent", t.bold(`${workflowGlyph(status, t)} ${run.workflow || "workflow"}`)) + t.fg("dim", ` [${run.runId || "unknown"}]`));
 		const pid = runtimePid(run);
 		add(t.fg("dim", `status: ${run.status || status}${run.stale ? `  ${formatStaleIndicator(run)}` : ""}  duration: ${elapsedForRun(run)}${pid && status === STATUSES.RUNNING ? `  pid: ${pid}` : ""}`));
-		const runTokens = formatTotalTokens(run.usage);
-		if (runTokens) add(t.fg("muted", `tokens: ${runTokens}`));
+		const runTokens = formatTokenSummary(run.usage);
+		if (runTokens) {
+			add(t.fg("muted", `tokens: ${runTokens}`));
+			for (const line of formatTokenBreakdown(run.usage)) add(t.fg("dim", `  ${line}`));
+		}
 		const runAnchorIo = run.activeIo;
 		this.addActiveIo(lines, runAnchorIo, width, "active I/O");
 		add("");
@@ -618,28 +721,54 @@ export class ThreadPhaseMonitorComponent {
 				const pStatus = phase.normalizedStatus || phase.status;
 				const progress = phase.fanout ? formatFanout(phase.fanout) : formatProgress(phase.progress);
 				const inference = inferenceLabel(phase);
-				const expandMark = this.expandedPhases.has(row.key)
-					? t.fg("dim", "▾ ")
-					: (phase.fanout?.items?.length || phase.artifacts?.length || (isRunningNode(phase) && phase.recentItems?.length)) ? t.fg("dim", "▸ ") : "  ";
+				const expandable = phase.fanout?.items?.length || phase.artifacts?.length || phase.commandLedger?.rows?.length || (isRunningNode(phase) && phase.recentItems?.length);
+				const expandMark = this.expandedPhases.has(row.key) ? t.fg("dim", "▾ ") : expandable ? t.fg("dim", "▸ ") : "  ";
 				add(`${prefix} ${expandMark}${t.fg(statusColor(pStatus), phaseStatusGlyph(pStatus))} ${selected ? t.fg("accent", phase.phase || "phase") : phase.phase || "phase"}${t.fg("muted", progress)}${inference ? t.fg("dim", ` — ${inference}`) : ""}`, true);
 				if (this.expandedPhases.has(row.key)) {
 					this.addPhaseHeader(lines, phase, width, runAnchorIo);
-					if (isRunningNode(phase) && phase.recentItems?.length) this.addTracePane(lines, phase.recentItems, width);
+					if (!phase.fanout && isRunningNode(phase) && phase.recentItems?.length) this.addAgentTextPane(lines, phase.recentItems, width, "    ");
 				}
 			} else if (row.kind === "stage") {
 				const stage = row.stage;
 				const iStatus = stage.normalizedStatus || stage.status;
-				const tokens = formatTotalTokens(stage.usage);
+				const tokens = formatTokenSummary(stage.usage);
 				const inference = inferenceLabel(stage);
-				const expandable = stage.artifacts?.length || (isRunningNode(stage) && stage.recentItems?.length);
+				const expandable = stage.artifacts?.length || stage.commandLedger?.rows?.length || (isRunningNode(stage) && stage.recentItems?.length);
 				const expandMark = this.expandedStages.has(row.key) ? t.fg("dim", "▾") : expandable ? t.fg("dim", "▸") : " ";
 				add(`${prefix}   ${expandMark}${t.fg(statusColor(iStatus), statusIcon(iStatus))} ${selected ? t.fg("accent", stage.label || stage.itemId) : t.fg("accent", stage.label || stage.itemId)}${tokens ? t.fg("muted", ` · ${tokens}`) : ""}${inference ? t.fg("dim", ` — ${inference}`) : ""}`, true);
-				if (this.expandedStages.has(row.key) && isRunningNode(stage) && stage.recentItems?.length) {
-					this.addTracePane(lines, stage.recentItems, width);
+				if (this.expandedStages.has(row.key)) {
+					this.addUsageBreakdown(lines, stage.usage, "      ");
+					if (isRunningNode(stage) && stage.recentItems?.length) this.addAgentTextPane(lines, stage.recentItems, width, "      ");
 				}
+			} else if (row.kind === "command") {
+				const command = row.command;
+				const state = commandStatePresentation(command.state);
+				const detailOpen = this.expandedCommands.has(row.key);
+				const expandMark = detailOpen ? "▾" : "▸";
+				const indent = row.stage ? "      " : "    ";
+				const toolName = command.toolName || "tool";
+				const concise = conciseCommand(command);
+				const elapsed = commandElapsed(command);
+				const flags = command.truncated ? " · [truncated]" : "";
+				const commandLine = width < 48
+					? `${prefix}${indent}${t.fg("dim", expandMark)} ${selected ? t.fg("accent", toolName) : toolName} ${t.fg(state.color, compactCommandStateLabel(command.state))}${elapsed ? t.fg("dim", ` ${elapsed}`) : ""}${command.truncated ? t.fg("warning", " truncated") : ""}`
+					: `${prefix}${indent}${t.fg("dim", expandMark)} ${t.fg(state.color, state.glyph)} ${selected ? t.fg("accent", toolName) : toolName}${t.fg(state.color, ` · ${state.label}`)}${elapsed ? t.fg("dim", ` · ${elapsed}`) : ""}${flags ? t.fg("warning", flags) : ""}${concise ? t.fg("muted", ` — ${concise}`) : ""}`;
+				add(commandLine, true);
+				if (detailOpen) this.addCommandDetails(lines, command, width, `${indent}  `);
+			} else if (row.kind === "commandHistory") {
+				const indent = row.stage ? "      " : "    ";
+				const showingAll = this.showAllCommands.has(row.ownerKey);
+				const retained = Number(row.ledger.retainedCommands || row.ledger.rows?.length || 0);
+				const dropped = Number(row.ledger.droppedCommands || 0);
+				const label = showingAll
+					? `▾ all:${retained} retained · enter recent`
+					: `▸ hidden:${row.hiddenCount} retained · enter all`;
+				const loss = dropped ? `dropped:${dropped} · ` : row.ledger.truncated ? "ledger truncated · " : "";
+				add(`${prefix}${indent}${t.fg("warning", `${loss}${label}`)}`, true);
 			} else if (row.kind === "artifact") {
 				const artifact = row.artifact;
-				add(`${prefix}     ${t.fg("success", "◉")} ${selected ? t.fg("accent", artifactTitle(artifact)) : artifactTitle(artifact)}${artifactTarget(artifact) ? t.fg("dim", ` — ${artifactTarget(artifact)}`) : ""}`, true);
+				const indent = row.stage ? "        " : "     ";
+				add(`${prefix}${indent}${t.fg("success", "◉")} ${selected ? t.fg("accent", artifactTitle(artifact)) : artifactTitle(artifact)}${artifactTarget(artifact) ? t.fg("dim", ` — ${artifactTarget(artifact)}`) : ""}`, true);
 			}
 		}
 		if (run.errors?.length) {
@@ -647,14 +776,21 @@ export class ThreadPhaseMonitorComponent {
 			add(t.fg("error", t.bold("Errors")));
 			for (const error of run.errors) add(t.fg("error", `- ${error.phase ? `${error.phase}: ` : ""}${error.message || error.error?.message || "error"}`));
 		}
-		return this.windowLines(lines, width, this.viewportHeight, selectedLine);
+		const anchorSelection = this.detailScrollKey === selectedKey ? undefined : selectedLine;
+		return this.windowLines(lines, width, this.viewportHeight, anchorSelection);
+	}
+
+	private addUsageBreakdown(lines: string[], usage: any, indent: string): void {
+		const summary = formatTokenSummary(usage);
+		if (!summary) return;
+		lines.push(this.theme.fg("muted", `${indent}tokens: ${summary}`));
+		for (const line of formatTokenBreakdown(usage)) lines.push(this.theme.fg("dim", `${indent}  ${line}`));
 	}
 
 	private addPhaseHeader(lines: string[], phase: PhaseSummary, width: number, runAnchorIo?: any): void {
 		const t = this.theme;
 		if (phase.startedAt) lines.push(t.fg("dim", `    duration: ${elapsedForPhase(phase)}`));
-		const phaseTokens = formatTotalTokens(phase.usage);
-		if (phaseTokens) lines.push(t.fg("muted", `    tokens: ${phaseTokens}`));
+		this.addUsageBreakdown(lines, phase.usage, "    ");
 		// Suppress phase-level I/O when it duplicates the run-anchor I/O (signal dedup).
 		if (phase.activeIo && !activeIoMatches(phase.activeIo, runAnchorIo)) {
 			this.addActiveIo(lines, phase.activeIo, width, "    I/O");
@@ -662,38 +798,72 @@ export class ThreadPhaseMonitorComponent {
 		if (phase.fanout) lines.push(t.fg("muted", `    fanout:${formatFanout(phase.fanout)} ${phase.fanout.label || ""}`));
 	}
 
-	// Render the most recent live reasoning / tool-call trace for a running phase or
-	// stage, from its projected recentItems. Non-selectable detail lines. Reasoning
-	// content deltas are coalesced into a single assembled line (signal dedup).
-	private addTracePane(lines: string[], items: any[], width: number): void {
+	private addCommandDetails(lines: string[], command: Record<string, any>, width: number, indent: string): void {
 		const t = this.theme;
-		const total = Array.isArray(items) ? items.length : 0;
+		const previews = [
+			["args", command.argsPreview],
+			["output", command.outputPreview],
+			["error", command.errorPreview],
+		] as const;
+		let shown = false;
+		for (const [label, preview] of previews) {
+			if (!preview) continue;
+			shown = true;
+			lines.push(t.fg(label === "error" ? "error" : "toolTitle", `${indent}${label}:`));
+			const safe = sanitizeIoText(preview.text || "");
+			if (safe) {
+				const bodyWidth = Math.max(1, width - indent.length - 2);
+				for (const sourceLine of safe.split(/\r?\n/)) {
+					const wrapped = wrapPlainText(sourceLine || " ", bodyWidth);
+					for (const line of wrapped) lines.push(t.fg(label === "error" ? "error" : "muted", `${indent}│ ${line}`));
+				}
+			}
+			for (const notice of previewNotices(preview)) lines.push(t.fg("warning", `${indent}[${notice}]`));
+		}
+		if (command.history?.length) {
+			shown = true;
+			lines.push(t.fg("toolTitle", `${indent}observed history:`));
+			for (const event of command.history) {
+				lines.push(t.fg("dim", `${indent}· ${event.type || "event"} → ${event.state || "unknown"}${event.at ? ` @ ${event.at}` : ""}`));
+			}
+			if (command.historyDropped) lines.push(t.fg("warning", `${indent}[${command.historyDropped} older history records dropped]`));
+		}
+		if (command.truncated && !previews.some(([, preview]) => previewNotices(preview).length) && !command.historyDropped) {
+			lines.push(t.fg("warning", `${indent}[command details truncated]`));
+			shown = true;
+		}
+		if (!shown) lines.push(t.fg("dim", `${indent}No bounded arguments, output, error, or history retained.`));
+	}
+
+	// Agent prose and thinking are optional, bounded, and kept distinct. Tool
+	// lifecycle rows come only from commandLedger and are never rendered here.
+	private addAgentTextPane(lines: string[], items: any[], width: number, indent: string): void {
+		const contentItems = (Array.isArray(items) ? items : []).filter((item) => item?.type === "content_delta");
+		const total = contentItems.length;
+		if (!total) return;
 		const page = Math.max(1, this.viewportHeight - 4);
 		this.traceOffset = Math.max(0, Math.min(this.traceOffset, Math.max(0, total - 1)));
-		const newest = total;
-		const end = Math.max(0, newest - this.traceOffset);
+		const end = Math.max(0, total - this.traceOffset);
 		const start = Math.max(0, end - page);
-		const visible = items.slice(start, end);
-		lines.push(truncateToWidth(t.fg("toolTitle", "    trace:") + t.fg("dim", " live reasoning / tool calls"), width));
-		if (total > page) lines.push(truncateToWidth(t.fg("dim", `      items ${start + 1}-${end} of ${total} • ctrl+u/d scroll`), width));
-		const reasoning: string[] = [];
-		const flushReasoning = () => {
-			if (!reasoning.length) return;
-			const text = reasoning.join("").replace(/\s+/g, " ").trim();
-			if (text) lines.push(truncateToWidth(t.fg("muted", `      ⎙ ${text}`), width));
-			reasoning.length = 0;
+		const visible = contentItems.slice(start, end);
+		lines.push(truncateToWidth(this.theme.fg("toolTitle", `${indent}agent text (bounded, optional):`), width));
+		if (total > page) lines.push(truncateToWidth(this.theme.fg("dim", `${indent}items ${start + 1}-${end} of ${total} • ctrl+u/d scroll`), width));
+		let currentType = "";
+		let fragments: string[] = [];
+		const flush = () => {
+			if (!fragments.length) return;
+			const text = fragments.join("").replace(/\s+/g, " ").trim();
+			const label = currentType === "thinking" ? "thinking" : currentType === "text" ? "assistant prose" : "agent content";
+			if (text) lines.push(truncateToWidth(this.theme.fg("muted", `${indent}${label}: ${text}`), width));
+			fragments = [];
 		};
 		for (const item of visible) {
-			if (!item || typeof item !== "object") continue;
-			if (item.type === "content_delta") { reasoning.push(String(item.delta ?? "")); continue; }
-			flushReasoning();
-			if (item.type === "tool_call_started") {
-				lines.push(truncateToWidth(t.fg("warning", `      🔧 ${item.toolName || "tool"} call started`), width));
-			} else if (item.type === "tool_call_completed") {
-				lines.push(truncateToWidth(t.fg("success", `      ✓ ${item.toolName || "tool"}${item.args ? ` ${String(item.args).slice(0, 60)}` : ""}`), width));
-			}
+			const type = String(item.contentType || "content");
+			if (currentType && type !== currentType) flush();
+			currentType = type;
+			fragments.push(String(item.delta ?? ""));
 		}
-		flushReasoning();
+		flush();
 	}
 
 	private addActiveIo(lines: string[], io: any, width: number, title = "I/O"): void {

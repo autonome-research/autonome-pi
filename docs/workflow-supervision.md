@@ -10,7 +10,7 @@ The public `dynamic_workflow` and `scripted_workflow` schemas are unchanged. On 
 supervisionMode: "main-agent"
 ```
 
-This value is immutable `workflow_start` ownership metadata. It is not accepted from workflow input or caller metadata. Scheduling trusts it only after the compact start projection verifies against the authoritative start record and the run belongs to the current Pi session and canonical cwd.
+This value is immutable `workflow_start` ownership metadata. It is not accepted from workflow input or caller metadata. Scheduling trusts it only after the compact start projection verifies against the authoritative start record, the run belongs to the current Pi session, and its absolute launch `cwd` agrees canonically with the system-recorded `cwdAtLaunch`. Missing, relative, malformed, or contradictory launch ownership fails closed.
 
 The marker is separate from `continuationMode: "terminal"`:
 
@@ -39,7 +39,7 @@ Operators may set `PI_DYNAMIC_WORKFLOW_DEFAULT_TIMEOUT_MS` to change the bounded
 
 ## Periodic progress reviews
 
-The visualizer schedules reviews only for verified, active, same-session/same-cwd runs carrying the marker. The default cadence is five minutes from the trusted run start. `PI_THREAD_PHASE_SUPERVISION_CHECK_MS` can change the cadence for an operator deployment (minimum one minute); there is no per-run/model-facing cadence control in this release.
+The visualizer schedules reviews only for verified, active runs carrying the marker and owned by the current session. Verified session ownership takes priority across tool-specified working directories: a Pi session may supervise its own hosted background workflow launched with `cwd` outside the session's startup/current directory. This does not weaken provenance checks—the authoritative launch `cwd` and system `cwdAtLaunch` must still be present, absolute, and canonically consistent, and another session's run remains denied. The default cadence for newly scheduled runs is ten minutes from the trusted run start. `PI_THREAD_PHASE_SUPERVISION_CHECK_MS` can change the cadence for an operator deployment (minimum one minute; `1200000` selects twenty minutes). Existing durable schedules retain their cadence across reload/restart. An explicit internal operator reschedule can adjust an unsubmitted schedule atomically without replacing its check identity or changing execution limits; pending/in-flight reviews are left intact. There is no model-facing cadence control in this release.
 
 Scheduling is durable. Restarting the host does not restart elapsed time: an overdue record becomes pending. Records use a dedicated progress-review schema and marker, remain bounded, coalesce due runs into bounded batches, and permit at most one pending check per run. Terminal completion or cancellation supersedes stale checks.
 
