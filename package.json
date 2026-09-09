@@ -48,6 +48,6 @@
     "@earendil-works/pi-coding-agent": "^0.84.2"
   },
   "overrides": {
-    "fast-uri": ">=3.1.5 <4.0.0"
+    "fast-uri": ">=3.1.6 <4.0.0"
   }
 }
