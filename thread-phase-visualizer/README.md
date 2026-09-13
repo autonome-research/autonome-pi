@@ -236,6 +236,14 @@ The demo script is intentionally not exposed as a slash command. Larger workflow
 - Shortcut: `ctrl+shift+t` opens the same dashboard directly
 - In the monitor, arrows or `j`/`k` select rows, Enter/Right expands or opens them, Left/`b`/Esc goes back, and Ctrl+U/Ctrl+D pages. Press `x` on a running workflow to request cancellation. Cancellation is requested through `~/.pi/agent/thread-phase/cancel/<runId>.json`; workflow runners cooperatively abort their thread-phase `AbortSignal` and terminate child subprocesses. All controls are documented in [`../docs/command-ledger-ui.md`](../docs/command-ledger-ui.md).
 
+## Footer status ownership and placement
+
+The visualizer publishes active status only as the text-free workflow glyph string through `ctx.ui.setStatus("thread-phase", ...)` and clears `thread-phase` when idle. During shutdown it also clears the visualizer's legacy `thread-phase-cwd` key so an older status cannot remain visible. It does not provide or override a footer renderer. Stock Pi controls placement and normally displays extension statuses on a third footer status row.
+
+RJLF's optional source patch changes that placement for **all** extension statuses, moving them onto the cwd/session row; Autonome does not install or apply the patch. RJLF's local/cloud chip is a separate `model-local-status` extension, independent of the patch, and uses `rjlf-model-class`. Both statuses can coexist, and neither extension should replace or clear the other's key.
+
+For read-only `/rjlf-status` diagnostics, legacy standalone `model-class` migration, and the explicit `npm run patch:check`, `npm run patch:apply`, and `npm run patch:restore` commands, see RJLF's [footer diagnostics and workflow coexistence guide](https://github.com/Code4me2/rjlf-pi-extensions/blob/main/docs/footer-diagnostics.md).
+
 ## Remaining visualizer work
 
 - Add usage budgets/threshold warnings on top of projected usage summaries.

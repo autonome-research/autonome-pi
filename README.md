@@ -45,6 +45,14 @@ Pi identifies git packages by repository URL, so remove the old source before in
 - Tool/API inspection remains available through `thread_phase_runs`.
 - Workflow skills are included in the package and should load automatically when tasks ask for dynamic workflows, mission workflows, structured workflow specs, scripted JavaScript workflows, or multi-phase dynamic execution.
 
+## Footer status coexistence
+
+Autonome publishes text-free live-workflow glyphs through Pi's `setStatus("thread-phase", ...)` API and clears only that key when idle. It does not replace or reposition Pi's footer. Stock Pi controls placement and normally renders extension statuses on a third footer status row.
+
+The optional [RJLF Pi extensions](https://github.com/Code4me2/rjlf-pi-extensions) source patch is a separate operator action that moves **all** extension statuses onto the cwd/session row. Autonome neither installs nor applies it. RJLF's local/cloud chip is published by its separate `model-local-status` extension and does not depend on the patch. The extensions own distinct keys (`thread-phase` and `rjlf-model-class`); neither should replace or clear the other's status.
+
+Use RJLF's read-only `/rjlf-status` command and its [footer diagnostics and migration guide](https://github.com/Code4me2/rjlf-pi-extensions/blob/main/docs/footer-diagnostics.md) to inspect publication/patch state or remove a legacy standalone `model-class` publisher. That guide documents the explicit `npm run patch:check`, `npm run patch:apply`, and `npm run patch:restore` commands; none are run by Autonome.
+
 ## Current status
 
 Latest release: [`v0.18.0`](docs/releases/v0.18.0.md). Fully restart Pi after upgrading to load the updated native modules.
