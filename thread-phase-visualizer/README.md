@@ -244,6 +244,60 @@ RJLF's optional source patch changes that placement for **all** extension status
 
 For read-only `/rjlf-status` diagnostics, legacy standalone `model-class` migration, and the explicit `npm run patch:check`, `npm run patch:apply`, and `npm run patch:restore` commands, see RJLF's [footer diagnostics and workflow coexistence guide](https://github.com/Code4me2/rjlf-pi-extensions/blob/main/docs/footer-diagnostics.md).
 
+## Optional read-only status bridge (v1)
+
+The visualizer can publish a private, local, versioned JSON snapshot for separately configured observers. It is disabled by default, adds no agent tool or UI adapter, and does not alter workflow ownership, supervision, continuation, cancellation, or recovery.
+
+Enable it before starting or reloading an interactive TUI or RPC session:
+
+```bash
+export PI_THREAD_PHASE_STATUS_BRIDGE=1
+# Optional; must be absolute and should be on a private local filesystem:
+export PI_THREAD_PHASE_STATUS_BRIDGE_DIR=/private/local/path
+```
+
+Without the override, the root is `${PI_THREAD_PHASE_STORE_DIR:-~/.pi/agent/thread-phase}/status-bridge`. Print and JSON worker invocations never publish. Disabling the option creates no bridge files or bridge timers.
+
+Each Pi session maps to an opaque `scopeId`; each session host/reload uses its own random publisher directory:
+
+```text
+<root>/v1/scopes/<scopeId>/publishers/<publisherId>/
+├── snapshot.json
+└── lease.json
+```
+
+There is deliberately no `latest` pointer or session registry. A consumer must receive the raw Pi session ID (the shell tool exposes it as `PI_SESSION_ID`) or an opaque `scopeId` out of band, then inspect only that scope. Do not enumerate scopes to guess the active session. Multiple hosts for one chat never overwrite one another. Scope and workflow IDs are the canonical unpadded base64url encoding of 32 bytes (43 characters after the prefix); publisher IDs encode exactly 16 bytes (22 characters after the prefix).
+
+The exact TypeScript shapes and reusable derivation/publisher/reader APIs are in [`lib/status-bridge.d.ts`](lib/status-bridge.d.ts). The snapshot exports only opaque identities, separate running/unknown/recent outcome counters, terminal timestamps, fixed policy/bounds, and publisher/source freshness. It never exports raw run IDs, names, paths, prompts, commands, errors, PIDs, hostnames, model/provider data, or a fabricated percentage/dominant status. Only a valid `workflow_end` establishes success, failure, or cancellation; phase errors and cancellation requests alone remain nonterminal. Historical terminal timestamps are evaluated as recorded and are not made recent by reload.
+
+V1 bounds are fixed: 8,000 index events, 256 projected runs, 64 published items, 256 publisher-directory entries, 16 KiB snapshots, and 2 KiB leases. Terminal results are recent for exactly 60 seconds. A successful bounded store observation is fresh for 30 seconds. Leases renew every 15 seconds and expire after 45 seconds; lease renewal does not change semantic snapshot `revision` or `changedAt`. Publisher freshness is availability, not workflow progress or evidence that a running workflow is not stalled.
+
+Publisher-directory allocation uses exclusive filesystem creation and retries a bounded number of random-ID collisions; it never opens or overwrites a colliding directory. Sequential allocation fails closed when the 256-entry capacity is reached. There is no cross-process scope lock, so simultaneous allocators that both observe the last free slot can transiently exceed that bound; readers then fail closed rather than scanning an unbounded directory.
+
+Each publisher removes only the exclusive directory it created, on clean replacement or shutdown. It never automatically deletes another publisher's directory: an expired timestamp makes a publisher unavailable to readers but does not prove that no live owner can renew it. A crash, interrupted initial write, or lease-less temporary-file residue can therefore consume capacity. Cleanup is deliberately offline/operator-owned: first stop every publisher for the configured session scope, then inspect and remove abandoned children of `<root>/v1/scopes/<scopeId>/publishers/`. If ownership cannot be established, leave the directory in place. This conservative policy avoids harmful deletion and accepts that repeated crashes can require manual cleanup.
+
+A minimal polling consumer from this checkout is:
+
+```js
+import {
+  createStatusBridgeReader,
+  statusBridgeRootFromEnv,
+} from "./thread-phase-visualizer/lib/status-bridge.mjs";
+
+const root = statusBridgeRootFromEnv(process.env);
+const reader = createStatusBridgeReader({ root, sessionId: process.env.PI_SESSION_ID });
+setInterval(() => {
+  const result = reader.read();
+  // Clear any prior running/success/failure display whenever this is unknown.
+  if (result.state === "unknown") return clearDisplay();
+  renderCounts(result.snapshot.counts);
+}, 5_000);
+```
+
+The reader validates schemas, exact canonical opaque-ID encodings, canonical `Date.prototype.toISOString()` UTC timestamps, freshness, revisions, regular no-follow files, size bounds, and publisher selection. A newer live publisher with unknown source wins; an expired newer publisher may yield to an older live one. `changedAt` is semantic and must not be used for freshness. Publication uses mode `0600` atomic same-directory replacement under mode `0700` directories. These local protections do not defend against a hostile process running as the same OS user, root, compromised storage or clock, or filesystems without normal same-directory atomic rename behavior.
+
+The low-frequency lifecycle keeps the existing footer observation separate from bridge projection: the footer tolerates corrupt tail records and has a 150-result cwd fallback, while the bridge rejects an incomplete source and selects up to 256 strictly session-owned runs. V1 therefore performs additional bounded synchronous index reads when enabled, including a post-projection parse probe with before/after file identity checks. Sharing a raw source observation while retaining separate verification and projection budgets is a deferred optimization; combining the final projections directly would change footer visibility or corruption semantics. No bridge reads occur on animation ticks.
+
 ## Remaining visualizer work
 
 - Add usage budgets/threshold warnings on top of projected usage summaries.

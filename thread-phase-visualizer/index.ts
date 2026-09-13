@@ -14,11 +14,18 @@ import {
 	formatUsageSummary,
 	getRunSummary,
 	latestRunSummaries,
+	normalizeStatus,
 	readIndex,
 	readRun,
 	runFileFor,
 } from "./lib/store.mjs";
 import { belongsToSession, formatOwnerMetadata, formatStaleIndicator, runSessionId } from "./lib/run-display.mjs";
+import {
+	STATUS_BRIDGE_INDEX_EVENT_LIMIT,
+	STATUS_BRIDGE_RUN_LIMIT,
+	createStatusBridgePublisher,
+	statusBridgeConfiguration,
+} from "./lib/status-bridge.mjs";
 import { canonicalCwd, canInspectRun, createCwdState, hasVerifiedLaunchCwd, matchesRunCwd, mergeMonitorRuns as mergeScopedMonitorRuns, trackCwdCommand } from "./lib/session-scope.mjs";
 import {
 	continuationClaimIsOwned,
@@ -246,6 +253,8 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	let watcher: fs.FSWatcher | undefined;
 	let statusRefreshTimer: NodeJS.Timeout | undefined;
 	let statusFooter: ReturnType<typeof createWorkflowFooterAnimator> | undefined;
+	let statusBridge: ReturnType<typeof createStatusBridgePublisher> | undefined;
+	let statusRuntimeToken: object | undefined;
 	const startupDeliveryTimers = new Set<ReturnType<typeof setTimeout>>();
 	let retryDeferredSubmissions: (() => void) | undefined;
 	let acknowledgeContinuation: ((runId: string, deliveryId: string) => void) | undefined;
@@ -356,8 +365,11 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		statusRuntimeToken = undefined;
 		statusFooter?.dispose();
 		statusFooter = undefined;
+		try { statusBridge?.close(); } catch { /* optional observer cleanup is best-effort */ }
+		statusBridge = undefined;
 		if (statusRefreshTimer) clearInterval(statusRefreshTimer);
 		statusRefreshTimer = undefined;
 		sessionTerminated = false;
@@ -377,18 +389,63 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 			})
 			: undefined;
 		statusFooter = sessionFooter;
+		const currentSessionId = ctx.sessionManager.getSessionId();
+		const runtimeToken = {};
+		statusRuntimeToken = runtimeToken;
+		const bridgeConfiguration = (ctx.mode === "tui" || ctx.mode === "rpc") ? statusBridgeConfiguration() : undefined;
+		let sessionBridge: ReturnType<typeof createStatusBridgePublisher> | undefined;
+		if (bridgeConfiguration) {
+			try {
+				sessionBridge = createStatusBridgePublisher({
+					root: bridgeConfiguration.root,
+					sessionId: currentSessionId,
+					normalizeStatus,
+				});
+				statusBridge = sessionBridge;
+			} catch {
+				// An optional observer must never interfere with the workflow/UI lifecycle.
+				sessionBridge = undefined;
+				statusBridge = undefined;
+			}
+		}
 		const updateStatus = () => {
 			// A cleared/replaced lifecycle must never read for or update its stale ctx.
-			if (!sessionFooter || statusFooter !== sessionFooter) return;
-			try {
-				const runs = mergeMonitorRuns(cwdState.activeCwd, currentSessionId);
-				sessionFooter.setWorkflowIds(runs.filter(isLiveRun).map((run) => String(run.runId || "")).filter(Boolean));
-			} catch {
-				// Store/projection failures hide background status rather than leaving stale UI.
-				sessionFooter.setWorkflowIds([]);
+			if (statusRuntimeToken !== runtimeToken) return;
+			if (sessionFooter && statusFooter === sessionFooter) {
+				try {
+					const runs = mergeMonitorRuns(cwdState.activeCwd, currentSessionId);
+					sessionFooter.setWorkflowIds(runs.filter(isLiveRun).map((run) => String(run.runId || "")).filter(Boolean));
+				} catch {
+					// Store/projection failures hide background status rather than leaving stale UI.
+					sessionFooter.setWorkflowIds([]);
+				}
+			}
+			if (sessionBridge && statusBridge === sessionBridge) {
+				try {
+					// Keep the footer's tolerant, 150-result cwd fallback independent from the
+					// bridge's strict 256-result ownership projection. Sharing that projection
+					// would change footer visibility or exhaust one side's verification budget.
+					// One post-observation probe is sufficient to reject pre-existing parse
+					// errors while the surrounding stats reject concurrent index changes.
+					const before = fs.statSync(INDEX_FILE, { bigint: true });
+					const ownedRuns = latestRunSummaries({
+						limit: STATUS_BRIDGE_RUN_LIMIT,
+						readLimit: STATUS_BRIDGE_INDEX_EVENT_LIMIT,
+						ownershipFilter: (run: AnyEvent) => run?.workflowStartResolved === true
+							&& run?.metadata?.sessionId === currentSessionId,
+					});
+					const sourceProbe = readIndex({ limit: STATUS_BRIDGE_INDEX_EVENT_LIMIT, readLimit: STATUS_BRIDGE_INDEX_EVENT_LIMIT });
+					const after = fs.statSync(INDEX_FILE, { bigint: true });
+					if (sourceProbe.parseErrors?.length || before.dev !== after.dev || before.ino !== after.ino
+						|| before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) {
+						throw new Error("status source changed during observation");
+					}
+					sessionBridge.observe(ownedRuns);
+				} catch {
+					try { sessionBridge.markUnknown("store-read-failed"); } catch { /* lease expiry fails closed */ }
+				}
 			}
 		};
-		const currentSessionId = ctx.sessionManager.getSessionId();
 		const continuationStoreDir = path.dirname(INDEX_FILE);
 		// Print/JSON worker invocations may load extensions recursively but do not
 		// own the interactive main-agent supervisor. TUI and RPC hosts do.
@@ -1056,12 +1113,15 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		// poll also removes runs that become stale solely because time passes or
 		// their PID exits, neither of which necessarily appends another event.
 		// The 120ms animation itself performs no store or liveness reads.
-		statusRefreshTimer = setInterval(updateStatus, STATUS_REFRESH_MS);
-		statusRefreshTimer.unref?.();
+		if (sessionFooter || sessionBridge) {
+			statusRefreshTimer = setInterval(updateStatus, STATUS_REFRESH_MS);
+			statusRefreshTimer.unref?.();
+		}
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		sessionTerminated = true;
+		statusRuntimeToken = undefined;
 		for (const timer of startupDeliveryTimers) clearTimeout(timer);
 		startupDeliveryTimers.clear();
 		retryDeferredSubmissions = undefined;
@@ -1074,6 +1134,8 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		statusRefreshTimer = undefined;
 		statusFooter?.dispose();
 		statusFooter = undefined;
+		try { statusBridge?.close(); } catch { /* optional observer cleanup is best-effort */ }
+		statusBridge = undefined;
 		try {
 			relinquishContinuationClaims({
 				storeDir: path.dirname(INDEX_FILE),
