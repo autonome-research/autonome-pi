@@ -8,7 +8,8 @@
     "smoke": "node scripts/smoke-test.mjs",
     "test:dynamic": "node --test dynamic-thread-phase-workflow/test/*.test.mjs",
     "test:store": "node --test thread-phase-visualizer/test/*.test.mjs",
-    "test": "npm run test:dynamic && npm run test:store && node scripts/smoke-test.mjs"
+    "test:title": "node --test thread-phase-terminal-title/test/*.test.mjs",
+    "test": "npm run test:dynamic && npm run test:store && npm run test:title && node scripts/smoke-test.mjs"
   },
   "keywords": [
     "pi-package",
@@ -24,6 +25,7 @@
   "pi": {
     "extensions": [
       "thread-phase-visualizer/index.ts",
+      "thread-phase-terminal-title/index.ts",
       "detach/index.ts",
       "codebase-exploration-workflow/index.ts",
       "code-review-workflow/index.ts",

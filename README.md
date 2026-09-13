@@ -5,6 +5,7 @@ Autonome's Pi package for shared extensions, workflow tooling, and skills.
 ## Contents
 
 - `thread-phase-visualizer` — generic TUI monitor and event store for `thread-phase-ui/v1` workflow events.
+- `thread-phase-terminal-title` — separately opt-in, read-only TUI terminal-title projection of the visualizer's status bridge.
 - `detach` — `/detach` and `/detach-status` commands for handing an interactive Pi session off to tmux so it can survive an SSH logout.
 - `codebase-exploration-workflow` — fanout codebase exploration workflow using Pi subagents.
 - `code-review-workflow` — git diff/commit code review workflow using Pi subagents.
@@ -43,11 +44,12 @@ Pi identifies git packages by repository URL, so remove the old source before in
 - `dynamic_workflow` composes validated subagent workflows directly from flat `agent`, `fanout`, `shell`, and `artifact` phases. `scripted_workflow` is the separate advanced unsandboxed JavaScript interface; `dynamic_thread_phase_workflow` is an inactive deprecated compatibility alias.
 - `mission_workflow` plans and activates approved Droid/Missions-style software missions. Always run `action: "plan"` and get user approval before `action: "activate"`.
 - Tool/API inspection remains available through `thread_phase_runs`.
+- Optional terminal-title symbols require both `PI_THREAD_PHASE_STATUS_BRIDGE=1` and `PI_THREAD_PHASE_TERMINAL_TITLE=1` before a full Pi restart. They use `⎊` for attention/unknown, exact `⚙︎` for active work, and `⌘` only for recent unaccompanied success while preserving Pi's session/cwd title. See [`thread-phase-terminal-title/README.md`](thread-phase-terminal-title/README.md) for precedence, sanitization, lifecycle, and terminal caveats.
 - Workflow skills are included in the package and should load automatically when tasks ask for dynamic workflows, mission workflows, structured workflow specs, scripted JavaScript workflows, or multi-phase dynamic execution.
 
 ## Footer status coexistence
 
-Autonome publishes text-free live-workflow glyphs through Pi's `setStatus("thread-phase", ...)` API and clears only that key when idle. It does not replace or reposition Pi's footer. Stock Pi controls placement and normally renders extension statuses on a third footer status row.
+Autonome publishes text-free live-workflow glyphs through Pi's `setStatus("thread-phase", ...)` API and clears only that key when idle. It does not replace or reposition Pi's footer. Stock Pi controls placement and normally renders extension statuses on a third footer status row. The separately opt-in terminal-title consumer uses only `setTitle()` and does not alter footer/status/widget APIs.
 
 The optional [RJLF Pi extensions](https://github.com/Code4me2/rjlf-pi-extensions) source patch is a separate operator action that moves **all** extension statuses onto the cwd/session row. Autonome neither installs nor applies it. RJLF's local/cloud chip is published by its separate `model-local-status` extension and does not depend on the patch. The extensions own distinct keys (`thread-phase` and `rjlf-model-class`); neither should replace or clear the other's status.
 
