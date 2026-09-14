@@ -9,6 +9,7 @@ export const WORKFLOW_ARTIFACT_LAYOUT = Object.freeze({
   harnessManifest: "workflow-harness-manifest.json",
   harnessSource: "workflow-harness.mjs",
   phaseOutputsDirectory: "phase-outputs",
+  delegationDirectory: "delegation",
 });
 
 export const RUNNER_OWNED_ARTIFACT_NAMES = Object.freeze(Object.values(WORKFLOW_ARTIFACT_LAYOUT));
@@ -33,5 +34,6 @@ export function atomicArtifactTemporaryPath(targetPath, token) {
 export function isRunnerOwnedArtifactName(fileName) {
   const name = String(fileName);
   if (RUNNER_OWNED_ARTIFACT_NAME_SET.has(name)) return true;
+  if (name.startsWith(`${WORKFLOW_ARTIFACT_LAYOUT.delegationDirectory}/`)) return true;
   return ATOMIC_ROOT_TARGET_NAMES.some((target) => name.startsWith(`${target}.`) && name.endsWith(".tmp"));
 }

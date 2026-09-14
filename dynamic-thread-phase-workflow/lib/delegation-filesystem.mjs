@@ -1,0 +1,112 @@
+// Scoped synchronous file primitives, NOT Pi adapters, a lease grant, or a shell sandbox.
+// Runtime must gate every invocation on active lane/leases (delegation-scope.leasesConflict),
+// including exclusive workspace ownership for rwx. No mutable caller 'lease held' flag.
+import * as fs from 'node:fs';
+import { dirname, join, relative, isAbsolute } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { normalizeScopePath, containsPath, validateDirectoryScope } from './delegation-scope.mjs';
+import { integer, object, list, text, unique, fail } from './delegation-contract.mjs';
+import { canonicalDirectory, boundedRead, sameFile, sha256, storageIO } from './delegation-storage.mjs';
+
+const MAX_FILE = 256 * 1024;
+const TEMP_PREFIX = '.delegation-write-';
+const within = (root, path) => path === root || path.startsWith(`${root}/`);
+
+export function createScopedFilesystem(options) {
+  object(options, ['workspace', 'permissions', 'directoryScope', 'protectedDirectories']);
+  const { permissions } = options;
+  const workspace = canonicalDirectory(options.workspace);
+  const directoryScope = validateDirectoryScope(options.directoryScope, permissions);
+  list(options.protectedDirectories, 32, 1).forEach(path => {
+    if (typeof path !== 'string' || !isAbsolute(path)) fail('SCOPE_DENIED', 'absolute protected directory required');
+    canonicalDirectory(path);
+  });
+  // These lists are copies, not mutable model/runtime boolean attestations. Include the
+  // actual artifact/control/profile roots even when they are outside the workspace.
+  const protectedDirectories = [...options.protectedDirectories, join(workspace, '.git'), join(workspace, '.pi')];
+  for (const scope of [...directoryScope.read, ...directoryScope.write]) {
+    canonicalDirectory(join(workspace, scope)); // scope roots must already be real directories
+    if (protectedDirectories.some(root => within(root, join(workspace, scope)))) fail('SCOPE_DENIED', 'protected scope root');
+  }
+  function check(path, operation, allowNew = false) {
+    normalizeScopePath(path);
+    if (path === '.' || path.split('/').some(p => p.startsWith(TEMP_PREFIX))) fail('SCOPE_DENIED', 'file path');
+    const absolute = join(workspace, path);
+    if (!within(workspace, absolute) || protectedDirectories.some(root => within(root, absolute))) fail('SCOPE_DENIED', 'protected/outside path');
+    const modes = operation === 'evidence' ? ['read', 'write'] : [operation];
+    if (!modes.some(mode => permissions.includes(mode === 'read' ? 'r' : 'w') && directoryScope[mode].some(root => containsPath(root, path)))) fail('SCOPE_DENIED', 'assignment');
+    canonicalDirectory(workspace);
+    // No implicit mkdir: a new file needs an existing, non-symlink canonical parent.
+    canonicalDirectory(dirname(absolute));
+    let stat;
+    try { stat = fs.lstatSync(absolute, { bigint: true }); }
+    catch (error) { if (!allowNew || error.code !== 'ENOENT') throw error; }
+    if (stat && (!stat.isFile() || stat.isSymbolicLink() || operation === 'write' && stat.nlink !== 1n)) fail('SCOPE_DENIED', 'nonregular/link alias');
+    return { absolute, stat };
+  }
+  function read(path, maxBytes = MAX_FILE, operation = 'read') {
+    integer(maxBytes, 0, MAX_FILE);
+    const { absolute } = check(path, operation);
+    return boundedRead(absolute, maxBytes);
+  }
+  function write(path, bytes, expected) {
+    if (typeof bytes === 'string') bytes = Buffer.from(text(bytes, MAX_FILE, true));
+    if (!Buffer.isBuffer(bytes) || bytes.length > MAX_FILE) fail('SCOPE_DENIED', 'write size');
+    bytes = Buffer.from(bytes);
+    const target = check(path, 'write', true);
+    if (expected !== undefined && (!target.stat || sha256(read(path, MAX_FILE, 'write')) !== expected)) fail('RESULT_INVALID', 'edit conflict');
+    const parent = dirname(target.absolute);
+    const parentStat = fs.lstatSync(parent, { bigint: true });
+    const temporary = join(parent, `${TEMP_PREFIX}${randomUUID()}`);
+    const io = storageIO(); let fd;
+    try {
+      fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+      io.writeAll(fd, bytes);
+      // Preserve ordinary mode bits, never setuid/setgid/sticky bits.
+      fs.fchmodSync(fd, target.stat ? Number(target.stat.mode & 0o777n) : 0o600);
+      fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined;
+      const current = check(path, 'write', true);
+      const currentParent = fs.lstatSync(parent, { bigint: true });
+      if (currentParent.dev !== parentStat.dev || currentParent.ino !== parentStat.ino ||
+          Boolean(current.stat) !== Boolean(target.stat) || target.stat && !sameFile(target.stat, current.stat)) fail('RESULT_INVALID', 'write race');
+      if (target.stat) fs.renameSync(temporary, target.absolute);
+      else { fs.linkSync(temporary, target.absolute); fs.unlinkSync(temporary); } // exclusive new file, no clobber
+      io.syncDirectory(parent);
+      return { path, bytes: bytes.length, sha256: sha256(bytes) };
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+      // A failed mutation is not automatically retried. Remove only our exact temporary;
+      // rename/fsync ambiguity can mean the target changed even when this method throws.
+      fs.rmSync(temporary, { force: true });
+    }
+  }
+  return Object.freeze({
+    readFile: (path, maxBytes) => read(path, maxBytes),
+    writeFile: (path, bytes) => write(path, bytes),
+    editFile(path, oldText, newText) {
+      text(oldText, MAX_FILE); text(newText, MAX_FILE, true);
+      const bytes = read(path, MAX_FILE, 'write');
+      const content = bytes.toString('utf8');
+      if (Buffer.from(content).compare(bytes) || content.indexOf(oldText) < 0 || content.indexOf(oldText) !== content.lastIndexOf(oldText)) fail('RESULT_INVALID', 'edit requires one exact UTF-8 match');
+      return write(path, content.replace(oldText, () => newText), sha256(bytes));
+    },
+    snapshotEvidence(entries) {
+      list(entries, 8); unique(entries.map(e => e.label));
+      let total = 0;
+      const sizes = entries.map(entry => {
+        object(entry, ['label', 'path', 'description']); text(entry.label, 80); text(entry.description, 512);
+        if (!/^[A-Za-z0-9_-]+$/.test(entry.label)) fail('INVALID_REQUEST');
+        const { stat } = check(entry.path, 'evidence');
+        if (stat.size > BigInt(MAX_FILE)) fail('RESULT_INVALID', 'oversized evidence');
+        total += Number(stat.size);
+        if (total > 1024 * 1024) fail('RESULT_INVALID', 'node evidence bytes');
+        return Number(stat.size);
+      });
+      return entries.map((entry, i) => {
+        const bytes = read(entry.path, sizes[i], 'evidence');
+        if (bytes.length !== sizes[i]) fail('RESULT_INVALID', 'evidence changed size');
+        return { label: entry.label, path: relative(workspace, join(workspace, entry.path)), description: entry.description, bytes };
+      });
+    },
+  });
+}
