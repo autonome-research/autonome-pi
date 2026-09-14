@@ -21,6 +21,13 @@ export interface BoundedProcessCommonOptions {
   onNoChild?: () => void;
   onChildStart?: (child: ChildProcess) => void;
   onChildEnd?: (child: ChildProcess) => void;
+  /** Internal trusted executor hook; never populate from worker/caller JSON. */
+  lifecycle?: {
+    attach(child: ChildProcess, abandon: () => void): void;
+    dispatch(): void;
+    terminate(signal: NodeJS.Signals): void;
+    settle(exit: { code: number | null; signal: NodeJS.Signals | null; spawnError?: Error }): Promise<Record<string, unknown>>;
+  };
 }
 
 export type BoundedProcessOptions = BoundedProcessCommonOptions & (
@@ -40,6 +47,7 @@ export interface BoundedProcessResult {
   aborted: boolean;
   durationMs: number;
   termination?: Record<string, unknown>;
+  scopeSettlement?: Record<string, unknown>;
   error?: string;
 }
 

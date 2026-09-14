@@ -87,15 +87,17 @@ export function reservedBytes(s) {
   const nodeCount = Object.keys(s.slots).length;
   const consumed = 3 * nodeCount - Object.values(s.slots).reduce((sum, slots) => sum + slots.length, 0);
   return calculateJournalHeadroom({ outstandingNodes: nodeCount,
-    outstandingBatches: s.batches.filter(b => !b.joined).length, outstandingCommands: 0, workflowOpen: s.workflowOpen }) - consumed * LIMITS.terminalRecordBytes;
+    outstandingBatches: s.batches.filter(b => !b.joined).length, outstandingCommands: 0, workflowOpen: s.workflowOpen }) - consumed * LIMITS.terminalRecordBytes
+    + (s.commands ?? []).reduce((sum, c) => sum + c.slots.length * LIMITS.terminalRecordBytes, 0);
 }
-export function terminalType(type) { return ['node_result', 'node_joined', 'node_closed', 'delegation_joined', 'workflow_delegation_closed'].includes(type); }
+export function terminalType(type) { return ['node_result', 'node_joined', 'node_closed', 'delegation_joined', 'workflow_delegation_closed', 'command_result', 'command_drained', 'command_closed'].includes(type); }
 export function checkCapacity(state, usedBytes, recordBytes, type) {
   integer(recordBytes, 1, terminalType(type) ? LIMITS.terminalRecordBytes : LIMITS.frameBytes);
   if (usedBytes + recordBytes + reservedBytes(state) > LIMITS.journalBytes) fail('JOURNAL_LIMIT');
   // Separate bounded projection growth allowance, not disk-space reservation. Node result,
   // join/index replacement + budget transition, and closure fit these compact allowances.
-  const projectionReserve = Object.values(state.slots).reduce((sum, slots) => sum + slots.length * 1024, 0) + state.batches.filter(b => !b.joined).length * 512;
+  const projectionReserve = Object.values(state.slots).reduce((sum, slots) => sum + slots.length * 1024, 0) + state.batches.filter(b => !b.joined).length * 512
+    + (state.commands ?? []).reduce((sum, c) => sum + c.slots.length * 1024, 0);
   if (Buffer.byteLength(canonicalJSON(state)) + projectionReserve > 1024 * 1024 - 1024) fail('JOURNAL_LIMIT', 'projection headroom');
 }
 export function reduceEvent(previous, event, manifest) {
@@ -104,6 +106,62 @@ export function reduceEvent(previous, event, manifest) {
   if (!s.workflowOpen || event.sequence !== s.sequence + 1) fail('OWNERSHIP_UNKNOWN', 'closed or nonmonotonic');
   const requireRequest = () => { hash(p.digest); uuid(p.invocationId); id(p.requestId); };
   switch (event.type) {
+    case 'command_scope': {
+      object(p, ['scopeId', 'invocationId', 'kind']); uuid(p.scopeId); uuid(p.invocationId);
+      enumValue(p.kind, ['worker', 'declared-shell']);
+      s.commandScopes ??= []; s.commands ??= [];
+      if (s.commandScopes.length >= 128 || s.commandScopes.some(x => x.scopeId === p.scopeId || x.invocationId === p.invocationId)) fail('ADMISSION_LIMIT');
+      if (p.kind === 'worker') invocationNode(s, p.invocationId);
+      else if (s.nodes.some(n => n.invocationId === p.invocationId)) fail('UNAUTHORIZED');
+      s.commandScopes.push({ ...p, frozen: false }); break;
+    }
+    case 'command_accepted': {
+      object(p, ['scopeId', 'commandId', 'processToken', 'occurrence', 'digest', 'kind']);
+      uuid(p.commandId); uuid(p.processToken); integer(p.occurrence, 1, 128); hash(p.digest);
+      enumValue(p.kind, ['worker', 'shell']);
+      const scope = s.commandScopes?.find(x => x.scopeId === p.scopeId);
+      if (!scope || scope.frozen) fail('PARENT_NOT_ACTIVE');
+      if (s.commands.length >= 128) fail('ADMISSION_LIMIT');
+      if (s.commands.some(c => c.commandId === p.commandId || c.processToken === p.processToken || c.scopeId === p.scopeId && c.occurrence === p.occurrence)) fail('REQUEST_CONFLICT');
+      const own = s.commands.filter(c => c.scopeId === p.scopeId);
+      if (p.kind === 'worker' && (scope.kind !== 'worker' || own.length || invocationNode(s, scope.invocationId).processToken !== p.processToken) ||
+          p.kind === 'shell' && (own.some(c => c.kind === 'shell' && c.slots.length) ||
+            scope.kind === 'worker' && !own.some(c => c.kind === 'worker' && c.pid && !c.result))) fail('PARENT_NOT_ACTIVE');
+      s.commands.push({ ...p, invocationId: scope.invocationId, pid: null, result: null, disposition: null, slots: ['result', 'drain', 'close'] }); break;
+    }
+    case 'command_started': {
+      object(p, ['commandId', 'pid']); integer(p.pid, 1);
+      const c = s.commands?.find(c => c.commandId === p.commandId);
+      if (!c || c.pid || c.result) fail('OWNERSHIP_UNKNOWN'); c.pid = p.pid; break;
+    }
+    case 'command_scope_frozen': {
+      object(p, ['scopeId']); const scope = s.commandScopes?.find(x => x.scopeId === p.scopeId);
+      if (!scope || scope.frozen) fail('PARENT_NOT_ACTIVE'); scope.frozen = true; break;
+    }
+    case 'command_result': {
+      object(p, ['commandId', 'classification', 'code', 'signal']);
+      enumValue(p.classification, ['clean', 'residual_cleanup', 'cancelled', 'timeout', 'callback_error', 'start_error', 'spawn_error', 'signal', 'nonzero', 'validation_error']);
+      if (p.code !== null) integer(p.code, 0, 255);
+      if (p.signal !== null) text(p.signal, 32);
+      const c = s.commands?.find(c => c.commandId === p.commandId);
+      if (!c || c.result || !c.slots.includes('result') ||
+          ['clean', 'residual_cleanup'].includes(p.classification) && (!c.pid || p.code !== 0 || p.signal !== null) ||
+          p.classification === 'signal' && (p.signal === null || p.code !== null) ||
+          p.classification === 'nonzero' && (p.code === null || p.code === 0 || p.signal !== null)) fail('OWNERSHIP_UNKNOWN');
+      c.result = { classification: p.classification, code: p.code, signal: p.signal }; c.slots.splice(c.slots.indexOf('result'), 1); break;
+    }
+    case 'command_drained': {
+      object(p, ['commandId', 'disposition']); enumValue(p.disposition, ['drained', 'no_child']);
+      const c = s.commands?.find(c => c.commandId === p.commandId);
+      if (!c?.result || c.disposition || !c.slots.includes('drain') ||
+          p.disposition === 'drained' && !c.pid || p.disposition === 'no_child' &&
+          (c.pid || !['cancelled', 'spawn_error', 'validation_error'].includes(c.result.classification))) fail('OWNERSHIP_UNKNOWN');
+      c.disposition = p.disposition; c.slots.splice(c.slots.indexOf('drain'), 1); break;
+    }
+    case 'command_closed': {
+      object(p, ['commandId']); const c = s.commands?.find(c => c.commandId === p.commandId);
+      if (!c?.disposition || c.slots.length !== 1 || c.slots[0] !== 'close') fail('OWNERSHIP_UNKNOWN'); c.slots = []; break;
+    }
     case 'root_reserved':
       object(p, ['rootPlanHash', 'count']);
       if (s.sequence || p.count !== manifest.roots.length || p.rootPlanHash !== sha256(canonicalJSON(manifest.roots))) fail('OWNERSHIP_UNKNOWN', 'root plan');
@@ -191,7 +249,8 @@ export function reduceEvent(previous, event, manifest) {
     }
     case 'workflow_delegation_closed':
       object(p, []);
-      if (!s.nodes.length || s.nodes.some(n => !n.closed) || s.batches.some(b => !b.joined)) fail('OWNERSHIP_UNKNOWN');
+      if (!s.nodes.length || s.nodes.some(n => !n.closed) || s.batches.some(b => !b.joined) ||
+          s.commands?.some(c => c.slots.length) || s.commandScopes?.some(c => !c.frozen)) fail('OWNERSHIP_UNKNOWN');
       s.workflowOpen = false; break;
     default: fail('UNSUPPORTED_VERSION', 'event type');
   }

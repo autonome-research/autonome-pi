@@ -84,7 +84,7 @@ export function runBoundedProcess(command, args, options = {}) {
     try {
       child = spawn(command, args, {
         cwd: options.cwd,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: options.lifecycle ? ["ignore", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
         env: options.env || process.env,
         shell: Boolean(options.shell),
         detached: process.platform !== "win32",
@@ -118,6 +118,12 @@ export function runBoundedProcess(command, args, options = {}) {
 
     const terminate = (signal = "SIGTERM") => {
       requestedSignal ||= signal;
+      if (options.lifecycle) {
+        // An opted live owner supplies identity-safe signaling. NEVER fall back
+        // to a PID/PGID signal when its authority is lost or unsupported.
+        options.lifecycle.terminate(signal);
+        return;
+      }
       terminateChild(child, signal);
       if (!killTimer) {
         killTimer = setTimeout(() => terminateChild(child, "SIGKILL"), killGraceMs);
@@ -155,9 +161,16 @@ export function runBoundedProcess(command, args, options = {}) {
         try { options.onChildEnd?.(child); } catch { /* lifecycle cleanup must not mask the process result */ }
       }
     };
-    const finish = ({ code, signal, spawnError }) => {
+    const finish = async ({ code, signal, spawnError }) => {
       if (settled) return;
       settled = true;
+      let scopeSettlement;
+      if (options.lifecycle) {
+        try { scopeSettlement = await options.lifecycle.settle({ code, signal, spawnError }); }
+        catch { scopeSettlement = { disposition: "unknown" }; }
+      }
+      // Opted settlement deliberately keeps timeout/abort ownership through
+      // direct exit, stream close and drain; legacy cleanup timing is unchanged.
       cleanup();
       const stdout = stdoutBuffer.value();
       const stderr = stderrBuffer.value();
@@ -189,6 +202,7 @@ export function runBoundedProcess(command, args, options = {}) {
         durationMs,
         termination,
         error,
+        ...(options.lifecycle ? { scopeSettlement } : {}),
       });
     };
 
@@ -225,7 +239,9 @@ export function runBoundedProcess(command, args, options = {}) {
     child.on("close", (code, signal) => finish({ code, signal }));
     if (childHasPid) {
       try {
+        options.lifecycle?.attach(child, () => finish({ code: null, signal: null }));
         options.onChildStart?.(child);
+        options.lifecycle?.dispatch();
       } catch (error) {
         streamCallbackError = error instanceof Error ? error : new Error(String(error));
         terminate("SIGTERM");

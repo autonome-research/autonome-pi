@@ -13,6 +13,14 @@ import { canonicalJSON, decodeCanonical, sha256, canonicalDirectory, boundedRead
 import { JOURNAL_SCHEMA, MANIFEST_SCHEMA, STATE_SCHEMA, uuid, validateManifest, initialState, reduceEvent, checkCapacity,
   nodeOf, invocationNode, requestPrior, reservedBytes, completionAuthority, validateCandidate } from './delegation-journal-model.mjs';
 
+const liveWriters = new WeakMap();
+const executorClaims = new WeakSet();
+// A stored snapshot or journal-shaped object cannot claim a live executor writer.
+export function claimDelegationExecutor(writer) {
+  const authority = liveWriters.get(writer);
+  if (!authority || executorClaims.has(writer)) fail('UNAUTHORIZED', 'live executor writer');
+  authority.guard(); executorClaims.add(writer); return authority;
+}
 const encode = value => Buffer.from(canonicalJSON(value));
 const plainRef = ({ artifactId, bytes, sha256 }) => ({ artifactId, bytes, sha256 });
 function artifactPlan(bytes) {
@@ -105,6 +113,7 @@ export function createDelegationJournal(options) {
   const manifestBytes = encode(manifest), manifestDigest = sha256(manifestBytes);
   const binding = { manifestDigest, runId: manifest.runId, specDigest: manifest.specDigest, profileDigest: manifest.profileDigest };
   let state = initialState(manifest), lastHash = manifestDigest, usedBytes = 0, fd, poisoned = false, busy = false, stopped = false;
+  const ownerLossListeners = new Set();
   const publish = plan => io.publish(join(directory, 'nodes'), `${plan.reference.artifactId.slice(9)}.blob`, plan.bytes);
   function guard() { if (poisoned || stopped || busy || process.pid !== manifest.ownerPid) fail('OWNERSHIP_UNKNOWN', 'writer unavailable; inspection only'); }
   function persist(type, payload, artifacts = [], at = Math.max(Date.now(), manifest.createdAt)) {
@@ -178,9 +187,35 @@ export function createDelegationJournal(options) {
     }
     if (!j.groups.some(g => g.token === token && g.pid === pid)) fail('OWNERSHIP_UNKNOWN', 'process journal ordering');
   }
-  return Object.freeze({
+  const writer = Object.freeze({
     directory, binding: Object.freeze(binding),
     snapshot() { return structuredClone({ inspectionOnly: true, resumable: false, state, usedBytes, reservedBytes: reservedBytes(state), lastHash, poisoned }); },
+    // Trusted live executor recording boundary only; these serializable records
+    // never authorize joins or signal/replay. Unknown outcomes retain all slots.
+    openCommandScope(kind, invocationId = randomUUID()) {
+      guard(); const scopeId = randomUUID();
+      persist('command_scope', { scopeId, invocationId, kind });
+      return Object.freeze({ scopeId, invocationId, ownerEpoch: manifest.ownerEpoch, runId: manifest.runId });
+    },
+    acceptCommand(scopeId, occurrence, processToken, kind, digest) {
+      guard(); const commandId = randomUUID();
+      try { processEntry(processToken, undefined); persist('command_accepted', { scopeId, commandId, occurrence, processToken, kind, digest }); }
+      catch (error) { poisoned = true; throw error; }
+      return commandId;
+    },
+    commandStarted(commandId, pid) {
+      guard(); const c = state.commands?.find(c => c.commandId === commandId);
+      if (!c) fail('UNAUTHORIZED');
+      try { processEntry(c.processToken, pid); persist('command_started', { commandId, pid }); }
+      catch (error) { poisoned = true; throw error; }
+    },
+    freezeCommandScope(scopeId) { guard(); persist('command_scope_frozen', { scopeId }); },
+    settleCommand(commandId, { classification, code, signal, disposition }) {
+      guard();
+      persist('command_result', { commandId, classification, code, signal });
+      persist('command_drained', { commandId, disposition });
+      persist('command_closed', { commandId });
+    },
     launchIntent(nodeId, processToken) {
       guard(); uuid(processToken);
       const n = nodeOf(state, nodeId);
@@ -278,8 +313,17 @@ export function createDelegationJournal(options) {
     },
     closeNode(nodeId) { guard(); if (!nodeOf(state, nodeId).closed) persist('node_closed', { nodeId }); },
     closeWorkflow() { guard(); if (state.workflowOpen) persist('workflow_delegation_closed', {}); },
-    dispose() { if (!stopped) { stopped = true; fs.closeSync(fd); } },
+    dispose() {
+      if (!stopped) {
+        stopped = true;
+        for (const listener of ownerLossListeners) listener();
+        ownerLossListeners.clear(); fs.closeSync(fd);
+      }
+    },
   });
+  liveWriters.set(writer, Object.freeze({ guard, runId: manifest.runId, ownerEpoch: manifest.ownerEpoch,
+    onOwnerLoss(listener) { guard(); ownerLossListeners.add(listener); return () => ownerLossListeners.delete(listener); } }));
+  return writer;
 }
 
 /** Strict trusted inspection. Required external binding is not inferred from editable
