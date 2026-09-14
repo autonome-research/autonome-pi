@@ -11,7 +11,8 @@ import { buildOwnChildJoinIndex, projectArtifactRead } from './delegation-contex
 import { createScopedFilesystem } from './delegation-filesystem.mjs';
 import { canonicalJSON, decodeCanonical, sha256, canonicalDirectory, boundedRead, storageIO, readStoredArtifact, validateStoredReference } from './delegation-storage.mjs';
 import { JOURNAL_SCHEMA, MANIFEST_SCHEMA, STATE_SCHEMA, uuid, validateManifest, initialState, reduceEvent, checkCapacity,
-  nodeOf, invocationNode, requestPrior, reservedBytes, completionAuthority, validateCandidate } from './delegation-journal-model.mjs';
+  nodeOf, invocationNode, requestPrior, reservedBytes, completionAuthority, validateCandidate, composeFinalResult } from './delegation-journal-model.mjs';
+import { takeResultCapability } from './delegation-results.mjs';
 
 const liveWriters = new WeakMap();
 const executorClaims = new WeakSet();
@@ -19,7 +20,16 @@ const executorClaims = new WeakSet();
 export function claimDelegationExecutor(writer) {
   const authority = liveWriters.get(writer);
   if (!authority || executorClaims.has(writer)) fail('UNAUTHORIZED', 'live executor writer');
-  authority.guard(); executorClaims.add(writer); return authority;
+  authority.guard(); executorClaims.add(writer);
+  // Do not leak the private result writer through the older executor claim.
+  return Object.freeze({ guard: authority.guard, runId: authority.runId, ownerEpoch: authority.ownerEpoch, onOwnerLoss: authority.onOwnerLoss });
+}
+// Exact in-memory coordinator provenance, NOT a raw-journal recording method.
+export function applyDelegationResult(writer, capability, operation) {
+  const authority = liveWriters.get(writer);
+  if (!authority) fail('UNAUTHORIZED');
+  authority.guard();
+  return authority.resultOperation(takeResultCapability(capability, writer, operation), operation);
 }
 const encode = value => Buffer.from(canonicalJSON(value));
 const plainRef = ({ artifactId, bytes, sha256 }) => ({ artifactId, bytes, sha256 });
@@ -37,8 +47,36 @@ const childResults = (s, parentId, extra) => s.nodes.filter(n => n.parentNodeId 
   schema: 'pi-workflow-delegation-node-result/v1', childNodeId: n.nodeId, status: n.result.status,
   summary: '', resultHash: n.result.sha256, resultArtifactId: n.result.artifactId,
 }));
-function resultContent(bytes, s, n) {
+function visibleEvidence(s, n, read) {
+  const entries = [...(n.inheritedEvidence ?? [])];
+  for (const child of s.nodes.filter(c => c.parentNodeId === n.nodeId && c.joined)) {
+    entries.push({ ownerNodeId: child.nodeId, reference: plainRef(child.result) });
+    if (child.candidate) {
+      const candidate = decodeCanonical(read(child.candidate));
+      for (const e of candidate.evidence) entries.push({ ownerNodeId: child.nodeId, reference: e.reference });
+    }
+  }
+  return [...new Map(entries.map(e => [e.reference.artifactId, e])).values()];
+}
+function candidateContent(s, n, reference, read) {
+  const visible = visibleEvidence(s, n, read);
+  const c = validateCandidate(decodeCanonical(read(reference)), s, n, visible.map(e => e.reference.artifactId));
+  c.evidence.forEach(e => read(e.reference));
+  for (const ref of new Set(c.request.acceptance.flatMap(a => a.evidenceIds).filter(id => !id.startsWith('local:')))) {
+    read(visible.find(e => e.reference.artifactId === ref).reference);
+  }
+  return c;
+}
+function resultContent(bytes, s, n, manifest, read) {
   const content = decodeCanonical(bytes);
+  if (content.schema === 'pi-workflow-delegation-result-evidence/v2') {
+    const candidate = n.candidate ? candidateContent(s, n, n.candidate, read) : null;
+    read(n.index);
+    s.nodes.filter(c => c.parentNodeId === n.nodeId && c.joined).forEach(c => read(plainRef(c.result)));
+    const expected = composeFinalResult(s, n, manifest, content.settlement?.scopeId, content.usage, candidate);
+    if (canonicalJSON(expected) !== canonicalJSON(content)) fail('RESULT_INVALID', 'final result content/binding');
+    return content;
+  }
   object(content, ['schema', 'nodeId', 'status', 'summary', 'cause', 'usageCompleteness', 'candidate', 'disposition']);
   if (content.schema !== 'pi-workflow-delegation-result-evidence/v1' || content.nodeId !== n.nodeId ||
       !['missing', 'partial', 'reported'].includes(content.usageCompleteness) || canonicalJSON(content.candidate) !== canonicalJSON(n.candidate)) fail('RESULT_INVALID');
@@ -53,16 +91,26 @@ function verifyIndex(bytes, s, ownerId, revision, extra) {
 function verifyEventArtifacts(event, s, manifest, read) {
   const p = event.payload;
   if (event.type === 'root_reserved') manifest.roots.forEach(n => verifyIndex(read(n.index), s, n.nodeId, 0));
-  if (event.type === 'delegation_accepted') p.children.forEach(n => verifyIndex(read(n.index), s, n.nodeId, 0));
+  if (event.type === 'delegation_accepted') {
+    const parent = invocationNode(s, p.invocationId), allowed = visibleEvidence(s, parent, read);
+    p.children.forEach(n => {
+      if (canonicalJSON((n.inheritedEvidence ?? []).map(e => e.reference.artifactId)) !== canonicalJSON(p.inheritedArtifactIds ?? [])) fail('PERMISSION_DENIED');
+      verifyIndex(read(n.index), s, n.nodeId, 0);
+      for (const e of n.inheritedEvidence ?? []) {
+        if (!allowed.some(a => canonicalJSON(a) === canonicalJSON(e))) fail('PERMISSION_DENIED', 'inherited evidence grant');
+        read(e.reference);
+      }
+    });
+  }
   if (event.type === 'completion_submitted') {
     const n = invocationNode(s, p.invocationId);
-    const c = validateCandidate(decodeCanonical(read(p.candidate)), s, n);
+    const c = candidateContent(s, n, p.candidate, read);
     if (p.digest !== sha256(canonicalJSON({ kind: 'complete', payload: c.request }))) fail('REQUEST_CONFLICT');
-    c.evidence.forEach(e => read(e.reference));
   }
   if (event.type === 'node_result') {
-    const c = resultContent(read(p.result), s, nodeOf(s, p.nodeId));
-    if (c.status !== p.status || c.disposition !== p.disposition) fail('RESULT_INVALID');
+    const c = resultContent(read(p.result), s, nodeOf(s, p.nodeId), manifest, read);
+    if (c.status !== p.status || c.disposition !== p.disposition ||
+        canonicalJSON(c.settlement ?? null) !== canonicalJSON(p.settlement ?? null)) fail('RESULT_INVALID');
   }
   if (event.type === 'node_joined') {
     const n = nodeOf(s, p.nodeId);
@@ -238,24 +286,33 @@ export function createDelegationJournal(options) {
         persist('worker_started', { nodeId: n.nodeId, invocationId, pid, processToken: n.processToken, profileDigest: manifest.profileDigest });
       } catch (error) { poisoned = true; throw error; }
     },
-    acceptDelegation(invocationId, requestId, request) {
+    acceptDelegation(invocationId, requestId, request, inheritedArtifactIds = []) {
       guard(); const serialized = canonicalJSON(request);
       if (Buffer.byteLength(serialized) > LIMITS.frameBytes) fail('INVALID_REQUEST');
-      const digest = sha256(canonicalJSON({ kind: 'delegate', payload: request }));
+      list(inheritedArtifactIds, 32).forEach(artifactId);
+      const inheritance = inheritedArtifactIds.length ? { inheritedArtifactIds: [...inheritedArtifactIds] } : {};
+      const digest = sha256(canonicalJSON({ kind: 'delegate', payload: request, ...inheritance }));
       if (duplicate(invocationId, requestId, digest)) return structuredClone(state.batches.find(b => b.invocationId === invocationId && b.requestId === requestId) ?? requestPrior(state, invocationId, requestId));
       try {
         validateDelegationRequest(request);
         const parent = invocationNode(state, invocationId);
+        list(inheritedArtifactIds, 32).forEach(artifactId);
+        if (new Set(inheritedArtifactIds).size !== inheritedArtifactIds.length) fail('INVALID_REQUEST');
+        const visible = visibleEvidence(state, parent, ref => readStoredArtifact(directory, ref));
+        const inheritedEvidence = inheritedArtifactIds.map(id => {
+          const e = visible.find(e => e.reference.artifactId === id);
+          if (!e) fail('PERMISSION_DENIED'); return e;
+        });
         const artifacts = [], acceptedAt = Math.max(Date.now(), manifest.createdAt);
         const children = request.children.map(c => {
           const nodeId = randomUUID(), index = indexPlan(nodeId, 0, []); artifacts.push(index);
           const authority = narrowAuthority(parent.authority, c, acceptedAt);
           scopeCheck(() => createScopedFilesystem({ workspace, permissions: authority.permissions, directoryScope: authority.directoryScope, protectedDirectories: manifest.protectedDirectories }));
           return { nodeId, agentBudget: c.agentBudget, label: c.label, authority, index: index.reference,
-            assignment: { task: c.task, acceptance: c.acceptance, ...(c.contextSummary === undefined ? {} : { parentContextSummary: c.contextSummary }) } };
+            ...(inheritedEvidence.length ? { inheritedEvidence } : {}), assignment: { task: c.task, acceptance: c.acceptance, ...(c.contextSummary === undefined ? {} : { parentContextSummary: c.contextSummary }) } };
         });
         const batchId = randomUUID();
-        persist('delegation_accepted', { invocationId, requestId, digest, request: structuredClone(request), children, batchId }, artifacts, acceptedAt);
+        persist('delegation_accepted', { invocationId, requestId, digest, request: structuredClone(request), children, batchId, ...inheritance }, artifacts, acceptedAt);
         return structuredClone(state.batches.find(b => b.batchId === batchId));
       } catch (error) {
         const code = error.message.split(':')[0];
@@ -275,7 +332,8 @@ export function createDelegationJournal(options) {
       if (prior) return structuredClone(prior.kind === 'complete' ? invocationNode(state, invocationId).candidate : prior);
       try {
         const n = invocationNode(state, invocationId);
-        validateCompletionRequest(request, completionAuthority(state, n));
+        validateCompletionRequest(request, completionAuthority(state, n,
+          visibleEvidence(state, n, ref => readStoredArtifact(directory, ref)).map(e => e.reference.artifactId)));
         const scoped = scopeCheck(() => createScopedFilesystem({ workspace, permissions: n.authority.permissions, directoryScope: n.authority.directoryScope, protectedDirectories: manifest.protectedDirectories }));
         const artifacts = [];
         const evidence = scopeCheck(() => scoped.snapshotEvidence(request.evidence)).map(e => {
@@ -301,8 +359,8 @@ export function createDelegationJournal(options) {
     },
     joinUnlaunched(nodeId) {
       guard(); const n = nodeOf(state, nodeId);
+      if (n.invocationId || !n.result) fail('OWNERSHIP_UNKNOWN', 'live result capability required');
       if (n.joined) return structuredClone(n.result);
-      if (n.invocationId || !n.result) fail('OWNERSHIP_UNKNOWN', 'launched settlement deferred');
       const plan = n.parentNodeId ? indexPlan(n.parentNodeId, state.sequence + 1, childResults(state, n.parentNodeId, n.nodeId)) : null;
       persist('node_joined', { nodeId, resultHash: n.result.sha256, parentIndex: plan?.reference ?? null }, plan ? [plan] : []);
       return structuredClone(nodeOf(state, nodeId).result);
@@ -321,7 +379,42 @@ export function createDelegationJournal(options) {
       }
     },
   });
-  liveWriters.set(writer, Object.freeze({ guard, runId: manifest.runId, ownerEpoch: manifest.ownerEpoch,
+  function resultOperation(proof, operation) {
+    guard();
+    const n = invocationNode(state, proof.scope.invocationId);
+    if (canonicalJSON(n.candidate) !== canonicalJSON(proof.candidate)) fail('REQUEST_CONFLICT', 'candidate changed after worker settlement');
+    const read = ref => readStoredArtifact(directory, ref);
+    const candidate = n.candidate ? candidateContent(state, n, n.candidate, read) : null;
+    read(n.index);
+    state.nodes.filter(c => c.parentNodeId === n.nodeId && c.joined).forEach(c => read(plainRef(c.result)));
+    const content = encode(composeFinalResult(state, n, manifest, proof.scope.scopeId, proof.usage, candidate));
+    if (operation === 'result') {
+      if (n.result) fail('REQUEST_CONFLICT', 'immutable existing result');
+      const result = artifactPlan(content), c = decodeCanonical(content);
+      persist('node_result', { nodeId: n.nodeId, result: result.reference, status: c.status,
+        disposition: c.disposition, settlement: c.settlement }, [result]);
+      proof.access.guard();
+      return Object.freeze({ ...result.reference });
+    }
+    if (!n.result || n.result.sha256 !== proof.reference.sha256 || canonicalJSON(plainRef(n.result)) !== canonicalJSON(proof.reference) ||
+        !read(proof.reference).equals(content)) fail('REQUEST_CONFLICT', 'immutable result identity/content');
+    if (operation === 'lookup') return proof.reference;
+    if (operation !== 'join') fail('UNAUTHORIZED');
+    if (!n.joined) {
+      const plan = n.parentNodeId ? indexPlan(n.parentNodeId, state.sequence + 1, childResults(state, n.parentNodeId, n.nodeId)) : null;
+      persist('node_joined', { nodeId: n.nodeId, resultHash: n.result.sha256, parentIndex: plan?.reference ?? null }, plan ? [plan] : []);
+    }
+    proof.access.guard();
+    // Structural delivery eligibility only. Scheduler later restores permits/leases.
+    const batch = state.batches.find(b => b.children.includes(n.nodeId));
+    if (batch && batch.children.every(id => nodeOf(state, id).joined)) {
+      writer.joinBatch(batch.batchId);
+      batch.children.forEach(id => { proof.access.guard(); writer.closeNode(id); });
+    } else if (!batch) writer.closeNode(n.nodeId);
+    proof.access.guard();
+    return proof.reference;
+  }
+  liveWriters.set(writer, Object.freeze({ guard, resultOperation, runId: manifest.runId, ownerEpoch: manifest.ownerEpoch,
     onOwnerLoss(listener) { guard(); ownerLossListeners.add(listener); return () => ownerLossListeners.delete(listener); } }));
   return writer;
 }

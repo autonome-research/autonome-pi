@@ -115,6 +115,8 @@ export function runBoundedProcess(command, args, options = {}) {
     let requestedSignal;
     let killTimer;
     let streamCallbackError;
+    let sourceClosed;
+    let sourceFailed = false;
 
     const terminate = (signal = "SIGTERM") => {
       requestedSignal ||= signal;
@@ -164,6 +166,9 @@ export function runBoundedProcess(command, args, options = {}) {
     const finish = async ({ code, signal, spawnError }) => {
       if (settled) return;
       settled = true;
+      // Only the trusted source opt-in waits here. Abandonment destroys the
+      // reader but must still observe its actual close before publishing usage.
+      if (sourceClosed) await sourceClosed;
       let scopeSettlement;
       if (options.lifecycle) {
         try { scopeSettlement = await options.lifecycle.settle({ code, signal, spawnError }); }
@@ -210,18 +215,34 @@ export function runBoundedProcess(command, args, options = {}) {
     // calling Buffer#toString independently would corrupt split code points.
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
+    const callbackFailed = (error) => {
+      streamCallbackError ||= error instanceof Error ? error : new Error(String(error));
+      // Keep normal identity-safe termination/drain; failure is never success.
+      terminate("SIGTERM");
+    };
     const observeChunk = (callback, chunk) => {
       if (!callback || streamCallbackError) return;
-      try {
-        callback(chunk);
-      } catch (error) {
-        streamCallbackError = error instanceof Error ? error : new Error(String(error));
-        // Do not settle until the child exits: the normal escalation timer must
-        // remain armed in case the child ignores SIGTERM.
-        terminate("SIGTERM");
-      }
+      try { callback(chunk); } catch (error) { callbackFailed(error); }
     };
+    if (options.stdoutSource) {
+      sourceClosed = new Promise(done => {
+        child.stdout.once("close", () => {
+          const complete = child.stdout.readableEnded && !sourceFailed;
+          if (!complete) callbackFailed(new Error("SOURCE_PROTOCOL: stdout observation incomplete"));
+          try { options.stdoutSource.close(complete); }
+          catch (error) { callbackFailed(error); }
+          finally { done(); }
+        });
+      });
+      child.stdout.on("error", error => { sourceFailed = true; callbackFailed(error); });
+    }
     child.stdout.on("data", (chunk) => {
+      // Authoritative input is independent of BOTH optional display callbacks,
+      // capture settings and retention bounds. Only its own failure stops it.
+      if (options.stdoutSource && !sourceFailed) {
+        try { options.stdoutSource.push(chunk); }
+        catch (error) { sourceFailed = true; callbackFailed(error); }
+      }
       observeChunk(options.onStdout, chunk);
       if (options.captureStdout !== false) stdoutBuffer.append(chunk);
     });

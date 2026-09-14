@@ -18,6 +18,11 @@ export interface BoundedProcessCommonOptions {
   captureStderr?: boolean;
   onStdout?: (chunk: string) => void;
   onStderr?: (chunk: string) => void;
+  /** Internal trusted source lifetime, independent of optional display/capture.
+   * close runs at actual stdout closure, before result; false means lost input.
+   * No hook is called when no stream was created. Never from caller/worker JSON.
+   */
+  stdoutSource?: { push(chunk: string): void; close(complete: boolean): void };
   onNoChild?: () => void;
   onChildStart?: (child: ChildProcess) => void;
   onChildEnd?: (child: ChildProcess) => void;

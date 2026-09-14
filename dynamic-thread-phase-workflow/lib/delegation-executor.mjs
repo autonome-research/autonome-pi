@@ -8,6 +8,12 @@ function freeze(value) {
   if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); }
   return value;
 }
+const resultOwners = new WeakMap();
+export function claimResultExecutor(executor, journal) {
+  const owner = resultOwners.get(executor);
+  if (!owner || owner.journal !== journal || owner.claimed) throw new Error('UNAUTHORIZED: original executor/journal required');
+  owner.access.guard(); owner.claimed = true; return owner.access;
+}
 const optionKeys = new Set(['cwd', 'env', 'signal', 'timeoutMs', 'noDeadline', 'killGraceMs', 'maxStdoutBytes', 'maxStderrBytes',
   'stdoutKeep', 'stderrKeep', 'captureStdout', 'captureStderr', 'onStdout', 'onStderr', 'onChildStart', 'onChildEnd']);
 
@@ -51,7 +57,7 @@ export function createDelegationExecutor({ journal, processJournal }) {
       commandId: command?.commandId ?? null, occurrence: command?.occurrence ?? null, ...inspection });
     receipts.set(receipt, { scope, command, used: false }); return receipt;
   }
-  function execute(handle, occurrence, command, args, options = {}, workerToken) {
+  function execute(handle, occurrence, command, args, options = {}, workerToken, stdoutSource) {
     guard(); const scope = scopeOf(handle);
     if (scope.frozen || scope.commands.some(c => c.kind === 'worker' && c.done)) throw new Error('PARENT_NOT_ACTIVE: command admission frozen');
     if (accepted >= SCOPED_LIMITS.commands) throw new Error('ADMISSION_LIMIT: commands');
@@ -76,7 +82,7 @@ export function createDelegationExecutor({ journal, processJournal }) {
       };
       try {
         result = await runBoundedProcess(ANCHOR_BINARY, ['-I', '-S', '-B', ANCHOR_PATH], {
-          ...options, lifecycle,
+          ...options, lifecycle, ...(stdoutSource ? { stdoutSource } : {}),
           onNoChild() { noChild = true; persist(() => processJournal.noChild(token)); },
           onChildStart(child) {
             persist(() => {
@@ -124,7 +130,8 @@ export function createDelegationExecutor({ journal, processJournal }) {
         receipt: disposition === 'unknown' ? null : mint(scope, entry, { disposition, classification, processToken: token }) };
       entry.done = true; entry.lifecycle = null; entry.outcome = freeze(outcome);
       // Large output is returned to the caller, not retained per accepted command.
-      entry.summary = freeze({ commandId, occurrence, processToken: token, disposition, classification });
+      entry.summary = freeze({ commandId, occurrence, processToken: token, disposition, classification,
+        code: outcome.code, signal: outcome.signal });
       return entry.outcome;
     })();
     // Drop resolved output/promise retention; only bounded compact inventory stays.
@@ -132,23 +139,27 @@ export function createDelegationExecutor({ journal, processJournal }) {
     promise.then(() => { entry.outcome = null; entry.promise = null; });
     return promise;
   }
-  return Object.freeze({
+  function startInvocation(nodeId, command, args, options = {}, sourceFactory) {
+    guard();
+    if (scopes.size >= SCOPED_LIMITS.scopes || accepted >= SCOPED_LIMITS.commands) throw new Error('ADMISSION_LIMIT');
+    let token, invocationId;
+    try {
+      token = processJournal.reserve();
+      const intent = journal.launchIntent(nodeId, token);
+      if (!intent.recordedNow) throw new Error('UNAUTHORIZED: intent already used');
+      invocationId = intent.invocationId;
+    } catch (error) { revoke(); throw error; }
+    try {
+      const scope = open('worker', invocationId);
+      // Private result-owner factory binds the generated identity BEFORE spawn
+      // or dispatch. Ordinary executor options cannot supply/replace this tap.
+      const stdoutSource = sourceFactory?.(invocationId);
+      return Object.freeze({ scope, result: execute(scope, 1, command, args, options, token, stdoutSource) });
+    } catch (error) { revoke(); throw error; }
+  }
+  const executor = Object.freeze({
     openDeclaredShell() { return open('declared-shell'); },
-    startInvocation(nodeId, command, args, options = {}) {
-      guard();
-      if (scopes.size >= SCOPED_LIMITS.scopes || accepted >= SCOPED_LIMITS.commands) throw new Error('ADMISSION_LIMIT');
-      let token, invocationId;
-      try {
-        token = processJournal.reserve();
-        const intent = journal.launchIntent(nodeId, token);
-        if (!intent.recordedNow) throw new Error('UNAUTHORIZED: intent already used');
-        invocationId = intent.invocationId;
-      } catch (error) { revoke(); throw error; }
-      try {
-        const scope = open('worker', invocationId);
-        return Object.freeze({ scope, result: execute(scope, 1, command, args, options, token) });
-      } catch (error) { revoke(); throw error; }
-    },
+    startInvocation(nodeId, command, args, options = {}) { return startInvocation(nodeId, command, args, options); },
     runShell(handle, occurrence, command, args = [], options = {}) { return execute(handle, occurrence, command, args, options); },
     async settleScope(handle) {
       guard(); const scope = scopeOf(handle);
@@ -166,7 +177,8 @@ export function createDelegationExecutor({ journal, processJournal }) {
       if (durable.length !== scope.commands.length || durable.some((c, i) => {
         const live = scope.commands[i];
         return c.commandId !== live.commandId || c.occurrence !== live.occurrence || c.processToken !== live.token ||
-          c.invocationId !== handle.invocationId || c.slots.length || c.disposition !== live.summary.disposition;
+          c.invocationId !== handle.invocationId || c.slots.length || c.disposition !== live.summary.disposition ||
+          canonicalJSON(c.result) !== canonicalJSON({ classification: live.summary.classification, code: live.summary.code, signal: live.summary.signal });
       })) { revoke(); return freeze({ disposition: 'unknown', receipt: null }); }
       scope.settlement ??= mint(scope, null, { disposition: 'drained', commands: scope.commands.map(c => c.summary) });
       return freeze({ disposition: 'drained', receipt: scope.settlement });
@@ -184,4 +196,17 @@ export function createDelegationExecutor({ journal, processJournal }) {
     },
     revoke,
   });
+  resultOwners.set(executor, { journal, claimed: false, access: Object.freeze({
+    guard, startInvocation,
+    check(handle, receipt) {
+      guard(); const scope = scopeOf(handle), provenance = receipts.get(receipt);
+      if (!provenance || provenance.used || handle.kind !== 'worker' || scope.settlement !== receipt || scope.commands.filter(c => c.kind === 'worker').length !== 1)
+        throw new Error('UNAUTHORIZED: original whole worker receipt required');
+    },
+    consume(handle, receipt) {
+      this.check(handle, receipt);
+      return executor.consumeReceipt(handle, receipt);
+    },
+  }) });
+  return executor;
 }

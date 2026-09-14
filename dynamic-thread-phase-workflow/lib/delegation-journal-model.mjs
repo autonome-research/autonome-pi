@@ -16,7 +16,10 @@ export function validateAuthority(a) {
   if (a.deadlineAt !== null) integer(a.deadlineAt);
 }
 function definition(n) {
-  object(n, ['nodeId', 'agentBudget', 'label', 'assignment', 'authority', 'index'], ['phaseIndex', 'itemIndex']);
+  object(n, ['nodeId', 'agentBudget', 'label', 'assignment', 'authority', 'index'], ['phaseIndex', 'itemIndex', 'inheritedEvidence']);
+  if (n.inheritedEvidence !== undefined) list(n.inheritedEvidence, 32).forEach(e => {
+    object(e, ['ownerNodeId', 'reference']); uuid(e.ownerNodeId); validateStoredReference(e.reference);
+  });
   uuid(n.nodeId); integer(n.agentBudget, 1, 128); text(n.label, 80); validateAssignment(n.assignment); validateAuthority(n.authority);
   validateStoredReference(n.index);
   if (n.phaseIndex !== undefined) integer(n.phaseIndex);
@@ -168,9 +171,14 @@ export function reduceEvent(previous, event, manifest) {
       s.budget = reserveRoots(s.budget, grants(manifest.roots), tid);
       manifest.roots.forEach(n => addNode(s, n)); break;
     case 'delegation_accepted': {
-      object(p, ['invocationId', 'requestId', 'digest', 'request', 'children', 'batchId']); requireRequest(); uuid(p.batchId);
+      object(p, ['invocationId', 'requestId', 'digest', 'request', 'children', 'batchId'], ['inheritedArtifactIds']); requireRequest(); uuid(p.batchId);
       validateDelegationRequest(p.request);
-      if (p.digest !== sha256(canonicalJSON({ kind: 'delegate', payload: p.request }))) fail('REQUEST_CONFLICT');
+      if (p.inheritedArtifactIds !== undefined) {
+        list(p.inheritedArtifactIds, 32, 1);
+        if (new Set(p.inheritedArtifactIds).size !== p.inheritedArtifactIds.length) fail('INVALID_REQUEST');
+      }
+      if (p.digest !== sha256(canonicalJSON({ kind: 'delegate', payload: p.request,
+        ...(p.inheritedArtifactIds ? { inheritedArtifactIds: p.inheritedArtifactIds } : {}) }))) fail('REQUEST_CONFLICT');
       const parent = invocationNode(s, p.invocationId); active(s, parent);
       if (p.request.directoryRevision !== s.sequence) fail('STALE_CONTEXT');
       list(p.children, 4, 1).forEach(definition);
@@ -218,19 +226,26 @@ export function reduceEvent(previous, event, manifest) {
       registerRequest(s, p, 'complete'); n.candidate = p.candidate; break;
     }
     case 'node_result': {
-      object(p, ['nodeId', 'result', 'status', 'disposition']); validateStoredReference(p.result); enumValue(p.status, RESULT_STATUSES);
+      object(p, ['nodeId', 'result', 'status', 'disposition'], ['settlement']); validateStoredReference(p.result); enumValue(p.status, RESULT_STATUSES);
       const n = nodeOf(s, p.nodeId);
-      if (n.result || ['success', 'partial'].includes(p.status)) fail('UNSUPPORTED_MODE', 'live executor settlement not implemented');
+      if (n.result) fail('REQUEST_CONFLICT');
+      if (p.settlement) {
+        object(p.settlement, ['scopeId', 'inventoryHash']);
+        const settlement = workerSettlement(s, n, p.settlement.scopeId);
+        if (canonicalJSON(settlement) !== canonicalJSON(p.settlement) || p.disposition !== 'drained') fail('OWNERSHIP_UNKNOWN');
+      } else if (['success', 'partial'].includes(p.status)) fail('UNSUPPORTED_MODE', 'live executor capability required');
       if (s.nodes.some(c => c.parentNodeId === n.nodeId && !c.joined) || s.batches.some(b => b.parentNodeId === n.nodeId && !b.joined)) fail('OWNERSHIP_UNKNOWN', 'descendants not structurally settled');
-      if (p.disposition !== (n.invocationId ? 'unknown' : 'never_launched') || !n.invocationId && !['cancelled', 'timeout', 'infrastructure_error'].includes(p.status)) fail('OWNERSHIP_UNKNOWN');
-      consume(s, n.nodeId, 'result'); n.result = { ...p.result, status: p.status, disposition: p.disposition }; break;
+      if (!p.settlement && (p.disposition !== (n.invocationId ? 'unknown' : 'never_launched') || !n.invocationId && !['cancelled', 'timeout', 'infrastructure_error'].includes(p.status))) fail('OWNERSHIP_UNKNOWN');
+      consume(s, n.nodeId, 'result'); n.result = { ...p.result, status: p.status, disposition: p.disposition,
+        ...(p.settlement ? { settlement: p.settlement } : {}) }; break;
     }
     case 'node_joined': {
       object(p, ['nodeId', 'resultHash', 'parentIndex']); hash(p.resultHash);
       const n = nodeOf(s, p.nodeId);
-      // Deliberate blocker: the existing process journal cannot prove this invocation's
-      // complete command/group set or clean exit. No supplied groupsInactive boolean.
-      if (n.invocationId || !n.result || n.result.sha256 !== p.resultHash) fail('OWNERSHIP_UNKNOWN', 'no live executor settlement proof');
+      // Pure replay checks durable structure only. The writer separately requires
+      // original live coordinator provenance for EVERY launched result/join.
+      if (!n.result || n.result.sha256 !== p.resultHash || n.invocationId && !n.result.settlement) fail('OWNERSHIP_UNKNOWN', 'no live executor settlement proof');
+      if (n.result.settlement && canonicalJSON(workerSettlement(s, n, n.result.settlement.scopeId)) !== canonicalJSON(n.result.settlement)) fail('OWNERSHIP_UNKNOWN');
       if (n.parentNodeId) { validateStoredReference(p.parentIndex); nodeOf(s, n.parentNodeId).index = p.parentIndex; }
       else if (p.parentIndex !== null) fail('INVALID_REQUEST');
       consume(s, n.nodeId, 'join');
@@ -244,7 +259,7 @@ export function reduceEvent(previous, event, manifest) {
     }
     case 'node_closed': {
       object(p, ['nodeId']); const n = nodeOf(s, p.nodeId);
-      if (!n.joined || s.batches.some(b => b.parentNodeId === n.nodeId && !b.joined)) fail('INVALID_REQUEST');
+      if (!n.joined || s.batches.some(b => !b.joined && (b.parentNodeId === n.nodeId || n.result?.settlement && b.children.includes(n.nodeId)))) fail('INVALID_REQUEST');
       consume(s, n.nodeId, 'close'); n.closed = true; break;
     }
     case 'workflow_delegation_closed':
@@ -256,17 +271,80 @@ export function reduceEvent(previous, event, manifest) {
   }
   s.sequence = event.sequence; return s;
 }
-export function completionAuthority(s, n) {
+// Canonical full inventory digest is inspection data, never a live receipt.
+export function workerSettlement(s, n, scopeId) {
+  uuid(scopeId);
+  const scope = s.commandScopes?.find(c => c.scopeId === scopeId);
+  const commands = s.commands?.filter(c => c.scopeId === scopeId) ?? [];
+  if (!n.invocationId || scope?.kind !== 'worker' || scope.invocationId !== n.invocationId || !scope.frozen ||
+      commands.filter(c => c.kind === 'worker' && c.processToken === n.processToken).length !== 1 ||
+      commands.some(c => c.slots.length || !c.result || !['drained', 'no_child'].includes(c.disposition))) fail('OWNERSHIP_UNKNOWN', 'whole worker inventory');
+  return { scopeId, inventoryHash: sha256(canonicalJSON(commands)) };
+}
+export function validateExclusiveUsage(u, invocationId) {
+  object(u, ['schema', 'invocationId', 'source', 'streamBytes', 'streamHash', 'completeness', 'counters', 'totals', 'problem', 'diagnostic']);
+  if (u.schema !== 'pi-workflow-exclusive-usage/v1' || u.invocationId !== invocationId || u.source !== 'worker-stdout') fail('RESULT_INVALID');
+  integer(u.streamBytes); hash(u.streamHash); enumValue(u.completeness, ['missing', 'partial', 'reported']);
+  object(u.counters, ['assistant', 'compaction', 'missing', 'partial', 'ignoredTool', 'unfinished']);
+  Object.values(u.counters).forEach(v => integer(v));
+  object(u.totals, ['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens', 'cost']);
+  for (const k of ['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens']) integer(u.totals[k]);
+  object(u.totals.cost, ['input', 'output', 'cacheRead', 'cacheWrite', 'total']);
+  Object.values(u.totals.cost).forEach(v => { if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || Object.is(v, -0)) fail('RESULT_INVALID'); });
+  if (u.problem !== null) enumValue(u.problem, ['SOURCE_PROTOCOL', 'USAGE_CONFLICT', 'USAGE_LIMIT', 'USAGE_LIFECYCLE_AMBIGUOUS', 'USAGE_IDENTITY_MISSING']);
+  if (u.diagnostic !== null) {
+    if (u.diagnostic.type === 'assistant_failure') {
+      object(u.diagnostic, ['type', 'stopReason']); enumValue(u.diagnostic.stopReason, ['error', 'aborted']);
+    } else {
+      object(u.diagnostic, ['type', 'aborted'], ['reason', 'willRetry', 'errorMessage']);
+      if (u.diagnostic.type !== 'compaction_failure' || typeof u.diagnostic.aborted !== 'boolean') fail('RESULT_INVALID');
+      if (u.diagnostic.reason !== undefined) enumValue(u.diagnostic.reason, ['manual', 'threshold', 'overflow']);
+      if (u.diagnostic.willRetry !== undefined && typeof u.diagnostic.willRetry !== 'boolean') fail('RESULT_INVALID');
+      if (u.diagnostic.errorMessage !== undefined) text(u.diagnostic.errorMessage, 4096);
+    }
+  }
+  const sources = u.counters.assistant + u.counters.compaction;
+  integer(sources);
+  if (u.counters.missing > sources || u.counters.partial > sources) fail('RESULT_INVALID');
+  const expected = sources === u.counters.missing ? 'missing' : u.problem || u.counters.unfinished || u.counters.missing || u.counters.partial ? 'partial' : 'reported';
+  if (u.completeness !== expected) fail('RESULT_INVALID', 'usage completeness');
+  return u;
+}
+export function composeFinalResult(s, n, manifest, scopeId, usage, candidate) {
+  const settlement = workerSettlement(s, n, scopeId);
+  validateExclusiveUsage(usage, n.invocationId);
+  if (s.nodes.some(c => c.parentNodeId === n.nodeId && !c.joined) || s.batches.some(b => b.parentNodeId === n.nodeId && !b.joined)) fail('OWNERSHIP_UNKNOWN', 'descendants not structurally settled');
+  const classes = s.commands.filter(c => c.scopeId === scopeId).map(c => c.result.classification);
+  let status, cause;
+  if (classes.includes('timeout')) { status = 'timeout'; cause = 'TIMEOUT'; }
+  else if (classes.includes('cancelled')) { status = 'cancelled'; cause = 'CANCELLED'; }
+  else if (usage.problem) { status = 'infrastructure_error'; cause = usage.problem; }
+  else if (classes.some(c => ['callback_error', 'start_error', 'spawn_error', 'validation_error'].includes(c))) {
+    status = 'infrastructure_error'; cause = classes.find(c => ['callback_error', 'start_error', 'spawn_error', 'validation_error'].includes(c)).toUpperCase();
+  } else if (classes.some(c => c !== 'clean')) { status = 'failed'; cause = classes.find(c => c !== 'clean').toUpperCase(); }
+  else if (usage.diagnostic) { status = 'failed'; cause = usage.diagnostic.type.toUpperCase(); }
+  else if (!candidate) { status = 'missing_completion'; cause = 'MISSING_COMPLETION'; }
+  else { status = candidate.request.status; cause = 'COMPLETION_CLAIM'; }
+  const completion = candidate ? { ...candidate.request,
+    acceptance: candidate.request.acceptance.map(a => ({ ...a, evidenceIds: a.evidenceIds.map(ref => ref.startsWith('local:') ?
+      candidate.evidence.find(e => e.label === ref.slice(6)).reference.artifactId : ref) })),
+    evidence: candidate.evidence.map((e, i) => ({ ownerNodeId: n.nodeId, label: e.label,
+      description: candidate.request.evidence[i].description, reference: e.reference })) } : null;
+  return { schema: 'pi-workflow-delegation-result-evidence/v2', runId: manifest.runId, ownerEpoch: manifest.ownerEpoch,
+    nodeId: n.nodeId, invocationId: n.invocationId, settlement, disposition: 'drained', status, cause,
+    summary: candidate?.request.summary ?? '', candidate: n.candidate, completion, usage,
+    ownChildJoinIndex: n.index, children: s.nodes.filter(c => c.parentNodeId === n.nodeId).map(c => ({ nodeId: c.nodeId, result: c.result })) };
+}
+export function completionAuthority(s, n, evidenceIds = []) {
   return { assignment: n.assignment,
     joinedChildren: s.nodes.filter(c => c.parentNodeId === n.nodeId && c.joined).map(c => ({ childNodeId: c.nodeId, resultHash: c.result.sha256 })),
-    // Only own/direct joined children artifacts. Explicit inherited evidence requires
-    // a future separately validated visibility grant, not caller-supplied IDs here.
-    visibleArtifactIds: s.nodes.filter(c => c.parentNodeId === n.nodeId && c.joined).flatMap(c => [c.result.artifactId]) };
+    visibleArtifactIds: [...new Set([...evidenceIds, ...(n.inheritedEvidence ?? []).map(e => e.reference.artifactId),
+      ...s.nodes.filter(c => c.parentNodeId === n.nodeId && c.joined).map(c => c.result.artifactId)])] };
 }
-export function validateCandidate(content, s, n) {
+export function validateCandidate(content, s, n, evidenceIds = []) {
   object(content, ['schema', 'nodeId', 'request', 'evidence']);
   if (content.schema !== 'pi-workflow-delegation-candidate/v1' || content.nodeId !== n.nodeId) fail('RESULT_INVALID');
-  validateCompletionRequest(content.request, completionAuthority(s, n));
+  validateCompletionRequest(content.request, completionAuthority(s, n, evidenceIds));
   list(content.evidence, 8).forEach(e => { object(e, ['label', 'reference']); text(e.label, 80); validateStoredReference(e.reference); });
   if (content.evidence.length !== content.request.evidence.length || content.evidence.some((e, i) => e.label !== content.request.evidence[i].label) ||
       content.evidence.some(e => e.reference.bytes > 256 * 1024) || content.evidence.reduce((sum, e) => sum + e.reference.bytes, 0) > 1024 * 1024) fail('RESULT_INVALID');
