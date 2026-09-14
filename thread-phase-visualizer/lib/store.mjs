@@ -1,8 +1,9 @@
-import { chmodSync, closeSync, existsSync, fstatSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { constants as fsConstants, chmodSync, closeSync, existsSync, fstatSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { canonicalCwd } from "./session-scope.mjs";
+import { STATUS_BRIDGE_INDEX_EVENT_LIMIT, STATUS_BRIDGE_RUN_LIMIT } from "./status-bridge.mjs";
 import { applyCommandLedgerEvent, createCommandLedger, finalizeCommandLedger, isCommandLedgerEvent } from "./command-ledger.mjs";
 
 export const SCHEMA_VERSION = "thread-phase-ui/v1";
@@ -1685,14 +1686,19 @@ export function getRunSummary(runId) {
   return restoreRunStartMetadata(projectRun(readRun(runId), { referenceTime }), undefined, { verify: true, referenceTime });
 }
 
-export function latestRunSummaries({ limit = 20, cwd, workflow, readLimit = 5000, filter, ownershipFilter, ownershipReadBudgetBytes = DEFAULT_OWNERSHIP_READ_BUDGET_BYTES, ownershipFallbackScanLimit = DEFAULT_OWNERSHIP_FALLBACK_SCAN_LIMIT, ownershipSidecarReadBudgetBytes = DEFAULT_OWNERSHIP_SIDECAR_READ_BUDGET_BYTES, ownershipSidecarScanLimit = DEFAULT_OWNERSHIP_SIDECAR_SCAN_LIMIT } = {}) {
+export function latestRunSummaries(options = {}) {
+  const referenceTime = projectionReferenceTime();
+  const { readLimit = 5000, cwd, workflow } = options;
+  return projectLatestRunSummaries(readIndex({ limit: readLimit, cwd, workflow }), options, referenceTime);
+}
+
+function projectLatestRunSummaries(events, { limit = 20, filter, ownershipFilter, ownershipReadBudgetBytes = DEFAULT_OWNERSHIP_READ_BUDGET_BYTES, ownershipFallbackScanLimit = DEFAULT_OWNERSHIP_FALLBACK_SCAN_LIMIT, ownershipSidecarReadBudgetBytes = DEFAULT_OWNERSHIP_SIDECAR_READ_BUDGET_BYTES, ownershipSidecarScanLimit = DEFAULT_OWNERSHIP_SIDECAR_SCAN_LIMIT } = {}, referenceTime = projectionReferenceTime()) {
   // Ownership and other authoritative fields may only be available from the
   // bounded run-prefix lookup. Restore them before applying a caller filter,
   // then enforce the result limit. This lets session-scoped callers fill their
   // requested limit from visible runs instead of letting newer foreign runs
   // consume a global pre-filter candidate limit.
-  const referenceTime = projectionReferenceTime();
-  const runs = projectRuns(readIndex({ limit: readLimit, cwd, workflow }), { referenceTime });
+  const runs = projectRuns(events, { referenceTime });
   const maxResults = positiveInteger(limit, 20);
   if (maxResults === 0) return [];
   const makeBudget = () => ({
@@ -1722,6 +1728,83 @@ export function latestRunSummaries({ limit = 20, cwd, workflow, readLimit = 5000
     if (visible.length >= maxResults) break;
   }
   return visible;
+}
+
+/**
+ * Strict bridge-only observation. Unlike tolerant readIndex/readRun recovery,
+ * this projects exactly one contiguous suffix: never skip an interior record
+ * and then restore an older start as evidence that a run is still running.
+ * Missing sources throw; an existing empty source is a valid empty observation.
+ */
+export function observeSessionRunSummaries(sessionId) {
+  if (typeof sessionId !== "string" || !sessionId) throw new Error("Session ID required");
+  const fd = openSync(INDEX_FILE, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0) | (fsConstants.O_NONBLOCK || 0));
+  try {
+    const before = fstatSync(fd, { bigint: true });
+    if (!before.isFile() || before.size > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("Invalid status source");
+    const size = Number(before.size);
+    // One slab bounds actual index I/O as well as retained input. No delimiter
+    // search outside it, even for a multi-gigabyte malformed record.
+    const bytes = Buffer.allocUnsafe(Math.min(size, DEFAULT_JSONL_READ_MAX_BYTES));
+    const offset = size - bytes.length;
+    if (bytes.length && readSync(fd, bytes, 0, bytes.length, offset) !== bytes.length) throw new Error("Short status source read");
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    const events = [];
+    let cursor = bytes.length;
+    let records = 0;
+    let truncatedBy;
+    while (cursor > 0) {
+      if (records === STATUS_BRIDGE_INDEX_EVENT_LIMIT) {
+        truncatedBy = "records";
+        break;
+      }
+      if (bytes[cursor - 1] !== 10) throw new Error("Incomplete status source record");
+      const start = cursor < 2 ? 0 : bytes.lastIndexOf(10, cursor - 2) + 1;
+      const length = cursor - start;
+      if (length > EVENT_RECORD_MAX_BYTES) throw new Error("Oversized status source record");
+      // At a byte cutoff the leading fragment is outside the chosen window.
+      // Its LF establishes the oldest trustworthy boundary. No older records
+      // are recovered across this boundary or across any malformed record.
+      if (start === 0 && offset > 0) {
+        truncatedBy = "bytes";
+        break;
+      }
+      records++;
+      if (length > 1) {
+        const event = JSON.parse(decoder.decode(bytes.subarray(start, cursor - 1)));
+        if (!event || typeof event !== "object" || Array.isArray(event)
+          || event.schema !== SCHEMA_VERSION || typeof event.runId !== "string" || safeRunId(event.runId) !== event.runId
+          || typeof event.workflow !== "string" || !event.workflow
+          || typeof event.type !== "string" || !event.type
+          || typeof event.timestamp !== "string" || !Number.isFinite(Date.parse(event.timestamp))
+          || new Date(event.timestamp).toISOString() !== event.timestamp) throw new Error("Malformed status source event");
+        events.push(event);
+      }
+      cursor = start;
+    }
+    const runs = projectLatestRunSummaries(events.reverse(), {
+      limit: STATUS_BRIDGE_RUN_LIMIT,
+      ownershipFilter: (run) => run?.workflowStartResolved === true && run?.metadata?.sessionId === sessionId,
+    });
+    const after = fstatSync(fd, { bigint: true });
+    const current = statSync(INDEX_FILE, { bigint: true });
+    for (const stat of [after, current]) {
+      if (before.dev !== stat.dev || before.ino !== stat.ino || runFileMetadataSignature(before) !== runFileMetadataSignature(stat)) {
+        throw new Error("Status source changed during observation");
+      }
+    }
+    return {
+      runs,
+      window: {
+        startByte: offset + cursor, endByte: size, records,
+        maxBytes: DEFAULT_JSONL_READ_MAX_BYTES, recordMaxBytes: EVENT_RECORD_MAX_BYTES,
+        recordLimit: STATUS_BRIDGE_INDEX_EVENT_LIMIT,
+        ...(truncatedBy ? { truncatedBy } : {}),
+      },
+    };
+  } finally {
+    closeSync(fd);
+  }
 }
 
 // Backward-compatible alias for the original projected run helper.

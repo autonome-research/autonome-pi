@@ -15,14 +15,13 @@ import {
 	getRunSummary,
 	latestRunSummaries,
 	normalizeStatus,
+	observeSessionRunSummaries,
 	readIndex,
 	readRun,
 	runFileFor,
 } from "./lib/store.mjs";
 import { belongsToSession, formatOwnerMetadata, formatStaleIndicator, runSessionId } from "./lib/run-display.mjs";
 import {
-	STATUS_BRIDGE_INDEX_EVENT_LIMIT,
-	STATUS_BRIDGE_RUN_LIMIT,
 	createStatusBridgePublisher,
 	statusBridgeConfiguration,
 } from "./lib/status-bridge.mjs";
@@ -425,22 +424,10 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 					// Keep the footer's tolerant, 150-result cwd fallback independent from the
 					// bridge's strict 256-result ownership projection. Sharing that projection
 					// would change footer visibility or exhaust one side's verification budget.
-					// One post-observation probe is sufficient to reject pre-existing parse
-					// errors while the surrounding stats reject concurrent index changes.
-					const before = fs.statSync(INDEX_FILE, { bigint: true });
-					const ownedRuns = latestRunSummaries({
-						limit: STATUS_BRIDGE_RUN_LIMIT,
-						readLimit: STATUS_BRIDGE_INDEX_EVENT_LIMIT,
-						ownershipFilter: (run: AnyEvent) => run?.workflowStartResolved === true
-							&& run?.metadata?.sessionId === currentSessionId,
-					});
-					const sourceProbe = readIndex({ limit: STATUS_BRIDGE_INDEX_EVENT_LIMIT, readLimit: STATUS_BRIDGE_INDEX_EVENT_LIMIT });
-					const after = fs.statSync(INDEX_FILE, { bigint: true });
-					if (sourceProbe.parseErrors?.length || before.dev !== after.dev || before.ino !== after.ino
-						|| before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) {
-						throw new Error("status source changed during observation");
-					}
-					sessionBridge.observe(ownedRuns);
+					// Validation and projection share one contiguous bounded source window;
+					// the store also checks index identity across ownership verification.
+					const observation = observeSessionRunSummaries(currentSessionId);
+					sessionBridge.observe(observation.runs);
 				} catch {
 					try { sessionBridge.markUnknown("store-read-failed"); } catch { /* lease expiry fails closed */ }
 				}

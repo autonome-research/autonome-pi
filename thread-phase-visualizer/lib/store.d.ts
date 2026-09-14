@@ -318,6 +318,24 @@ export type ThreadPhaseRunSummaryReadOptions = {
   /** Internal security prefilter over compact ownership data; may be rechecked after sidecar verification. */
   ownershipFilter?: (run: ThreadPhaseRunSummary) => boolean;
 };
+export type ThreadPhaseStatusObservation = {
+  runs: ThreadPhaseRunSummary[];
+  /** Local-only source scope; never published as paths/offsets in the text-free bridge. */
+  window: {
+    /** Contiguous record-aligned suffix [startByte, endByte). */
+    startByte: number;
+    endByte: number;
+    /** Physical records, including empty lines, before event deduplication. */
+    records: number;
+    maxBytes: number;
+    /** Serialized record bound including LF. */
+    recordMaxBytes: number;
+    recordLimit: number;
+    truncatedBy?: "bytes" | "records";
+  };
+};
+/** Bridge-only strict 8 MiB / 8000-record tail; throws on corrupt/changed/missing source. */
+export function observeSessionRunSummaries(sessionId: string): ThreadPhaseStatusObservation;
 export function latestRunSummaries(options?: ThreadPhaseRunSummaryReadOptions): ThreadPhaseRunSummary[];
 export function latestRuns(options?: ThreadPhaseRunSummaryReadOptions): ThreadPhaseRunSummary[];
 export function formatUsageSummary(usage: ThreadPhaseUsageSummary | undefined): string;
