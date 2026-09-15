@@ -1,9 +1,12 @@
 // INTERNAL runner-local scheduling. No public decoder, worker transport or recovery.
 import { PipelineCache, runPipeline } from '@autonome-research/thread-phase';
 import { boundedFanout } from '@autonome-research/thread-phase/patterns';
-import { claimDelegationScheduler, inspectDelegationJournal } from './delegation-journal.mjs';
+import { claimDelegationScheduler, inspectDelegationJournal, readDelegationArtifactPage } from './delegation-journal.mjs';
 import { createDelegationExecutor, guardDelegationExecutor, takeExecutorDenial } from './delegation-executor.mjs';
 import { createDelegationResults } from './delegation-results.mjs';
+import { buildDelegationContext, projectArtifactRead } from './delegation-context.mjs';
+import { allocationCounters } from './delegation-budget.mjs';
+import { readStoredArtifact } from './delegation-storage.mjs';
 import { createScopedFilesystem } from './delegation-filesystem.mjs';
 import { leasesConflict } from './delegation-scope.mjs';
 import { effectiveAuthority } from './delegation-journal-model.mjs';
@@ -26,10 +29,11 @@ export function delegationLaneCap(maxDepth, concurrency = 3, operator = {}) {
 }
 
 export function createDelegationRuntime(options) {
-  object(options, ['journal', 'processJournal', 'phases', 'worker'], ['operator', 'deadlinePolicy', 'signal', 'onInvocation', 'onEvent']);
-  const { journal, processJournal, worker, signal, onInvocation, onEvent } = options;
+  object(options, ['journal', 'processJournal', 'phases', 'worker'], ['operator', 'deadlinePolicy', 'signal', 'onInvocation', 'onEvent', 'bridge']);
+  const { journal, processJournal, worker, signal, onInvocation, onEvent, bridge } = options;
   if (typeof worker !== 'function' || onInvocation !== undefined && typeof onInvocation !== 'function' ||
-      onEvent !== undefined && typeof onEvent !== 'function') fail('INVALID_REQUEST');
+      onEvent !== undefined && typeof onEvent !== 'function' || bridge !== undefined &&
+      (!bridge || typeof bridge.prepare !== 'function' || typeof bridge.bind !== 'function' || typeof bridge.close !== 'function')) fail('INVALID_REQUEST');
   if (options.operator !== undefined) object(options.operator, [], ['maxConcurrentAgents', 'maxLiveAgents']);
   if (signal !== undefined && !(signal instanceof AbortSignal)) fail('INVALID_REQUEST', 'AbortSignal required');
   const operator = { maxConcurrentAgents: 3, maxLiveAgents: 24, ...options.operator };
@@ -219,6 +223,70 @@ export function createDelegationRuntime(options) {
     n.joined = true; n.mode = 'joined'; clearTimeout(n.timer); n.timer = null;
     emit('joined', n);
   }
+  function contextState(d) {
+    if (d.joined) return 'joined';
+    if (d.result) return d.result.status === 'cancelled' ? 'cancelled' : 'failed';
+    if (d.stopped) return d.stopped === 'cancelled' ? 'cancelled' : 'failed';
+    return ({ waiting_children: 'waiting_children', result_pending_exit: 'result_pending_exit', running: 'running' })[d.schedulerState] ?? 'queued';
+  }
+  function treeRoot(d, all) {
+    let current = d;
+    while (current.parentNodeId) current = all.find(n => n.nodeId === current.parentNodeId);
+    return current;
+  }
+  function visibleReferences(s, n) {
+    return [...(n.inheritedEvidence ?? []).map(e => e.reference),
+      ...s.nodes.filter(c => c.parentNodeId === n.nodeId && c.joined && c.result).map(c => ({
+        artifactId: c.result.artifactId, bytes: c.result.bytes, sha256: c.result.sha256,
+      })), n.index];
+  }
+  function page(reference, request) {
+    return readDelegationArtifactPage(journal.directory, reference, request, [reference.artifactId]);
+  }
+  function scopedRead(action) {
+    try { return action(); }
+    catch (error) {
+      if (['ENOENT', 'ENOTDIR', 'ELOOP'].includes(error?.code)) throw new Error('SCOPE_DENIED: path unavailable');
+      if (['EACCES', 'EPERM'].includes(error?.code)) throw new Error('PERMISSION_DENIED: path access');
+      throw error;
+    }
+  }
+  function contextFor(n) {
+    const s = state(), d = durable(n.nodeId), all = s.nodes;
+    const nodes = all.map(item => {
+      const root = treeRoot(item, all);
+      return { nodeId: item.nodeId, treeRootNodeId: root.nodeId,
+        ...(item.parentNodeId ? { parentNodeId: item.parentNodeId } : {}), phaseIndex: root.phaseIndex ?? 0,
+        ...(item.itemIndex === undefined ? {} : { itemIndex: item.itemIndex }), depth: root.nodeId === item.nodeId ? 0 : allocationDepth(item, all),
+        label: item.label, state: contextState(item), task: item.assignment.task, scopePreview: JSON.stringify(item.authority.directoryScope),
+        createdSequence: 1, ...(item.result ? { resultArtifactId: item.result.artifactId, resultStatus: item.result.status } : {}) };
+    });
+    const selfNode = nodes.find(item => item.nodeId === d.nodeId);
+    const counters = allocationCounters(s.budget, d.nodeId);
+    const joinedChildren = all.filter(item => item.parentNodeId === d.nodeId && item.joined);
+    const indexReference = { ...d.index, revision: joinedChildren.length ? s.sequence : 0, childCount: joinedChildren.length };
+    const ancestors = [];
+    let current = d;
+    while (current.parentNodeId) { current = all.find(item => item.nodeId === current.parentNodeId); ancestors.unshift({ nodeId: current.nodeId, label: current.label, constraintsSummary: current.assignment.parentContextSummary ?? '' }); }
+    const evidence = visibleReferences(s, d).map(reference => {
+      const bytes = readStoredArtifact(journal.directory, reference);
+      return { artifactId: reference.artifactId, ownerNodeId: d.nodeId, bytes: reference.bytes, sha256: reference.sha256,
+        preview: bytes.subarray(0, 160).toString('utf8') };
+    });
+    return buildDelegationContext({ runId: manifest.runId, budgetScopeId: manifest.budgetScopeId,
+      directoryRevision: s.sequence, asOfEventSequence: s.sequence, workflowContext: manifest.policy.context,
+      self: { nodeId: d.nodeId, treeRootNodeId: selfNode.treeRootNodeId, ...(d.parentNodeId ? { parentNodeId: d.parentNodeId } : {}),
+        depth: selfNode.depth, state: selfNode.state, label: d.label, grantedPermissions: d.authority.permissions,
+        grantedTools: d.authority.grantedTools, directoryScope: d.authority.directoryScope,
+        ...(effectiveAuthority(d).deadlineAt === null ? {} : { deadlineAt: effectiveAuthority(d).deadlineAt }),
+        agentBudget: counters.agentBudget, spent: counters.spent, available: counters.available, reservedForChildren: counters.reservedForChildren },
+      assignment: d.assignment, ancestors, nodes, evidence, inheritedArtifactIds: (d.inheritedEvidence ?? []).map(e => e.reference.artifactId), ownChildJoinIndex: indexReference });
+  }
+  function allocationDepth(item, all) {
+    let depth = 0, current = item;
+    while (current.parentNodeId) { depth++; current = all.find(n => n.nodeId === current.parentNodeId); }
+    return depth;
+  }
   function nodeHandle(n) {
     const d = durable(n.nodeId);
     const files = createScopedFilesystem({ workspace: manifest.workspace, permissions: d.authority.permissions,
@@ -228,6 +296,23 @@ export function createDelegationRuntime(options) {
       assignment: immutable({ ...structuredClone(d.assignment), authority: effectiveAuthority(d), nodeId: n.nodeId }),
       inspect() { count(n); return summary(n); },
       revision() { count(n); check(n); return state().sequence; },
+      directoryRevision() { guard(); return state().sequence; },
+      repeat(requestId) { count(n); id(requestId); check(n); return true; },
+      context(requestId) { return requestOnce(n, requestId, 'context', {}, () => contextFor(n)); },
+      artifact(requestId, request) { return requestOnce(n, requestId, 'artifact', request, () => {
+        check(n); const refs = visibleReferences(state(), durable(n.nodeId));
+        const reference = refs.find(ref => ref.artifactId === request.artifactId);
+        if (!reference) fail('PERMISSION_DENIED');
+        return page(reference, request);
+      }); },
+      fileRead(requestId, path, maxBytes) { return requestOnce(n, requestId, 'file_read', { path, maxBytes }, () => {
+        check(n); return scopedRead(() => files.readFile(path, maxBytes));
+      }); },
+      fileGrep(requestId, path, pattern) { return requestOnce(n, requestId, 'file_grep', { path, pattern }, () => { check(n); return scopedRead(() => files.grep(path, pattern)); }); },
+      fileFind(requestId, path) { return requestOnce(n, requestId, 'file_find', { path }, () => { check(n); return scopedRead(() => files.find(path)); }); },
+      fileLs(requestId, path) { return requestOnce(n, requestId, 'file_ls', { path }, () => { check(n); return scopedRead(() => files.ls(path)); }); },
+      fileWrite(requestId, path, bytes) { return requestOnce(n, requestId, 'file_write', { path, bytes: Buffer.from(bytes).toString('base64') }, () => { check(n); return files.writeFile(path, bytes); }); },
+      fileEdit(requestId, path, oldText, newText) { return requestOnce(n, requestId, 'file_edit', { path, oldText, newText }, () => { check(n); return files.editFile(path, oldText, newText); }); },
       readFile(...args) {
         count(n); check(n);
         try { return files.readFile(...args); }
@@ -305,21 +390,31 @@ export function createDelegationRuntime(options) {
   async function runNode(n) {
     guard(); arm(n);
     if (n.stopCause || cancelled || failure) return unlaunched(n, n.stopCause ?? (cancelled ? 'cancelled' : 'infrastructure_error'));
-    let recipe;
+    let recipe, prepared;
     try {
       recipe = worker(immutable(structuredClone(durable(n.nodeId))));
-      object(recipe, ['command', 'args'], ['env', 'onStdout', 'onChildStart']);
+      object(recipe, ['command', 'args'], ['env', 'onStdout', 'onStderr', 'onChildStart', 'tools']);
+      if (recipe.tools !== undefined) list(recipe.tools, 32, 1).forEach(name => text(name, 64));
       text(recipe.command, 4096); list(recipe.args, 128).forEach(a => text(a, 16384, true));
     } catch { return unlaunched(n, 'infrastructure_error'); }
     try {
       // Trusted callback/recipe, never model-authorized executable/options.
       arm(n); if (n.deadlineAt !== null && n.deadlineAt <= Date.now()) stopTree(n, 'timeout');
       if (n.stopCause) return unlaunched(n, n.stopCause);
+      if (bridge) {
+        const depth = allocationDepth(durable(n.nodeId), state().nodes);
+        const tools = recipe.tools ?? [...durable(n.nodeId).authority.grantedTools, 'workflow_context', 'workflow_complete',
+          ...(depth < manifest.policy.maxDepth ? ['workflow_delegate'] : [])];
+        prepared = bridge.prepare(n.nodeId, tools);
+      }
+      if (prepared !== undefined && (!prepared || !Buffer.isBuffer(prepared.bootstrap) || prepared.bootstrap.length > 4096)) fail('INVALID_REQUEST', 'worker bootstrap');
       const remaining = n.deadlineAt === null ? null : n.deadlineAt - Date.now();
       const launched = results.startInvocation(n.nodeId, recipe.command, recipe.args, {
         cwd: manifest.workspace, env: recipe.env ?? {}, signal: n.controller.signal,
         ...(remaining === null || remaining > MAX_TIMEOUT_MS ? { noDeadline: true } : { timeoutMs: Math.max(1, remaining) }),
+        ...(prepared ? { workerBootstrap: prepared.bootstrap } : {}),
         ...(recipe.onStdout ? { onStdout: recipe.onStdout } : {}),
+        ...(recipe.onStderr ? { onStderr: recipe.onStderr } : {}),
         onChildStart(child) {
           if (n.deadlineAt !== null && n.deadlineAt <= Date.now()) stopTree(n, 'timeout');
           return recipe.onChildStart?.(child);
@@ -329,6 +424,7 @@ export function createDelegationRuntime(options) {
       n.mode = n.stopCause || n.workerDone ? 'stopping' : 'active';
       if (n.mode === 'active') emit('running', n);
       const handle = nodeHandle(n);
+      if (prepared) bridge.bind(n.nodeId, handle, n.scope.invocationId);
       if (onInvocation) Promise.resolve().then(() => {
         if (n.stopCause || n.workerDone || held) return;
         n.callbacks.call(onInvocation, [handle], () => stopTree(n, 'infrastructure_error'));
@@ -336,6 +432,7 @@ export function createDelegationRuntime(options) {
       const outcome = await launched.result;
       if (outcome.disposition === 'unknown') { hold(); fail('OWNERSHIP_UNKNOWN'); }
       workerStopped(n);
+      if (prepared) bridge.close(n.nodeId);
       n.mode = 'settling';
       // Receipt consumption is irreversible: subtree joins FIRST, whole scope
       // drain SECOND, actual coordinator publication/join LAST.
@@ -349,6 +446,7 @@ export function createDelegationRuntime(options) {
       await eventCallbacks.drain(); guard();
       return summary(n);
     } catch (error) {
+      if (prepared) { try { bridge.close(n.nodeId); } catch {} }
       if (!n.scope && takeExecutorDenial(executor, error, n.nodeId, 'timeout')) {
         stopTree(n, 'timeout'); return unlaunched(n, 'timeout');
       }

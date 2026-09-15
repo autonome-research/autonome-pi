@@ -134,7 +134,8 @@ export async function runFixture(version, mode = 'tree', options = {}) {
     if (depth > 2 || records.length >= 3) throw new Error('FIXTURE_NODE_LIMIT');
     const directories = profileDirectories(join(root, `worker${depth}`));
     for (const directory of Object.values(directories)) await mkdir(directory, { recursive: true, mode: 0o700 });
-    const env = workerEnvironment({ ...directories, tmpDir: root, nodePath: process.execPath });
+    const env = { ...workerEnvironment({ ...directories, tmpDir: root, nodePath: process.execPath }),
+      PI_DELEGATION_BRIDGE_SOCKET: socketPath };
     await mkdir(join(directories.agentDir, 'extensions'));
     await writeFile(join(directories.agentDir, 'extensions/poison.ts'), poison);
     await writeFile(join(directories.agentDir, 'AGENTS.md'), 'POISON_GLOBAL_CONTEXT');
@@ -145,7 +146,7 @@ export async function runFixture(version, mode = 'tree', options = {}) {
     const record = { depth, nodeId: `node${depth}`, invocationId: `fixture-invocation-${depth}`, capability: randomBytes(32).toString('hex'),
       requests: 0, events: [], results: [], env, stderr: '', stdout: '', code: null };
     records.push(record);
-    const args = ['--import', join(supportDir, 'no-network.mjs'), version.cliPath,
+    const args = ['--import', join(supportDir, 'no-network.mjs'), '--import', join(supportDir, 'strict-no-network.mjs'), version.cliPath,
       '--mode', 'json', '--print', '--no-session', '--no-approve', '--no-extensions', '--no-skills', '--no-themes', '--no-prompt-templates', '--no-context-files',
       '--system-prompt', 'FIXTURE ONLY deterministic protocol compatibility', '--append-system-prompt', 'No discovery.',
       '--tools', workerNames(depth).join(','), ...(options.missingProvider ? [] : ['-e', join(supportDir, 'provider.ts')]), '-e', join(supportDir, 'worker.ts'),

@@ -37,7 +37,7 @@ export function claimResultExecutor(executor, journal) {
   owner.access.guard(); owner.claimed = true; return owner.access;
 }
 const optionKeys = new Set(['cwd', 'env', 'signal', 'timeoutMs', 'noDeadline', 'killGraceMs', 'maxStdoutBytes', 'maxStderrBytes',
-  'stdoutKeep', 'stderrKeep', 'captureStdout', 'captureStderr', 'onStdout', 'onStderr', 'onChildStart', 'onChildEnd']);
+  'stdoutKeep', 'stderrKeep', 'captureStdout', 'captureStderr', 'onStdout', 'onStderr', 'onChildStart', 'onChildEnd', 'workerBootstrap']);
 
 export function createDelegationExecutor({ journal, processJournal }) {
   const authority = claimDelegationExecutor(journal);
@@ -106,8 +106,9 @@ export function createDelegationExecutor({ journal, processJournal }) {
           Object.keys(options).some(k => !optionKeys.has(k))) throw new Error('INVALID_REQUEST: command/options');
       if (!workerToken && options.noDeadline === true) throw new Error('INVALID_REQUEST: shell requires deadline');
       argv = [command, ...args];
+      if (options.workerBootstrap !== undefined && !workerToken) throw new Error('UNAUTHORIZED: worker bootstrap');
       lifecycle = createScopedProcess(argv, options.killGraceMs, () => { if (workerToken) freezeAdmission(scope); }, revoke,
-        () => callbackFailed(scope));
+        () => callbackFailed(scope), Boolean(workerToken && options.workerBootstrap));
       // Native preflight may reenter trusted observers before any reservation.
       if (scope.frozen || scope.blocked) throw new Error('PARENT_NOT_ACTIVE: command admission frozen');
     } catch (cause) {

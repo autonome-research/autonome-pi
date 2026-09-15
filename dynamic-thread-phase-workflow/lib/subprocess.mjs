@@ -101,6 +101,7 @@ export function runBoundedProcess(command, args, options = {}) {
     let killGraceMs;
     let stdoutBuffer;
     let stderrBuffer;
+    let workerBootstrap;
     try {
       if (options.noDeadline !== undefined && typeof options.noDeadline !== "boolean") {
         throw new Error("process noDeadline must be a boolean");
@@ -113,6 +114,10 @@ export function runBoundedProcess(command, args, options = {}) {
       killGraceMs = normalizeTimeoutMs(options.killGraceMs ?? DEFAULT_KILL_GRACE_MS, "process killGraceMs");
       stdoutBuffer = new BoundedTextBuffer(options.maxStdoutBytes ?? DEFAULT_CAPTURE_BYTES, { keep: options.stdoutKeep ?? "head" });
       stderrBuffer = new BoundedTextBuffer(options.maxStderrBytes ?? DEFAULT_CAPTURE_BYTES, { keep: options.stderrKeep ?? "tail" });
+      if (options.workerBootstrap !== undefined) {
+        if (!Buffer.isBuffer(options.workerBootstrap) || options.workerBootstrap.length > 4096) throw new Error('INVALID_REQUEST: worker bootstrap');
+        workerBootstrap = Buffer.from(options.workerBootstrap);
+      }
     } catch (error) {
       try { reportNoChild(); } catch (proofError) { reject(proofError); return; }
       reject(error);
@@ -141,7 +146,8 @@ export function runBoundedProcess(command, args, options = {}) {
     try {
       child = spawn(command, args, {
         cwd: options.cwd,
-        stdio: options.lifecycle ? ["ignore", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
+        stdio: workerBootstrap ? ["ignore", "pipe", "pipe", "pipe", "pipe"] :
+          options.lifecycle ? ["ignore", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
         env: options.env || process.env,
         shell: Boolean(options.shell),
         detached: process.platform !== "win32",
@@ -225,6 +231,7 @@ export function runBoundedProcess(command, args, options = {}) {
       if (killTimer) clearTimeout(killTimer);
       options.signal?.removeEventListener("abort", onWorkflowAbort);
       timeoutController?.signal.removeEventListener("abort", onTimeoutAbort);
+      if (workerBootstrap) { try { child.stdio[4]?.destroy(); } catch {} }
       if (childHasPid && !callbacks) {
         try { options.onChildEnd?.(child); } catch { /* legacy cleanup must not mask the process result */ }
       }
@@ -298,6 +305,13 @@ export function runBoundedProcess(command, args, options = {}) {
       catch { /* the owned lifecycle retains failure/unknown; never skip termination */ }
       terminate("SIGTERM");
     };
+    if (workerBootstrap) {
+      // The anchor intentionally closes this handoff after passing it to the
+      // payload; ECONNRESET on the parent pipe is not a worker lifecycle failure.
+      child.stdio[4].on('error', () => {});
+      try { child.stdio[4].end(workerBootstrap); }
+      catch (error) { callbackFailed(error); }
+    }
     const observeChunk = (kind, callback, chunk) => {
       if (!callback || streamCallbackError || published) return;
       try {

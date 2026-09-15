@@ -15,10 +15,10 @@ export function probeGroup(pid) {
   catch (error) { return error?.code === 'ESRCH' ? 'gone' : 'unknown'; }
 }
 
-export function createScopedProcess(argv, graceMs = SCOPED_LIMITS.graceMs, onDirect = () => {}, onLoss = () => {}, onCallbackFailure = () => {}) {
+export function createScopedProcess(argv, graceMs = SCOPED_LIMITS.graceMs, onDirect = () => {}, onLoss = () => {}, onCallbackFailure = () => {}, preserveWorkerFd = false) {
   if (process.platform !== 'linux') throw new Error('UNSUPPORTED_MODE: Linux subreaper/pidfd required');
-  if (!Number.isSafeInteger(graceMs) || graceMs < 1 || graceMs > SCOPED_LIMITS.maxGraceMs) throw new Error('INVALID_REQUEST: grace');
-  const config = JSON.stringify({ type: 'dispatch', argv, graceMs }) + '\n';
+  if (!Number.isSafeInteger(graceMs) || graceMs < 1 || graceMs > SCOPED_LIMITS.maxGraceMs || typeof preserveWorkerFd !== 'boolean') throw new Error('INVALID_REQUEST: grace');
+  const config = JSON.stringify({ type: 'dispatch', argv, graceMs, ...(preserveWorkerFd ? { preserveWorkerFd: true } : {}) }) + '\n';
   if (Buffer.byteLength(config) > 64000) throw new Error('INVALID_REQUEST: command bound');
   let child, ready = false, dispatch = false, sent = false, stopped = false, unknown = false;
   let requested = false, termSent = false, direct = null, residual = false, empty = false, buffer = '', frames = 0;
@@ -34,7 +34,7 @@ export function createScopedProcess(argv, graceMs = SCOPED_LIMITS.graceMs, onDir
     clearTimeout(bootstrapTimer); clearTimeout(shutdownTimer);
     // Veto synchronously BEFORE reader-close listeners/abandonment. Reentrant
     // executor revoke cannot send anything on this already-lost channel.
-    for (const action of [onLoss, () => child?.stdio[3]?.destroy(), () => child?.stdout.destroy(),
+    for (const action of [onLoss, () => child?.stdio[3]?.destroy(), () => child?.stdio[4]?.destroy(), () => child?.stdout.destroy(),
       () => child?.stderr.destroy(), () => child?.unref(), () => abandon?.()]) {
       try { action(); } catch { /* keep unknown; one failing listener cannot skip cleanup */ }
     }

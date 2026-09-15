@@ -39,9 +39,9 @@ export function createScopedFilesystem(options, { guard = () => {}, onMutationEr
     canonicalDirectory(join(workspace, scope)); // scope roots must already be real directories
     if (protectedDirectories.some(root => within(root, join(workspace, scope)))) fail('SCOPE_DENIED', 'protected scope root');
   }
-  function check(path, operation, allowNew = false) {
+  function check(path, operation, allowNew = false, allowAny = false, directory = false) {
     guard(); normalizeScopePath(path);
-    if (path === '.' || path.split('/').some(p => p.startsWith(TEMP_PREFIX))) fail('SCOPE_DENIED', 'file path');
+    if ((!directory && path === '.') || path.split('/').some(p => p.startsWith(TEMP_PREFIX))) fail('SCOPE_DENIED', 'file path');
     const absolute = join(workspace, path);
     if (!within(workspace, absolute) || protectedDirectories.some(root => within(root, absolute))) fail('SCOPE_DENIED', 'protected/outside path');
     const modes = operation === 'evidence' ? ['read', 'write'] : [operation];
@@ -52,7 +52,7 @@ export function createScopedFilesystem(options, { guard = () => {}, onMutationEr
     let stat;
     try { stat = fs.lstatSync(absolute, { bigint: true }); }
     catch (error) { if (!allowNew || error.code !== 'ENOENT') throw error; }
-    if (stat && (!stat.isFile() || stat.isSymbolicLink() || operation === 'write' && stat.nlink !== 1n)) fail('SCOPE_DENIED', 'nonregular/link alias');
+    if (stat && ((!allowAny && !stat.isFile()) || stat.isSymbolicLink() || operation === 'write' && stat.nlink !== 1n)) fail('SCOPE_DENIED', 'nonregular/link alias');
     guard(); return { absolute, stat };
   }
   function read(path, maxBytes = MAX_FILE, operation = 'read') {
@@ -112,8 +112,55 @@ export function createScopedFilesystem(options, { guard = () => {}, onMutationEr
       }
     }
   }
+  function directory(path) {
+    const checked = check(path, 'read', false, true, true);
+    if (!fs.lstatSync(checked.absolute).isDirectory()) fail('SCOPE_DENIED', 'directory required');
+    return checked;
+  }
+  function entries(path) {
+    const values = [], checked = directory(path);
+    const handle = fs.opendirSync(checked.absolute);
+    try {
+      for (let entry; (entry = handle.readSync()) !== null;) {
+        if (values.length >= 128) fail('CONTEXT_LIMIT', 'directory entries');
+        if (entry.isSymbolicLink()) continue;
+        values.push(entry.name);
+      }
+    } finally { handle.closeSync(); }
+    return values.sort((a, b) => a.localeCompare(b));
+  }
+  function search(path, pattern, filesOnly = false) {
+    text(path, 4096); text(pattern, 256, true);
+    if (!pattern && !filesOnly) fail('INVALID_REQUEST', 'empty search pattern');
+    const matches = [], seen = { count: 0 };
+    function walk(relativePath) {
+      for (const name of entries(relativePath)) {
+        if (++seen.count > 128) fail('CONTEXT_LIMIT', 'search entries');
+        const child = relativePath === '.' ? name : `${relativePath}/${name}`;
+        const stat = fs.lstatSync(check(child, 'read', false, true).absolute);
+        if (stat.isDirectory()) walk(child);
+        else if (stat.isFile()) {
+          if (filesOnly) matches.push(child);
+          else for (const [line, value] of read(child).toString('utf8').split('\n').entries()) if (value.includes(pattern)) {
+            matches.push(`${child}:${line + 1}: ${value}`);
+            if (matches.length >= 100 || Buffer.byteLength(matches.join('\n')) > 8192) fail('CONTEXT_LIMIT', 'matches');
+          }
+        }
+      }
+    }
+    const checked = check(path, 'read', false, true, true), root = checked.absolute, stat = fs.lstatSync(root);
+    if (stat.isDirectory()) walk(path);
+    else if (stat.isFile() && !filesOnly) for (const [line, value] of read(path).toString('utf8').split('\n').entries()) if (value.includes(pattern)) {
+      matches.push(`${path}:${line + 1}: ${value}`);
+      if (matches.length >= 100 || Buffer.byteLength(matches.join('\n')) > 8192) fail('CONTEXT_LIMIT', 'matches');
+    }
+    return matches.join('\n');
+  }
   return Object.freeze({
     readFile: (path, maxBytes) => operation(() => read(path, maxBytes)),
+    ls: path => operation(() => entries(path)),
+    find: path => operation(() => search(path, '', true)),
+    grep: (path, pattern) => operation(() => search(path, pattern)),
     writeFile: (path, bytes) => operation(() => write(path, bytes)),
     editFile: (path, oldText, newText) => operation(() => {
       text(oldText, MAX_FILE); text(newText, MAX_FILE, true);

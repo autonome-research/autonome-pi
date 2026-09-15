@@ -49,6 +49,7 @@ def main():
 
     dispatch = None
     term_sent = False
+    preserve_worker_fd = False
 
     def budget():
         now = time.monotonic()
@@ -58,7 +59,7 @@ def main():
             raise RuntimeError("bootstrap deadline")
 
     def check(timeout=0):
-        nonlocal buffer, dispatch, stopping, grace
+        nonlocal buffer, dispatch, stopping, grace, preserve_worker_fd
         # One parser, no recursive dispatch. Collect at most 64 KiB/four reads;
         # a still-readable flood fails unknown rather than starving action checks.
         budget()
@@ -87,9 +88,15 @@ def main():
             if message.get("type") == "term" and set(message) == {"type"}:
                 if stopping is None:
                     stopping = time.monotonic()
-            elif message.get("type") == "dispatch" and set(message) == {"type", "argv", "graceMs"}:
+            elif message.get("type") == "dispatch" and (
+                    set(message) == {"type", "argv", "graceMs"} or
+                    set(message) == {"type", "argv", "graceMs", "preserveWorkerFd"} and
+                    type(message["preserveWorkerFd"]) is bool):
                 if launched or dispatch is not None:
                     raise RuntimeError("duplicate dispatch")
+                preserve_worker_fd = message.get("preserveWorkerFd", False)
+                if type(preserve_worker_fd) is not bool:
+                    raise RuntimeError("bootstrap fd")
                 argv, ms = message["argv"], message["graceMs"]
                 if type(ms) is not int or not 1 <= ms <= 5000:
                     raise RuntimeError("grace bound")
@@ -123,7 +130,11 @@ def main():
             launched = True
             if stopping is None:
                 try:
-                    payload = subprocess.Popen(argv, close_fds=True)
+                    if preserve_worker_fd:
+                        os.fstat(4)
+                    payload = subprocess.Popen(argv, close_fds=True, pass_fds=(4,)) if preserve_worker_fd else subprocess.Popen(argv, close_fds=True)
+                    if preserve_worker_fd:
+                        os.close(4)
                 except OSError:
                     direct = True
                     send({"type": "direct", "code": None, "signal": None, "spawnError": True})

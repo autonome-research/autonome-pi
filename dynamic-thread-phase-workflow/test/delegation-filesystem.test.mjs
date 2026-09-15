@@ -233,7 +233,17 @@ test('temporary cleanup never deletes a replacement or an unowned failed-open pa
   }
 });
 
-test('no stock grep/find/ls/shell adapter is silently exposed', t => {
-  const { scoped } = fixture(t);
-  assert.deepEqual(Object.keys(scoped).sort(), ['editFile', 'readFile', 'snapshotEvidence', 'writeFile']);
+test('scoped ls/find/grep are bounded, text-valued, and no-follow', t => {
+  const { root, scoped } = fixture(t);
+  fs.mkdirSync(join(root, 'workspace/src/nested'));
+  fs.writeFileSync(join(root, 'workspace/src/a.txt'), 'NEEDLE allowed\n');
+  fs.writeFileSync(join(root, 'workspace/src/nested/b.txt'), 'other\n');
+  assert.deepEqual(scoped.ls('src'), ['a.txt', 'nested']);
+  assert.equal(scoped.find('src'), 'src/a.txt\nsrc/nested/b.txt');
+  assert.equal(scoped.grep('src', 'NEEDLE'), 'src/a.txt:1: NEEDLE allowed');
+  fs.symlinkSync('../src-other', join(root, 'workspace/src/link'));
+  assert.throws(() => scoped.ls('src/link'), /nonregular\/link alias/);
+  assert.doesNotMatch(scoped.find('src'), /src\/link/);
+  for (let i = 0; i < 128; i++) fs.writeFileSync(join(root, 'workspace/src', `bounded-${i}`), 'x');
+  assert.throws(() => scoped.ls('src'), /directory entries/);
 });

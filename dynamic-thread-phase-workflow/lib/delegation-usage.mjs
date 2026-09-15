@@ -5,7 +5,7 @@ import { exclusiveUsageObserver } from '../worker/exclusive-usage.mjs';
 import { canonicalJSON } from './delegation-storage.mjs';
 import { text } from './delegation-contract.mjs';
 
-const ignored = new Set(['agent_start', 'agent_end', 'turn_end', 'message_start', 'message_update',
+const ignored = new Set(['agent_start', 'agent_end', 'agent_settled', 'turn_end', 'message_start', 'message_update',
   'tool_execution_start', 'tool_execution_update', 'tool_execution_end', 'session']);
 // Pi Message + coding-agent CustomAgentMessages (both supported SDKs). Validate
 // the accounting envelope, not display content or provider-specific metadata.
