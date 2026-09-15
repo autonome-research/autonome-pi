@@ -10,7 +10,7 @@ const capabilities = new WeakMap();
 export function takeResultCapability(capability, journal, operation) {
   const p = capabilities.get(capability);
   if (!p || p.journal !== journal || p.failed) fail('UNAUTHORIZED', 'live result capability');
-  p.access.guard();
+  p.access.validate(p.scope, p.receipt);
   if (operation === 'result') {
     if (p.phase !== 'ready') fail('UNAUTHORIZED', 'spent finalization');
     p.phase = 'spent';
@@ -57,7 +57,7 @@ export function createDelegationResults(options) {
       w.receipt = receipt;
       w.pending = (async () => {
         await w.done;
-        access.guard();
+        access.check(scope, receipt);
         const capability = Object.freeze({});
         const proof = { journal, access, scope, receipt, usage: w.usage, candidate: w.candidate, phase: 'ready', reference: null, failed: false };
         capabilities.set(capability, proof); w.capability = capability;

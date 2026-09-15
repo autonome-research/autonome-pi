@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { createDelegationJournal, inspectDelegationJournal, applyDelegationResult, claimDelegationExecutor, readDelegationArtifactPage } from '../lib/delegation-journal.mjs';
+import { createDelegationJournal, inspectDelegationJournal, applyDelegationResult, claimDelegationExecutor, readDelegationArtifactPage, applyObserverSeal } from '../lib/delegation-journal.mjs';
 import { createDelegationExecutor } from '../lib/delegation-executor.mjs';
 import { createDelegationResults } from '../lib/delegation-results.mjs';
 import { createProcessJournal } from '../lib/process-journal.mjs';
@@ -12,6 +12,7 @@ import { readStoredArtifact, canonicalJSON, sha256 } from '../lib/delegation-sto
 import { probeGroup } from '../lib/scoped-process.mjs';
 import { assertBudgetInvariants } from '../lib/delegation-budget.mjs';
 import { invocationUsage } from '../lib/delegation-usage.mjs';
+import { initialState, reduceEvent } from '../lib/delegation-journal-model.mjs';
 import { PiJsonEventCollector } from '../lib/pi-json-stream.mjs';
 const worker = new URL('./support/delegation-results/worker.mjs', import.meta.url).pathname;
 const oldWorker = new URL('./support/delegation-executor/process.mjs', import.meta.url).pathname;
@@ -551,6 +552,88 @@ test('RJ1 trusted source hook cannot enter ordinary executor command options', a
   const receipt = (await f.e.settleScope(declared)).receipt;
   await assert.rejects(() => f.c.finalize(declared, receipt), /UNAUTHORIZED/);
   assert.equal(f.state().budget.spent, 0);
+});
+
+test('callback lifetime: late stdout/stderr/end evidence is separate from immutable command/source and rejects forged seals', async t => {
+  for (const [hook, bit] of [['onStdout', 2], ['onStderr', 4], ['onChildEnd', 8]]) {
+    const f = fixture(t); let reject, delivered = '';
+    const deferred = new Promise((_, r) => { reject = r; });
+    const source = JSON.stringify({ type: 'turn_start' }) + '\n' + JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', usage: {
+      input: 5, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 7, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    } } }) + '\n';
+    const w = f.c.startInvocation(f.state().nodes[0].nodeId, process.execPath,
+      ['-e', `process.stdout.write(${JSON.stringify(source)});process.stderr.write('err');`], { timeoutMs: 2000,
+        onChildStart(p) { p.stdout.on('data', chunk => { delivered += chunk; }); }, [hook]() { return deferred; } });
+    f.promises.push(w.result);
+    const physical = await w.result; assert.equal(physical.classification, 'clean');
+    const command = structuredClone(f.state().commands[0]);
+    assert.throws(() => applyObserverSeal(f.j, { scopeId: w.scope.scopeId, failures: [bit] }), /UNAUTHORIZED/);
+    reject(Error('actual opted callback rejection after acknowledgement')); await pause(0);
+    assert.deepEqual(f.state().commands[0], command);
+    const settled = await f.e.settleScope(w.scope); assert.equal(settled.ok, false);
+    const ref = await f.c.finalize(w.scope, settled.receipt), content = f.read(ref);
+    assert.equal(content.cause, 'CALLBACK_ERROR'); assert.deepEqual(content.callbackFailures, [bit]);
+    assert.equal(content.usage.problem, null); assert.equal(content.usage.diagnostic, null);
+    assert.equal(content.usage.streamBytes, Buffer.byteLength(delivered)); assert.equal(content.usage.streamHash, sha256(delivered));
+    assert.equal(content.usage.totals.totalTokens, 7); assert.equal(content.usage.completeness, 'reported');
+    f.c.join(w.scope, ref); const before = f.j.snapshot();
+    assert.equal(await f.c.finalize(w.scope, settled.receipt), ref); f.c.join(w.scope, ref);
+    assert.deepEqual(f.j.snapshot(), before); assert.deepEqual(f.state().commands[0], command);
+    const view = inspect(f), events = fs.readFileSync(join(f.j.directory, 'events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    let state = initialState(view.manifest);
+    for (const event of events) {
+      if (event.type === 'scope_observers_sealed') {
+        for (const failures of [[], [1], [15], ['2'], [16], [bit, 0]])
+          assert.throws(() => reduceEvent(state, { ...event, payload: { ...event.payload, failures } }, view.manifest));
+        const sealed = reduceEvent(state, event, view.manifest);
+        assert.throws(() => reduceEvent(sealed, { ...event, sequence: sealed.sequence + 1 }, view.manifest), /OWNERSHIP_UNKNOWN/);
+        assert.equal(Buffer.byteLength(canonicalJSON(event)) < 4096, true);
+      }
+      state = reduceEvent(state, event, view.manifest);
+    }
+    assert.deepEqual(state, view.state);
+  }
+});
+
+test('callback lifetime: finite end expiry seals immutable evidence before receipt/finalize/join; later rejection is inert', async t => {
+  const f = fixture(t); let reject;
+  const deferred = new Promise((_, r) => { reject = r; });
+  const w = f.start(undefined, 'clean', { onChildEnd() { return deferred; } });
+  await w.ready; f.submit(w); w.release();
+  assert.equal((await w.result).classification, 'clean');
+  const settled = await f.e.settleScope(w.scope);
+  assert.deepEqual(settled.receipt.callbackFailures, [8]); assert.equal(settled.ok, false);
+  const pending = f.c.finalize(w.scope, settled.receipt);
+  reject(Error('after seal, during finalize await')); await Promise.resolve();
+  const ref = await pending; assert.equal(f.read(ref).cause, 'CALLBACK_ERROR');
+  const beforeJoin = f.read(ref); f.c.join(w.scope, ref);
+  assert.deepEqual(f.read(ref), beforeJoin); assert.equal(await f.c.finalize(w.scope, settled.receipt), ref);
+  assert.equal(f.state().budget.freeWorkflow, 7); assert.deepEqual(inspect(f).state, f.state());
+});
+
+test('CL1 consumed original authority must survive event preparation before any new publication', async t => {
+  for (const type of ['node_result', 'node_joined', 'node_closed']) {
+    const f = fixture(t), w = f.start(); await w.ready; f.submit(w);
+    w.release(); await w.result;
+    const receipt = (await f.e.settleScope(w.scope)).receipt;
+    const ref = type === 'node_result' ? null : await f.c.finalize(w.scope, receipt);
+    let before, files;
+    const stringify = JSON.stringify;
+    JSON.stringify = function(value, ...args) {
+      if (!before && value === type) {
+        before = f.state(); files = fs.readdirSync(join(f.j.directory, 'nodes')).sort();
+        f.e.revoke(); // Observed synchronously during encoding, BEFORE disk mutation.
+      }
+      return stringify(value, ...args);
+    };
+    try {
+      if (ref) assert.throws(() => f.c.join(w.scope, ref), /OWNERSHIP_UNKNOWN/);
+      else await assert.rejects(f.c.finalize(w.scope, receipt), /OWNERSHIP_UNKNOWN/);
+    } finally { JSON.stringify = stringify; }
+    assert.ok(before); assert.deepEqual(f.state(), before); assert.deepEqual(inspect(f).state, before);
+    assert.deepEqual(fs.readdirSync(join(f.j.directory, 'nodes')).sort(), files);
+    await assert.rejects(f.c.finalize(w.scope, receipt), /OWNERSHIP_UNKNOWN|UNAUTHORIZED/);
+  }
 });
 
 test('RJ3 token/cost aggregate overflow retains representable prefix AND independent bounded diagnostic', async t => {

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { BoundedTextBuffer } from "../lib/bounded-buffer.mjs";
-import { normalizeTimeoutMs, runBoundedProcess } from "../lib/subprocess.mjs";
+import { getEventListeners } from 'node:events';
+import { createCallbackLifetime, CALLBACK_LIMITS, normalizeTimeoutMs, runBoundedProcess } from "../lib/subprocess.mjs";
+import { createScopedProcess, ANCHOR_BINARY, ANCHOR_PATH, probeGroup } from '../lib/scoped-process.mjs';
 
 test("BoundedTextBuffer retains a byte-safe head", () => {
   const buffer = new BoundedTextBuffer(7, { keep: "head" });
@@ -250,6 +252,101 @@ test("runBoundedProcess preserves workflow cancellation separately from timeout"
   assert.equal(result.termination.kind, "cancelled");
   assert.equal(result.error, "operator cancelled");
 });
+
+test('repair: opted callback rejection veto precedes queued observation, source closes independently before result', async t => {
+  for (const kind of ['stdout', 'async-stdout', 'source', 'source-close']) {
+    const order = []; let vetoed = false, pid, delivered = '', calls = 0;
+    const script = "process.on('SIGTERM',()=>process.stdout.write('tail',()=>process.exit(0)));process.stdout.write('first');setTimeout(()=>process.exit(0),1000)";
+    const lifecycle = createScopedProcess([process.execPath, '-e', script], 100, () => {}, () => {}, () => { vetoed = true; order.push('veto'); });
+    const result = await runBoundedProcess(ANCHOR_BINARY, ['-I', '-S', '-B', ANCHOR_PATH], {
+      timeoutMs: 2000, lifecycle, onChildStart(c) { pid = c.pid; },
+      stdoutSource: { push(chunk) {
+        delivered += chunk;
+        if (kind === 'source') { queueMicrotask(() => assert.equal(vetoed, true)); throw Error('source failed'); }
+      }, close() { order.push('source-close'); if (kind === 'source-close') throw Error('source close failed'); } },
+      onStdout() {
+        calls++;
+        if (kind === 'stdout') { queueMicrotask(() => assert.equal(vetoed, true)); throw Error('display failed'); }
+        if (kind === 'async-stdout') { setImmediate(() => assert.equal(vetoed, true)); return Promise.reject(Error('display rejected')); }
+      }, onChildEnd() { order.push('end'); },
+    });
+    order.push('result');
+    assert.equal(result.scopeSettlement.disposition, 'drained'); assert.equal(probeGroup(pid), 'gone');
+    assert.equal(result.termination.kind, 'callback_error'); assert.equal(vetoed, true);
+    assert.ok(order.indexOf('source-close') < order.indexOf('end')); assert.ok(order.indexOf('end') < order.indexOf('result'));
+    if (kind.includes('stdout')) { assert.equal(calls, 1); assert.equal(delivered, 'firsttail'); }
+    t.diagnostic(JSON.stringify({ kind, pid, group: 'ESRCH', order, signals: 'owned lifecycle only; no teardown signals' }));
+  }
+});
+
+test('callback lifetime: repeated cap/expiry seals detach all reactions and own exactly one finite timer', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  for (let repeat = 0; repeat < 4; repeat++) {
+    const callbacks = createCallbackLifetime(), rejects = []; let failures = 0, overflowCalled = false;
+    for (let i = 0; i < CALLBACK_LIMITS.pending; i++) {
+      callbacks.call(() => new Promise((_, reject) => rejects.push(reject)), [], () => failures++);
+    }
+    callbacks.call(() => { overflowCalled = true; }, [], () => failures++);
+    assert.equal(overflowCalled, false); assert.equal(failures, 1);
+    assert.equal(callbacks.inspect().pending, 128);
+    const one = callbacks.seal(), two = callbacks.seal();
+    assert.equal(callbacks.inspect().timer, true);
+    t.mock.timers.tick(CALLBACK_LIMITS.settleMs); await Promise.all([one, two]);
+    assert.deepEqual(callbacks.inspect(), { pending: 0, accepting: false, sealed: true, timer: false });
+    assert.equal(failures, 129);
+    rejects.forEach(reject => { reject(Error('late')); reject(Error('repeated')); });
+    await Promise.resolve(); await Promise.resolve();
+    callbacks.call(() => { overflowCalled = true; }, [], () => failures++);
+    callbacks.close(); t.mock.timers.tick(10000);
+    assert.equal(overflowCalled, false); assert.equal(failures, 129);
+  }
+});
+
+test('callback lifetime: reentrant admission reserves first, close cancels pending timer, fulfillment leaves no reaction ownership', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const callbacks = createCallbackLifetime(); let reject, failures = 0, invoked = 0;
+  const reenter = () => { invoked++; callbacks.call(reenter, [], () => failures++); };
+  callbacks.call(reenter, [], () => failures++);
+  assert.equal(invoked, 128); assert.equal(failures, 1); assert.equal(callbacks.inspect().pending, 0);
+  const pending = createCallbackLifetime();
+  pending.call(() => new Promise((_, r) => { reject = r; }), [], () => failures++);
+  const seal = pending.seal(); pending.close(); await seal;
+  assert.equal(pending.inspect().timer, false); reject(Error('after loss')); await Promise.resolve();
+  t.mock.timers.tick(5000); assert.equal(failures, 1);
+  const success = createCallbackLifetime();
+  success.call(() => Promise.resolve(), [], () => failures++);
+  await success.seal(); assert.equal(success.inspect().pending, 0); assert.equal(success.inspect().timer, false);
+});
+
+for (const boundary of ['late-stdout', 'never-end', 'cancel', 'deadline'])
+  test(`callback lifetime: standalone opted subprocess ${boundary} is finite without truncating source or late signaling`, async t => {
+    let reject, pid, writes = 0, afterDrain = false, delivered = '';
+    const deferred = new Promise((_, r) => { reject = r; }), abort = new AbortController();
+    const lifecycle = createScopedProcess([process.execPath, '-e', "process.stdout.write('complete-source')"], 100);
+    const before = Date.now();
+    const result = await runBoundedProcess(ANCHOR_BINARY, ['-I', '-S', '-B', ANCHOR_PATH], {
+      lifecycle, signal: abort.signal, timeoutMs: boundary === 'deadline' ? 600 : 2500,
+      stdoutSource: { push(chunk) { delivered += chunk; }, close(complete) { assert.equal(complete, true); } },
+      onChildStart(p) {
+        pid = p.pid; const write = p.stdio[3].write;
+        p.stdio[3].write = function(...args) { if (afterDrain) writes++; return write.apply(this, args); };
+      },
+      ...(boundary === 'late-stdout' ? { onStdout() { return deferred; } } : {}),
+      onChildEnd() {
+        assert.equal(probeGroup(pid), 'gone'); afterDrain = true;
+        if (boundary === 'late-stdout') { setTimeout(() => reject(Error('observed while sealing')), 20); return; }
+        if (boundary === 'cancel') setTimeout(() => abort.abort('operator during observer settlement'), 20);
+        return deferred;
+      },
+    });
+    assert.equal(result.ok, false); assert.equal(result.stdout, delivered); assert.equal(delivered, 'complete-source');
+    assert.equal(result.termination.kind, boundary === 'cancel' ? 'cancelled' : boundary === 'deadline' ? 'timeout' : 'callback_error');
+    assert.equal(getEventListeners(abort.signal, 'abort').length, 0); assert.equal(writes, 0);
+    assert.ok(Date.now() - before < 2500); assert.equal(probeGroup(pid), 'gone');
+    const original = JSON.stringify(result); reject(Error('post-seal')); await Promise.resolve(); await Promise.resolve();
+    assert.equal(JSON.stringify(result), original); assert.equal(writes, 0);
+    t.diagnostic(JSON.stringify({ boundary, pid, group: 'ESRCH', elapsed: Date.now() - before, teardownSignals: 0 }));
+  });
 
 test("timeout validation rejects values that Node timers cannot represent", () => {
   assert.equal(normalizeTimeoutMs(1), 1);

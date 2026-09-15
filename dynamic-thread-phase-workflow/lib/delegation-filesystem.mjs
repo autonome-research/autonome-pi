@@ -12,8 +12,19 @@ const MAX_FILE = 256 * 1024;
 const TEMP_PREFIX = '.delegation-write-';
 const within = (root, path) => path === root || path.startsWith(`${root}/`);
 
-export function createScopedFilesystem(options) {
+// The optional binding is trusted runner code, never worker options or a lease attestation.
+export function createScopedFilesystem(options, { guard = () => {}, onMutationError = () => {} } = {}) {
   object(options, ['workspace', 'permissions', 'directoryScope', 'protectedDirectories']);
+  if (typeof guard !== 'function' || typeof onMutationError !== 'function') fail('INVALID_REQUEST');
+  let busy = false, mutated = false;
+  function operation(action) {
+    if (busy) fail('SCOPE_DENIED', 'nested file operation');
+    busy = true; mutated = false;
+    try { guard(); const value = action(); guard(); return value; }
+    catch (error) { if (mutated) onMutationError(); throw error; }
+    finally { busy = false; }
+  }
+  const mutate = action => { guard(); mutated = true; return action(); };
   const { permissions } = options;
   const workspace = canonicalDirectory(options.workspace);
   const directoryScope = validateDirectoryScope(options.directoryScope, permissions);
@@ -29,7 +40,7 @@ export function createScopedFilesystem(options) {
     if (protectedDirectories.some(root => within(root, join(workspace, scope)))) fail('SCOPE_DENIED', 'protected scope root');
   }
   function check(path, operation, allowNew = false) {
-    normalizeScopePath(path);
+    guard(); normalizeScopePath(path);
     if (path === '.' || path.split('/').some(p => p.startsWith(TEMP_PREFIX))) fail('SCOPE_DENIED', 'file path');
     const absolute = join(workspace, path);
     if (!within(workspace, absolute) || protectedDirectories.some(root => within(root, absolute))) fail('SCOPE_DENIED', 'protected/outside path');
@@ -42,12 +53,12 @@ export function createScopedFilesystem(options) {
     try { stat = fs.lstatSync(absolute, { bigint: true }); }
     catch (error) { if (!allowNew || error.code !== 'ENOENT') throw error; }
     if (stat && (!stat.isFile() || stat.isSymbolicLink() || operation === 'write' && stat.nlink !== 1n)) fail('SCOPE_DENIED', 'nonregular/link alias');
-    return { absolute, stat };
+    guard(); return { absolute, stat };
   }
   function read(path, maxBytes = MAX_FILE, operation = 'read') {
     integer(maxBytes, 0, MAX_FILE);
     const { absolute } = check(path, operation);
-    return boundedRead(absolute, maxBytes);
+    return boundedRead(absolute, maxBytes, { guard });
   }
   function write(path, bytes, expected) {
     if (typeof bytes === 'string') bytes = Buffer.from(text(bytes, MAX_FILE, true));
@@ -58,39 +69,60 @@ export function createScopedFilesystem(options) {
     const parent = dirname(target.absolute);
     const parentStat = fs.lstatSync(parent, { bigint: true });
     const temporary = join(parent, `${TEMP_PREFIX}${randomUUID()}`);
-    const io = storageIO(); let fd;
+    const io = storageIO(point => { if (point.startsWith('before:')) guard(); }); let fd;
+    function ownsTemporary() {
+      canonicalDirectory(parent);
+      const currentParent = fs.lstatSync(parent, { bigint: true });
+      let named;
+      try { named = fs.lstatSync(temporary, { bigint: true }); }
+      catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+      const opened = fs.fstatSync(fd, { bigint: true });
+      return currentParent.dev === parentStat.dev && currentParent.ino === parentStat.ino &&
+        named.dev === opened.dev && named.ino === opened.ino;
+    }
     try {
-      fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+      mutate(() => { fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600); });
       io.writeAll(fd, bytes);
       // Preserve ordinary mode bits, never setuid/setgid/sticky bits.
-      fs.fchmodSync(fd, target.stat ? Number(target.stat.mode & 0o777n) : 0o600);
-      fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined;
+      mutate(() => fs.fchmodSync(fd, target.stat ? Number(target.stat.mode & 0o777n) : 0o600));
+      mutate(() => fs.fsyncSync(fd));
       const current = check(path, 'write', true);
       const currentParent = fs.lstatSync(parent, { bigint: true });
       if (currentParent.dev !== parentStat.dev || currentParent.ino !== parentStat.ino ||
           Boolean(current.stat) !== Boolean(target.stat) || target.stat && !sameFile(target.stat, current.stat)) fail('RESULT_INVALID', 'write race');
-      if (target.stat) fs.renameSync(temporary, target.absolute);
-      else { fs.linkSync(temporary, target.absolute); fs.unlinkSync(temporary); } // exclusive new file, no clobber
-      io.syncDirectory(parent);
+      if (!ownsTemporary()) fail('RESULT_INVALID', 'temporary replaced');
+      if (target.stat) mutate(() => fs.renameSync(temporary, target.absolute));
+      else {
+        mutate(() => fs.linkSync(temporary, target.absolute)); // exclusive new file, no clobber
+        guard();
+        if (!ownsTemporary()) fail('RESULT_INVALID', 'temporary replaced');
+        mutate(() => fs.unlinkSync(temporary));
+      }
+      guard(); io.syncDirectory(parent);
       return { path, bytes: bytes.length, sha256: sha256(bytes) };
     } finally {
-      if (fd !== undefined) fs.closeSync(fd);
-      // A failed mutation is not automatically retried. Remove only our exact temporary;
-      // rename/fsync ambiguity can mean the target changed even when this method throws.
-      fs.rmSync(temporary, { force: true });
+      if (fd !== undefined) {
+        try {
+          // No pathname cleanup on lost/lent authority. Keep the descriptor pinned
+          // through identity checks; never delete a replacement at our former name.
+          let live = false;
+          try { guard(); live = true; } catch { /* retain the ambiguous temporary */ }
+          if (live && ownsTemporary()) mutate(() => fs.unlinkSync(temporary));
+        } finally { fs.closeSync(fd); }
+      }
     }
   }
   return Object.freeze({
-    readFile: (path, maxBytes) => read(path, maxBytes),
-    writeFile: (path, bytes) => write(path, bytes),
-    editFile(path, oldText, newText) {
+    readFile: (path, maxBytes) => operation(() => read(path, maxBytes)),
+    writeFile: (path, bytes) => operation(() => write(path, bytes)),
+    editFile: (path, oldText, newText) => operation(() => {
       text(oldText, MAX_FILE); text(newText, MAX_FILE, true);
       const bytes = read(path, MAX_FILE, 'write');
       const content = bytes.toString('utf8');
       if (Buffer.from(content).compare(bytes) || content.indexOf(oldText) < 0 || content.indexOf(oldText) !== content.lastIndexOf(oldText)) fail('RESULT_INVALID', 'edit requires one exact UTF-8 match');
       return write(path, content.replace(oldText, () => newText), sha256(bytes));
-    },
-    snapshotEvidence(entries) {
+    }),
+    snapshotEvidence: entries => operation(() => {
       list(entries, 8); unique(entries.map(e => e.label));
       let total = 0;
       const sizes = entries.map(entry => {
@@ -107,6 +139,6 @@ export function createScopedFilesystem(options) {
         if (bytes.length !== sizes[i]) fail('RESULT_INVALID', 'evidence changed size');
         return { label: entry.label, path: relative(workspace, join(workspace, entry.path)), description: entry.description, bytes };
       });
-    },
+    }),
   });
 }

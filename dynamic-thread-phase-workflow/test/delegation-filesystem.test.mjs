@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { syncBuiltinESMExports } from 'node:module';
 import { createScopedFilesystem } from '../lib/delegation-filesystem.mjs';
 import { boundedRead, canonicalDirectory, canonicalJSON, decodeCanonical, storageIO, publishStoredArtifact, readStoredArtifact } from '../lib/delegation-storage.mjs';
 import { leasesConflict } from '../lib/delegation-scope.mjs';
@@ -150,6 +151,86 @@ test('short writes are completed, zero writes fail, same-size replacement and gr
     return result;
   });
   assert.throws(() => boundedRead(path, 4), /changed during read/);
+});
+
+test('bound file operations deny preparation loss and partial-read siblings without stale delivery', t => {
+  for (const kind of ['write', 'edit', 'read', 'evidence']) for (const cut of ['path', 'read']) {
+    if (kind === 'write' && cut === 'read') continue;
+    const { root, options } = fixture(t);
+    fs.writeFileSync(join(root, 'workspace/src/file'), 'original');
+    let live = true, fired = false, reads = 0, ambiguous = 0;
+    const scoped = createScopedFilesystem(options, { guard() { assert.ok(live, 'original authority lost'); }, onMutationError() { ambiguous++; } });
+    const method = cut === 'path' ? 'realpathSync' : 'readSync', original = fs[method];
+    const mock = t.mock.method(fs, method, (...args) => {
+      const value = cut === 'read' ? original(args[0], args[1], args[2], 1, args[4]) : original(...args);
+      if (cut === 'read') reads++;
+      if (!fired) { fired = true; live = false; }
+      return value;
+    });
+    try {
+      assert.throws(() => kind === 'write' ? scoped.writeFile('src/file', 'changed') : kind === 'edit' ? scoped.editFile('src/file', 'original', 'changed') :
+        kind === 'read' ? scoped.readFile('src/file') : scoped.snapshotEvidence([{ label: 'e', path: 'src/file', description: 'e' }]), /original authority lost/);
+    } finally { mock.mock.restore(); }
+    assert.equal(fired, true); assert.equal(ambiguous, 0); assert.equal(reads, cut === 'read' ? 1 : 0);
+    assert.equal(fs.readFileSync(join(root, 'workspace/src/file'), 'utf8'), 'original');
+    assert.deepEqual(fs.readdirSync(join(root, 'workspace/src')), ['file']);
+  }
+});
+
+test('bound write/edit actions retain ambiguity and exact temporaries after partial write or acknowledgement loss', t => {
+  for (const kind of ['write', 'edit']) for (const cut of ['writeSync', 'fchmodSync', 'renameSync', 'closeSync']) {
+    const { root, options } = fixture(t);
+    fs.writeFileSync(join(root, 'workspace/src/file'), 'original');
+    let live = true, fired = false, ambiguous = 0, writes = 0;
+    const scoped = createScopedFilesystem(options, { guard() { assert.ok(live, 'original authority lost'); }, onMutationError() { ambiguous++; } });
+    const original = fs[cut], write = fs.writeSync;
+    const mock = t.mock.method(fs, cut, (...args) => {
+      const directoryClose = cut === 'closeSync' && fs.fstatSync(args[0]).isDirectory();
+      const value = cut === 'writeSync' ? original(args[0], args[1], args[2], 1) : original(...args);
+      if (cut === 'writeSync') writes++;
+      if (!fired && (cut !== 'closeSync' || directoryClose)) { fired = true; live = false; }
+      return value;
+    });
+    syncBuiltinESMExports();
+    try { assert.throws(() => kind === 'write' ? scoped.writeFile('src/file', 'changed') : scoped.editFile('src/file', 'original', 'changed'), /original authority lost/); }
+    finally { mock.mock.restore(); syncBuiltinESMExports(); }
+    assert.equal(fired, true); assert.equal(ambiguous, 1);
+    const published = ['renameSync', 'closeSync'].includes(cut);
+    assert.equal(fs.readFileSync(join(root, 'workspace/src/file'), 'utf8'), published ? 'changed' : 'original');
+    const temps = fs.readdirSync(join(root, 'workspace/src')).filter(p => p.startsWith('.delegation-write-'));
+    assert.equal(temps.length, published ? 0 : 1);
+    if (cut === 'writeSync') { assert.equal(writes, 1); assert.equal(fs.statSync(join(root, 'workspace/src', temps[0])).size, 1); }
+    assert.equal(fs.writeSync, write);
+  }
+});
+
+test('temporary cleanup never deletes a replacement or an unowned failed-open pathname; nested calls denied', t => {
+  for (const cut of ['openSync', 'fchmodSync']) {
+    const { root, options } = fixture(t); let replacement, nested = false;
+    const scoped = createScopedFilesystem(options);
+    const original = fs[cut];
+    const mock = t.mock.method(fs, cut, (...args) => {
+      if (cut === 'openSync' && typeof args[0] === 'string' && args[0].includes('.delegation-write-')) {
+        replacement = args[0];
+        const foreign = original(replacement, 'wx');
+        try { fs.writeSync(foreign, 'foreign'); } finally { fs.closeSync(foreign); }
+        return original(...args); // EEXIST, no owned descriptor
+      }
+      const value = original(...args);
+      if (cut === 'fchmodSync') {
+        assert.throws(() => scoped.writeFile('src/nested', 'bad'), /nested file operation/); nested = true;
+        replacement = join(root, 'workspace/src', fs.readdirSync(join(root, 'workspace/src')).find(p => p.startsWith('.delegation-write-')));
+        fs.unlinkSync(replacement); fs.writeFileSync(replacement, 'foreign');
+        throw Error('RESULT_INVALID: mutation error must not become a safe denial');
+      }
+      return value;
+    });
+    syncBuiltinESMExports();
+    try { assert.throws(() => scoped.writeFile('src/file', 'changed')); }
+    finally { mock.mock.restore(); syncBuiltinESMExports(); }
+    assert.equal(fs.readFileSync(replacement, 'utf8'), 'foreign'); assert.equal(fs.existsSync(join(root, 'workspace/src/file')), false);
+    assert.equal(nested, cut === 'fchmodSync');
+  }
 });
 
 test('no stock grep/find/ls/shell adapter is silently exposed', t => {

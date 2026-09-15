@@ -63,8 +63,9 @@ function addNode(s, n, parentNodeId = null) {
     candidate: null, result: null, joined: false, closed: false, calls: 0 });
   s.slots[n.nodeId] = ['result', 'join', 'close'];
 }
+export const effectiveAuthority = n => ({ ...n.authority, deadlineAt: n.effectiveDeadlineAt === undefined ? n.authority.deadlineAt : n.effectiveDeadlineAt });
 function active(s, n) {
-  if (!n.pid || n.candidate || n.result || n.joined || s.batches.some(b => b.parentNodeId === n.nodeId && !b.joined)) fail('PARENT_NOT_ACTIVE');
+  if (n.stopped || !n.pid || n.candidate || n.result || n.joined || s.batches.some(b => b.parentNodeId === n.nodeId && !b.joined)) fail('PARENT_NOT_ACTIVE');
 }
 export function requestPrior(s, invocationId, requestId) {
   id(requestId); invocationNode(s, invocationId);
@@ -91,17 +92,28 @@ export function reservedBytes(s) {
   const consumed = 3 * nodeCount - Object.values(s.slots).reduce((sum, slots) => sum + slots.length, 0);
   return calculateJournalHeadroom({ outstandingNodes: nodeCount,
     outstandingBatches: s.batches.filter(b => !b.joined).length, outstandingCommands: 0, workflowOpen: s.workflowOpen }) - consumed * LIMITS.terminalRecordBytes
-    + (s.commands ?? []).reduce((sum, c) => sum + c.slots.length * LIMITS.terminalRecordBytes, 0);
+    + (s.commands ?? []).reduce((sum, c) => sum + c.slots.length * LIMITS.terminalRecordBytes, 0)
+    + (s.commandScopes ?? []).filter(c => c.observerFailures === null).length * LIMITS.terminalRecordBytes;
 }
-export function terminalType(type) { return ['node_result', 'node_joined', 'node_closed', 'delegation_joined', 'workflow_delegation_closed', 'command_result', 'command_drained', 'command_closed'].includes(type); }
+export function terminalType(type) { return ['node_result', 'node_joined', 'node_closed', 'delegation_joined', 'workflow_delegation_closed', 'command_result', 'command_drained', 'command_closed', 'scope_observers_sealed'].includes(type); }
 export function checkCapacity(state, usedBytes, recordBytes, type) {
   integer(recordBytes, 1, terminalType(type) ? LIMITS.terminalRecordBytes : LIMITS.frameBytes);
   if (usedBytes + recordBytes + reservedBytes(state) > LIMITS.journalBytes) fail('JOURNAL_LIMIT');
   // Separate bounded projection growth allowance, not disk-space reservation. Node result,
   // join/index replacement + budget transition, and closure fit these compact allowances.
   const projectionReserve = Object.values(state.slots).reduce((sum, slots) => sum + slots.length * 1024, 0) + state.batches.filter(b => !b.joined).length * 512
-    + (state.commands ?? []).reduce((sum, c) => sum + c.slots.length * 1024, 0);
+    + (state.commands ?? []).reduce((sum, c) => sum + c.slots.length * 1024, 0)
+    + (state.commandScopes ?? []).filter(c => c.observerFailures === null).length * 1024;
   if (Buffer.byteLength(canonicalJSON(state)) + projectionReserve > 1024 * 1024 - 1024) fail('JOURNAL_LIMIT', 'projection headroom');
+}
+// Shared live/replay semantic preflight. true is a deadline denial, not a
+// no-child certificate; only the original executor's pre-spawn stack owns that.
+export function launchDeadlineDenied(s, p, at) {
+  object(p, ['nodeId', 'invocationId', 'processToken']); uuid(p.invocationId); uuid(p.processToken);
+  const n = nodeOf(s, p.nodeId);
+  if (n.result || n.invocationId || n.stopped || s.nodes.some(x => x.invocationId === p.invocationId || x.processToken === p.processToken)) fail('INVALID_REQUEST');
+  if (s.scheduler && (n.parentNodeId ? nodeOf(s, n.parentNodeId).schedulerState !== 'waiting_children' : n.effectiveDeadlineAt === undefined)) fail('PARENT_NOT_ACTIVE');
+  return Boolean(s.scheduler && effectiveAuthority(n).deadlineAt !== null && effectiveAuthority(n).deadlineAt <= at);
 }
 export function reduceEvent(previous, event, manifest) {
   const s = structuredClone(previous), p = event.payload;
@@ -109,6 +121,32 @@ export function reduceEvent(previous, event, manifest) {
   if (!s.workflowOpen || event.sequence !== s.sequence + 1) fail('OWNERSHIP_UNKNOWN', 'closed or nonmonotonic');
   const requireRequest = () => { hash(p.digest); uuid(p.invocationId); id(p.requestId); };
   switch (event.type) {
+    case 'scheduler_configured': {
+      object(p, ['maxConcurrentAgents', 'maxLiveAgents', 'rootTimeouts']);
+      integer(p.maxConcurrentAgents, 1, 16); integer(p.maxLiveAgents, 1, 128);
+      if (s.scheduler || s.sequence !== 1 || Math.floor(p.maxLiveAgents / (manifest.policy.maxDepth + 1)) < 1) fail('UNSUPPORTED_MODE');
+      list(p.rootTimeouts, 128, 1);
+      if (p.rootTimeouts.length !== manifest.roots.length) fail('INVALID_REQUEST');
+      p.rootTimeouts.forEach(t => { if (t !== null) integer(t, 1, 2147483647); });
+      s.scheduler = structuredClone(p);
+      s.nodes.forEach(n => { n.schedulerState = 'queued'; }); break;
+    }
+    case 'root_activated': {
+      object(p, ['nodeId', 'deadlineAt']);
+      const n = nodeOf(s, p.nodeId), index = manifest.roots.findIndex(r => r.nodeId === n.nodeId);
+      if (!s.scheduler || index < 0 || n.invocationId || n.result || n.stopped || n.effectiveDeadlineAt !== undefined) fail('PARENT_NOT_ACTIVE');
+      const timeout = s.scheduler.rootTimeouts[index];
+      const deadline = Math.min(n.authority.deadlineAt ?? Infinity, timeout === null ? Infinity : integer(event.at + timeout));
+      if (p.deadlineAt !== (deadline === Infinity ? null : deadline)) fail('INVALID_REQUEST', 'effective root deadline');
+      n.effectiveDeadlineAt = p.deadlineAt; n.schedulerState = 'admitted'; break;
+    }
+    case 'node_stopped': {
+      object(p, ['nodeId', 'cause']);
+      enumValue(p.cause, ['timeout', 'cancelled', 'infrastructure_error']);
+      const n = nodeOf(s, p.nodeId);
+      if (!s.scheduler || n.result || n.stopped) fail('PARENT_NOT_ACTIVE');
+      n.stopped = p.cause; n.schedulerState = 'stopping'; break;
+    }
     case 'command_scope': {
       object(p, ['scopeId', 'invocationId', 'kind']); uuid(p.scopeId); uuid(p.invocationId);
       enumValue(p.kind, ['worker', 'declared-shell']);
@@ -119,7 +157,8 @@ export function reduceEvent(previous, event, manifest) {
       s.commandScopes.push({ ...p, frozen: false }); break;
     }
     case 'command_accepted': {
-      object(p, ['scopeId', 'commandId', 'processToken', 'occurrence', 'digest', 'kind']);
+      object(p, ['scopeId', 'commandId', 'processToken', 'occurrence', 'digest', 'kind'], ['callbackHooks']);
+      if (p.callbackHooks !== undefined) integer(p.callbackHooks, 1, 15);
       uuid(p.commandId); uuid(p.processToken); integer(p.occurrence, 1, 128); hash(p.digest);
       enumValue(p.kind, ['worker', 'shell']);
       const scope = s.commandScopes?.find(x => x.scopeId === p.scopeId);
@@ -130,6 +169,7 @@ export function reduceEvent(previous, event, manifest) {
       if (p.kind === 'worker' && (scope.kind !== 'worker' || own.length || invocationNode(s, scope.invocationId).processToken !== p.processToken) ||
           p.kind === 'shell' && (own.some(c => c.kind === 'shell' && c.slots.length) ||
             scope.kind === 'worker' && !own.some(c => c.kind === 'worker' && c.pid && !c.result))) fail('PARENT_NOT_ACTIVE');
+      if (p.callbackHooks) scope.observerFailures = null; // One reserved seal for the entire scope, not one per callback.
       s.commands.push({ ...p, invocationId: scope.invocationId, pid: null, result: null, disposition: null, slots: ['result', 'drain', 'close'] }); break;
     }
     case 'command_started': {
@@ -165,6 +205,19 @@ export function reduceEvent(previous, event, manifest) {
       object(p, ['commandId']); const c = s.commands?.find(c => c.commandId === p.commandId);
       if (!c?.disposition || c.slots.length !== 1 || c.slots[0] !== 'close') fail('OWNERSHIP_UNKNOWN'); c.slots = []; break;
     }
+    case 'scope_observers_sealed': {
+      object(p, ['scopeId', 'failures']); uuid(p.scopeId); list(p.failures, 128);
+      const scope = s.commandScopes?.find(c => c.scopeId === p.scopeId);
+      const commands = s.commands?.filter(c => c.scopeId === p.scopeId) ?? [];
+      if (!scope?.frozen || scope.observerFailures !== null || p.failures.length !== commands.length ||
+          commands.some(c => c.slots.length || !c.result || !c.disposition) ||
+          s.nodes.some(n => n.invocationId === scope.invocationId && n.result?.settlement)) fail('OWNERSHIP_UNKNOWN', 'observer seal order/reservation');
+      p.failures.forEach((mask, i) => {
+        integer(mask, 0, 14);
+        if (mask & 1 || (mask & (commands[i].callbackHooks ?? 0)) !== mask) fail('OWNERSHIP_UNKNOWN', 'observer hook binding');
+      });
+      scope.observerFailures = [...p.failures]; break;
+    }
     case 'root_reserved':
       object(p, ['rootPlanHash', 'count']);
       if (s.sequence || p.count !== manifest.roots.length || p.rootPlanHash !== sha256(canonicalJSON(manifest.roots))) fail('OWNERSHIP_UNKNOWN', 'root plan');
@@ -185,14 +238,15 @@ export function reduceEvent(previous, event, manifest) {
       if (p.children.length !== p.request.children.length || s.batches.some(b => b.batchId === p.batchId)) fail('INVALID_REQUEST');
       p.children.forEach((n, i) => {
         const c = p.request.children[i];
-        const authority = narrowAuthority(parent.authority, c, event.at);
+        const authority = narrowAuthority(effectiveAuthority(parent), c, event.at);
         const assignment = { task: c.task, acceptance: c.acceptance, ...(c.contextSummary === undefined ? {} : { parentContextSummary: c.contextSummary }) };
         if (n.phaseIndex !== undefined || n.itemIndex !== undefined || n.agentBudget !== c.agentBudget || n.label !== c.label ||
             canonicalJSON(n.assignment) !== canonicalJSON(assignment) || canonicalJSON(n.authority) !== canonicalJSON(authority)) fail('PERMISSION_DENIED');
       });
       registerRequest(s, p, 'delegate');
       s.budget = reserveChildren(s.budget, parent.nodeId, grants(p.children), tid);
-      p.children.forEach(n => addNode(s, n, parent.nodeId));
+      p.children.forEach(n => { addNode(s, n, parent.nodeId); if (s.scheduler) nodeOf(s, n.nodeId).schedulerState = 'queued'; });
+      if (s.scheduler) parent.schedulerState = 'waiting_children';
       s.batches.push({ batchId: p.batchId, parentNodeId: parent.nodeId, invocationId: p.invocationId, requestId: p.requestId,
         children: p.children.map(c => c.nodeId), joined: false }); break;
     }
@@ -207,9 +261,8 @@ export function reduceEvent(previous, event, manifest) {
       countRequest(s, p.invocationId); break;
     }
     case 'launch_intent': {
-      object(p, ['nodeId', 'invocationId', 'processToken']); uuid(p.invocationId); uuid(p.processToken);
+      if (launchDeadlineDenied(s, p, event.at)) fail('DEADLINE_EXPIRED');
       const n = nodeOf(s, p.nodeId);
-      if (n.result || n.invocationId || s.nodes.some(x => x.invocationId === p.invocationId || x.processToken === p.processToken)) fail('INVALID_REQUEST');
       s.budget = chargeLaunchIntent(s.budget, n.nodeId, tid);
       n.invocationId = p.invocationId; n.processToken = p.processToken; break;
     }
@@ -217,13 +270,14 @@ export function reduceEvent(previous, event, manifest) {
       object(p, ['nodeId', 'invocationId', 'pid', 'processToken', 'profileDigest']); integer(p.pid, 1);
       const n = nodeOf(s, p.nodeId);
       if (!n.invocationId || n.pid || n.result || n.invocationId !== p.invocationId || n.processToken !== p.processToken || p.profileDigest !== manifest.profileDigest) fail('OWNERSHIP_UNKNOWN');
-      n.pid = p.pid; break;
+      n.pid = p.pid; if (s.scheduler) n.schedulerState = 'running'; break;
     }
     case 'completion_submitted': {
       object(p, ['invocationId', 'requestId', 'digest', 'candidate']); requireRequest(); validateStoredReference(p.candidate);
       const n = invocationNode(s, p.invocationId); active(s, n);
       if (s.budget.nodes.find(b => b.nodeId === n.nodeId).children.some(child => !nodeOf(s, child).joined)) fail('RESULT_INVALID', 'unjoined children');
-      registerRequest(s, p, 'complete'); n.candidate = p.candidate; break;
+      registerRequest(s, p, 'complete'); n.candidate = p.candidate;
+      if (s.scheduler) n.schedulerState = 'result_pending_exit'; break;
     }
     case 'node_result': {
       object(p, ['nodeId', 'result', 'status', 'disposition'], ['settlement']); validateStoredReference(p.result); enumValue(p.status, RESULT_STATUSES);
@@ -250,12 +304,13 @@ export function reduceEvent(previous, event, manifest) {
       else if (p.parentIndex !== null) fail('INVALID_REQUEST');
       consume(s, n.nodeId, 'join');
       s.budget = joinAllocation(s.budget, n.nodeId, { terminal: true, groupsInactive: true, structuralJoin: true }, tid);
-      n.joined = true; break;
+      n.joined = true; if (s.scheduler) n.schedulerState = 'joined'; break;
     }
     case 'delegation_joined': {
       object(p, ['batchId']); const b = s.batches.find(b => b.batchId === p.batchId);
       if (!b || b.joined || b.children.some(c => !nodeOf(s, c).joined)) fail('INVALID_REQUEST');
-      b.joined = true; break;
+      b.joined = true;
+      if (s.scheduler && !nodeOf(s, b.parentNodeId).stopped) nodeOf(s, b.parentNodeId).schedulerState = 'running'; break;
     }
     case 'node_closed': {
       object(p, ['nodeId']); const n = nodeOf(s, p.nodeId);
@@ -265,7 +320,7 @@ export function reduceEvent(previous, event, manifest) {
     case 'workflow_delegation_closed':
       object(p, []);
       if (!s.nodes.length || s.nodes.some(n => !n.closed) || s.batches.some(b => !b.joined) ||
-          s.commands?.some(c => c.slots.length) || s.commandScopes?.some(c => !c.frozen)) fail('OWNERSHIP_UNKNOWN');
+          s.commands?.some(c => c.slots.length) || s.commandScopes?.some(c => !c.frozen || c.observerFailures === null)) fail('OWNERSHIP_UNKNOWN');
       s.workflowOpen = false; break;
     default: fail('UNSUPPORTED_VERSION', 'event type');
   }
@@ -276,7 +331,7 @@ export function workerSettlement(s, n, scopeId) {
   uuid(scopeId);
   const scope = s.commandScopes?.find(c => c.scopeId === scopeId);
   const commands = s.commands?.filter(c => c.scopeId === scopeId) ?? [];
-  if (!n.invocationId || scope?.kind !== 'worker' || scope.invocationId !== n.invocationId || !scope.frozen ||
+  if (!n.invocationId || scope?.kind !== 'worker' || scope.invocationId !== n.invocationId || !scope.frozen || scope.observerFailures === null ||
       commands.filter(c => c.kind === 'worker' && c.processToken === n.processToken).length !== 1 ||
       commands.some(c => c.slots.length || !c.result || !['drained', 'no_child'].includes(c.disposition))) fail('OWNERSHIP_UNKNOWN', 'whole worker inventory');
   return { scopeId, inventoryHash: sha256(canonicalJSON(commands)) };
@@ -314,16 +369,28 @@ export function composeFinalResult(s, n, manifest, scopeId, usage, candidate) {
   const settlement = workerSettlement(s, n, scopeId);
   validateExclusiveUsage(usage, n.invocationId);
   if (s.nodes.some(c => c.parentNodeId === n.nodeId && !c.joined) || s.batches.some(b => b.parentNodeId === n.nodeId && !b.joined)) fail('OWNERSHIP_UNKNOWN', 'descendants not structurally settled');
-  const classes = s.commands.filter(c => c.scopeId === scopeId).map(c => c.result.classification);
+  const commands = s.commands.filter(c => c.scopeId === scopeId);
+  const callbackFailures = s.commandScopes.find(c => c.scopeId === scopeId).observerFailures;
+  const classes = commands.map(c => c.result.classification);
+  // Separate sealed observer evidence; acknowledged command results never change.
+  if (callbackFailures?.some(Boolean)) classes.push('callback_error');
+  // Scheduler shell-only abort follows worker freeze; genuine user/deadline
+  // stops are persisted on the node. Hold/loss cannot supply a whole receipt.
+  // Defer consequential shell cancellation, never the worker's own outcome.
+  const cancelled = classes.includes('cancelled');
+  const primaryCancellation = cancelled && (!s.scheduler || commands.some(c => c.kind === 'worker' && c.result.classification === 'cancelled'));
+  const failures = classes.filter(c => c !== 'clean' && c !== 'cancelled');
   let status, cause;
-  if (classes.includes('timeout')) { status = 'timeout'; cause = 'TIMEOUT'; }
-  else if (classes.includes('cancelled')) { status = 'cancelled'; cause = 'CANCELLED'; }
+  if (n.stopped) { status = n.stopped; cause = n.stopped === 'timeout' ? 'TIMEOUT' : n.stopped === 'cancelled' ? 'CANCELLED' : 'SCHEDULER_FAILURE'; }
+  else if (classes.includes('timeout')) { status = 'timeout'; cause = 'TIMEOUT'; }
+  else if (primaryCancellation) { status = 'cancelled'; cause = 'CANCELLED'; }
   else if (usage.problem) { status = 'infrastructure_error'; cause = usage.problem; }
   else if (classes.some(c => ['callback_error', 'start_error', 'spawn_error', 'validation_error'].includes(c))) {
     status = 'infrastructure_error'; cause = classes.find(c => ['callback_error', 'start_error', 'spawn_error', 'validation_error'].includes(c)).toUpperCase();
-  } else if (classes.some(c => c !== 'clean')) { status = 'failed'; cause = classes.find(c => c !== 'clean').toUpperCase(); }
+  } else if (failures.length) { status = 'failed'; cause = failures[0].toUpperCase(); }
   else if (usage.diagnostic) { status = 'failed'; cause = usage.diagnostic.type.toUpperCase(); }
   else if (!candidate) { status = 'missing_completion'; cause = 'MISSING_COMPLETION'; }
+  else if (cancelled) { status = 'cancelled'; cause = 'CANCELLED'; } // A candidate cannot mask an interrupted active shell.
   else { status = candidate.request.status; cause = 'COMPLETION_CLAIM'; }
   const completion = candidate ? { ...candidate.request,
     acceptance: candidate.request.acceptance.map(a => ({ ...a, evidenceIds: a.evidenceIds.map(ref => ref.startsWith('local:') ?
@@ -333,6 +400,7 @@ export function composeFinalResult(s, n, manifest, scopeId, usage, candidate) {
   return { schema: 'pi-workflow-delegation-result-evidence/v2', runId: manifest.runId, ownerEpoch: manifest.ownerEpoch,
     nodeId: n.nodeId, invocationId: n.invocationId, settlement, disposition: 'drained', status, cause,
     summary: candidate?.request.summary ?? '', candidate: n.candidate, completion, usage,
+    ...(callbackFailures ? { callbackFailures } : {}),
     ownChildJoinIndex: n.index, children: s.nodes.filter(c => c.parentNodeId === n.nodeId).map(c => ({ nodeId: c.nodeId, result: c.result })) };
 }
 export function completionAuthority(s, n, evidenceIds = []) {

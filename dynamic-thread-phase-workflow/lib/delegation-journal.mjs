@@ -11,11 +11,44 @@ import { buildOwnChildJoinIndex, projectArtifactRead } from './delegation-contex
 import { createScopedFilesystem } from './delegation-filesystem.mjs';
 import { canonicalJSON, decodeCanonical, sha256, canonicalDirectory, boundedRead, storageIO, readStoredArtifact, validateStoredReference } from './delegation-storage.mjs';
 import { JOURNAL_SCHEMA, MANIFEST_SCHEMA, STATE_SCHEMA, uuid, validateManifest, initialState, reduceEvent, checkCapacity,
-  nodeOf, invocationNode, requestPrior, reservedBytes, completionAuthority, validateCandidate, composeFinalResult } from './delegation-journal-model.mjs';
+  nodeOf, invocationNode, requestPrior, reservedBytes, completionAuthority, validateCandidate, composeFinalResult, effectiveAuthority, launchDeadlineDenied } from './delegation-journal-model.mjs';
 import { takeResultCapability } from './delegation-results.mjs';
+import { takeObserverSeal, delegationPublicationOwner } from './delegation-executor.mjs';
+export function applyObserverSeal(writer, capability) {
+  const authority = liveWriters.get(writer);
+  if (!authority) fail('UNAUTHORIZED');
+  authority.guard(); authority.sealObservers(takeObserverSeal(capability, writer)); authority.guard();
+}
 
 const liveWriters = new WeakMap();
+// Private provenance/liveness check, NOT mutation entry: safe while persist is
+// busy. Every recording API still uses guard(), so nested writes stay denied.
+export function guardDelegationWriter(writer) {
+  const authority = liveWriters.get(writer);
+  if (!authority) fail('UNAUTHORIZED');
+  authority.live();
+}
+const launchTimeouts = new WeakMap();
+export function takeLaunchTimeout(writer, error, nodeId, token) {
+  const denial = launchTimeouts.get(error);
+  if (!denial || denial.writer !== writer || denial.nodeId !== nodeId || denial.token !== token) return false;
+  liveWriters.get(writer).guard(); launchTimeouts.delete(error); return true;
+}
 const executorClaims = new WeakSet();
+const schedulerClaims = new WeakSet();
+// Local veto only, including failed start/persistence before handle association.
+// Unlike freezeCommandScope this performs no I/O and grants no settlement.
+export function vetoDelegationScope(writer, scopeId) {
+  const authority = liveWriters.get(writer);
+  if (!authority) fail('UNAUTHORIZED');
+  authority.vetoScope(scopeId);
+}
+export function claimDelegationScheduler(writer, configuration) {
+  const authority = liveWriters.get(writer);
+  if (!authority || schedulerClaims.has(writer) || executorClaims.has(writer)) fail('UNAUTHORIZED', 'fresh original scheduler journal');
+  authority.guard(); schedulerClaims.add(writer);
+  return authority.scheduler(configuration);
+}
 // A stored snapshot or journal-shaped object cannot claim a live executor writer.
 export function claimDelegationExecutor(writer) {
   const authority = liveWriters.get(writer);
@@ -139,7 +172,13 @@ export function createDelegationJournal(options) {
   list(options.roots, 128, 1); list(options.protectedDirectories, 31, 1).forEach(p => canonicalDirectory(p));
   if (options.fault !== undefined && typeof options.fault !== 'function') fail('INVALID_REQUEST');
   const directory = join(artifactDirectory, WORKFLOW_ARTIFACT_LAYOUT.delegationDirectory);
-  const io = storageIO(options.fault);
+  let publication, writer;
+  const io = storageIO(point => {
+    options.fault?.(point);
+    // Reuse the existing last-before-syscall seam, AFTER fault instrumentation.
+    // A previous write may exist; loss never authorizes the next one or rollback.
+    if (publication && point.startsWith('before:')) { live(); publication.guard(); }
+  });
   const plans = [];
   const roots = options.roots.map(r => {
     object(r, ['phaseIndex', 'agentBudget', 'label', 'task', 'permissions', 'directoryScope', 'deadlineAt'], ['itemIndex']);
@@ -162,10 +201,13 @@ export function createDelegationJournal(options) {
   const binding = { manifestDigest, runId: manifest.runId, specDigest: manifest.specDigest, profileDigest: manifest.profileDigest };
   let state = initialState(manifest), lastHash = manifestDigest, usedBytes = 0, fd, poisoned = false, busy = false, stopped = false;
   const ownerLossListeners = new Set();
+  let schedulerFreeze;
   const publish = plan => io.publish(join(directory, 'nodes'), `${plan.reference.artifactId.slice(9)}.blob`, plan.bytes);
-  function guard() { if (poisoned || stopped || busy || process.pid !== manifest.ownerPid) fail('OWNERSHIP_UNKNOWN', 'writer unavailable; inspection only'); }
-  function persist(type, payload, artifacts = [], at = Math.max(Date.now(), manifest.createdAt)) {
-    guard(); busy = true;
+  function live() { if (poisoned || stopped || process.pid !== manifest.ownerPid) fail('OWNERSHIP_UNKNOWN', 'writer unavailable; inspection only'); }
+  function guard() { live(); if (busy) fail('OWNERSHIP_UNKNOWN', 'writer busy; nested mutation denied'); }
+  const writerProof = Object.freeze({ guard: live });
+  function persist(type, payload, artifacts = [], at = Math.max(Date.now(), manifest.createdAt), proof = delegationPublicationOwner(writer) ?? writerProof) {
+    guard(); proof.guard(); busy = true; publication = proof;
     try {
       const body = { schema: JOURNAL_SCHEMA, sequence: state.sequence + 1, eventId: randomUUID(), ownerEpoch: manifest.ownerEpoch,
         manifestDigest, previousHash: lastHash, at, type, payloadDigest: sha256(canonicalJSON(payload)), payload };
@@ -174,7 +216,12 @@ export function createDelegationJournal(options) {
       const next = reduceEvent(state, event, manifest);
       checkCapacity(next, usedBytes, bytes.length, type);
       verifyEventArtifacts(event, state, manifest, ref => artifacts.find(a => canonicalJSON(a.reference) === canonicalJSON(ref))?.bytes ?? readStoredArtifact(directory, ref));
-      // No disk mutation until reducers, encoded bytes, artifacts and projection fit.
+      const projection = encode({ schema: STATE_SCHEMA, resumable: false, manifestDigest,
+        lastHash: event.hash, usedBytes: usedBytes + bytes.length, state: next });
+      if (projection.length > 1024 * 1024) fail('JOURNAL_LIMIT');
+      // Encoding/validation is preparation, NOT an issued write. Retain the
+      // original consumed proof across it; frozen receipt JSON is insufficient.
+      proof.validate?.(); live(); proof.guard();
       try {
         artifacts.forEach(publish);
         canonicalDirectory(directory, true);
@@ -183,12 +230,11 @@ export function createDelegationJournal(options) {
             !named.isFile() || named.nlink !== 1 || named.uid !== process.getuid() || (named.mode & 0o077)) fail('OWNERSHIP_UNKNOWN', 'journal replaced/changed');
         io.writeAll(fd, bytes); io.step('event-fsync', () => fs.fsyncSync(fd));
         state = next; lastHash = event.hash; usedBytes += bytes.length;
-        const projection = encode({ schema: STATE_SCHEMA, resumable: false, manifestDigest, lastHash, usedBytes, state });
-        if (projection.length > 1024 * 1024) fail('JOURNAL_LIMIT');
         io.publish(directory, 'state.json', projection, false);
+        live(); proof.guard(); // Failed acknowledgement remains held, even after durable publication.
       } catch (error) { poisoned = true; throw error; }
       return structuredClone(event);
-    } finally { busy = false; }
+    } finally { publication = undefined; busy = false; }
   }
   // Exclusive allocation is the lock. It is NEVER removed by close/failure/restart.
   // Any failed construction leaves an unclaimable directory for manual inspection.
@@ -235,7 +281,14 @@ export function createDelegationJournal(options) {
     }
     if (!j.groups.some(g => g.token === token && g.pid === pid)) fail('OWNERSHIP_UNKNOWN', 'process journal ordering');
   }
-  const writer = Object.freeze({
+  function joinBatch(batchId, proof) {
+    guard(); if (state.batches.find(b => b.batchId === batchId)?.joined) return;
+    persist('delegation_joined', { batchId }, [], undefined, proof); // no second credit return
+  }
+  function closeNode(nodeId, proof) {
+    guard(); if (!nodeOf(state, nodeId).closed) persist('node_closed', { nodeId }, [], undefined, proof);
+  }
+  writer = Object.freeze({
     directory, binding: Object.freeze(binding),
     snapshot() { return structuredClone({ inspectionOnly: true, resumable: false, state, usedBytes, reservedBytes: reservedBytes(state), lastHash, poisoned }); },
     // Trusted live executor recording boundary only; these serializable records
@@ -245,9 +298,9 @@ export function createDelegationJournal(options) {
       persist('command_scope', { scopeId, invocationId, kind });
       return Object.freeze({ scopeId, invocationId, ownerEpoch: manifest.ownerEpoch, runId: manifest.runId });
     },
-    acceptCommand(scopeId, occurrence, processToken, kind, digest) {
+    acceptCommand(scopeId, occurrence, processToken, kind, digest, callbackHooks = 0) {
       guard(); const commandId = randomUUID();
-      try { processEntry(processToken, undefined); persist('command_accepted', { scopeId, commandId, occurrence, processToken, kind, digest }); }
+      try { processEntry(processToken, undefined); persist('command_accepted', { scopeId, commandId, occurrence, processToken, kind, digest, ...(callbackHooks ? { callbackHooks } : {}) }); }
       catch (error) { poisoned = true; throw error; }
       return commandId;
     },
@@ -257,7 +310,11 @@ export function createDelegationJournal(options) {
       try { processEntry(c.processToken, pid); persist('command_started', { commandId, pid }); }
       catch (error) { poisoned = true; throw error; }
     },
-    freezeCommandScope(scopeId) { guard(); persist('command_scope_frozen', { scopeId }); },
+    freezeCommandScope(scopeId) {
+      guard(); persist('command_scope_frozen', { scopeId });
+      // Private scheduler veto only; durable direct-exit freeze is NOT drain.
+      schedulerFreeze?.(scopeId);
+    },
     settleCommand(commandId, { classification, code, signal, disposition }) {
       guard();
       persist('command_result', { commandId, classification, code, signal });
@@ -271,9 +328,21 @@ export function createDelegationJournal(options) {
         if (n.processToken !== processToken) fail('REQUEST_CONFLICT');
         return Object.freeze({ invocationId: n.invocationId, recordedNow: false });
       }
-      const invocationId = randomUUID();
-      try { processEntry(processToken, undefined); persist('launch_intent', { nodeId, invocationId, processToken }); }
-      catch (error) { poisoned = true; throw error; } // reserve may already exist; never dispatch on failure
+      const invocationId = randomUUID(), payload = { nodeId, invocationId, processToken };
+      let at, deadlineDenied;
+      try {
+        processEntry(processToken, undefined);
+        at = Math.max(Date.now(), manifest.createdAt);
+        deadlineDenied = launchDeadlineDenied(state, payload, at);
+      } catch (error) { poisoned = true; throw error; }
+      if (deadlineDenied) {
+        // Exact live semantic denial before ANY persist mutation. The process
+        // reservation still belongs to the executor; this alone cannot clear it.
+        const error = new Error('DEADLINE_EXPIRED: launch intent denied');
+        launchTimeouts.set(error, { writer, nodeId, token: processToken }); throw error;
+      }
+      try { persist('launch_intent', payload, [], at); }
+      catch (error) { poisoned = true; throw error; } // all persist ambiguity still poisons
       // recordedNow is an append outcome, NOT a process permit. A repeated intent
       // must never dispatch again; the future executor supplies all other launch gates.
       return Object.freeze({ invocationId, recordedNow: true });
@@ -306,7 +375,7 @@ export function createDelegationJournal(options) {
         const artifacts = [], acceptedAt = Math.max(Date.now(), manifest.createdAt);
         const children = request.children.map(c => {
           const nodeId = randomUUID(), index = indexPlan(nodeId, 0, []); artifacts.push(index);
-          const authority = narrowAuthority(parent.authority, c, acceptedAt);
+          const authority = narrowAuthority(effectiveAuthority(parent), c, acceptedAt);
           scopeCheck(() => createScopedFilesystem({ workspace, permissions: authority.permissions, directoryScope: authority.directoryScope, protectedDirectories: manifest.protectedDirectories }));
           return { nodeId, agentBudget: c.agentBudget, label: c.label, authority, index: index.reference,
             ...(inheritedEvidence.length ? { inheritedEvidence } : {}), assignment: { task: c.task, acceptance: c.acceptance, ...(c.contextSummary === undefined ? {} : { parentContextSummary: c.contextSummary }) } };
@@ -354,7 +423,9 @@ export function createDelegationJournal(options) {
       const content = encode({ schema: 'pi-workflow-delegation-result-evidence/v1', nodeId, ...outcome, candidate: n.candidate, disposition });
       if (n.result) { if (n.result.sha256 !== sha256(content)) fail('REQUEST_CONFLICT'); return plainRef(n.result); }
       const result = artifactPlan(content);
-      persist('node_result', { nodeId, result: result.reference, status: outcome.status, disposition }, [result]);
+      // Raw launched failure is diagnostic unknown, never live settlement. Keep
+      // its original-writer recording contract even after executor revocation.
+      persist('node_result', { nodeId, result: result.reference, status: outcome.status, disposition }, [result], undefined, n.invocationId ? writerProof : undefined);
       return structuredClone(result.reference);
     },
     joinUnlaunched(nodeId) {
@@ -365,11 +436,8 @@ export function createDelegationJournal(options) {
       persist('node_joined', { nodeId, resultHash: n.result.sha256, parentIndex: plan?.reference ?? null }, plan ? [plan] : []);
       return structuredClone(nodeOf(state, nodeId).result);
     },
-    joinBatch(batchId) {
-      guard(); if (state.batches.find(b => b.batchId === batchId)?.joined) return;
-      persist('delegation_joined', { batchId }); // no second credit return
-    },
-    closeNode(nodeId) { guard(); if (!nodeOf(state, nodeId).closed) persist('node_closed', { nodeId }); },
+    joinBatch(batchId) { joinBatch(batchId); },
+    closeNode(nodeId) { closeNode(nodeId); },
     closeWorkflow() { guard(); if (state.workflowOpen) persist('workflow_delegation_closed', {}); },
     dispose() {
       if (!stopped) {
@@ -381,6 +449,9 @@ export function createDelegationJournal(options) {
   });
   function resultOperation(proof, operation) {
     guard();
+    const publication = { guard: proof.access.liveGuard,
+      validate: () => proof.access.validatePublication(proof.scope, proof.receipt) };
+    proof.access.validate(proof.scope, proof.receipt);
     const n = invocationNode(state, proof.scope.invocationId);
     if (canonicalJSON(n.candidate) !== canonicalJSON(proof.candidate)) fail('REQUEST_CONFLICT', 'candidate changed after worker settlement');
     const read = ref => readStoredArtifact(directory, ref);
@@ -391,30 +462,55 @@ export function createDelegationJournal(options) {
     if (operation === 'result') {
       if (n.result) fail('REQUEST_CONFLICT', 'immutable existing result');
       const result = artifactPlan(content), c = decodeCanonical(content);
+      proof.access.validate(proof.scope, proof.receipt);
       persist('node_result', { nodeId: n.nodeId, result: result.reference, status: c.status,
-        disposition: c.disposition, settlement: c.settlement }, [result]);
+        disposition: c.disposition, settlement: c.settlement }, [result], undefined, publication);
       proof.access.guard();
       return Object.freeze({ ...result.reference });
     }
     if (!n.result || n.result.sha256 !== proof.reference.sha256 || canonicalJSON(plainRef(n.result)) !== canonicalJSON(proof.reference) ||
         !read(proof.reference).equals(content)) fail('REQUEST_CONFLICT', 'immutable result identity/content');
+    proof.access.validate(proof.scope, proof.receipt);
     if (operation === 'lookup') return proof.reference;
     if (operation !== 'join') fail('UNAUTHORIZED');
     if (!n.joined) {
       const plan = n.parentNodeId ? indexPlan(n.parentNodeId, state.sequence + 1, childResults(state, n.parentNodeId, n.nodeId)) : null;
-      persist('node_joined', { nodeId: n.nodeId, resultHash: n.result.sha256, parentIndex: plan?.reference ?? null }, plan ? [plan] : []);
+      proof.access.validate(proof.scope, proof.receipt);
+      persist('node_joined', { nodeId: n.nodeId, resultHash: n.result.sha256, parentIndex: plan?.reference ?? null }, plan ? [plan] : [], undefined, publication);
     }
     proof.access.guard();
     // Structural delivery eligibility only. Scheduler later restores permits/leases.
     const batch = state.batches.find(b => b.children.includes(n.nodeId));
     if (batch && batch.children.every(id => nodeOf(state, id).joined)) {
-      writer.joinBatch(batch.batchId);
-      batch.children.forEach(id => { proof.access.guard(); writer.closeNode(id); });
-    } else if (!batch) writer.closeNode(n.nodeId);
+      joinBatch(batch.batchId, publication);
+      batch.children.forEach(id => { proof.access.guard(); closeNode(id, publication); });
+    } else if (!batch) closeNode(n.nodeId, publication);
     proof.access.guard();
     return proof.reference;
   }
-  liveWriters.set(writer, Object.freeze({ guard, resultOperation, runId: manifest.runId, ownerEpoch: manifest.ownerEpoch,
+  liveWriters.set(writer, Object.freeze({ guard, live, resultOperation,
+    sealObservers: proof => persist('scope_observers_sealed', proof.payload, [], undefined, proof), runId: manifest.runId, ownerEpoch: manifest.ownerEpoch,
+    vetoScope(scopeId) { schedulerFreeze?.(scopeId); },
+    scheduler(configuration) {
+      persist('scheduler_configured', configuration);
+      return Object.freeze({ guard,
+        onScopeFrozen(listener) {
+          guard(); if (schedulerFreeze || typeof listener !== 'function') fail('UNAUTHORIZED');
+          schedulerFreeze = listener;
+        },
+        activateRoot(nodeId) {
+          guard(); const at = Math.max(Date.now(), manifest.createdAt), n = nodeOf(state, nodeId);
+          const timeout = state.scheduler.rootTimeouts[manifest.roots.findIndex(r => r.nodeId === nodeId)];
+          const deadline = Math.min(n.authority.deadlineAt ?? Infinity, timeout === null ? Infinity : at + timeout);
+          persist('root_activated', { nodeId, deadlineAt: deadline === Infinity ? null : deadline }, [], at);
+          return deadline === Infinity ? null : deadline;
+        },
+        stopNode(nodeId, cause) {
+          guard(); const n = nodeOf(state, nodeId);
+          if (!n.result && !n.stopped) persist('node_stopped', { nodeId, cause });
+        },
+      });
+    },
     onOwnerLoss(listener) { guard(); ownerLossListeners.add(listener); return () => ownerLossListeners.delete(listener); } }));
   return writer;
 }

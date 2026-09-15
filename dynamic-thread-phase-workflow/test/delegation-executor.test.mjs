@@ -8,7 +8,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { EventEmitter, getEventListeners } from 'node:events';
 import { createDelegationJournal, inspectDelegationJournal } from '../lib/delegation-journal.mjs';
 import { createProcessJournal } from '../lib/process-journal.mjs';
-import { createDelegationExecutor } from '../lib/delegation-executor.mjs';
+import { createDelegationExecutor, guardDelegationExecutor, takeExecutorDenial } from '../lib/delegation-executor.mjs';
 import { probeGroup, ANCHOR_PATH, createScopedProcess } from '../lib/scoped-process.mjs';
 const script = new URL('./support/delegation-executor/process.mjs', import.meta.url).pathname;
 const pause = ms => new Promise(r => setTimeout(r, ms));
@@ -57,7 +57,7 @@ async function declaredPhase(f, mode, next, options) {
   const settled = await f.executor.settleScope(handle);
   if (!settled.receipt) return result;
   f.executor.consumeReceipt(handle, settled.receipt);
-  if (result.ok) next();
+  if (result.ok && settled.ok) next();
   return result;
 }
 
@@ -304,6 +304,168 @@ test('opted UTF8 streaming/capture limits and fixed-shell success use shared pro
     { ...defaults, maxStdoutBytes: 1024, maxStderrBytes: 1024 }));
   assert.equal(large.ok, true); assert.equal(large.stdoutTruncated, true); assert.equal(large.stderrTruncated, true);
   assert.doesNotMatch(large.stdout, /\uFFFD/); assert.ok(Buffer.byteLength(large.stdout) < 1200);
+});
+
+test('repair: actual channel loss synchronously vetoes all original scopes/receipts before later listener', async t => {
+  const f = fixture(t), declared = f.executor.openDeclaredShell();
+  const prior = await f.run(declared, 1, 'utf8');
+  const channels = [], writes = [[], []]; let ready = 0;
+  const workers = f.journal.snapshot().state.nodes.map((n, i) => f.executor.startInvocation(n.nodeId, process.execPath,
+    ['-e', "process.stdout.write('ready');setTimeout(()=>{},700)"], { timeoutMs: 2000,
+      onChildStart(child) {
+        channels[i] = child.stdio[3]; const write = channels[i].write;
+        channels[i].write = function(value, ...args) { writes[i].push(String(value)); return write.call(this, value, ...args); };
+      }, onStdout() { ready++; } }));
+  workers.forEach(w => f.track(w.result));
+  const until = Date.now() + 3000;
+  while (ready < 2 && Date.now() < until) await pause(10);
+  assert.equal(ready, 2);
+  const checked = new Promise(resolve => channels[0].once('error', () => {
+    assert.equal(f.executor.inspect().lost, true);
+    assert.throws(() => guardDelegationExecutor(f.executor), /OWNERSHIP_UNKNOWN/);
+    assert.throws(() => f.executor.consumeReceipt(declared, prior.receipt, prior.commandId), /OWNERSHIP_UNKNOWN/);
+    assert.throws(() => f.executor.runShell(workers[1].scope, 2, '/bin/true', [], defaults), /OWNERSHIP_UNKNOWN/);
+    f.executor.revoke(); resolve();
+  }));
+  const before = writes[0].length; channels[0].destroy(Error('live owned loss')); await checked;
+  assert.equal(writes[0].length, before, 'no revoke/TERM on already-observed lost authority');
+  assert.equal(writes[1].filter(s => s.includes('revoke')).length, 1);
+  assert.ok((await Promise.all(workers.map(w => w.result))).every(r => r.disposition === 'unknown' && !r.receipt));
+});
+
+test('repair: reentrant/throwing loss listener and reader close cannot skip loss or other cleanup', async t => {
+  let notified = 0, abandoned = 0, unreferenced = 0; const destroyed = [];
+  const stream = name => Object.assign(new EventEmitter(), { setEncoding() {}, write() {}, destroy() { destroyed.push(name); if (name === 'out') throw Error('close failure'); } });
+  const child = Object.assign(new EventEmitter(), { pid: 12345, stdout: stream('out'), stderr: stream('err'), stdio: [null, null, null, stream('control')], unref() { unreferenced++; } });
+  t.mock.method(process, 'kill', () => { throw Object.assign(Error('unknown'), { code: 'EPERM' }); });
+  const lifecycle = createScopedProcess(['/bin/true'], 100, () => {}, () => { notified++; lifecycle.revoke(); throw Error('listener'); });
+  lifecycle.attach(child, () => abandoned++);
+  child.stdio[3].emit('error', Error('owned channel loss'));
+  child.stdio[3].emit('error', Error('repeat')); lifecycle.revoke(); lifecycle.terminate(); lifecycle.dispatch();
+  assert.equal(notified, 1); assert.equal(abandoned, 1); assert.equal(unreferenced, 1);
+  assert.deepEqual(destroyed, ['control', 'out', 'err']);
+  assert.equal((await lifecycle.settle({ code: 0 })).disposition, 'unknown');
+});
+
+test('repair: synchronous control write loss cannot re-arm shutdown after abandonment', t => {
+  const timers = new Set(); let losses = 0;
+  t.mock.method(globalThis, 'setTimeout', fn => { timers.add(fn); return fn; });
+  t.mock.method(globalThis, 'clearTimeout', fn => timers.delete(fn));
+  const stream = () => Object.assign(new EventEmitter(), { setEncoding() {}, destroy() {}, write(value, callback) { callback(Error('synchronous owned write error')); } });
+  const child = Object.assign(new EventEmitter(), { pid: 12345, stdout: stream(), stderr: stream(), stdio: [null, null, null, stream()], unref() {} });
+  const lifecycle = createScopedProcess(['/bin/true'], 100, () => {}, () => losses++);
+  lifecycle.attach(child, () => {});
+  child.stdio[3].emit('data', '{"type":"ready","pid":12345}\n');
+  lifecycle.terminate();
+  assert.equal(losses, 1); assert.equal(timers.size, 0);
+  lifecycle.terminate(); lifecycle.revoke(); assert.equal(timers.size, 0);
+});
+
+test('repair: start rejection vetoes scope in its first rejection reaction before later listeners', async t => {
+  const f = fixture(t), scope = f.executor.openDeclaredShell(); let checked = false;
+  const result = await f.run(scope, 1, 'utf8', { onChildStart() {
+    const rejected = Promise.reject(Error('async start failure'));
+    queueMicrotask(() => { rejected.catch(() => {
+      assert.throws(() => f.executor.runShell(scope, 2, '/bin/true', [], defaults), /PARENT_NOT_ACTIVE|OWNERSHIP_UNKNOWN/); checked = true;
+    }); }); return rejected;
+  } });
+  assert.equal(checked, true); assert.equal(result.classification, 'start_error');
+  assert.equal(result.disposition, 'unknown'); assert.equal(result.physicalDisposition, 'drained');
+  assert.equal(f.executor.inspect().acceptedCommands, 1);
+});
+
+test('repair: sync/async end failure blocks reentrant admission before result publication', async t => {
+  for (const async of [false, true]) {
+    const f = fixture(t), scope = f.executor.openDeclaredShell(); let checked = false;
+    const probe = () => { assert.throws(() => f.executor.runShell(scope, 2, '/bin/true', [], defaults), /PARENT_NOT_ACTIVE/); checked = true; };
+    const result = await f.run(scope, 1, 'utf8', { onChildEnd() {
+      if (async) { setImmediate(probe); return Promise.reject(Error('async end failure')); }
+      queueMicrotask(probe); throw Error('end failure');
+    } });
+    if (async) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(checked, true); assert.equal(result.classification, 'callback_error'); assert.equal(result.disposition, 'drained');
+    assert.equal(f.executor.inspect().acceptedCommands, 1);
+  }
+});
+
+test('repair: preadmission denial provenance is exact, single-use and covers occurrence/command caps', async t => {
+  const f = fixture(t), scope = f.executor.openDeclaredShell(), other = f.executor.openDeclaredShell();
+  const abort = new AbortController(); abort.abort('finite no-child');
+  await f.run(scope, 1, 'utf8', { signal: abort.signal });
+  for (const [occurrence, command, pattern] of [[1, '/bin/true', /REQUEST_CONFLICT/], [2, '\u0001'.repeat(11000), /command bound/]]) {
+    let error;
+    assert.throws(() => f.executor.runShell(scope, occurrence, command, [], defaults), e => { error = e; return pattern.test(e.message); });
+    assert.equal(takeExecutorDenial(f.executor, new Error(error.message), scope, 'shell'), false);
+    assert.equal(takeExecutorDenial({ ...f.executor }, error, scope, 'shell'), false);
+    assert.equal(takeExecutorDenial(f.executor, error, other, 'shell'), false);
+    assert.equal(takeExecutorDenial(f.executor, error, scope, 'shell'), true);
+    assert.equal(takeExecutorDenial(f.executor, error, scope, 'shell'), false);
+  }
+  for (let i = 2; i <= 128; i++) await f.run(scope, i, 'utf8', { signal: abort.signal });
+  let error;
+  assert.throws(() => f.executor.runShell(scope, 129, '/bin/true', [], defaults), e => { error = e; return /ADMISSION_LIMIT/.test(e.message); });
+  assert.equal(takeExecutorDenial(f.executor, error, scope, 'shell'), true);
+  assert.equal(f.executor.inspect().lost, false); assert.equal(f.executor.inspect().acceptedCommands, 128);
+  assert.equal((await f.executor.settleScope(scope)).receipt.commands.length, 128);
+});
+
+for (const [hook, bit] of [['onChildStart', 1], ['onStdout', 2], ['onStderr', 4], ['onChildEnd', 8]])
+  test(`callback lifetime: acknowledged ${hook} command cannot authorize a stale whole declared scope`, async t => {
+    const f = fixture(t), scope = f.executor.openDeclaredShell();
+    let reject;
+    const deferred = new Promise((_, r) => { reject = r; });
+    const first = await f.track(f.executor.runShell(scope, 1, process.execPath,
+      ['-e', "process.stdout.write('out');process.stderr.write('err')"], { ...defaults, [hook]() { return deferred; } }));
+    assert.equal(first.classification, 'clean'); assert.equal(first.disposition, 'drained');
+    const acknowledged = structuredClone(f.journal.snapshot().state.commands[0]);
+    // A different command in the SAME original scope is still physically live.
+    let ready;
+    const live = new Promise(r => { ready = r; });
+    const second = f.track(f.executor.runShell(scope, 2, process.execPath,
+      ['-e', "process.stdout.write('ready');setTimeout(()=>{},150)"], { ...defaults, onStdout() { ready(); } }));
+    await live;
+    reject(Error('observed after physical acknowledgement')); await pause(0);
+    assert.throws(() => f.executor.runShell(scope, 3, '/bin/true', [], defaults), /PARENT_NOT_ACTIVE/);
+    assert.deepEqual(f.journal.snapshot().state.commands[0], acknowledged);
+    if (bit === 1) assert.throws(() => f.executor.consumeReceipt(scope, first.receipt, first.commandId), /OWNERSHIP_UNKNOWN/);
+    else f.executor.consumeReceipt(scope, first.receipt, first.commandId); // Physical acknowledgement only.
+    await second;
+    const settled = await f.executor.settleScope(scope);
+    assert.deepEqual(f.journal.snapshot().state.commands[0], acknowledged);
+    assert.equal(first.ok, true); // Immutable historical command, NOT scope approval.
+    if (bit === 1) { assert.equal(settled.receipt, null); assert.equal(settled.disposition, 'unknown'); }
+    else {
+      assert.equal(settled.ok, false); assert.deepEqual(settled.receipt.callbackFailures, [bit, 0]);
+      f.executor.consumeReceipt(scope, settled.receipt);
+      assert.deepEqual(inspectDelegationJournal(f.journal.directory, f.journal.binding).state, f.journal.snapshot().state);
+    }
+  });
+
+test('callback lifetime: declared phase consumer checks sealed scope, not historical clean command', async t => {
+  const f = fixture(t); let advances = 0, reject;
+  const deferred = new Promise((_, r) => { reject = r; });
+  const result = await declaredPhase(f, 'utf8', () => advances++, { onChildEnd() { return deferred; } });
+  assert.equal(result.ok, true); assert.equal(advances, 0);
+  reject(Error('post-seal end rejection')); await pause(0); assert.equal(advances, 0);
+});
+
+test('callback lifetime: pending start expiry holds; owner loss interrupts finite observer wait without new signals', async t => {
+  for (const loss of [false, true]) {
+    const f = fixture(t), scope = f.executor.openDeclaredShell();
+    let reject, channel; const deferred = new Promise((_, r) => { reject = r; });
+    const r = await f.run(scope, 1, 'utf8', { onChildStart(p) { channel = p.stdio[3]; return deferred; } });
+    assert.equal(r.classification, 'clean');
+    let writes = 0; const write = channel.write;
+    channel.write = function(...args) { writes++; return write.apply(this, args); };
+    const before = Date.now(), pending = f.executor.settleScope(scope);
+    if (loss) setTimeout(() => f.executor.revoke(), 20);
+    const settled = await pending;
+    assert.equal(settled.receipt, null); assert.equal(settled.disposition, 'unknown');
+    assert.ok(Date.now() - before < (loss ? 800 : 2500));
+    const snapshot = f.journal.snapshot(); reject(Error('post-seal rejection')); await pause(0);
+    assert.deepEqual(f.journal.snapshot(), snapshot); assert.equal(writes, 0);
+    assert.equal(f.executor.inspect().lost, true);
+  }
 });
 
 test('owner revoke disables pending escalation and all receipts; finite fixture fallback is not settlement permission', async t => {

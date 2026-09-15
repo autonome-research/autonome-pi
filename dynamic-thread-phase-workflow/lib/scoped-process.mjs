@@ -15,7 +15,7 @@ export function probeGroup(pid) {
   catch (error) { return error?.code === 'ESRCH' ? 'gone' : 'unknown'; }
 }
 
-export function createScopedProcess(argv, graceMs = SCOPED_LIMITS.graceMs, onDirect = () => {}) {
+export function createScopedProcess(argv, graceMs = SCOPED_LIMITS.graceMs, onDirect = () => {}, onLoss = () => {}, onCallbackFailure = () => {}) {
   if (process.platform !== 'linux') throw new Error('UNSUPPORTED_MODE: Linux subreaper/pidfd required');
   if (!Number.isSafeInteger(graceMs) || graceMs < 1 || graceMs > SCOPED_LIMITS.maxGraceMs) throw new Error('INVALID_REQUEST: grace');
   const config = JSON.stringify({ type: 'dispatch', argv, graceMs }) + '\n';
@@ -25,19 +25,22 @@ export function createScopedProcess(argv, graceMs = SCOPED_LIMITS.graceMs, onDir
   let bootstrapTimer, shutdownTimer, abandon;
   function send(value) {
     if (!child || stopped || !ready) return;
-    child.stdio[3].write(value, error => { if (error && !stopped) lose(); });
+    try { child.stdio[3].write(value, error => { if (error && !stopped) lose(); }); }
+    catch { lose(); }
   }
   function lose() {
+    if (unknown) return;
     unknown = true; stopped = true;
     clearTimeout(bootstrapTimer); clearTimeout(shutdownTimer);
-    // Disconnect is revocation, not permission to send any PID-based signal.
-    child?.stdio[3]?.destroy(); child?.stdout.destroy(); child?.stderr.destroy();
-    // Uninterruptible helper/OS failure must not retain unlimited local timers
-    // or listeners. Diagnostic abandonment holds authority; it is NOT cleanup.
-    child?.unref(); abandon?.();
+    // Veto synchronously BEFORE reader-close listeners/abandonment. Reentrant
+    // executor revoke cannot send anything on this already-lost channel.
+    for (const action of [onLoss, () => child?.stdio[3]?.destroy(), () => child?.stdout.destroy(),
+      () => child?.stderr.destroy(), () => child?.unref(), () => abandon?.()]) {
+      try { action(); } catch { /* keep unknown; one failing listener cannot skip cleanup */ }
+    }
   }
   function shutdownBound() {
-    shutdownTimer ??= setTimeout(lose, SCOPED_LIMITS.shutdownMs);
+    if (!stopped) shutdownTimer ??= setTimeout(lose, SCOPED_LIMITS.shutdownMs);
   }
   function flush() {
     if (!ready || stopped) return;
@@ -50,6 +53,7 @@ export function createScopedProcess(argv, graceMs = SCOPED_LIMITS.graceMs, onDir
       bootstrapTimer = setTimeout(lose, SCOPED_LIMITS.bootstrapMs);
       child.stdio[3].setEncoding('utf8');
       child.stdio[3].on('error', () => { if (!stopped) lose(); });
+      child.stdio[3].on('close', () => { if (!stopped && !empty) lose(); });
       child.stdio[3].on('data', chunk => {
         if (stopped) return;
         buffer += chunk;
@@ -79,8 +83,9 @@ export function createScopedProcess(argv, graceMs = SCOPED_LIMITS.graceMs, onDir
         if (code !== 0) lose();
       });
     },
+    callbackFailed() { if (!stopped) onCallbackFailure(); },
     dispatch() { dispatch = true; flush(); },
-    terminate() { if (!stopped) { requested = true; flush(); } },
+    terminate() { if (!stopped && !empty) { requested = true; flush(); } },
     revoke() { if (!stopped) { send('{"type":"revoke"}\n'); lose(); } },
     async settle(exit) {
       clearTimeout(bootstrapTimer); clearTimeout(shutdownTimer);
@@ -90,9 +95,13 @@ export function createScopedProcess(argv, graceMs = SCOPED_LIMITS.graceMs, onDir
         await new Promise(resolve => setTimeout(resolve, SCOPED_LIMITS.pollMs));
         group = probeGroup(child.pid);
       }
+      const drained = !unknown && ready && empty && exit.code === 0 && group === 'gone';
+      // An unattached lifecycle never owned a child/channel. The subprocess's
+      // separate exact no-child callback (e.g. ENOENT) decides that disposition.
+      if (!drained && child) lose();
       stopped = true;
-      child?.stdio[3]?.destroy();
-      return Object.freeze({ disposition: !unknown && ready && empty && exit.code === 0 && group === 'gone' ? 'drained' : 'unknown',
+      try { child?.stdio[3]?.destroy(); } catch { lose(); }
+      return Object.freeze({ disposition: drained && !unknown ? 'drained' : 'unknown',
         direct, residual, group, anchorPid: child?.pid ?? null });
     },
   });

@@ -13,6 +13,63 @@ export function normalizeTimeoutMs(value, label = "timeoutMs") {
   return timeout;
 }
 
+// Private opted observer policy; matches the scoped post-drain probe budget.
+export const CALLBACK_LIMITS = Object.freeze({ pending: 128, settleMs: 1000 });
+// Promise reactions retain ONLY this detachable cell, not a runner/child closure.
+function watchCallback(value, cell) {
+  Promise.resolve(value).then(() => cell.finish?.(), error => cell.finish?.(error, true));
+}
+export function createCallbackLifetime() {
+  const pending = new Set();
+  let accepting = true, sealed = false, timer, waiting, resolveWait;
+  function done() {
+    if (pending.size) return;
+    clearTimeout(timer); timer = undefined;
+    const resolve = resolveWait; resolveWait = undefined; waiting = undefined; resolve?.();
+  }
+  function close() {
+    accepting = false; sealed = true;
+    for (const cell of pending) cell.finish = null;
+    pending.clear(); done();
+  }
+  function drain() {
+    if (!pending.size) return Promise.resolve();
+    if (!waiting) {
+      waiting = new Promise(resolve => { resolveWait = resolve; });
+      timer = setTimeout(() => {
+        accepting = false;
+        for (const cell of [...pending]) cell.finish?.(new Error('CALLBACK_TIMEOUT: observer settlement expired'), true);
+      }, CALLBACK_LIMITS.settleMs);
+    }
+    return waiting;
+  }
+  return Object.freeze({
+    call(callback, args, failed) {
+      if (!callback || !accepting) return;
+      if (pending.size >= CALLBACK_LIMITS.pending) {
+        accepting = false; failed(new Error('CALLBACK_LIMIT: pending observers')); return;
+      }
+      const cell = { finish: null };
+      cell.finish = (error, rejected = false) => {
+        if (!cell.finish) return;
+        cell.finish = null; pending.delete(cell);
+        try { if (rejected) failed(error); } catch { /* failure observers never create an unhandled rejection */ }
+        finally { done(); }
+      };
+      pending.add(cell); // Reserve before a reentrant callback, even a synchronous one.
+      try {
+        const value = callback(...args);
+        if (value?.then) watchCallback(value, cell);
+        else cell.finish?.();
+      } catch (error) { cell.finish?.(error, true); }
+    },
+    drain,
+    async seal() { accepting = false; await drain(); sealed = true; },
+    close,
+    inspect() { return Object.freeze({ pending: pending.size, accepting, sealed, timer: timer !== undefined }); },
+  });
+}
+
 /** Terminate the whole subprocess group where supported. */
 export function terminateChild(child, signal = "SIGTERM") {
   try {
@@ -117,6 +174,15 @@ export function runBoundedProcess(command, args, options = {}) {
     let streamCallbackError;
     let sourceClosed;
     let sourceFailed = false;
+    let published = false;
+    const callbacks = options.lifecycle ? options.callbackLifetime ?? createCallbackLifetime() : null;
+    const observe = (kind, callback, args) => {
+      if (callbacks) callbacks.call(callback, args, error => {
+        try { options.onCallbackFailure?.(kind); }
+        finally { callbackFailed(error); }
+      });
+      else callback?.(...args);
+    };
 
     const terminate = (signal = "SIGTERM") => {
       requestedSignal ||= signal;
@@ -159,8 +225,8 @@ export function runBoundedProcess(command, args, options = {}) {
       if (killTimer) clearTimeout(killTimer);
       options.signal?.removeEventListener("abort", onWorkflowAbort);
       timeoutController?.signal.removeEventListener("abort", onTimeoutAbort);
-      if (childHasPid) {
-        try { options.onChildEnd?.(child); } catch { /* lifecycle cleanup must not mask the process result */ }
+      if (childHasPid && !callbacks) {
+        try { options.onChildEnd?.(child); } catch { /* legacy cleanup must not mask the process result */ }
       }
     };
     const finish = async ({ code, signal, spawnError }) => {
@@ -176,7 +242,15 @@ export function runBoundedProcess(command, args, options = {}) {
       }
       // Opted settlement deliberately keeps timeout/abort ownership through
       // direct exit, stream close and drain; legacy cleanup timing is unchanged.
+      if (callbacks) {
+        if (childHasPid) observe('end', options.onChildEnd, [child]);
+        // Executor-owned observers live beyond the immutable physical command.
+        // Standalone opted subprocesses own their seal here, with the same bound.
+        if (!options.callbackLifetime) await callbacks.seal();
+        else await Promise.resolve(); // Observe already-rejected end hooks, never await arbitrary work.
+      }
       cleanup();
+      published = true;
       const stdout = stdoutBuffer.value();
       const stderr = stderrBuffer.value();
       const durationMs = Date.now() - startedAt;
@@ -216,13 +290,19 @@ export function runBoundedProcess(command, args, options = {}) {
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     const callbackFailed = (error) => {
+      if (published) return; // Scope evidence is handled above; never rewrite a command or signal after acknowledgement.
       streamCallbackError ||= error instanceof Error ? error : new Error(String(error));
-      // Keep normal identity-safe termination/drain; failure is never success.
+      // Synchronous veto before callback-queued operations; NOT owner revoke.
+      // Source observation still runs through actual stdout close independently.
+      try { options.lifecycle?.callbackFailed?.(); }
+      catch { /* the owned lifecycle retains failure/unknown; never skip termination */ }
       terminate("SIGTERM");
     };
-    const observeChunk = (callback, chunk) => {
-      if (!callback || streamCallbackError) return;
-      try { callback(chunk); } catch (error) { callbackFailed(error); }
+    const observeChunk = (kind, callback, chunk) => {
+      if (!callback || streamCallbackError || published) return;
+      try {
+        observe(kind, callback, [chunk]);
+      } catch (error) { callbackFailed(error); }
     };
     if (options.stdoutSource) {
       sourceClosed = new Promise(done => {
@@ -243,11 +323,11 @@ export function runBoundedProcess(command, args, options = {}) {
         try { options.stdoutSource.push(chunk); }
         catch (error) { sourceFailed = true; callbackFailed(error); }
       }
-      observeChunk(options.onStdout, chunk);
+      observeChunk('stdout', options.onStdout, chunk);
       if (options.captureStdout !== false) stdoutBuffer.append(chunk);
     });
     child.stderr.on("data", (chunk) => {
-      observeChunk(options.onStderr, chunk);
+      observeChunk('stderr', options.onStderr, chunk);
       if (options.captureStderr !== false) stderrBuffer.append(chunk);
     });
     child.on("error", (error) => {
@@ -261,11 +341,10 @@ export function runBoundedProcess(command, args, options = {}) {
     if (childHasPid) {
       try {
         options.lifecycle?.attach(child, () => finish({ code: null, signal: null }));
-        options.onChildStart?.(child);
+        observe('start', options.onChildStart, [child]);
         options.lifecycle?.dispatch();
       } catch (error) {
-        streamCallbackError = error instanceof Error ? error : new Error(String(error));
-        terminate("SIGTERM");
+        callbackFailed(error);
       }
     }
   });

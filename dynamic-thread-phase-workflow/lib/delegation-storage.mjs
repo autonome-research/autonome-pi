@@ -49,9 +49,10 @@ export function canonicalDirectory(path, privateDirectory = false) {
 export function sameFile(a, b) {
   return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs && a.nlink === b.nlink;
 }
-export function boundedRead(path, maxBytes, { privateFile = false } = {}) {
+export function boundedRead(path, maxBytes, { privateFile = false, guard = () => {} } = {}) {
   integer(maxBytes, 0, 16 * 1024 * 1024);
-  canonicalDirectory(dirname(path), privateFile);
+  if (typeof guard !== 'function') fail('INVALID_REQUEST');
+  guard(); canonicalDirectory(dirname(path), privateFile); guard();
   const fd = fs.openSync(path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   try {
     const before = fs.fstatSync(fd, { bigint: true });
@@ -60,13 +61,14 @@ export function boundedRead(path, maxBytes, { privateFile = false } = {}) {
     const buffer = Buffer.alloc(Number(before.size) + 1);
     let size = 0;
     while (size < buffer.length) {
+      guard();
       const n = fs.readSync(fd, buffer, size, buffer.length - size, null);
       if (!n) break;
       size += n;
     }
     const after = fs.fstatSync(fd, { bigint: true });
     if (size !== Number(before.size) || !sameFile(before, after) || !sameFile(after, fs.lstatSync(path, { bigint: true }))) fail('OWNERSHIP_UNKNOWN', 'file changed during read');
-    return buffer.subarray(0, size);
+    guard(); return buffer.subarray(0, size);
   } finally { fs.closeSync(fd); }
 }
 // Fault hook is trusted test instrumentation, never persisted and never a worker parameter.
