@@ -23,7 +23,11 @@ export function loadProgressReviewRecords({ storeDir, maxEntries = DEFAULT_PROGR
   return withState(storeDir, maxEntries, (records) => ({ result: records.map((record) => ({ ...record })), records }));
 }
 
-/** Create the first schedule from the trusted workflow start, or make an overdue schedule pending. */
+/**
+ * INTERNAL/TRUSTED ONLY: create the first schedule from trusted workflow-start
+ * metadata, or make an overdue schedule pending. Public cadence validation and
+ * authoritative metadata validation must happen before calling this function.
+ */
 export function ensureProgressReview(runId, { storeDir, startedAt, cadenceMs = DEFAULT_PROGRESS_REVIEW_CADENCE_MS, maxEntries = DEFAULT_PROGRESS_REVIEW_LIMIT, now } = {}) {
   validateId(runId, "run id");
   const startMs = timestamp(startedAt, "trusted workflow start");
@@ -60,9 +64,12 @@ export function ensureProgressReview(runId, { storeDir, startedAt, cadenceMs = D
   });
 }
 
-/** Explicit operator adjustment only; never rewrite a pending/in-flight review.
- * The check identity and trusted start survive. sequence is the cadence-period
- * index, not an acknowledgement count, so rebase it along with dueAt.
+/**
+ * INTERNAL/TRUSTED OPERATOR ONLY: explicit adjustment; never rewrite a
+ * pending/in-flight review. Public cadence validation and authoritative
+ * metadata validation must happen before calling this function. The check
+ * identity and trusted start survive. sequence is the cadence-period index,
+ * not an acknowledgement count, so rebase it along with dueAt.
  */
 export function rescheduleProgressReview(runId, { storeDir, checkId, cadenceMs, maxEntries = DEFAULT_PROGRESS_REVIEW_LIMIT, now } = {}) {
   validateId(runId, "run id");
@@ -302,6 +309,10 @@ function timestamp(value, label) {
   return parsed;
 }
 function clock(value) { return value === undefined ? Date.now() : timestamp(value, "progress review clock"); }
+// INTERNAL/TRUSTED ONLY duration normalization. This deliberately preserves
+// historical millisecond fixtures and operator reschedule behavior; it is not
+// validation of public progressReviewIntervalMs. Public and authoritative
+// metadata boundaries must validate before calling cadence APIs.
 function positiveDuration(value, label) {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) throw new Error(`${label} must be a positive finite duration`);

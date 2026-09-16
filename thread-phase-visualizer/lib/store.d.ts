@@ -20,6 +20,8 @@ export type ThreadPhaseOwnerMetadata = {
   sessionFile?: string;
   launchSource?: string;
   cwdAtLaunch?: string;
+  supervisionMode?: string;
+  progressReviewIntervalMs?: number;
   [key: string]: unknown;
 };
 

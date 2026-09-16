@@ -188,7 +188,7 @@ test("tool_result reconciliation schedules verified owned work across cwd scope 
     "changing the session cwd must not revoke owned supervision");
 });
 
-test("a supported cross-directory tool launch survives restart and scope changes, then terminal index discovery removes supervision", { timeout: 20_000 }, async (t) => {
+test("a supported cross-directory tool launch survives restart and scope changes, then terminal index discovery removes supervision", { timeout: 20_000 }, async () => {
   const sessionId = "supervision-real-cross-directory-session";
   const launchCwd = mkdtempSync(join(tmpdir(), "supervision-real-launch-"));
   const laterSessionCwd = mkdtempSync(join(tmpdir(), "supervision-real-host-"));
@@ -205,9 +205,12 @@ test("a supported cross-directory tool launch survives restart and scope changes
   const first = harness();
   registerVisualizer(first.api);
   const firstCtx = context(sessionId, idle);
+  const cleanupErrors = [];
+  let primaryError;
   let replacement;
   let replacementCtx;
   let runId;
+  let settled = false;
   try {
     await first.handlers.get("session_start")({}, firstCtx);
     const tools = new Map();
@@ -219,7 +222,7 @@ test("a supported cross-directory tool launch survives restart and scope changes
       background: true,
       timeoutMs: 8_000,
       phases: [{ type: "agent", name: "worker", prompt: "wait for the test release" }],
-    }, undefined, undefined, { cwd: storeDir, sessionManager: { getSessionId: () => sessionId } });
+    }, undefined, undefined, { cwd: storeDir, mode: "tui", sessionManager: { getSessionId: () => sessionId } });
     runId = launched.details.runId;
     assert.equal(launched.details.background, true);
 
@@ -250,22 +253,62 @@ test("a supported cross-directory tool launch survives restart and scope changes
     assert.equal(supervision.loadProgressReviewRecords({ storeDir }).some((record) => record.runId === runId), true);
 
     writeFileSync(releaseFile, "release");
-    await waitFor(() => Boolean(store.getRunSummary(runId).endedAt), "the supported workflow did not finish", 10_000);
+    await waitFor(
+      () => store.readRun(runId, { readLimit: 50_000 }).some((event) => event.type === store.EVENT_TYPES.WORKFLOW_END),
+      "the supported workflow did not finish",
+      10_000,
+    );
+    settled = true;
     await waitFor(
       () => !supervision.loadProgressReviewRecords({ storeDir }).some((record) => record.runId === runId),
       "terminal index discovery did not remove the supervision record",
     );
+  } catch (error) {
+    primaryError = error;
   } finally {
-    if (!existsSync(releaseFile)) writeFileSync(releaseFile, "release");
-    if (replacement && replacementCtx) replacement.handlers.get("session_shutdown")({}, replacementCtx);
-    else first.handlers.get("session_shutdown")({}, firstCtx);
-    if (previousPi === undefined) delete process.env.PI_DYNAMIC_WORKFLOW_PI_BIN;
-    else process.env.PI_DYNAMIC_WORKFLOW_PI_BIN = previousPi;
-    if (previousRelease === undefined) delete process.env.PI_TEST_SUPERVISION_RELEASE;
-    else process.env.PI_TEST_SUPERVISION_RELEASE = previousRelease;
-    rmSync(launchCwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(laterSessionCwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    try {
+      try {
+        if (!existsSync(releaseFile)) writeFileSync(releaseFile, "release");
+      } catch (error) { cleanupErrors.push(error); }
+      if (runId && !settled) {
+        try {
+          await waitFor(
+            () => store.readRun(runId, { readLimit: 50_000 }).some((event) => event.type === store.EVENT_TYPES.WORKFLOW_END),
+            "the supported workflow did not finish during cleanup",
+            10_000,
+          );
+          settled = true;
+        } catch (error) { cleanupErrors.push(error); }
+      }
+    } finally {
+      try {
+        try {
+          if (replacement && replacementCtx) replacement.handlers.get("session_shutdown")({}, replacementCtx);
+        } catch (error) { cleanupErrors.push(error); }
+      } finally {
+        try { first.handlers.get("session_shutdown")({}, firstCtx); } catch (error) { cleanupErrors.push(error); }
+        finally {
+          try {
+            if (previousPi === undefined) delete process.env.PI_DYNAMIC_WORKFLOW_PI_BIN;
+            else process.env.PI_DYNAMIC_WORKFLOW_PI_BIN = previousPi;
+          } catch (error) { cleanupErrors.push(error); }
+          try {
+            if (previousRelease === undefined) delete process.env.PI_TEST_SUPERVISION_RELEASE;
+            else process.env.PI_TEST_SUPERVISION_RELEASE = previousRelease;
+          } catch (error) { cleanupErrors.push(error); }
+          if (settled) {
+            try { rmSync(launchCwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }); }
+            catch (error) { cleanupErrors.push(error); }
+            try { rmSync(laterSessionCwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }); }
+            catch (error) { cleanupErrors.push(error); }
+          }
+        }
+      }
+    }
   }
+
+  if (cleanupErrors.length) throw new AggregateError([...(primaryError ? [primaryError] : []), ...cleanupErrors], primaryError?.message || "cross-directory fixture cleanup failed", { cause: primaryError });
+  if (primaryError) throw primaryError;
 });
 
 test("ambiguous cancellation markers suppress reviews without blocking the host", (t) => {

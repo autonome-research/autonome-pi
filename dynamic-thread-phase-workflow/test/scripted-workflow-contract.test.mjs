@@ -51,13 +51,24 @@ test("registered scripted schema replaces the harness tool without declarative s
 
   const declarative = registered.get("dynamic_workflow").parameters;
   const declarativeJson = JSON.stringify(declarative);
-  assert.equal(Buffer.byteLength(declarativeJson), 4_494);
-  assert.equal(createHash("sha256").update(declarativeJson).digest("hex"), "812252eee7b29d7bdbe551dd4ab48f0e524e57d706bc76dc6fec53d64d3c9cf8");
+  assert.equal(Buffer.byteLength(declarativeJson), 4_673);
+  assert.equal(createHash("sha256").update(declarativeJson).digest("hex"), "1004e3c9bed97d1e7f4dcf591b56b89502ff0ca87b2775b592c23270b60d9f41");
+  assert.deepEqual(declarative.properties.progressReviewIntervalMs, {
+    type: "integer", minimum: 60_000, maximum: 86_400_000,
+    description: "Hosted background progress-review cadence in milliseconds; this is not a timeout.",
+  });
 
   const scripted = registered.get("scripted_workflow").parameters;
-  const scriptedBytes = Buffer.byteLength(JSON.stringify(scripted));
+  const scriptedJson = JSON.stringify(scripted);
+  const scriptedBytes = Buffer.byteLength(scriptedJson);
   t.diagnostic(`scripted schema: 920 bytes / 10 properties before -> ${scriptedBytes} bytes / ${Object.keys(scripted.properties).length} properties after`);
-  assert.deepEqual(Object.keys(scripted.properties), ["script", "scriptFile", "template", "name", "cwd", "model", "timeoutMs", "background", "after", "permissions"]);
+  assert.equal(scriptedBytes, 1_107);
+  assert.equal(createHash("sha256").update(scriptedJson).digest("hex"), "e7a580638c1ce737aa1327be2207bc6f369412525f2ed2a84ed2f9d0857d1018");
+  assert.deepEqual(Object.keys(scripted.properties), ["script", "scriptFile", "template", "name", "cwd", "model", "timeoutMs", "background", "progressReviewIntervalMs", "after", "permissions"]);
+  assert.deepEqual(scripted.properties.progressReviewIntervalMs, {
+    type: "integer", minimum: 60_000, maximum: 86_400_000,
+    description: "Hosted background progress-review cadence in milliseconds; this is not a timeout.",
+  });
   assert.equal(scripted.additionalProperties, false);
   assert.deepEqual(scripted.required, ["permissions"]);
   assert.deepEqual(scripted.properties.permissions.enum, ["rwx"]);

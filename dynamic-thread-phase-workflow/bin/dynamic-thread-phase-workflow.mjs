@@ -58,6 +58,8 @@ const MAX_OUTPUT_BYTES = 250_000;
 const MAX_SPEC_BYTES = 1_000_000;
 const MAX_RESUME_MANIFEST_BYTES = 1_000_000;
 const MAX_RESUME_OUTPUT_BYTES = 4_000_000;
+const MIN_PROGRESS_REVIEW_INTERVAL_MS = 60_000;
+const MAX_PROGRESS_REVIEW_INTERVAL_MS = 86_400_000;
 const RESUME_RUN_ID = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$/;
 const SAVED_TEMPLATE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const V2_PERMISSIONS = new Set(["r", "w", "rw", "rwx"]);
@@ -318,6 +320,16 @@ function validateV2Permissions(value, label) {
 function validatePositiveInteger(value, label, max) {
   if (value === undefined) return;
   if (!Number.isSafeInteger(value) || value < 1 || value > max) throw new Error(`${label} must be an integer between 1 and ${max}`);
+}
+
+function validateProgressReviewInterval(value, label, { cli = false } = {}) {
+  if (value === undefined) return undefined;
+  if (cli && (typeof value !== "string" || !/^\d+$/.test(value))) throw new Error(`${label} must be an integer between ${MIN_PROGRESS_REVIEW_INTERVAL_MS} and ${MAX_PROGRESS_REVIEW_INTERVAL_MS}`);
+  const number = cli ? Number(value) : value;
+  if (!Number.isSafeInteger(number) || number < MIN_PROGRESS_REVIEW_INTERVAL_MS || number > MAX_PROGRESS_REVIEW_INTERVAL_MS) {
+    throw new Error(`${label} must be an integer between ${MIN_PROGRESS_REVIEW_INTERVAL_MS} and ${MAX_PROGRESS_REVIEW_INTERVAL_MS}`);
+  }
+  return number;
 }
 
 function validateTimeout(value, label) {
@@ -845,11 +857,14 @@ function loadResumeInvocation(runId, sessionId) {
     throw new Error("Resume checkpoint does not match the authoritative source session owner");
   }
   if (sourceSummary.cwd !== manifest.cwd) throw new Error("Resume checkpoint does not match the authoritative source cwd owner");
+  const storedCadence = sourceSummary.metadata && Object.prototype.hasOwnProperty.call(sourceSummary.metadata, "progressReviewIntervalMs")
+    ? validateProgressReviewInterval(sourceSummary.metadata.progressReviewIntervalMs, "Authoritative source progressReviewIntervalMs")
+    : undefined;
   const supervisionMode = sourceSummary.metadata?.supervisionMode === "main-agent"
     && sourceSummary.trigger?.kind === "background"
     ? "main-agent"
     : undefined;
-  return { spec, cwd: manifest.cwd, model: manifest.model, savedTemplate, supervisionMode, sourceSummary };
+  return { spec, cwd: manifest.cwd, model: manifest.model, savedTemplate, supervisionMode, progressReviewIntervalMs: storedCadence, sourceSummary };
 }
 
 function loadResumeState(runId, { spec, cwd, model, sessionId, sourceSummary: verifiedSourceSummary }) {
@@ -1375,7 +1390,7 @@ async function main() {
   if (resumeOnly && hasSpecInput) throw new Error("resumeRunId must be used without structured spec input");
   if (args.after !== undefined && resumeOnly) throw new Error("Provide only one of after or resumeRunId");
   if (!harnessFile && !hasSpecInput && !resumeOnly) throw new Error("Provide structured spec input or --resume-run-id");
-  const resumeOverrides = ["cwd", "model", "permissions", "timeout", "name", "after", "auto-continue", "saved-template"].filter((key) => args[key] !== undefined);
+  const resumeOverrides = ["cwd", "model", "permissions", "timeout", "name", "after", "auto-continue", "saved-template", "progress-review-interval-ms"].filter((key) => args[key] !== undefined);
   if (resumeOnly && resumeOverrides.length) throw new Error(`Run-ID-only resume derives execution configuration and template provenance from the trusted source run; remove: ${resumeOverrides.join(", ")}`);
   if (resumeOnly && args["supervise-agents"] !== undefined) {
     throw new Error("Run-ID-only resume derives supervision policy from trusted source ownership; remove: supervise-agents");
@@ -1398,6 +1413,10 @@ async function main() {
   const backgroundMode = isTruthyFlag(args.background)
     || Boolean(process.env.PI_DYNAMIC_WORKFLOW_BACKGROUND || process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND);
   const requestedAgentSupervision = isTruthyFlag(args["supervise-agents"]);
+  const requestedProgressReviewIntervalMs = validateProgressReviewInterval(args["progress-review-interval-ms"], "--progress-review-interval-ms", { cli: true });
+  if (requestedProgressReviewIntervalMs !== undefined && (!requestedAgentSupervision || !backgroundMode || !args["session-id"] || resumeOnly)) {
+    throw new Error("--progress-review-interval-ms requires a new hosted supervised background workflow");
+  }
   if (requestedAgentSupervision && !backgroundMode) throw new Error("--supervise-agents requires a background workflow");
   if (requestedAgentSupervision && !args["session-id"]) throw new Error("--supervise-agents requires an originating Pi session");
   if (requestedAgentSupervision && (isTruthyFlag(args["legacy-spec"]) || spec.schema === "pi-dynamic-workflow/v1")) {
@@ -1406,6 +1425,9 @@ async function main() {
   const supervisionMode = backgroundMode
     && (resumeOnly ? resumeInvocation?.supervisionMode === "main-agent" : requestedAgentSupervision)
     ? "main-agent"
+    : undefined;
+  const progressReviewIntervalMs = supervisionMode
+    ? (resumeOnly ? resumeInvocation?.progressReviewIntervalMs : requestedProgressReviewIntervalMs)
     : undefined;
   const cleanupInputFile = args["js-file"] || args["harness-file"] || args["spec-file"];
   if (isTruthyFlag(args["cleanup-input"]) && cleanupInputFile) generatedInputDirectory(cleanupInputFile);
@@ -1455,7 +1477,7 @@ async function main() {
       cwd,
       trigger: { kind: isBackground ? "background" : "manual", dynamic: true },
       input: spec,
-      metadata: { pid: process.pid, processJournalVersion: 1, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, mode: harnessFile ? "javascript" : "spec", permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, continuationMode: isBackground ? "terminal" : "none", ...(supervisionMode ? { supervisionMode } : {}), autoContinue: isTruthyFlag(args["auto-continue"] ?? spec.autoContinue), sessionId: args["session-id"], sessionFile: args["session-file"], savedTemplate, ...chain, resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length },
+      metadata: { pid: process.pid, processJournalVersion: 1, cancellable: true, cancelSignal: "SIGTERM", dynamic: true, mode: harnessFile ? "javascript" : "spec", permissions: spec.permissions || DEFAULT_PERMISSIONS, maxPermissions: MAX_PERMISSIONS, continuationMode: isBackground ? "terminal" : "none", ...(supervisionMode ? { supervisionMode } : {}), ...(progressReviewIntervalMs !== undefined ? { progressReviewIntervalMs } : {}), autoContinue: isTruthyFlag(args["auto-continue"] ?? spec.autoContinue), sessionId: args["session-id"], sessionFile: args["session-file"], savedTemplate, ...chain, resumedFromRunId: resumeState?.sourceRunId, resumedPhaseCount: resumeState?.entries.length },
       message: `${workflow} started`,
     });
     if (successorReservation) commitSuccessor(successorReservation);

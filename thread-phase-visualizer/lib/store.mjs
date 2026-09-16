@@ -1279,7 +1279,7 @@ function compactOwnerMetadata(metadata) {
   const compact = {};
   for (const key of [
     "sessionId", "sessionFile", "launchSource", "source", "cwdAtLaunch", "cwd",
-    "pid", "ppid", "hostname", "cancellable", "cancelSignal", "autoContinue", "continuationMode", "supervisionMode",
+    "pid", "ppid", "hostname", "cancellable", "cancelSignal", "autoContinue", "continuationMode", "supervisionMode", "progressReviewIntervalMs",
     "dynamic", "mode", "permissions", "maxPermissions", "chainId", "rootRunId", "parentRunId", "chainStep",
     "resumedFromRunId", "resumedPhaseCount", "processJournalVersion", "savedTemplate",
   ]) {

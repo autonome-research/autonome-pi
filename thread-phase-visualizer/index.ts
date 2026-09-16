@@ -67,6 +67,8 @@ const requestedSupervisionCadenceMs = Number(process.env.PI_THREAD_PHASE_SUPERVI
 const SUPERVISION_CADENCE_MS = Number.isFinite(requestedSupervisionCadenceMs) && requestedSupervisionCadenceMs >= 60_000
 	? Math.floor(requestedSupervisionCadenceMs)
 	: DEFAULT_PROGRESS_REVIEW_CADENCE_MS;
+const MIN_PROGRESS_REVIEW_INTERVAL_MS = 60_000;
+const MAX_PROGRESS_REVIEW_INTERVAL_MS = 86_400_000;
 const MAX_PROGRESS_REVIEW_BATCH = 8;
 const MAX_PROGRESS_REVALIDATIONS = 32;
 const PROGRESS_REVIEW_ACK_WATCHDOG_MS = 10 * 60 * 1000;
@@ -189,6 +191,24 @@ function artifactKey(a: AnyEvent): string {
 }
 function artifactTargetText(a: AnyEvent): string {
 	return a?.path || a?.url || "";
+}
+
+function strictProgressReviewInterval(value: unknown): number | undefined {
+	return Number.isSafeInteger(value) && (value as number) >= MIN_PROGRESS_REVIEW_INTERVAL_MS && (value as number) <= MAX_PROGRESS_REVIEW_INTERVAL_MS
+		? value as number
+		: undefined;
+}
+
+function progressReviewCadence(summary: AnyEvent, existing: AnyEvent | undefined): number | undefined {
+	const metadata = summary?.metadata;
+	if (metadata && Object.prototype.hasOwnProperty.call(metadata, "progressReviewIntervalMs")) {
+		const explicit = strictProgressReviewInterval(metadata.progressReviewIntervalMs);
+		// A durable schedule already owns its cadence. Do not replace it with an
+		// operator/default fallback merely because malformed historical metadata is
+		// being observed; malformed new metadata never grants a new schedule.
+		return explicit ?? (existing ? Number(existing.cadenceMs) : undefined);
+	}
+	return existing ? Number(existing.cadenceMs) : SUPERVISION_CADENCE_MS;
 }
 
 function formatRunDetail(run: AnyEvent): string {
@@ -814,11 +834,14 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		const reconcileReviewSchedules = (candidateRunIds: Iterable<string> = []) => {
 			if (!supervisionHost) return;
 			const ids = new Set<string>(candidateRunIds);
+			let durableRecords: AnyEvent[];
 			try {
-				for (const record of loadProgressReviewRecords({ storeDir: continuationStoreDir })) ids.add(record.runId);
+				durableRecords = loadProgressReviewRecords({ storeDir: continuationStoreDir });
+				for (const record of durableRecords) ids.add(record.runId);
 			} catch {
 				return;
 			}
+			const durableByRunId = new Map(durableRecords.map((record) => [record.runId, record]));
 			const orderedIds = [...ids];
 			const inspected = Math.min(orderedIds.length, MAX_PROGRESS_REVALIDATIONS);
 			const start = orderedIds.length ? reviewRevalidationCursor % orderedIds.length : 0;
@@ -830,11 +853,16 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 						currentReviewRunIds.delete(runId);
 						discardProgressReview(runId, { storeDir: continuationStoreDir });
 					} else if (disposition === "active" && summary?.startedAt) {
+						const cadenceMs = progressReviewCadence(summary, durableByRunId.get(runId));
+						if (cadenceMs === undefined) {
+							currentReviewRunIds.delete(runId);
+							continue;
+						}
 						currentReviewRunIds.add(runId);
 						ensureProgressReview(runId, {
 						storeDir: continuationStoreDir,
 						startedAt: summary.startedAt,
-						cadenceMs: SUPERVISION_CADENCE_MS,
+						cadenceMs,
 						});
 					} else currentReviewRunIds.delete(runId);
 				} catch {

@@ -16,7 +16,7 @@ function registeredTools() {
 }
 
 function context(cwd, sessionId = "timeout-policy-session") {
-  return { cwd, sessionManager: { getSessionId: () => sessionId } };
+  return { cwd, mode: "tui", sessionManager: { getSessionId: () => sessionId } };
 }
 
 async function waitForRunEnd(store, runId, timeoutMs = 8_000) {

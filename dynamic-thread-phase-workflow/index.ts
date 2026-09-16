@@ -20,6 +20,16 @@ const RUNNER_KILL_GRACE_MS = 8_000;
 const MAX_SAVED_TEMPLATE_BYTES = 1_000_000;
 const SAVED_TEMPLATE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const LEGACY_PREPARED_CALL = Symbol("legacy-prepared-dynamic-workflow-call");
+const MIN_PROGRESS_REVIEW_INTERVAL_MS = 60_000;
+const MAX_PROGRESS_REVIEW_INTERVAL_MS = 86_400_000;
+
+function isHostedSupervisionContext(ctx: any): boolean {
+	return ctx?.mode === "tui" || ctx?.mode === "rpc";
+}
+
+function canLaunchHostedSupervision(params: any, ctx: any): boolean {
+	return params?.background === true && isHostedSupervisionContext(ctx) && Boolean(ctx?.sessionManager?.getSessionId?.());
+}
 
 function savedWorkflowDirectory(): string {
 	return path.resolve(process.env.PI_DYNAMIC_WORKFLOW_TEMPLATE_DIR || path.join(homedir(), ".pi", "agent", "workflows"));
@@ -133,9 +143,9 @@ function renderStructuredTemplate(value: any, inputs: Record<string, any>, used:
 	});
 }
 
-const PUBLIC_WORKFLOW_KEYS = new Set(["name", "cwd", "permissions", "model", "timeoutMs", "background", "after", "resumeRunId", "template", "inputs", "phases"]);
-const SCRIPTED_WORKFLOW_KEYS = new Set(["script", "scriptFile", "template", "name", "cwd", "model", "timeoutMs", "background", "after", "permissions"]);
-const TEMPLATE_WORKFLOW_KEYS = new Set(["name", "cwd", "permissions", "model", "timeoutMs", "background", "phases"]);
+const PUBLIC_WORKFLOW_KEYS = new Set(["name", "cwd", "permissions", "model", "timeoutMs", "background", "progressReviewIntervalMs", "after", "resumeRunId", "template", "inputs", "phases"]);
+const SCRIPTED_WORKFLOW_KEYS = new Set(["script", "scriptFile", "template", "name", "cwd", "model", "timeoutMs", "background", "progressReviewIntervalMs", "after", "permissions"]);
+const TEMPLATE_WORKFLOW_KEYS = new Set(["name", "cwd", "permissions", "model", "timeoutMs", "background", "progressReviewIntervalMs", "phases"]);
 const LEGACY_OUTER_KEYS = new Set(["spec", "harness", "harnessFile", "name", "permissions", "cwd", "model", "background", "autoContinue", "after", "resumeRunId", "timeout"]);
 const EXECUTABLE_PHASE_COMMON = ["type", "name", "permissions", "timeoutMs", "attempts"];
 const WORKFLOW_NAME = /^[a-zA-Z0-9_.:-]+$/;
@@ -164,6 +174,12 @@ function validatePermission(value: unknown, label: string): void {
 	}
 }
 
+function validateProgressReviewInterval(value: unknown, label: string): void {
+	if (value !== undefined && (!Number.isSafeInteger(value) || (value as number) < MIN_PROGRESS_REVIEW_INTERVAL_MS || (value as number) > MAX_PROGRESS_REVIEW_INTERVAL_MS)) {
+		throw new Error(`${label} must be an integer between ${MIN_PROGRESS_REVIEW_INTERVAL_MS} and ${MAX_PROGRESS_REVIEW_INTERVAL_MS}.`);
+	}
+}
+
 function validateTools(value: unknown, label: string): void {
 	if (value === undefined) return;
 	if (!Array.isArray(value) || value.length === 0 || !value.every((tool) => typeof tool === "string")) {
@@ -179,6 +195,7 @@ function validatePublicWorkflow(params: any, label = "dynamic_workflow"): void {
 	validatePermission(params.permissions, `${label}.permissions`);
 	validateBoundedInteger(params.timeoutMs, `${label}.timeoutMs`, 3_600_000);
 	if (params.background !== undefined && typeof params.background !== "boolean") throw new Error(`${label}.background must be a boolean.`);
+	validateProgressReviewInterval(params.progressReviewIntervalMs, `${label}.progressReviewIntervalMs`);
 	if (params.after !== undefined && (typeof params.after !== "string" || !RUN_ID.test(params.after))) throw new Error(`${label}.after must be a safe run identifier.`);
 	if (params.resumeRunId !== undefined && (typeof params.resumeRunId !== "string" || !RUN_ID.test(params.resumeRunId))) throw new Error(`${label}.resumeRunId must be a safe run identifier.`);
 	if (params.template !== undefined && (typeof params.template !== "string" || !SAVED_TEMPLATE_NAME.test(params.template))) throw new Error(`${label}.template must be a safe saved-template name.`);
@@ -274,6 +291,7 @@ function resolveScriptedWorkflowParams(params: any): any {
 	validateOptionalString(params.model, "scripted_workflow.model", true);
 	validateBoundedInteger(params.timeoutMs, "scripted_workflow.timeoutMs", MAX_TIMEOUT_MS);
 	if (params.background !== undefined && typeof params.background !== "boolean") throw new Error("scripted_workflow.background must be a boolean.");
+	validateProgressReviewInterval(params.progressReviewIntervalMs, "scripted_workflow.progressReviewIntervalMs");
 	if (params.after !== undefined && (typeof params.after !== "string" || !RUN_ID.test(params.after))) throw new Error("scripted_workflow.after must be a safe run identifier.");
 	if (params.permissions !== "rwx") throw new Error('scripted_workflow requires explicit permissions: "rwx".');
 	if (params.template !== undefined && (typeof params.template !== "string" || params.template.length > 200 || !SAVED_TEMPLATE_NAME.test(params.template))) throw new Error("scripted_workflow.template must be a safe saved-template name of at most 200 characters.");
@@ -520,6 +538,7 @@ function workflowParametersSchema() {
 		model: Type.Optional(Type.String({ description: "Default model pattern for agent/fanout phases." })),
 		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 3_600_000, description: "Default agent/shell phase timeout." })),
 		background: Type.Optional(Type.Boolean({ description: "Run in the background; successful and failed terminal runs return control to this Pi session, while cancellation does not." })),
+		progressReviewIntervalMs: Type.Optional(Type.Integer({ minimum: MIN_PROGRESS_REVIEW_INTERVAL_MS, maximum: MAX_PROGRESS_REVIEW_INTERVAL_MS, description: "Hosted background progress-review cadence in milliseconds; this is not a timeout." })),
 		after: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Terminal successful or failed parent run. This workflow becomes its single chained successor." })),
 		resumeRunId: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Resume this structured run from its trusted spec and completed phase artifacts. Use without phases or template." })),
 		template: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", description: "Saved structured workflow name from ~/.pi/agent/workflows/<name>.json. Use instead of phases." })),
@@ -538,6 +557,7 @@ function scriptedWorkflowParametersSchema() {
 		model: Type.Optional(Type.String({ minLength: 1 })),
 		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_TIMEOUT_MS })),
 		background: Type.Optional(Type.Boolean({ description: "Return to chat after success/failure, not cancellation." })),
+		progressReviewIntervalMs: Type.Optional(Type.Integer({ minimum: MIN_PROGRESS_REVIEW_INTERVAL_MS, maximum: MAX_PROGRESS_REVIEW_INTERVAL_MS, description: "Hosted background progress-review cadence in milliseconds; this is not a timeout." })),
 		after: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$" })),
 		permissions: StringEnum(["rwx"] as const, { description: "Required: unsandboxed read/write/execute access." }),
 	}, { additionalProperties: false });
@@ -590,7 +610,7 @@ function legacySpecToPublic(args: any): any {
 }
 
 function publicWorkflowToLegacySpec(params: any): any {
-	const { after: _after, background: _background, template: _template, resumeRunId: _resumeRunId, inputs: _inputs, systemTemplateProvenance: _provenance, ...spec } = params;
+	const { after: _after, background: _background, progressReviewIntervalMs: _progressReviewIntervalMs, template: _template, resumeRunId: _resumeRunId, inputs: _inputs, systemTemplateProvenance: _provenance, ...spec } = params;
 	return {
 		schema: "pi-dynamic-workflow/v2",
 		...spec,
@@ -605,9 +625,10 @@ function publicWorkflowToLegacySpec(params: any): any {
 	};
 }
 
-async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any, legacyName: string, publicKind: "dynamic" | "scripted" = "dynamic", internal: { superviseAgents?: boolean } = {}) {
-	if (!internal || typeof internal !== "object" || Array.isArray(internal) || Object.keys(internal).some((key) => key !== "superviseAgents")) throw new Error("Invalid internal workflow launch policy.");
+async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any, legacyName: string, publicKind: "dynamic" | "scripted" = "dynamic", internal: { superviseAgents?: boolean; progressReviewIntervalMs?: number } = {}) {
+	if (!internal || typeof internal !== "object" || Array.isArray(internal) || Object.keys(internal).some((key) => !["superviseAgents", "progressReviewIntervalMs"].includes(key))) throw new Error("Invalid internal workflow launch policy.");
 	if (internal.superviseAgents !== undefined && typeof internal.superviseAgents !== "boolean") throw new Error("Internal superviseAgents policy must be a boolean.");
+	validateProgressReviewInterval(internal.progressReviewIntervalMs, "Internal progress review interval");
 	if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error("Workflow arguments must be an object.");
 	validateOptionalString(params.cwd, "cwd", true);
 	validateOptionalString(params.model, "model");
@@ -616,6 +637,13 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 	if (params.autoContinue !== undefined && typeof params.autoContinue !== "boolean") throw new Error("autoContinue must be a boolean.");
 	if (params.after !== undefined && (typeof params.after !== "string" || !RUN_ID.test(params.after))) throw new Error("after must be a safe run identifier.");
 	if (params.resumeRunId !== undefined && (typeof params.resumeRunId !== "string" || !RUN_ID.test(params.resumeRunId))) throw new Error("resumeRunId must be a safe run identifier.");
+	validateProgressReviewInterval(params.progressReviewIntervalMs, "progressReviewIntervalMs");
+	if (params.progressReviewIntervalMs !== undefined && (legacyName || !internal.superviseAgents || !canLaunchHostedSupervision(params, ctx))) {
+		throw new Error("progressReviewIntervalMs is only valid for a new hosted supervised background workflow.");
+	}
+	if (params.progressReviewIntervalMs !== undefined && internal.progressReviewIntervalMs !== params.progressReviewIntervalMs) {
+		throw new Error("progressReviewIntervalMs must use the trusted workflow launch seam.");
+	}
 	if (params.systemTemplateProvenance !== undefined && (typeof params.systemTemplateProvenance !== "string" || !SAVED_TEMPLATE_NAME.test(params.systemTemplateProvenance))) throw new Error("Saved-template provenance is invalid.");
 	const hasSpec = params.spec !== undefined;
 	const hasHarness = params.harness !== undefined;
@@ -626,6 +654,7 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 	if ((hasHarness || hasHarnessFile) && params.resumeRunId !== undefined) throw new Error("resumeRunId is supported only for structured workflows, not harnesses.");
 	if (params.after !== undefined && params.resumeRunId !== undefined) throw new Error("Provide only one of after or resumeRunId.");
 	if (internal.superviseAgents && (!params.background || legacyName || hasResumeOnly)) throw new Error("Internal main-agent supervision is only valid for new public background launches.");
+	if (internal.superviseAgents && !isHostedSupervisionContext(ctx)) throw new Error("Main-agent supervision requires a hosted TUI or RPC session.");
 	if (internal.superviseAgents && !ctx.sessionManager?.getSessionId?.()) throw new Error("Main-agent supervision requires an originating Pi session.");
 	if (hasSpec && (!params.spec || typeof params.spec !== "object" || Array.isArray(params.spec))) throw new Error("spec must be a non-null object.");
 	if (hasHarness && (typeof params.harness !== "string" || !params.harness.trim())) throw new Error("harness must be a non-empty string.");
@@ -656,6 +685,7 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 		if (params.timeout !== undefined) args.push("--timeout", String(normalizeTimeoutMs(params.timeout, "timeout")));
 		if (params.background) args.push("--background");
 		if (internal.superviseAgents) args.push("--supervise-agents");
+		if (internal.progressReviewIntervalMs !== undefined) args.push("--progress-review-interval-ms", String(internal.progressReviewIntervalMs));
 		if (params.autoContinue) args.push("--auto-continue");
 		if (params.after) args.push("--after", params.after);
 		if (params.resumeRunId) args.push("--resume-run-id", params.resumeRunId);
@@ -687,7 +717,7 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 		"Set dynamic_workflow permissions to r, w, rw, or rwx; phases inherit that default and may override it within operator policy.",
 		"Use dynamic_workflow agent phases for one subagent and fanout phases for parallel subagents. Shell phases require rwx.",
 		"Use {{outputs.phase-name}} only to reference earlier phase outputs; fanout prompts may also use {{item}} and {{index}}.",
-		"Use background=true for long or open-ended agent workflows. Explicit timeoutMs values remain hard limits; successful and failed background runs return control to chat, while user-cancelled runs do not.",
+		"Use background=true for long or open-ended agent workflows. Optional progressReviewIntervalMs is a strict 60000..86400000 ms review cadence for hosted background launches, not a timeout; explicit timeoutMs values remain hard limits.",
 		"Reusable structured workflows may be loaded by template name from ~/.pi/agent/workflows/<name>.json instead of supplying phases.",
 		"Use after with a terminal successful or failed run id to create its single model-selected chained successor; Pi generates the child run and chain identities.",
 		"Use resumeRunId by itself to continue the same structured workflow from its trusted stored spec and validated completed phase-output artifacts.",
@@ -713,9 +743,13 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 				cwd: resolved.cwd,
 				model: resolved.model,
 				background: resolved.background,
+				progressReviewIntervalMs: resolved.progressReviewIntervalMs,
 				after: resolved.after,
 				systemTemplateProvenance: resolved.systemTemplateProvenance,
-			}, signal, onUpdate, ctx, "", "dynamic", { superviseAgents: resolved.background === true && !legacyPreparedCall && Boolean(ctx.sessionManager?.getSessionId?.()) });
+			}, signal, onUpdate, ctx, "", "dynamic", {
+				superviseAgents: !legacyPreparedCall && canLaunchHostedSupervision(resolved, ctx),
+				progressReviewIntervalMs: resolved.progressReviewIntervalMs,
+			});
 		},
 	});
 
@@ -729,11 +763,15 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 			"scripted_workflow executes arbitrary unsandboxed Node.js and always requires explicit permissions=rwx.",
 			"scripted_workflow accepts exactly one of inline script, scriptFile, or a saved self-contained .mjs template.",
 			"scripted_workflow provides ctx.phase, ctx.shell, ctx.pi, ctx.fanout, ctx.artifact, ctx.emit, ctx.cancelled(), and ctx.signal.",
+			"Use progressReviewIntervalMs only for a new hosted background scripted workflow; it changes review cadence, never timeout or recovery behavior.",
 		],
 		parameters: scriptedWorkflowParametersSchema(),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const resolved = resolveScriptedWorkflowParams(params);
-			return executeDynamicWorkflow({ ...resolved, timeout: resolved.timeoutMs }, signal, onUpdate, ctx, "", "scripted", { superviseAgents: resolved.background === true && Boolean(ctx.sessionManager?.getSessionId?.()) });
+			return executeDynamicWorkflow({ ...resolved, timeout: resolved.timeoutMs }, signal, onUpdate, ctx, "", "scripted", {
+				superviseAgents: canLaunchHostedSupervision(resolved, ctx),
+				progressReviewIntervalMs: resolved.progressReviewIntervalMs,
+			});
 		},
 	});
 

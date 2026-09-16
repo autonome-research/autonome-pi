@@ -168,15 +168,18 @@ Top-level controls:
 - `model` — inherited agent model pattern
 - `timeoutMs` — explicit inherited hard deadline for agent and shell subprocesses
 - `background` — detach after durable readiness and return `runId` + `pid`
+- `progressReviewIntervalMs` — optional strict integer cadence from 60,000 through 86,400,000 ms. It is valid only on a new hosted supervised background `dynamic_workflow` or `scripted_workflow`; it is a review cadence, never a timeout or intervention policy.
 - `after` — terminal successful or failed parent run; this run becomes its single session-scoped successor
 
 Fanout concurrency is phase-local. Caller descriptions, metadata, top-level concurrency, and retry-backoff controls are not part of the declarative contract.
 
-Use `background: true` for long or open-ended agent workflows. New public background `dynamic_workflow` and `scripted_workflow` calls launched from a Pi session are privately marked for main-agent supervision; this does not add a model-facing field. For their Pi agent, fanout-agent, and scripted `ctx.pi` subprocesses, an omitted phase/helper/workflow timeout means no wall-clock kill deadline. An explicit phase or scripted-helper `timeoutMs` wins over an explicit workflow `timeoutMs`, and every explicit deadline remains a hard limit.
+Use `background: true` for long or open-ended agent workflows. New public background `dynamic_workflow` and `scripted_workflow` calls launched from a hosted TUI or RPC session are privately marked for main-agent supervision; a session id alone is not sufficient and this does not add a model-facing field. For their Pi agent, fanout-agent, and scripted `ctx.pi` subprocesses, an omitted phase/helper/workflow timeout means no wall-clock kill deadline. An explicit phase or scripted-helper `timeoutMs` wins over an explicit workflow `timeoutMs`, and every explicit deadline remains a hard limit.
 
 Shell subprocesses always retain the default bound when no explicit deadline is supplied. Foreground workflows, the deprecated alias, explicit v1 CLI workflows, historical prepared calls, unowned launches, and source runs without verified supervision metadata retain the previous default bound (10 minutes). The internal operator setting `PI_DYNAMIC_WORKFLOW_DEFAULT_TIMEOUT_MS` can change that fallback without changing the tool schema. Prefer background mode for legitimately open-ended agent work.
 
-The durable progress-review timer asks the main agent to inspect current state and use existing tools to report, wait, or intervene. It does **not** infer that a workflow is busy or stuck, and it never kills, retries, resumes, or launches work. Activity is evidence only. Readiness remains bounded to five seconds, cancellation remains cooperative with SIGTERM-to-SIGKILL escalation, and process-journal ownership remains enforced. See [Workflow supervision](../docs/workflow-supervision.md).
+The durable progress-review schedule asks the main agent to inspect current state and use existing tools to report, wait, or intervene. It does **not** infer that a workflow is busy or stuck, and it never kills, retries, resumes, or launches work. Activity is evidence only. Readiness remains bounded to five seconds, cancellation remains cooperative with SIGTERM-to-SIGKILL escalation, and process-journal ownership remains enforced. See [Workflow supervision](../docs/workflow-supervision.md).
+
+Cadence precedence is exact: an explicit valid `progressReviewIntervalMs` wins for a new hosted background launch; an existing durable schedule wins across reload/restart; otherwise a new unconfigured schedule uses `PI_THREAD_PHASE_SUPERVISION_CHECK_MS`, then the ten-minute default. Structured saved-template defaults are resolved before invocation-level overrides, and the resolved value is validated before runner/input/run artifacts are created. Resume accepts only `resumeRunId` and optional `background`: a legitimate background resume inherits the exact cadence from verified authoritative source metadata, while old supervised sources without the field use the operator/default fallback. Foreground, unhosted, legacy, phase/helper, and resume overrides are rejected. Recursive workers share the root policy and create no schedules of their own.
 
 Successful and failed background runs still use the existing terminal continuation behavior. Failure continuations include failed phases, errors, checkpoints, and partial artifacts. Progress reviews are distinct from completion, while user-cancelled runs never auto-continue and cannot launch a chained successor.
 
@@ -252,7 +255,7 @@ The child receives a new system-generated run id, inherits the parent's chain id
 
 `scripted_workflow` is a separate advanced tool for loops, branching, tournaments, custom scoring, or other control flow that declarative phases cannot express. Script code is arbitrary unsandboxed Node.js and requires explicit `permissions: "rwx"`. Prefer `dynamic_workflow` for ordinary composition.
 
-Inline mode accepts a self-contained ES module in `script`; file mode accepts its path in `scriptFile`; saved mode accepts a safe `template` name for `<name>.mjs`. These source modes are mutually exclusive. The remaining controls are only `name`, `cwd`, `model`, `timeoutMs`, `background`, and `after`.
+Inline mode accepts a self-contained ES module in `script`; file mode accepts its path in `scriptFile`; saved mode accepts a safe `template` name for `<name>.mjs`. These source modes are mutually exclusive. The remaining controls are only `name`, `cwd`, `model`, `timeoutMs`, `background`, `progressReviewIntervalMs`, and `after`; the cadence is valid only for a new hosted supervised background launch and never changes timeouts or intervention behavior.
 
 ```js
 export default async function workflow(ctx) {

@@ -111,8 +111,9 @@ Mixed-permission example:
 ## Execution policy
 
 - Set `cwd` explicitly when execution differs from the Pi session cwd.
-- Top-level `model` and `timeoutMs` provide phase defaults. An explicit `timeoutMs` is always a hard limit. Fanout concurrency is phase-local; descriptions, caller metadata, retry backoff, and supervision cadence are not declarative fields.
-- Use `background: true` for long or open-ended agent work. New background dynamic/scripted launches are privately marked for main-agent supervision: a durable ten-minute timer asks the main agent to inspect logs and decide whether to wait, report, or intervene. The timer does not detect a stall and never kills, retries, resumes, or launches work. Success and failure still durably return control to chat; progress reviews are distinct from completion and user cancellation does not auto-continue.
+- Top-level `model` and `timeoutMs` provide phase defaults. An explicit `timeoutMs` is always a hard limit. Fanout concurrency is phase-local; descriptions, caller metadata, and retry backoff are not declarative fields.
+- `progressReviewIntervalMs` is an optional strict integer in inclusive `60000..86400000` milliseconds, only for a new hosted supervised background launch; it is a review cadence, not a timeout or intervention control.
+- Use `background: true` for long or open-ended agent work. New hosted background dynamic/scripted launches from a TUI or RPC context with an originating session ID are privately marked for main-agent supervision. For a newly created schedule, the durable timer uses the validated `progressReviewIntervalMs` launch cadence, or the operator-configured cadence with a 10-minute fallback when the field is omitted; an existing durable schedule keeps its cadence and check identity on reload/restart. The timer asks the main agent to inspect logs and decide whether to wait, report, or intervene. It does not detect a stall and never kills, retries, resumes, or launches work. Success and failure still durably return control to chat; progress reviews are distinct from completion and user cancellation does not auto-continue.
 - Foreground calls remain bounded because they occupy their own supervisor. Shell phases retain their normal default bound. Do not use foreground mode for intentionally open-ended agent work.
 - Use `after` with a trusted terminal successful or failed run id to launch its single chained successor. Do not chain from a cancelled run.
 - Add an artifact phase when the user expects a durable report.
@@ -126,7 +127,7 @@ Store reusable workflows under `~/.pi/agent/workflows/` (or `PI_DYNAMIC_WORKFLOW
 - `<name>.json` is a flat structured `dynamic_workflow` object. Invoke it with `{ "template": "name", "inputs": { ... } }` instead of phases. Use `{{inputs.key}}` placeholders; exact placeholders preserve JSON values, while placeholders embedded in text require scalars.
 - `<name>.mjs` is a self-contained advanced script. Invoke it with `scripted_workflow` using `{ "template": "name", "permissions": "rwx" }`.
 
-Missing or unused structured-template inputs fail preflight. Invocation-level workflow defaults override structured-template defaults; trusted saved-template provenance is stored separately from caller data. For `dynamic_workflow`, use exactly one of `template`, `phases`, or `resumeRunId`. For `scripted_workflow`, use exactly one of `template`, `script`, or `scriptFile`. Template names are safe identifiers rather than paths. Symlinks, non-files, traversal, and files above 1 MB fail preflight. Templates do not bypass permission ceilings or normal validation. Authoring remains explicit and file-based; the tools do not overwrite saved templates.
+Missing or unused structured-template inputs fail preflight. Invocation-level workflow defaults override structured-template defaults, including `progressReviewIntervalMs`; the resolved value is validated before runner/input/run artifacts are created. Trusted saved-template provenance is stored separately from caller data. For `dynamic_workflow`, use exactly one of `template`, `phases`, or `resumeRunId`. For `scripted_workflow`, use exactly one of `template`, `script`, or `scriptFile`. Template names are safe identifiers rather than paths. Symlinks, non-files, traversal, and files above 1 MB fail preflight. Templates do not bypass permission ceilings or normal validation. Authoring remains explicit and file-based; the tools do not overwrite saved templates.
 
 ## Chaining
 
@@ -146,7 +147,7 @@ Structured workflows write an atomic `workflow-checkpoint.json` plus hashed per-
 { "resumeRunId": "review-src-..." }
 ```
 
-Resume is fail-closed. The trusted run supplies the compiled spec, real working directory, effective model, permissions, template provenance, and Pi session; repeating or overriding them is rejected. Checkpoints must contain a contiguous prefix of matching phases, output files must remain inside the source run's artifact directory, and their sizes and SHA-256 hashes must verify. Validated outputs are copied into the new run's own checkpoint chain; completed phases are not re-executed, and execution continues at the first uncheckpointed phase. Scripted workflows cannot use `resumeRunId`. A single resumable phase output is capped at 4 MB.
+Resume is fail-closed. The trusted run supplies the compiled spec, real working directory, effective model, permissions, template provenance, Pi session, and (for a legitimate background resume) the exact authoritative progress-review cadence; repeating or overriding them is rejected. Older supervised sources without the field use the operator/default cadence. Foreground resumes remain bounded. Checkpoints must contain a contiguous prefix of matching phases, output files must remain inside the source run's artifact directory, and their sizes and SHA-256 hashes must verify. Validated outputs are copied into the new run's own checkpoint chain; completed phases are not re-executed, and execution continues at the first uncheckpointed phase. Scripted workflows cannot use `resumeRunId`. A single resumable phase output is capped at 4 MB.
 
 Resume proves that the earlier phase completed and that its output artifact is intact. It cannot make an interrupted, non-checkpointed side effect idempotent; design shell/write phases accordingly.
 
@@ -154,7 +155,7 @@ Resume proves that the earlier phase completed and that its output artifact is i
 
 Use the separate `scripted_workflow` tool only for loops, branching, tournaments, custom scoring, or control flow that declarative phases cannot represent. Prefer `dynamic_workflow` for ordinary composition. `scripted_workflow` requires explicit `permissions: "rwx"` in every source mode and executes arbitrary unsandboxed JavaScript.
 
-Provide exactly one source: inline self-contained ES module text in `script`, a module path in `scriptFile`, or a saved self-contained `.mjs` `template`. Its execution controls are `name`, `cwd`, `model`, `timeoutMs`, `background`, and `after`; structured, resume, metadata, legacy harness, and unknown fields are rejected.
+Provide exactly one source: inline self-contained ES module text in `script`, a module path in `scriptFile`, or a saved self-contained `.mjs` `template`. Its execution controls are `name`, `cwd`, `model`, `timeoutMs`, `background`, `progressReviewIntervalMs`, and `after`; structured, resume, metadata, legacy harness, and unknown fields are rejected.
 
 Script helpers:
 
@@ -166,7 +167,7 @@ Script helpers:
 - `ctx.emit(kind, data)`
 - `ctx.cancelled()` / `ctx.signal`
 
-In a supervised background scripted run, `ctx.pi` and `ctx.fanout` may run without an implicit wall-clock deadline only when neither helper nor workflow has an explicit timeout; explicit helper/workflow deadlines still win. `ctx.shell` remains bounded. There is no script helper or workflow field for changing check cadence or steering the supervisor in this initial release.
+In a supervised background scripted run, `ctx.pi` and `ctx.fanout` may run without an implicit wall-clock deadline only when neither helper nor workflow has an explicit timeout; explicit helper/workflow deadlines still win. `ctx.shell` remains bounded. There is no script helper for changing cadence or steering the supervisor after launch.
 
 Prefer a standalone TypeScript extension using thread-phase directly when logic becomes reusable, domain-specific, operationally important, or recovery-heavy.
 
