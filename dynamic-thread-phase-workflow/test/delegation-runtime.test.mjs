@@ -10,7 +10,7 @@ import { getEventListeners } from 'node:events';
 import { createDelegationRuntime, delegationLaneCap } from '../lib/delegation-runtime.mjs';
 import { createDelegationJournal, inspectDelegationJournal } from '../lib/delegation-journal.mjs';
 import { createProcessJournal } from '../lib/process-journal.mjs';
-import { readStoredArtifact } from '../lib/delegation-storage.mjs';
+import { canonicalJSON, readStoredArtifact } from '../lib/delegation-storage.mjs';
 import { probeGroup } from '../lib/scoped-process.mjs';
 import { assertBudgetInvariants } from '../lib/delegation-budget.mjs';
 import { initialState, reduceEvent, composeFinalResult } from '../lib/delegation-journal-model.mjs';
@@ -25,9 +25,10 @@ function fixture(t, options = {}) {
   fs.writeFileSync(join(dir, 'workspace/src/file'), 'parent');
   fs.writeFileSync(join(dir, 'workspace/src/narrow/file'), 'child');
   const phases = options.phases ?? [{ type: 'agent', name: 'root' }];
-  const roots = phases.flatMap((p, phaseIndex) => p.type === 'shell' ? [] : (p.items ?? [p.name]).map((label, itemIndex) => ({
+  const roots = phases.flatMap((p, phaseIndex) => !['agent', 'fanout'].includes(p.type) ? [] : (p.items ?? [p.name]).map((label, itemIndex) => ({
     phaseIndex, ...(p.items ? { itemIndex } : {}), agentBudget: options.budgets?.[phaseIndex] ?? 8,
-    label, task: `finite ${label}`, permissions: options.permissions?.[itemIndex] ?? 'r', directoryScope: scope, deadlineAt: options.deadlineAt ?? null,
+    label, ...(options.deferred ? { taskTemplate: `finite template ${label} {{outputs}}`, contextTemplate: `context ${phaseIndex}:${itemIndex}` } : { task: `finite ${label}` }),
+    permissions: options.permissions?.[itemIndex] ?? 'r', directoryScope: scope, deadlineAt: options.deadlineAt ?? null,
   })));
   let armedFault;
   const j = createDelegationJournal({ artifactDirectory: join(dir, 'artifacts'), workspace: join(dir, 'workspace'), protectedDirectories: [join(dir, 'profile')],
@@ -35,7 +36,7 @@ function fixture(t, options = {}) {
     policy: { maxDepth: options.depth ?? 2, totalAgentBudget: roots.reduce((s, n) => s + n.agentBudget, 0), directoryScope: scope, context: { objective: 'finite', constraints: [] } },
     roots, fault(point) { armedFault?.(point); } });
   const pj = createProcessJournal(join(dir, 'artifacts'), 'runtime-fixture');
-  const starts = [], gates = new Map(), handles = new Map(), events = [], owned = new Set();
+  const starts = [], gates = new Map(), handles = new Map(), events = [], emittedArtifacts = [], owned = new Set();
   const originalStarted = pj.started;
   pj.started = (token, pid) => { owned.add(pid); originalStarted(token, pid); };
   const state = () => j.snapshot().state;
@@ -71,10 +72,13 @@ function fixture(t, options = {}) {
         if (options.drive) await options.drive(h, f);
         else { complete(h); release(h); }
       },
-      onEvent(e) { events.push(e); options.onEvent?.(e, f); }, ...overrides });
+      onEvent(e) { events.push(e); options.onEvent?.(e, f); },
+      ...(options.render ? { render: input => options.render(input, f) } : {}),
+      ...(options.emitArtifact ? { emitArtifact: input => { emittedArtifacts.push(input); return options.emitArtifact(input, f); } } : {}),
+      ...overrides });
     return runtime;
   }
-  const f = { dir, j, pj, state, content, gates, handles, starts, events, complete, release, build,
+  const f = { dir, j, pj, state, content, gates, handles, starts, events, emittedArtifacts, complete, release, build,
     get runtime() { return runtime; }, armFault(fn) { armedFault = fn; },
     delegate(h, children, requestId = 'delegate') { return h.delegate(requestId, { directoryRevision: h.revision(), children }); } };
   t.after(async () => {
@@ -106,6 +110,102 @@ test('cap matrix and strict static ingress reject before spawn', async t => {
   assert.throws(() => f.build({ operator: null }), /INVALID_REQUEST/);
   assert.throws(() => f.build({ deadlinePolicy: null }), /INVALID_REQUEST/);
   assert.equal(f.starts.length, 0);
+});
+
+test('deferred ordered phases bind prior verified outputs, duplicate item indexes, shell and artifact positions before activation', async t => {
+  const phases = [
+    { type: 'agent', name: 'first' },
+    { type: 'artifact', name: 'snapshot', from: 'first' },
+    { type: 'shell', name: 'shell', permissions: 'rwx', command: 'template shell' },
+    { type: 'fanout', name: 'review', items: ['duplicate', 'duplicate'], concurrency: 2 },
+  ];
+  const f = fixture(t, { phases, budgets: [1, 0, 0, 1], depth: 0, deferred: true,
+    render(input) {
+      if (input.kind === 'shell') {
+        assert.equal(input.outputs.first.summary, 'finite claim'); return 'printf shell-bound';
+      }
+      if (input.kind === 'artifact') {
+        assert.equal(input.value.summary, 'finite claim'); return `artifact:${input.value.result.sha256}`;
+      }
+      if (input.phaseIndex === 0) {
+        assert.deepEqual(Object.keys(input.outputs), []); return [{ task: 'rendered first', parentContextSummary: 'root context' }];
+      }
+      assert.equal(input.phaseIndex, 3); assert.equal(input.outputs.first.summary, 'finite claim');
+      assert.equal(input.outputs.shell.stdout, 'shell-bound'); assert.match(input.outputs.snapshot.content, /^artifact:/);
+      return input.roots.map(root => ({ task: `review item ${root.itemIndex} after ${input.outputs.first.result.sha256}` }));
+    },
+    emitArtifact(input) { assert.equal(input.phase.name, 'snapshot'); assert.match(input.content, /^artifact:/); },
+    drive(h, f) {
+      const n = f.state().nodes.find(n => n.nodeId === h.assignment.nodeId);
+      assert.equal(f.runtime.inspect().outputs[n.phaseIndex === 0 ? 'first' : 'review'], undefined);
+      if (n.phaseIndex === 0) {
+        assert.equal(h.assignment.task, 'rendered first');
+        const context = h.context('materialized-context');
+        assert.equal(context.assignment.task, 'rendered first');
+        assert.ok(context.directory.some(row => row.phaseIndex === 3 && /finite template duplicate/.test(row.assignmentPreview)));
+      } else assert.equal(h.assignment.task, `review item ${n.itemIndex} after ${f.runtime.inspect().outputs.first.result.sha256}`);
+      assert.match(h.assignment.acceptance[0].criterion, /sha256:[a-f0-9]{64}/);
+      f.complete(h); f.release(h);
+    } });
+  const result = await f.build().run(); assert.equal(result.status, 'success');
+  assert.equal(f.emittedArtifacts.length, 1); assert.equal(f.starts.length, 3);
+  const state = f.state();
+  assert.deepEqual(state.materializations.map(m => m.phaseIndex), [0, 3]);
+  assert.deepEqual(state.nodes.map(n => n.itemIndex), [undefined, 0, 1]);
+  state.nodes.forEach(n => {
+    const result = f.content(n); assert.equal(result.assignment.task, n.assignment.task);
+    assert.equal(result.taskHash, createHash('sha256').update(n.assignment.task).digest('hex'));
+    assert.equal(result.assignmentHash, createHash('sha256').update(canonicalJSON(n.assignment)).digest('hex'));
+  });
+  assert.deepEqual(f.runtime.inspect().outputs.review.map(row => row.itemIndex), [0, 1]);
+  assert.deepEqual(inspectDelegationJournal(f.j.directory, f.j.binding).state, state);
+  const events = fs.readFileSync(join(f.j.directory, 'events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  for (const phaseIndex of [0, 3]) {
+    const materialized = events.findIndex(e => e.type === 'root_assignments_materialized' && e.payload.phaseIndex === phaseIndex);
+    const activated = events.findIndex(e => e.type === 'root_activated' && state.nodes.find(n => n.nodeId === e.payload.nodeId)?.phaseIndex === phaseIndex);
+    assert.ok(materialized >= 0 && activated > materialized);
+  }
+});
+
+test('whole deferred fanout validation is atomic: one oversized task launches and materializes none', async t => {
+  const f = fixture(t, { phases: [{ type: 'fanout', name: 'review', items: ['duplicate', 'duplicate'], concurrency: 2 }],
+    budgets: [1], depth: 0, deferred: true, render({ roots }) { return roots.map((_, i) => i ? { task: 'x'.repeat(4097) } : { task: 'valid' }); } });
+  const before = f.j.snapshot().state.sequence;
+  const result = await f.build().run(); assert.equal(result.status, 'failed'); assert.equal(result.held, false);
+  assert.equal(f.starts.length, 0); assert.equal(f.state().materializations.length, 0); assert.equal(f.state().budget.spent, 0);
+  assert.ok(f.state().sequence > before); // only known terminal cleanup, never a materialization/activation
+  const events = fs.readFileSync(join(f.j.directory, 'events.jsonl'), 'utf8');
+  assert.doesNotMatch(events, /root_assignments_materialized|root_activated/);
+  assert.ok(f.state().nodes.every(n => n.joined && n.closed && n.assignment === undefined));
+});
+
+test('deferred rendering has bounded late rejection and cancellation/loss checks before publication', async t => {
+  for (const boundary of ['late-reject', 'cancel', 'loss']) {
+    let reject, resolve;
+    const pending = new Promise((yes, no) => { resolve = yes; reject = no; });
+    const f = fixture(t, { deferred: true, render() { return pending; } });
+    const runtime = f.build(), running = runtime.run();
+    await pause(20); assert.equal(f.starts.length, 0); assert.equal(f.state().materializations.length, 0);
+    if (boundary === 'cancel') { runtime.cancel(); resolve([{ task: 'too late' }]); }
+    else if (boundary === 'loss') { f.j.dispose(); resolve([{ task: 'too late' }]); }
+    const result = await running;
+    assert.equal(result.held, boundary === 'loss');
+    assert.equal(result.status, boundary === 'loss' ? 'unknown' : boundary === 'cancel' ? 'cancelled' : 'failed');
+    assert.equal(f.starts.length, 0); assert.equal(f.state().materializations.length, 0);
+    const snapshot = f.j.snapshot(); reject(Error('late render rejection')); await pause(0); assert.deepEqual(f.j.snapshot(), snapshot);
+  }
+});
+
+test('artifact emission rejection produces no artifact output or later root activation', async t => {
+  const f = fixture(t, { deferred: true,
+    phases: [{ type: 'agent', name: 'first' }, { type: 'artifact', name: 'report', from: 'first' }, { type: 'agent', name: 'later' }],
+    budgets: [1, 0, 1], depth: 0,
+    render(input) { return input.kind === 'roots' ? [{ task: `rendered ${input.phase.name}` }] : 'artifact content'; },
+    emitArtifact() { return Promise.reject(Error('artifact write failed')); } });
+  const result = await f.build().run(); assert.equal(result.status, 'failed'); assert.equal(result.held, false);
+  assert.equal(f.starts.length, 1); assert.equal(f.runtime.inspect().outputs.report, undefined);
+  const later = f.state().nodes.find(n => n.phaseIndex === 2);
+  assert.equal(later.invocationId, null); assert.equal(later.assignment, undefined);
 });
 
 test('real tree at D+1 headroom: live parked ancestors, read-only parallel lane, serial failure/partial review, fixed later quota', async t => {
@@ -148,7 +248,12 @@ test('real tree at D+1 headroom: live parked ancestors, read-only parallel lane,
   assert.equal(f.starts.length, 6); assert.equal(new Set(f.starts).size, 6);
   const s = f.state(); assertBudgetInvariants(s.budget); assert.equal(s.budget.spent, 6); assert.equal(s.budget.acceptedNodes, 6);
   assert.equal(s.budget.freeWorkflow, 6);
-  assert.equal(s.nodes.reduce((sum, n) => sum + f.content(n).usage.totals.totalTokens, 0), 42);
+  const contents = s.nodes.map(n => f.content(n));
+  contents.forEach(content => {
+    assert.equal(content.schema, 'pi-workflow-delegation-result-evidence/v2');
+    for (const field of ['assignment', 'assignmentHash', 'taskHash']) assert.equal(Object.hasOwn(content, field), false);
+  });
+  assert.equal(contents.reduce((sum, content) => sum + content.usage.totals.totalTokens, 0), 42);
   assert.deepEqual(inspectDelegationJournal(f.j.directory, f.j.binding).state, s);
   assert.equal(f.runtime.inspect().lanes.length, 0);
 });
@@ -588,6 +693,54 @@ test('far-future finite absolute grant does not overflow Node timer into immedia
   assert.equal((await runtime.run()).status, 'success');
   assert.equal(f.state().nodes[0].effectiveDeadlineAt, Number.MAX_SAFE_INTEGER);
   assert.equal(f.state().nodes[0].result.status, 'success');
+});
+
+test('deadline timer rechecks its fixed absolute due time before timing out', async t => {
+  const nativeSetTimeout = globalThis.setTimeout, nativeClearTimeout = globalThis.clearTimeout;
+  const wakeups = [];
+  let capture = 'initial', clockMock, active;
+  const activeNode = new Promise(resolve => { active = resolve; });
+  const timerMock = t.mock.method(globalThis, 'setTimeout', (callback, delay, ...args) => {
+    if (capture === 'rearm' || capture === 'initial' && delay > 25000) {
+      const timer = nativeSetTimeout(() => {}, 60000, ...args); timer.unref();
+      wakeups.push({ callback, delay, timer }); capture = null; return timer;
+    }
+    return nativeSetTimeout(callback, delay, ...args);
+  });
+  const f = fixture(t, { phases: [{ type: 'agent', name: 'root', timeoutMs: 30000 }], drive() { active(); } });
+  const runtime = f.build(), running = runtime.run();
+  let finished = false;
+  try {
+    await activeNode;
+    assert.equal(wakeups.length, 1);
+    const deadline = f.state().nodes[0].effectiveDeadlineAt;
+    assert.equal(runtime.inspect().nodes[0].deadlineAt, deadline);
+
+    nativeClearTimeout(wakeups[0].timer); capture = 'rearm';
+    clockMock = t.mock.method(Date, 'now', () => deadline - 1);
+    wakeups[0].callback();
+    clockMock.mock.restore(); clockMock = null;
+    assert.equal(wakeups.length, 2); assert.equal(wakeups[1].delay, 1);
+    assert.equal(f.state().nodes[0].stopped, undefined);
+    assert.equal(f.state().nodes[0].effectiveDeadlineAt, deadline);
+    assert.equal(runtime.inspect().nodes[0].deadlineAt, deadline);
+
+    nativeClearTimeout(wakeups[1].timer);
+    clockMock = t.mock.method(Date, 'now', () => deadline);
+    wakeups[1].callback();
+    clockMock.mock.restore(); clockMock = null;
+    assert.equal(f.state().nodes[0].stopped, 'timeout');
+    assert.equal(f.state().nodes[0].effectiveDeadlineAt, deadline);
+
+    const result = await running; finished = true;
+    assert.equal(result.status, 'failed'); assert.equal(result.held, false);
+    const node = f.state().nodes[0];
+    assert.equal(node.result.status, 'timeout'); assert.equal(node.joined, true); assert.equal(node.closed, true);
+  } finally {
+    clockMock?.mock.restore(); timerMock.mock.restore();
+    wakeups.forEach(({ timer }) => nativeClearTimeout(timer));
+    if (!finished) { runtime.cancel(); await running.catch(() => {}); }
+  }
 });
 
 async function shellReady(file) {

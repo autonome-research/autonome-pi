@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { createDelegationJournal, inspectDelegationJournal, readDelegationArtifactPage } from '../lib/delegation-journal.mjs';
+import { claimDelegationScheduler, createDelegationJournal, inspectDelegationJournal, readDelegationArtifactPage } from '../lib/delegation-journal.mjs';
 import { canonicalJSON, sha256, readStoredArtifact } from '../lib/delegation-storage.mjs';
 import { checkCapacity, initialState, reservedBytes, reduceEvent } from '../lib/delegation-journal-model.mjs';
 import { createProcessJournal } from '../lib/process-journal.mjs';
@@ -52,6 +52,7 @@ test('exclusive create, generated immutable bindings, exact roots and inspection
   const seen = inspect(j);
   assert.equal(seen.inspectionOnly, true); assert.equal(seen.resumable, false); assert.equal(seen.launchAuthorized, false);
   assert.equal(seen.state.budget.acceptedNodes, 1); assert.equal(seen.state.budget.spent, 0);
+  assert.equal(Object.hasOwn(seen.state, 'materializations'), false); // old immediate-root state shape remains unchanged
   assert.equal(seen.reservedBytes, 4 * 4096); assert.equal(seen.projection, 'current');
   assert.equal(seen.manifest.policyDigest, sha256(canonicalJSON(opts.policy)));
   assert.match(seen.manifest.ownerEpoch, /^[0-9a-f-]{36}$/);
@@ -70,6 +71,80 @@ test('strict options reject caller node/root/epoch/capability metadata before al
     assert.equal(fs.existsSync(join(opts.artifactDirectory, 'delegation')), false);
   }
   const opts = options(t); opts.roots[0].nodeId = 'forged'; assert.throws(() => createDelegationJournal(opts), /INVALID_REQUEST/);
+});
+
+test('deferred phase materializes one complete immutable assignment artifact through original scheduler authority', t => {
+  const opts = options(t);
+  opts.policy.totalAgentBudget = 2;
+  const { task: _task, ...root } = opts.roots[0];
+  opts.roots = ['duplicate', 'duplicate'].map((label, itemIndex) => ({ ...root, phaseIndex: 2, itemIndex,
+    agentBudget: 1, label, taskTemplate: `Review {{item}} at {{index}}`, contextTemplate: 'Use prior verified output' }));
+  const j = createDelegationJournal(opts); t.after(() => j.dispose());
+  const before = j.snapshot(), roots = before.state.nodes;
+  assert.ok(roots.every(n => n.assignment === undefined && n.taskTemplate));
+  const pj = createProcessJournal(opts.artifactDirectory, opts.runId), token = pj.reserve();
+  assert.throws(() => j.launchIntent(roots[0].nodeId, token), /deferred root assignment unresolved/);
+  assert.equal(j.snapshot().poisoned, false); assert.equal(j.snapshot().state.sequence, before.state.sequence);
+  const scheduler = claimDelegationScheduler(j, { maxConcurrentAgents: 2, maxLiveAgents: 6, rootTimeouts: [null, null] });
+  const afterConfiguration = j.snapshot();
+  const assignments = roots.map((n, itemIndex) => ({ nodeId: n.nodeId, task: `Rendered duplicate item ${itemIndex}`,
+    parentContextSummary: `context ${itemIndex}` }));
+  assert.throws(() => ({ ...scheduler }).materializePhase(2, assignments), /original scheduler capability/);
+  const foreignOpts = options(t); const { task: _foreignTask, ...foreignRoot } = foreignOpts.roots[0];
+  foreignOpts.roots[0] = { ...foreignRoot, taskTemplate: 'foreign deferred' };
+  const foreign = createDelegationJournal(foreignOpts); t.after(() => foreign.dispose());
+  const foreignScheduler = claimDelegationScheduler(foreign, { maxConcurrentAgents: 1, maxLiveAgents: 3, rootTimeouts: [null] });
+  const foreignBefore = foreign.snapshot();
+  assert.throws(() => foreignScheduler.materializePhase(2, assignments), /complete deferred phase/);
+  assert.deepEqual(foreign.snapshot(), foreignBefore);
+  const targetArtifactsBefore = fs.readdirSync(join(j.directory, 'nodes')).sort();
+  const targetEventsBefore = fs.readFileSync(join(j.directory, 'events.jsonl'));
+  const assertTargetUnchanged = () => {
+    assert.deepEqual(j.snapshot(), afterConfiguration);
+    assert.deepEqual(fs.readdirSync(join(j.directory, 'nodes')).sort(), targetArtifactsBefore);
+    assert.deepEqual(fs.readFileSync(join(j.directory, 'events.jsonl')), targetEventsBefore);
+  };
+  assert.throws(() => scheduler.materializePhase.call(foreignScheduler, 2, assignments), /UNAUTHORIZED/);
+  assertTargetUnchanged(); assert.deepEqual(foreign.snapshot(), foreignBefore);
+  foreign.dispose();
+  assert.throws(() => scheduler.materializePhase.call(foreignScheduler, 2, assignments), /UNAUTHORIZED/);
+  assertTargetUnchanged(); assert.deepEqual(foreign.snapshot(), foreignBefore);
+  assert.throws(() => scheduler.materializePhase(2, assignments.slice(0, 1)), /complete deferred phase/);
+  assert.throws(() => scheduler.materializePhase(2, assignments.map((a, i) => ({ ...a, task: i ? 'x'.repeat(4097) : a.task }))), /text/);
+  assert.deepEqual(j.snapshot(), afterConfiguration); // validation failures issue no assignment artifact/event
+  const reference = scheduler.materializePhase(2, assignments);
+  const content = JSON.parse(readStoredArtifact(j.directory, reference));
+  assert.equal(content.schema, 'pi-workflow-delegation-root-assignments/v1');
+  assert.deepEqual(content.roots.map(r => r.itemIndex), [0, 1]);
+  assert.deepEqual(content.roots.map(r => r.assignment.task), assignments.map(a => a.task));
+  content.roots.forEach(r => assert.match(r.assignment.acceptance[0].criterion, new RegExp(r.taskHash)));
+  const state = j.snapshot().state;
+  assert.equal(state.materializations.length, 1); assert.deepEqual(state.nodes.map(n => n.assignment.task), assignments.map(a => a.task));
+  assert.equal(state.budget.acceptedNodes, 2); assert.equal(state.budget.spent, 0); assert.equal(state.budget.freeWorkflow, 0);
+  assert.throws(() => scheduler.materializePhase(2, assignments), /phase cannot materialize/);
+  assert.deepEqual(inspectDelegationJournal(j.directory, j.binding).state, state);
+  const events = fs.readFileSync(join(j.directory, 'events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(events.filter(e => e.type === 'root_assignments_materialized').length, 1);
+  assert.ok(events.find(e => e.type === 'root_assignments_materialized').payload.assignments.artifactId);
+  const blob = join(j.directory, 'nodes', `${reference.artifactId.slice(9)}.blob`);
+  fs.chmodSync(blob, 0o600); fs.writeFileSync(blob, 'corrupt');
+  assert.throws(() => inspectDelegationJournal(j.directory, j.binding), /integrity|canonical|JSON/);
+});
+
+test('materialization append ambiguity poisons writer; inspection verifies durable artifact without granting replay', t => {
+  let armed = false;
+  const opts = options(t, { fault(point) { if (armed && point === 'after:event-fsync') throw Error('materialization acknowledgement lost'); } });
+  const { task: _task, ...root } = opts.roots[0];
+  opts.roots[0] = { ...root, taskTemplate: 'Deferred {{outputs.prior}}' };
+  const j = createDelegationJournal(opts); t.after(() => j.dispose());
+  const scheduler = claimDelegationScheduler(j, { maxConcurrentAgents: 1, maxLiveAgents: 3, rootTimeouts: [null] });
+  const nodeId = j.snapshot().state.nodes[0].nodeId; armed = true;
+  assert.throws(() => scheduler.materializePhase(0, [{ nodeId, task: 'rendered' }]), /acknowledgement lost/);
+  armed = false; assert.equal(j.snapshot().poisoned, true);
+  const view = inspectDelegationJournal(j.directory, j.binding);
+  assert.equal(view.launchAuthorized, false); assert.equal(view.state.materializations.length, 1);
+  assert.equal(view.state.nodes[0].assignment.task, 'rendered');
+  assert.throws(() => scheduler.activateRoot(nodeId), /writer unavailable/);
 });
 
 test('128 roots fit one compact root-plan reference and reserve admission at once', t => {

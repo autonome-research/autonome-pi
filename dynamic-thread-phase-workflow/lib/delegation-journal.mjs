@@ -5,13 +5,14 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { WORKFLOW_ARTIFACT_LAYOUT } from './artifact-layout.mjs';
-import { object, list, text, integer, id, hash, fail, LIMITS, artifactId, validateContextRequest, validateDelegationPolicy, validateDelegationRequest, validateCompletionRequest } from './delegation-contract.mjs';
+import { object, list, text, integer, id, hash, fail, LIMITS, artifactId, validateAssignment, validateContextRequest, validateDelegationPolicy, validateDelegationRequest, validateCompletionRequest } from './delegation-contract.mjs';
 import { narrowAuthority, intersectTools } from './delegation-scope.mjs';
 import { buildOwnChildJoinIndex, projectArtifactRead } from './delegation-context.mjs';
 import { createScopedFilesystem } from './delegation-filesystem.mjs';
 import { canonicalJSON, decodeCanonical, sha256, canonicalDirectory, boundedRead, storageIO, readStoredArtifact, validateStoredReference } from './delegation-storage.mjs';
-import { JOURNAL_SCHEMA, MANIFEST_SCHEMA, STATE_SCHEMA, uuid, validateManifest, initialState, reduceEvent, checkCapacity,
-  nodeOf, invocationNode, requestPrior, reservedBytes, completionAuthority, validateCandidate, composeFinalResult, effectiveAuthority, launchDeadlineDenied } from './delegation-journal-model.mjs';
+import { JOURNAL_SCHEMA, MANIFEST_SCHEMA, STATE_SCHEMA, ROOT_ASSIGNMENTS_SCHEMA, uuid, validateManifest, initialState, reduceEvent, checkCapacity,
+  nodeOf, invocationNode, requestPrior, reservedBytes, completionAuthority, validateCandidate, composeFinalResult, effectiveAuthority, launchDeadlineDenied,
+  validateRootAssignmentsEvidence } from './delegation-journal-model.mjs';
 import { takeResultCapability } from './delegation-results.mjs';
 import { takeObserverSeal, delegationPublicationOwner } from './delegation-executor.mjs';
 export function applyObserverSeal(writer, capability) {
@@ -76,6 +77,29 @@ function indexPlan(nodeId, revision, children) {
   const built = buildOwnChildJoinIndex({ artifactId, ownerNodeId: nodeId, revision, children });
   return { bytes: Buffer.from(built.content), reference: plainRef(built.reference) };
 }
+function rootAssignmentsPlan(manifest, phaseIndex, assignments) {
+  integer(phaseIndex); list(assignments, 128, 1);
+  const roots = manifest.roots.filter(n => n.phaseIndex === phaseIndex);
+  if (!roots.length || roots.some(n => n.taskTemplate === undefined) || assignments.length !== roots.length) fail('INVALID_REQUEST', 'complete deferred phase required');
+  const rows = assignments.map((value, i) => {
+    object(value, ['nodeId', 'task'], ['parentContextSummary']);
+    text(value.task, 4096);
+    if (value.parentContextSummary !== undefined) text(value.parentContextSummary, 2048, true);
+    const root = roots[i];
+    if (value.nodeId !== root.nodeId) fail('INVALID_REQUEST', 'ordered root identity');
+    const taskHash = sha256(value.task);
+    const assignment = { task: value.task, acceptance: [{ id: 'assignment',
+      criterion: `Satisfy the assigned phase task (sha256:${taskHash}) and cite supporting evidence.` }],
+      ...(value.parentContextSummary === undefined ? {} : { parentContextSummary: value.parentContextSummary }) };
+    validateAssignment(assignment);
+    return { nodeId: root.nodeId, ...(root.itemIndex === undefined ? {} : { itemIndex: root.itemIndex }),
+      templateHash: root.templateHash, taskHash, assignmentHash: sha256(canonicalJSON(assignment)), assignment };
+  });
+  const content = { schema: ROOT_ASSIGNMENTS_SCHEMA, runId: manifest.runId, specDigest: manifest.specDigest, phaseIndex, roots: rows };
+  validateRootAssignmentsEvidence(content, manifest, phaseIndex);
+  const plan = artifactPlan(encode(content));
+  return { plan, payload: { phaseIndex, count: roots.length, assignments: plan.reference } };
+}
 const childResults = (s, parentId, extra) => s.nodes.filter(n => n.parentNodeId === parentId && (n.joined || n.nodeId === extra)).map(n => ({
   schema: 'pi-workflow-delegation-node-result/v1', childNodeId: n.nodeId, status: n.result.status,
   summary: '', resultHash: n.result.sha256, resultArtifactId: n.result.artifactId,
@@ -123,6 +147,11 @@ function verifyIndex(bytes, s, ownerId, revision, extra) {
 }
 function verifyEventArtifacts(event, s, manifest, read) {
   const p = event.payload;
+  let evidence;
+  if (event.type === 'root_assignments_materialized') {
+    object(p, ['phaseIndex', 'count', 'assignments']); integer(p.phaseIndex); integer(p.count, 1, 128); validateStoredReference(p.assignments);
+    evidence = validateRootAssignmentsEvidence(decodeCanonical(read(p.assignments)), manifest, p.phaseIndex);
+  }
   if (event.type === 'root_reserved') manifest.roots.forEach(n => verifyIndex(read(n.index), s, n.nodeId, 0));
   if (event.type === 'delegation_accepted') {
     const parent = invocationNode(s, p.invocationId), allowed = visibleEvidence(s, parent, read);
@@ -149,6 +178,7 @@ function verifyEventArtifacts(event, s, manifest, read) {
     const n = nodeOf(s, p.nodeId);
     if (n.parentNodeId) verifyIndex(read(p.parentIndex), s, n.parentNodeId, event.sequence, n.nodeId);
   }
+  return evidence;
 }
 function validateEnvelope(e, s, manifest, manifestDigest, previousHash) {
   object(e, ['schema', 'sequence', 'eventId', 'ownerEpoch', 'manifestDigest', 'previousHash', 'at', 'type', 'payloadDigest', 'payload', 'hash']);
@@ -181,12 +211,20 @@ export function createDelegationJournal(options) {
   });
   const plans = [];
   const roots = options.roots.map(r => {
-    object(r, ['phaseIndex', 'agentBudget', 'label', 'task', 'permissions', 'directoryScope', 'deadlineAt'], ['itemIndex']);
+    object(r, ['phaseIndex', 'agentBudget', 'label', 'permissions', 'directoryScope', 'deadlineAt'], ['itemIndex', 'task', 'taskTemplate', 'contextTemplate']);
+    if ((r.task !== undefined) === (r.taskTemplate !== undefined) || r.contextTemplate !== undefined && r.taskTemplate === undefined)
+      fail('INVALID_REQUEST', 'exactly one task or taskTemplate');
+    if (r.task !== undefined) text(r.task, 4096);
+    else { text(r.taskTemplate, 4096); if (r.contextTemplate !== undefined) text(r.contextTemplate, 2048, true); }
     const nodeId = randomUUID();
     const index = indexPlan(nodeId, 0, []); plans.push(index);
+    const template = r.taskTemplate === undefined ? null : { task: r.taskTemplate,
+      ...(r.contextTemplate === undefined ? {} : { parentContextSummary: r.contextTemplate }) };
     return { nodeId, phaseIndex: r.phaseIndex, ...(r.itemIndex === undefined ? {} : { itemIndex: r.itemIndex }),
       agentBudget: r.agentBudget, label: r.label,
-      assignment: { task: r.task, acceptance: [{ id: 'assignment', criterion: 'Satisfy the assigned phase task and cite supporting evidence.' }] },
+      ...(template ? { taskTemplate: r.taskTemplate, ...(r.contextTemplate === undefined ? {} : { contextTemplate: r.contextTemplate }),
+        templateHash: sha256(canonicalJSON(template)) } :
+        { assignment: { task: r.task, acceptance: [{ id: 'assignment', criterion: 'Satisfy the assigned phase task and cite supporting evidence.' }] } }),
       authority: { permissions: r.permissions, directoryScope: structuredClone(r.directoryScope),
         grantedTools: intersectTools(r.permissions, ['read', 'grep', 'find', 'ls', 'edit', 'write', 'bash']), deadlineAt: r.deadlineAt }, index: index.reference };
   });
@@ -213,9 +251,9 @@ export function createDelegationJournal(options) {
         manifestDigest, previousHash: lastHash, at, type, payloadDigest: sha256(canonicalJSON(payload)), payload };
       const event = { ...body, hash: sha256(canonicalJSON(body)) };
       const bytes = Buffer.from(`${canonicalJSON(event)}\n`);
-      const next = reduceEvent(state, event, manifest);
+      const evidence = verifyEventArtifacts(event, state, manifest, ref => artifacts.find(a => canonicalJSON(a.reference) === canonicalJSON(ref))?.bytes ?? readStoredArtifact(directory, ref));
+      const next = reduceEvent(state, event, manifest, evidence);
       checkCapacity(next, usedBytes, bytes.length, type);
-      verifyEventArtifacts(event, state, manifest, ref => artifacts.find(a => canonicalJSON(a.reference) === canonicalJSON(ref))?.bytes ?? readStoredArtifact(directory, ref));
       const projection = encode({ schema: STATE_SCHEMA, resumable: false, manifestDigest,
         lastHash: event.hash, usedBytes: usedBytes + bytes.length, state: next });
       if (projection.length > 1024 * 1024) fail('JOURNAL_LIMIT');
@@ -324,6 +362,7 @@ export function createDelegationJournal(options) {
     launchIntent(nodeId, processToken) {
       guard(); uuid(processToken);
       const n = nodeOf(state, nodeId);
+      if (!n.assignment) fail('PARENT_NOT_ACTIVE', 'deferred root assignment unresolved');
       if (n.invocationId) {
         if (n.processToken !== processToken) fail('REQUEST_CONFLICT');
         return Object.freeze({ invocationId: n.invocationId, recordedNow: false });
@@ -493,13 +532,22 @@ export function createDelegationJournal(options) {
     vetoScope(scopeId) { schedulerFreeze?.(scopeId); },
     scheduler(configuration) {
       persist('scheduler_configured', configuration);
-      return Object.freeze({ guard,
+      const capability = {
+        guard,
         onScopeFrozen(listener) {
           guard(); if (schedulerFreeze || typeof listener !== 'function') fail('UNAUTHORIZED');
           schedulerFreeze = listener;
         },
+        materializePhase(phaseIndex, assignments) {
+          if (this !== capability) fail('UNAUTHORIZED', 'original scheduler capability required');
+          guard();
+          const { plan, payload } = rootAssignmentsPlan(manifest, phaseIndex, assignments);
+          persist('root_assignments_materialized', payload, [plan]);
+          return Object.freeze({ ...plan.reference });
+        },
         activateRoot(nodeId) {
           guard(); const at = Math.max(Date.now(), manifest.createdAt), n = nodeOf(state, nodeId);
+          if (!n.assignment) fail('PARENT_NOT_ACTIVE', 'deferred root assignment unresolved');
           const timeout = state.scheduler.rootTimeouts[manifest.roots.findIndex(r => r.nodeId === nodeId)];
           const deadline = Math.min(n.authority.deadlineAt ?? Infinity, timeout === null ? Infinity : at + timeout);
           persist('root_activated', { nodeId, deadlineAt: deadline === Infinity ? null : deadline }, [], at);
@@ -509,7 +557,8 @@ export function createDelegationJournal(options) {
           guard(); const n = nodeOf(state, nodeId);
           if (!n.result && !n.stopped) persist('node_stopped', { nodeId, cause });
         },
-      });
+      };
+      return Object.freeze(capability);
     },
     onOwnerLoss(listener) { guard(); ownerLossListeners.add(listener); return () => ownerLossListeners.delete(listener); } }));
   return writer;
@@ -539,8 +588,8 @@ export function inspectDelegationJournal(directory, binding) {
     const event = decodeCanonical(Buffer.from(line));
     validateEnvelope(event, state, manifest, binding.manifestDigest, lastHash);
     if (ids.has(event.eventId)) fail('OWNERSHIP_UNKNOWN', 'event identity'); ids.add(event.eventId);
-    verifyEventArtifacts(event, state, manifest, ref => readStoredArtifact(directory, ref));
-    const next = reduceEvent(state, event, manifest); checkCapacity(next, usedBytes, size, event.type);
+    const evidence = verifyEventArtifacts(event, state, manifest, ref => readStoredArtifact(directory, ref));
+    const next = reduceEvent(state, event, manifest, evidence); checkCapacity(next, usedBytes, size, event.type);
     state = next; lastHash = event.hash; usedBytes += size;
     prefixes.set(state.sequence, { lastHash, usedBytes, stateDigest: sha256(canonicalJSON(state)) });
   }

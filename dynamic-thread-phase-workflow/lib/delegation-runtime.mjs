@@ -6,17 +6,20 @@ import { createDelegationExecutor, guardDelegationExecutor, takeExecutorDenial }
 import { createDelegationResults } from './delegation-results.mjs';
 import { buildDelegationContext, projectArtifactRead } from './delegation-context.mjs';
 import { allocationCounters } from './delegation-budget.mjs';
-import { readStoredArtifact } from './delegation-storage.mjs';
+import { canonicalJSON, decodeCanonical, readStoredArtifact, sha256 } from './delegation-storage.mjs';
 import { createScopedFilesystem } from './delegation-filesystem.mjs';
 import { leasesConflict } from './delegation-scope.mjs';
 import { effectiveAuthority } from './delegation-journal-model.mjs';
 import { MAX_TIMEOUT_MS, createCallbackLifetime } from './subprocess.mjs';
-import { canonicalJSON, sha256 } from './delegation-storage.mjs';
 import { object, list, integer, text, id, fail } from './delegation-contract.mjs';
 
 function immutable(value) {
   if (value && typeof value === 'object') { Object.values(value).forEach(immutable); Object.freeze(value); }
   return value;
+}
+function validatePriorReferences(template, prior) {
+  for (const match of String(template).matchAll(/\{\{\s*(?:output:|outputs\.)([^}\s]+)\s*\}\}/gu))
+    if (!prior.has(match[1])) fail('INVALID_REQUEST', `unknown or forward phase output: ${match[1]}`);
 }
 export function delegationLaneCap(maxDepth, concurrency = 3, operator = {}) {
   object(operator, [], ['maxConcurrentAgents', 'maxLiveAgents']);
@@ -29,10 +32,12 @@ export function delegationLaneCap(maxDepth, concurrency = 3, operator = {}) {
 }
 
 export function createDelegationRuntime(options) {
-  object(options, ['journal', 'processJournal', 'phases', 'worker'], ['operator', 'deadlinePolicy', 'signal', 'onInvocation', 'onEvent', 'bridge']);
-  const { journal, processJournal, worker, signal, onInvocation, onEvent, bridge } = options;
+  object(options, ['journal', 'processJournal', 'phases', 'worker'],
+    ['operator', 'deadlinePolicy', 'signal', 'onInvocation', 'onEvent', 'bridge', 'render', 'emitArtifact']);
+  const { journal, processJournal, worker, signal, onInvocation, onEvent, bridge, render, emitArtifact } = options;
   if (typeof worker !== 'function' || onInvocation !== undefined && typeof onInvocation !== 'function' ||
-      onEvent !== undefined && typeof onEvent !== 'function' || bridge !== undefined &&
+      onEvent !== undefined && typeof onEvent !== 'function' || render !== undefined && typeof render !== 'function' ||
+      emitArtifact !== undefined && typeof emitArtifact !== 'function' || bridge !== undefined &&
       (!bridge || typeof bridge.prepare !== 'function' || typeof bridge.bind !== 'function' || typeof bridge.close !== 'function')) fail('INVALID_REQUEST');
   if (options.operator !== undefined) object(options.operator, [], ['maxConcurrentAgents', 'maxLiveAgents']);
   if (signal !== undefined && !(signal instanceof AbortSignal)) fail('INVALID_REQUEST', 'AbortSignal required');
@@ -57,23 +62,39 @@ export function createDelegationRuntime(options) {
       object(p, ['type', 'name', 'items'], ['concurrency', 'timeoutMs', 'failOnItemFailure']);
       list(p.items, 128, 1).forEach(v => text(v, 4096, true));
       if (p.failOnItemFailure !== undefined && typeof p.failOnItemFailure !== 'boolean') fail('INVALID_REQUEST');
-    } else if (p.type === 'shell') { object(p, ['type', 'name', 'command', 'permissions'], ['timeoutMs']); text(p.command, 16384); if (p.permissions !== 'rwx') fail('PERMISSION_DENIED'); }
-    else fail('UNSUPPORTED_MODE', 'static internal agent/fanout/shell phases only');
+    } else if (p.type === 'shell') {
+      object(p, ['type', 'name', 'command', 'permissions'], ['timeoutMs']); text(p.command, 16384); validatePriorReferences(p.command, names);
+      if (p.permissions !== 'rwx') fail('PERMISSION_DENIED');
+    } else if (p.type === 'artifact') {
+      object(p, ['type', 'name'], ['from']);
+      if (p.from !== undefined && (!names.has(p.from) || typeof p.from !== 'string')) fail('INVALID_REQUEST', 'artifact source must be prior phase');
+      if (!emitArtifact || p.from === undefined && !render) fail('UNSUPPORTED_MODE', 'artifact callbacks required');
+    } else fail('UNSUPPORTED_MODE', 'static internal agent/fanout/shell/artifact phases only');
     text(p.name, 80); if (names.has(p.name)) fail('INVALID_REQUEST'); names.add(p.name);
     if (p.timeoutMs !== undefined) integer(p.timeoutMs, 1, 2147483647);
-    if (p.type !== 'shell') {
+    if (p.type === 'agent' || p.type === 'fanout') {
       delegationLaneCap(manifest.policy.maxDepth, p.concurrency ?? 3, operator);
+      for (const root of manifest.roots.filter(n => n.phaseIndex === phaseIndex)) {
+        if (root.taskTemplate !== undefined) validatePriorReferences(root.taskTemplate, new Set([...names].filter(name => name !== p.name)));
+        if (root.contextTemplate !== undefined) validatePriorReferences(root.contextTemplate, new Set([...names].filter(name => name !== p.name)));
+      }
       for (let itemIndex = 0; itemIndex < (p.items?.length ?? 1); itemIndex++) enumerated.push({ phaseIndex, itemIndex: p.items ? itemIndex : undefined });
     }
   });
   if (enumerated.length !== manifest.roots.length || enumerated.some((r, i) =>
     r.phaseIndex !== manifest.roots[i].phaseIndex || r.itemIndex !== manifest.roots[i].itemIndex)) fail('INVALID_REQUEST', 'static manifest root enumeration');
+  for (const p of phases.map((phase, phaseIndex) => ({ phase, phaseIndex }))) {
+    const roots = manifest.roots.filter(n => n.phaseIndex === p.phaseIndex);
+    const deferred = roots.filter(n => n.taskTemplate !== undefined).length;
+    if (deferred && (deferred !== roots.length || !render)) fail('UNSUPPORTED_MODE', 'deferred roots require one trusted phase renderer');
+  }
   const authority = claimDelegationScheduler(journal, { ...operator, rootTimeouts: manifest.roots.map(n => timeout(phases[n.phaseIndex])) });
   const executor = createDelegationExecutor({ journal, processJournal });
   const results = createDelegationResults({ journal, executor });
   const nodes = new Map(), lanes = new Map(), waiters = [];
   const eventCallbacks = createCallbackLifetime();
   let ran = false, held = false, cancelled = false, failure = false, calls = 0, phaseIndex = -1, declared = null;
+  const outputs = {};
   let reportHeld;
   const heldDiagnostic = new Promise(resolve => { reportHeld = resolve; });
   // ponytail: scan detached snapshots at <=128 nodes; add indexed live reads
@@ -113,6 +134,54 @@ export function createDelegationRuntime(options) {
     if (!onEvent) return;
     const failed = () => { failure = true; stopAll('infrastructure_error'); };
     eventCallbacks.call(onEvent, [immutable({ kind, phaseIndex, ...(n ? { node: summary(n) } : {}) })], failed);
+  }
+  async function trustedCallback(callback, input) {
+    const lifetime = createCallbackLifetime();
+    let value, error;
+    lifetime.call(() => Promise.resolve(callback(immutable(structuredClone(input)))).then(result => { value = result; }), [], caught => { error = caught; });
+    await lifetime.seal();
+    guard();
+    if (cancelled || failure) fail('CANCELLED');
+    if (error) fail('CALLBACK_ERROR', 'trusted phase callback failed');
+    return value;
+  }
+  function setOutput(name, value) {
+    const next = structuredClone(value);
+    if (Buffer.byteLength(canonicalJSON(next)) > 1024 * 1024) fail('RESULT_INVALID', 'phase output bound');
+    outputs[name] = immutable(next);
+    if (Buffer.byteLength(canonicalJSON(outputs)) > 2 * 1024 * 1024) fail('RESULT_INVALID', 'phase output cache bound');
+    return outputs[name];
+  }
+  function verifiedRootOutput(root) {
+    try {
+      const n = durable(root.nodeId);
+      if (!n.joined || !n.result) fail('OWNERSHIP_UNKNOWN', 'root output before structural join');
+      const reference = { artifactId: n.result.artifactId, bytes: n.result.bytes, sha256: n.result.sha256 };
+      const content = decodeCanonical(readStoredArtifact(journal.directory, reference));
+      if (content.nodeId !== n.nodeId || content.status !== n.result.status || typeof content.summary !== 'string' || Buffer.byteLength(content.summary) > 4096)
+        fail('RESULT_INVALID', 'root result evidence');
+      return { nodeId: n.nodeId, phaseIndex: root.phaseIndex, ...(root.itemIndex === undefined ? {} : { itemIndex: root.itemIndex }),
+        label: n.label, status: n.result.status, summary: content.summary, cause: content.cause, result: reference };
+    } catch (error) { hold(); throw error; }
+  }
+  async function materializeRoots(p, index, roots) {
+    if (!roots.length || roots[0].taskTemplate === undefined) return;
+    const rendered = await trustedCallback(render, { kind: 'roots', phaseIndex: index, phase: p,
+      roots: roots.map(n => ({ nodeId: n.nodeId, phaseIndex: n.phaseIndex,
+        ...(n.itemIndex === undefined ? {} : { itemIndex: n.itemIndex }), label: n.label,
+        taskTemplate: n.taskTemplate, ...(n.contextTemplate === undefined ? {} : { contextTemplate: n.contextTemplate }), templateHash: n.templateHash })),
+      outputs });
+    list(rendered, roots.length, roots.length);
+    const assignments = rendered.map((value, i) => {
+      if (typeof value === 'string') value = { task: value };
+      object(value, ['task'], ['parentContextSummary']); text(value.task, 4096);
+      if (value.parentContextSummary !== undefined) text(value.parentContextSummary, 2048, true);
+      return { nodeId: roots[i].nodeId, task: value.task,
+        ...(value.parentContextSummary === undefined ? {} : { parentContextSummary: value.parentContextSummary }) };
+    });
+    guard();
+    authority.materializePhase(index, assignments);
+    guard();
   }
   function entry(nodeId) {
     let n = nodes.get(nodeId);
@@ -160,13 +229,14 @@ export function createDelegationRuntime(options) {
   }
   function cancel() { cancelled = true; stopAll('cancelled'); }
   function arm(n) {
-    if (n.deadlineAt === null || n.timer || n.joined) return;
+    if (held || cancelled || n.stopCause || n.deadlineAt === null || n.timer || n.joined) return;
     const remaining = n.deadlineAt - Date.now();
     if (remaining <= 0) stopTree(n, 'timeout');
     else {
       n.timer = setTimeout(() => {
-        if (remaining > MAX_TIMEOUT_MS) { n.timer = null; arm(n); }
-        else stopTree(n, 'timeout');
+        n.timer = null;
+        if (held || cancelled || n.stopCause || n.joined) return;
+        try { guard(); arm(n); } catch { /* guard holds lost authority; never rearm it */ }
       }, Math.min(remaining, MAX_TIMEOUT_MS));
       n.timer.unref();
     }
@@ -258,7 +328,7 @@ export function createDelegationRuntime(options) {
       return { nodeId: item.nodeId, treeRootNodeId: root.nodeId,
         ...(item.parentNodeId ? { parentNodeId: item.parentNodeId } : {}), phaseIndex: root.phaseIndex ?? 0,
         ...(item.itemIndex === undefined ? {} : { itemIndex: item.itemIndex }), depth: root.nodeId === item.nodeId ? 0 : allocationDepth(item, all),
-        label: item.label, state: contextState(item), task: item.assignment.task, scopePreview: JSON.stringify(item.authority.directoryScope),
+        label: item.label, state: contextState(item), task: item.assignment?.task ?? item.taskTemplate, scopePreview: JSON.stringify(item.authority.directoryScope),
         createdSequence: 1, ...(item.result ? { resultArtifactId: item.result.artifactId, resultStatus: item.result.status } : {}) };
     });
     const selfNode = nodes.find(item => item.nodeId === d.nodeId);
@@ -467,6 +537,7 @@ export function createDelegationRuntime(options) {
   function acquire(root, cap) { return new Promise((resolve, reject) => { waiters.push({ root, cap, resolve, reject }); pump(); }); }
   async function rootsPhase(p, index) {
     const roots = manifest.roots.filter(n => n.phaseIndex === index);
+    await materializeRoots(p, index, roots);
     const cap = delegationLaneCap(manifest.policy.maxDepth, p.type === 'agent' ? 1 : p.concurrency ?? 3, operator);
     const values = await boundedFanout({ items: roots, concurrency: cap, runner: async root => { try {
       const n = entry(root.nodeId), admitted = await acquire(root, cap);
@@ -477,16 +548,23 @@ export function createDelegationRuntime(options) {
       guard(); if (!n.joined) fail('OWNERSHIP_UNKNOWN');
       lanes.delete(root.nodeId); pump(); return result;
     } catch (error) { hold(); throw error; } } });
+    setOutput(p.name, p.type === 'agent' ? verifiedRootOutput(roots[0]) : roots.map(verifiedRootOutput));
     if (values.some(v => !['success', 'partial'].includes(v.result.status)) && p.failOnItemFailure !== false) fail('PHASE_FAILED');
   }
-  async function shellPhase(p) {
+  async function shellPhase(p, index) {
     guard(); if (lanes.size || waiters.length) fail('OWNERSHIP_UNKNOWN');
+    let commandText = p.command;
+    if (render) {
+      commandText = await trustedCallback(render, { kind: 'shell', phaseIndex: index, phase: p, value: p.command, outputs });
+      text(commandText, 16384);
+    }
+    guard();
     const scope = executor.openDeclaredShell(); declared = new AbortController();
     if (cancelled || failure) declared.abort('cancelled');
     let command;
     try {
-      command = executor.runShell(scope, 1, '/bin/sh', ['-c', p.command],
-        { cwd: manifest.workspace, env: {}, signal: declared.signal, timeoutMs: timeout(p, true) });
+      command = executor.runShell(scope, 1, '/bin/sh', ['-c', commandText],
+        { cwd: manifest.workspace, env: {}, signal: declared.signal, timeoutMs: timeout(p, true), maxStdoutBytes: 16384, maxStderrBytes: 16384 });
     } catch (error) {
       if (!takeExecutorDenial(executor, error, scope, 'shell')) { hold(); throw error; }
       // Exact preadmission denial leaves an originally owned empty declared
@@ -499,7 +577,18 @@ export function createDelegationRuntime(options) {
     const settlement = await executor.settleScope(scope);
     if (!settlement.receipt || outcome.disposition === 'unknown') { hold(); fail('OWNERSHIP_UNKNOWN'); }
     executor.consumeReceipt(scope, settlement.receipt); declared = null;
+    setOutput(p.name, { status: outcome.ok && settlement.ok ? 'success' : 'failed', classification: outcome.classification,
+      stdout: outcome.stdout, stderr: outcome.stderr, code: outcome.code, signal: outcome.signal });
     if (!outcome.ok || !settlement.ok) fail('PHASE_FAILED', 'declared shell did not settle cleanly');
+  }
+  async function artifactPhase(p, index) {
+    guard();
+    const source = p.from === undefined ? null : outputs[p.from];
+    const content = render ? await trustedCallback(render, { kind: 'artifact', phaseIndex: index, phase: p, value: source, outputs }) : canonicalJSON(source);
+    text(content, 1024 * 1024, true);
+    await trustedCallback(emitArtifact, { phaseIndex: index, phase: p, content, source, outputs });
+    guard();
+    setOutput(p.name, { content, ...(p.from === undefined ? {} : { from: p.from }) });
   }
   authority.onScopeFrozen(scopeId => {
     try {
@@ -517,7 +606,7 @@ export function createDelegationRuntime(options) {
     inspect() {
       return immutable({ inspectionOnly: true, launchAuthorized: false, held, cancelled, phaseIndex,
         reservedLiveSlots: lanes.size * (manifest.policy.maxDepth + 1), lanes: [...lanes.keys()], waitingRoots: waiters.length,
-        nodes: [...nodes.values()].map(summary), executor: executor.inspect() });
+        outputs: structuredClone(outputs), nodes: [...nodes.values()].map(summary), executor: executor.inspect() });
     },
     async run() {
       if (ran) fail('UNAUTHORIZED', 'no retry/resume'); ran = true;
@@ -527,7 +616,9 @@ export function createDelegationRuntime(options) {
           guard(); if (cancelled || failure) fail('CANCELLED'); phaseIndex = index; emit('phase');
           await eventCallbacks.drain(); guard();
           if (cancelled || failure) fail('CANCELLED');
-          if (p.type === 'shell') await shellPhase(p); else await rootsPhase(p, index);
+          if (p.type === 'shell') await shellPhase(p, index);
+          else if (p.type === 'artifact') await artifactPhase(p, index);
+          else await rootsPhase(p, index);
           guard(); if (cancelled || failure) fail('CANCELLED');
           yield { type: 'data', phase: p.name, joined: true };
         } }));

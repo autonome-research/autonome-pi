@@ -8,6 +8,7 @@ import { canonicalJSON, sha256, validateStoredReference } from './delegation-sto
 export const JOURNAL_SCHEMA = 'pi-workflow-delegation-journal/v1';
 export const MANIFEST_SCHEMA = 'pi-workflow-delegation-manifest/v1';
 export const STATE_SCHEMA = 'pi-workflow-delegation-state/v1';
+export const ROOT_ASSIGNMENTS_SCHEMA = 'pi-workflow-delegation-root-assignments/v1';
 export const uuid = value => { if (typeof value !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) fail('INVALID_REQUEST', 'generated UUID'); return value; };
 export function validateAuthority(a) {
   object(a, ['permissions', 'directoryScope', 'grantedTools', 'deadlineAt']);
@@ -25,6 +26,23 @@ function definition(n) {
   if (n.phaseIndex !== undefined) integer(n.phaseIndex);
   if (n.itemIndex !== undefined) integer(n.itemIndex, 0, 127);
 }
+function rootDefinition(n) {
+  object(n, ['nodeId', 'phaseIndex', 'agentBudget', 'label', 'authority', 'index'],
+    ['itemIndex', 'assignment', 'taskTemplate', 'contextTemplate', 'templateHash']);
+  uuid(n.nodeId); integer(n.phaseIndex); integer(n.agentBudget, 1, 128); text(n.label, 80);
+  validateAuthority(n.authority); validateStoredReference(n.index);
+  if (n.itemIndex !== undefined) integer(n.itemIndex, 0, 127);
+  const immediate = n.assignment !== undefined, deferred = n.taskTemplate !== undefined;
+  if (immediate === deferred) fail('INVALID_REQUEST', 'exactly one immediate or deferred root assignment');
+  if (immediate) validateAssignment(n.assignment);
+  else {
+    text(n.taskTemplate, 4096);
+    if (n.contextTemplate !== undefined) text(n.contextTemplate, 2048, true);
+    hash(n.templateHash);
+    const template = { task: n.taskTemplate, ...(n.contextTemplate === undefined ? {} : { parentContextSummary: n.contextTemplate }) };
+    if (n.templateHash !== sha256(canonicalJSON(template))) fail('OWNERSHIP_UNKNOWN', 'root template digest');
+  }
+}
 export function validateManifest(m) {
   object(m, ['schema', 'resumable', 'runId', 'budgetScopeId', 'ownerEpoch', 'ownerPid', 'hostname', 'createdAt', 'specDigest', 'profileDigest', 'policyDigest', 'policy', 'roots', 'workspace', 'protectedDirectories']);
   if (m.schema !== MANIFEST_SCHEMA || m.resumable !== false) fail('UNSUPPORTED_VERSION');
@@ -33,9 +51,14 @@ export function validateManifest(m) {
   text(m.workspace, 4096); list(m.protectedDirectories, 32, 1).forEach(p => text(p, 4096));
   if (sha256(canonicalJSON(m.policy)) !== m.policyDigest) fail('OWNERSHIP_UNKNOWN', 'policy digest');
   list(m.roots, 128, 1).forEach(n => {
-    definition(n); integer(n.phaseIndex);
+    rootDefinition(n);
     narrowScope(m.policy.directoryScope, n.authority.directoryScope);
   });
+  for (const phaseIndex of new Set(m.roots.map(n => n.phaseIndex))) {
+    const roots = m.roots.filter(n => n.phaseIndex === phaseIndex);
+    if (roots.some(n => n.taskTemplate !== undefined) && roots.some(n => n.assignment !== undefined))
+      fail('INVALID_REQUEST', 'phase roots must be uniformly immediate or deferred');
+  }
   const positions = m.roots.map(n => `${n.phaseIndex}:${n.itemIndex ?? '-'}`);
   if (new Set(positions).size !== positions.length) fail('INVALID_REQUEST', 'root positions');
   for (let i = 0; i < m.roots.length; i++) {
@@ -50,7 +73,8 @@ export function validateManifest(m) {
 }
 export function initialState(manifest) {
   return { schema: STATE_SCHEMA, resumable: false, budget: createBudgetState(manifest.policy), nodes: [], batches: [], requests: [],
-    requestCount: 0, slots: {}, workflowOpen: true, sequence: 0 };
+    requestCount: 0, slots: {}, workflowOpen: true, sequence: 0,
+    ...(manifest.roots.some(n => n.taskTemplate !== undefined) ? { materializations: [] } : {}) };
 }
 export function nodeOf(s, nodeId) { const n = s.nodes.find(n => n.nodeId === nodeId); if (!n) fail('INVALID_REQUEST', 'unknown node'); return n; }
 export function invocationNode(s, invocationId) {
@@ -111,11 +135,30 @@ export function checkCapacity(state, usedBytes, recordBytes, type) {
 export function launchDeadlineDenied(s, p, at) {
   object(p, ['nodeId', 'invocationId', 'processToken']); uuid(p.invocationId); uuid(p.processToken);
   const n = nodeOf(s, p.nodeId);
+  if (!n.assignment) fail('PARENT_NOT_ACTIVE', 'deferred root assignment unresolved');
   if (n.result || n.invocationId || n.stopped || s.nodes.some(x => x.invocationId === p.invocationId || x.processToken === p.processToken)) fail('INVALID_REQUEST');
   if (s.scheduler && (n.parentNodeId ? nodeOf(s, n.parentNodeId).schedulerState !== 'waiting_children' : n.effectiveDeadlineAt === undefined)) fail('PARENT_NOT_ACTIVE');
   return Boolean(s.scheduler && effectiveAuthority(n).deadlineAt !== null && effectiveAuthority(n).deadlineAt <= at);
 }
-export function reduceEvent(previous, event, manifest) {
+export function validateRootAssignmentsEvidence(content, manifest, phaseIndex) {
+  object(content, ['schema', 'runId', 'specDigest', 'phaseIndex', 'roots']);
+  if (content.schema !== ROOT_ASSIGNMENTS_SCHEMA || content.runId !== manifest.runId || content.specDigest !== manifest.specDigest || content.phaseIndex !== phaseIndex)
+    fail('RESULT_INVALID', 'root assignment artifact binding');
+  const expected = manifest.roots.filter(n => n.phaseIndex === phaseIndex);
+  list(content.roots, 128, 1);
+  if (content.roots.length !== expected.length) fail('RESULT_INVALID', 'complete phase assignments required');
+  content.roots.forEach((row, i) => {
+    object(row, ['nodeId', 'templateHash', 'taskHash', 'assignmentHash', 'assignment'], ['itemIndex']);
+    const root = expected[i]; uuid(row.nodeId); hash(row.templateHash); hash(row.taskHash); hash(row.assignmentHash); validateAssignment(row.assignment);
+    if (row.nodeId !== root.nodeId || row.itemIndex !== root.itemIndex || row.templateHash !== root.templateHash ||
+        row.taskHash !== sha256(row.assignment.task) || row.assignmentHash !== sha256(canonicalJSON(row.assignment)))
+      fail('RESULT_INVALID', 'root assignment identity/hash');
+    const criterion = `Satisfy the assigned phase task (sha256:${row.taskHash}) and cite supporting evidence.`;
+    if (canonicalJSON(row.assignment.acceptance) !== canonicalJSON([{ id: 'assignment', criterion }])) fail('RESULT_INVALID', 'root acceptance/task binding');
+  });
+  return content;
+}
+export function reduceEvent(previous, event, manifest, evidence) {
   const s = structuredClone(previous), p = event.payload;
   const tid = event.eventId;
   if (!s.workflowOpen || event.sequence !== s.sequence + 1) fail('OWNERSHIP_UNKNOWN', 'closed or nonmonotonic');
@@ -131,10 +174,26 @@ export function reduceEvent(previous, event, manifest) {
       s.scheduler = structuredClone(p);
       s.nodes.forEach(n => { n.schedulerState = 'queued'; }); break;
     }
+    case 'root_assignments_materialized': {
+      object(p, ['phaseIndex', 'count', 'assignments']); integer(p.phaseIndex); integer(p.count, 1, 128); validateStoredReference(p.assignments);
+      const roots = manifest.roots.filter(n => n.phaseIndex === p.phaseIndex);
+      if (!s.scheduler || !roots.length || p.count !== roots.length || roots.some(n => n.taskTemplate === undefined) ||
+          s.materializations?.some(m => m.phaseIndex === p.phaseIndex)) fail('PARENT_NOT_ACTIVE', 'phase cannot materialize');
+      const nodes = roots.map(root => nodeOf(s, root.nodeId));
+      if (nodes.some(n => n.assignment || n.invocationId || n.result || n.stopped || n.effectiveDeadlineAt !== undefined || n.schedulerState !== 'queued'))
+        fail('PARENT_NOT_ACTIVE', 'root already resolved or activated');
+      validateRootAssignmentsEvidence(evidence, manifest, p.phaseIndex);
+      evidence.roots.forEach((row, i) => {
+        nodes[i].assignment = structuredClone(row.assignment);
+        nodes[i].materialization = structuredClone(p.assignments);
+      });
+      s.materializations.push({ phaseIndex: p.phaseIndex, count: p.count, assignments: structuredClone(p.assignments) });
+      break;
+    }
     case 'root_activated': {
       object(p, ['nodeId', 'deadlineAt']);
       const n = nodeOf(s, p.nodeId), index = manifest.roots.findIndex(r => r.nodeId === n.nodeId);
-      if (!s.scheduler || index < 0 || n.invocationId || n.result || n.stopped || n.effectiveDeadlineAt !== undefined) fail('PARENT_NOT_ACTIVE');
+      if (!s.scheduler || index < 0 || !n.assignment || n.invocationId || n.result || n.stopped || n.effectiveDeadlineAt !== undefined) fail('PARENT_NOT_ACTIVE');
       const timeout = s.scheduler.rootTimeouts[index];
       const deadline = Math.min(n.authority.deadlineAt ?? Infinity, timeout === null ? Infinity : integer(event.at + timeout));
       if (p.deadlineAt !== (deadline === Infinity ? null : deadline)) fail('INVALID_REQUEST', 'effective root deadline');
@@ -398,7 +457,10 @@ export function composeFinalResult(s, n, manifest, scopeId, usage, candidate) {
     evidence: candidate.evidence.map((e, i) => ({ ownerNodeId: n.nodeId, label: e.label,
       description: candidate.request.evidence[i].description, reference: e.reference })) } : null;
   return { schema: 'pi-workflow-delegation-result-evidence/v2', runId: manifest.runId, ownerEpoch: manifest.ownerEpoch,
-    nodeId: n.nodeId, invocationId: n.invocationId, settlement, disposition: 'drained', status, cause,
+    nodeId: n.nodeId, invocationId: n.invocationId,
+    ...(manifest.roots.some(root => root.taskTemplate !== undefined) ? { assignment: n.assignment,
+      assignmentHash: sha256(canonicalJSON(n.assignment)), taskHash: sha256(n.assignment.task) } : {}),
+    settlement, disposition: 'drained', status, cause,
     summary: candidate?.request.summary ?? '', candidate: n.candidate, completion, usage,
     ...(callbackFailures ? { callbackFailures } : {}),
     ownChildJoinIndex: n.index, children: s.nodes.filter(c => c.parentNodeId === n.nodeId).map(c => ({ nodeId: c.nodeId, result: c.result })) };
