@@ -4,7 +4,7 @@
 // the launch profile is a synthetic fixture installed via the TEST-ONLY seam.
 import test, { after, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import registerDynamicWorkflows, { __setV3LaunchProfileForTests } from "../index.ts";
@@ -64,10 +64,13 @@ const v3 = () => ({
   delegation: {
     maxDepth: 1,
     totalAgentBudget: 2,
-    directoryScope: { read: ["src"], write: [] },
+    // The workspace exists, so an authorized launch reaches worker spawn.
+    directoryScope: { read: ["."], write: [] },
     context: { objective: "Bounded review", constraints: ["stay in scope"] },
   },
-  phases: [{ type: "shell", name: "step", command: "true" }],
+  // The stub workerEntryPath exits 0 without a bootstrap read, so execution
+  // reaches worker spawn and the root node ends missing_completion.
+  phases: [{ type: "agent", name: "step", prompt: "Complete the bounded fixture step." }],
 });
 
 function tool() {
@@ -98,17 +101,25 @@ test("v3 requires a hosted tui/rpc session before any grant work", async () => {
   assert.equal(existsSync(storeDir), false);
 });
 
-test("authorized v3 launch ends in the bounded NOT_IMPLEMENTED denial with zero residue", async () => {
+test("authorized v3 launch executes and fails closed on the stub worker with a durable failed run", async () => {
   prepareEnv({ gate: "1" });
   __setV3LaunchProfileForTests(profile());
   const before = tempResidue();
   let failure;
   await tool().execute("call-3", { v3: v3() }, undefined, undefined, ctx()).catch((error) => { failure = error; });
-  assert.match(String(failure?.message || failure), /NOT_IMPLEMENTED/);
+  assert.match(String(failure?.message || failure), /PHASE_FAILED/);
   const diagnostic = String(failure?.stack || failure);
-  assert.ok(!diagnostic.includes(SENTINEL), "credential sentinel must never appear in denial output");
+  assert.ok(!diagnostic.includes(SENTINEL), "credential sentinel must never appear in failure output");
   assert.deepEqual(tempResidue(), before, "no pi-dynamic-workflow temp residue");
-  assert.equal(existsSync(storeDir), false, "no visualizer store/runs/journal/checkpoint artifacts");
+  // Execution now records a durable failed run (mirrors the v2 test cleanup).
+  assert.equal(existsSync(storeDir), true, "failed run artifacts/journal are retained");
+  const runId = /"runId": "([^"]+)"/.exec(String(failure?.message))?.[1];
+  assert.ok(runId, "bounded failure record carries the runId");
+  const resultArtifact = JSON.parse(readFileSync(join(storeDir, "artifacts", runId, "workflow-result.json"), "utf8"));
+  assert.equal(resultArtifact.schema, "pi-dynamic-workflow-result/v2");
+  assert.equal(resultArtifact.status, "failed");
+  assert.equal(resultArtifact.resumable, false);
+  rmSync(storeDir, { recursive: true, force: true });
 });
 
 test("a changed session between prepare and consume mismatches and burns the grant", async () => {

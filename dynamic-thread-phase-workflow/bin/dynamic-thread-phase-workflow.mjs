@@ -11,7 +11,7 @@ import { commitSuccessor, releaseSuccessor, reserveSuccessor } from "../../threa
 import { MAX_TIMEOUT_MS, normalizeTimeoutMs, runBoundedProcess, terminateChild } from "../lib/subprocess.mjs";
 import { receiveLaunchEnvelope } from "../lib/delegation-launch-authorization.mjs";
 import { validateDelegationPolicy } from "../lib/delegation-contract.mjs";
-import { canonicalDirectory, canonicalJSON, sha256 } from "../lib/delegation-storage.mjs";
+import { canonicalDirectory, canonicalJSON, decodeCanonical, readStoredArtifact, sha256 } from "../lib/delegation-storage.mjs";
 import { assertProcessGroupsStopped, createProcessJournal } from "../lib/process-journal.mjs";
 import {
   RUNNER_OWNED_ARTIFACT_NAMES,
@@ -69,7 +69,6 @@ const SAVED_TEMPLATE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const V2_PERMISSIONS = new Set(["r", "w", "rw", "rwx"]);
 const CHAIN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_CHAIN_RUNS = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_CHAIN_RUNS || 20);
-const V3_DENIAL_EXIT_CODE = 78;
 const V3_LAUNCH_ENVELOPE_FD = 3;
 const V3_SPEC_SCHEMA = "pi-dynamic-workflow/v3";
 const V3_FORBIDDEN_FLAGS = ["resume-run-id", "after", "js-file", "harness-file", "legacy-spec", "supervise-agents", "spec", "auto-continue", "timeout", "model", "name", "saved-template", "permissions"];
@@ -865,6 +864,11 @@ function loadResumeInvocation(runId, sessionId) {
     throw new Error("Resume checkpoint does not match the authoritative source session owner");
   }
   if (sourceSummary.cwd !== manifest.cwd) throw new Error("Resume checkpoint does not match the authoritative source cwd owner");
+  // Forged-downgrade guard: v3 runs never write a checkpoint, and the
+  // authoritative workflow_start metadata marker rejects even a planted one.
+  if (sourceSummary.metadata?.delegation === "v3") {
+    throw new Error(`Cannot resume workflow ${runId}: recursive v3 delegation runs are not resumable`);
+  }
   const storedCadence = sourceSummary.metadata && Object.prototype.hasOwnProperty.call(sourceSummary.metadata, "progressReviewIntervalMs")
     ? validateProgressReviewInterval(sourceSummary.metadata.progressReviewIntervalMs, "Authoritative source progressReviewIntervalMs")
     : undefined;
@@ -1369,13 +1373,237 @@ async function runHarness(ctx, harnessFile) {
   return await entry(harnessCtx);
 }
 
+const V3_SETUP_CODES = /^(INVALID_REQUEST|UNSUPPORTED_VERSION|UNSUPPORTED_MODE|SCOPE_DENIED|PERMISSION_DENIED|BUDGET_EXHAUSTED|DEPTH_LIMIT|ADMISSION_LIMIT|JOURNAL_LIMIT|UNAUTHORIZED|FRAME_LIMIT|OWNERSHIP_UNKNOWN|LAUNCH_CANCELLED):/;
+
+// Uncoded setup errors (e.g. a raw ENOENT from a missing scope directory in
+// canonicalDirectory, whose raw throw is load-bearing elsewhere) map to
+// EXECUTION_FAILED; coded contract failures keep their code.
+function v3SetupCode(error) {
+  const match = V3_SETUP_CODES.exec(String(error?.message || error));
+  return match ? match[1] : "EXECUTION_FAILED";
+}
+
+// Artifact phase contents land beneath the reserved runner-owned phase-outputs
+// directory; strict compile gives unique phase names, so no collision logic.
+function v3EmitArtifact(visualizerRun, artifactsDir) {
+  return ({ phase, content }) => {
+    const directory = join(artifactsDir, WORKFLOW_ARTIFACT_LAYOUT.phaseOutputsDirectory);
+    mkdirSync(directory, { recursive: true });
+    const path = join(directory, `${safeName(phase.name)}.md`);
+    const temporary = atomicArtifactTemporaryPath(path, process.pid);
+    writeFileSync(temporary, content, "utf8");
+    renameSync(temporary, path);
+    artifact(visualizerRun, { kind: "markdown", title: phase.name, path });
+  };
+}
+
+// Trusted runner-side read-only usage aggregation over immutable per-node
+// result evidence: v2 content carries usage.totals/completeness, v1 failure
+// records carry usageCompleteness with zero totals. Worst-of completeness.
+function aggregateV3Usage(journal, state) {
+  const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  const rank = { reported: 0, partial: 1, missing: 2 };
+  let completeness = "reported";
+  let results = 0;
+  for (const node of state.nodes) {
+    if (!node.result) continue;
+    results++;
+    // Project the plain {artifactId,bytes,sha256} reference: validateStoredReference
+    // requires exactly those keys, and durable node.result also carries status/disposition.
+    const content = decodeCanonical(readStoredArtifact(journal.directory,
+      { artifactId: node.result.artifactId, bytes: node.result.bytes, sha256: node.result.sha256 }));
+    const usage = content.schema === "pi-workflow-delegation-result-evidence/v2"
+      ? { totals: content.usage.totals, completeness: content.usage.completeness }
+      : { totals: null, completeness: content.usageCompleteness };
+    if (usage.totals) {
+      for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"]) totals[key] += usage.totals[key];
+      for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"]) totals.cost[key] += usage.totals.cost[key];
+    }
+    if ((rank[usage.completeness] ?? 2) > rank[completeness]) completeness = usage.completeness;
+  }
+  if (!results) completeness = "missing";
+  return { totals, completeness };
+}
+
+const V3_EMPTY_USAGE = () => ({ totals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, completeness: "missing" });
+
+// pi-dynamic-workflow-result/v2: every run that emitted workflow_start records
+// a durable result, including setup failures (the v2 pattern). Executor
+// settlement precedes this write by construction (runNode settles/finalizes/
+// joins before runtime.run() resolves).
+function writeV3WorkflowResult({ visualizerRun, artifactsDir, binding, journal, runtime, policy, status, error }) {
+  const state = journal?.snapshot().state;
+  const payload = {
+    schema: "pi-dynamic-workflow-result/v2",
+    runId: visualizerRun.runId,
+    launchId: binding.launchId,
+    specDigest: binding.specDigest,
+    policyDigest: binding.policyDigest,
+    resourceProfileDigest: binding.resourceProfileDigest,
+    status,
+    resumable: false,
+    updatedAt: new Date().toISOString(),
+    ...(error ? { error: { name: error.name, message: error.message || String(error) } } : {}),
+    // verifiedRootOutput entries with {artifactId,bytes,sha256} references.
+    phases: runtime ? runtime.inspect().outputs : {},
+    budget: { totalAgentBudget: policy?.totalAgentBudget ?? null, spent: state?.budget.spent ?? 0 },
+    admission: { ...binding.effective },
+    usage: journal && state ? aggregateV3Usage(journal, state) : V3_EMPTY_USAGE(),
+    delegation: journal && state
+      ? { manifestDigest: journal.binding.manifestDigest, events: state.sequence, closed: !state.workflowOpen }
+      : null,
+  };
+  const resultPath = join(artifactsDir, WORKFLOW_ARTIFACT_LAYOUT.result);
+  const temporary = atomicArtifactTemporaryPath(resultPath, process.pid);
+  writeFileSync(temporary, safeStringify(payload), "utf8");
+  renameSync(temporary, resultPath);
+  artifact(visualizerRun, { kind: "json", title: status === STATUSES.SUCCESS ? "Workflow result" : "Partial workflow result", path: resultPath });
+  return resultPath;
+}
+
+// Authorized v3 execution. Never throws: every post-receipt outcome is one
+// bounded record {ok:true,...} (exit 0), {ok:false,code:CANCELLED} (exit 130),
+// or {ok:false,code} (exit 1). Detached readiness is written after all
+// prerequisites are durable and before runtime.run(); from there, execution
+// failures surface through the monitor/result artifact (v2 background
+// contract). No checkpoint is ever written; v3 runs are not resumable.
+async function executeV3Authorized(receipt, spec, args, cwd, background, cadence, controller, readyFile) {
+  const binding = receipt.binding;
+  const launchId = binding.launchId;
+  const writeReady = (record) => {
+    if (!readyFile) return;
+    const temporary = `${readyFile}.${process.pid}.tmp`;
+    writeFileSync(temporary, JSON.stringify(record, null, 2), "utf8");
+    renameSync(temporary, readyFile);
+  };
+  let compiled, visualizerRun, journal, bridge, runtime;
+  const workflow = spec.name || "delegation-v3";
+  const runId = createRunId(workflow);
+  const artifactsDir = join(ARTIFACTS_DIR, runId);
+  try {
+    // Lazy post-receipt imports only: delegation-runtime statically imports
+    // thread-phase core, and v2/harness startup must not regress in
+    // THREAD_PHASE_CORE_PATH fallback environments.
+    const { compileV3Spec, makeV3Render, buildV3WorkerRecipe } = await import("../lib/delegation-v3.mjs");
+    const { createDelegationRuntime } = await import("../lib/delegation-runtime.mjs");
+    const { createDelegationJournal } = await import("../lib/delegation-journal.mjs");
+    const { createDelegationBridge } = await import("../lib/delegation-bridge.mjs");
+    compiled = compileV3Spec(spec); // pure; coded failures precede every side effect
+    mkdirSync(artifactsDir, { recursive: true });
+    const workersRoot = join(artifactsDir, "workers");
+    mkdirSync(workersRoot, { mode: 0o700 });
+    visualizerRun = createRun({
+      runId,
+      workflow,
+      cwd,
+      trigger: { kind: background ? "background" : "manual", dynamic: true },
+      // Digests only: a <=1MiB spec would not fit the workflow_start limit.
+      input: { schema: V3_SPEC_SCHEMA, specDigest: binding.specDigest, policyDigest: binding.policyDigest, launchId },
+      metadata: { pid: process.pid, processJournalVersion: 1, cancellable: true, cancelSignal: "SIGTERM", dynamic: true,
+        mode: "spec", delegation: "v3", resumable: false,
+        continuationMode: background ? "terminal" : "none", autoContinue: false,
+        ...(background ? { supervisionMode: "main-agent" } : {}),
+        ...(cadence !== null ? { progressReviewIntervalMs: cadence } : {}),
+        sessionId: String(args["session-id"]), sessionFile: args["session-file"] ? String(args["session-file"]) : undefined,
+        specDigest: binding.specDigest, policyDigest: binding.policyDigest, resourceProfileDigest: binding.resourceProfileDigest, launchId,
+        maxConcurrentAgents: binding.effective.maxConcurrentAgents, maxLiveAgents: binding.effective.maxLiveAgents },
+      message: `${workflow} started`,
+    });
+    const delegationProcessJournal = createProcessJournal(artifactsDir, runId);
+    const specPath = join(artifactsDir, WORKFLOW_ARTIFACT_LAYOUT.spec);
+    writeFileSync(specPath, JSON.stringify(spec, null, 2), "utf8");
+    artifact(visualizerRun, { kind: "json", title: "Compiled workflow spec", path: specPath });
+    journal = createDelegationJournal({ artifactDirectory: artifactsDir, workspace: cwd, protectedDirectories: [workersRoot],
+      runId, specDigest: binding.specDigest, profileDigest: binding.resourceProfileDigest, policy: compiled.policy, roots: compiled.roots });
+    // Default: the bridge owns its mkdtemp root and removes it on close; the
+    // <=107B socket-path limit is handled internally.
+    bridge = await createDelegationBridge();
+    runtime = createDelegationRuntime({ journal, processJournal: delegationProcessJournal, phases: compiled.phases, bridge,
+      operator: { ...binding.effective }, deadlinePolicy: { supervised: background }, signal: controller.signal,
+      render: makeV3Render(compiled), emitArtifact: v3EmitArtifact(visualizerRun, artifactsDir),
+      worker: (node) => buildV3WorkerRecipe({ node, nodes: journal.snapshot().state.nodes, binding, workersRoot, policy: compiled.policy }),
+      // Bounded status lines only: never prompts, summaries, or worker stdout.
+      onEvent: (event) => phaseEvent(visualizerRun, compiled.phases[event.phaseIndex]?.name ?? "delegation", {
+        kind: `delegation_${event.kind}`,
+        ...(event.node ? { nodeId: event.node.nodeId, label: event.node.label, state: event.node.state, status: event.node.result?.status } : {}) }),
+    });
+  } catch (error) {
+    const cancelled = cancellationRequested || isAbortError(error) || controller.signal.aborted;
+    const code = cancelled ? "CANCELLED" : v3SetupCode(error);
+    if (visualizerRun) {
+      try {
+        writeV3WorkflowResult({ visualizerRun, artifactsDir, binding, journal, runtime: undefined, policy: compiled?.policy,
+          status: cancelled ? STATUSES.CANCELLED : STATUSES.FAILED, error });
+      } catch (artifactError) {
+        const message = artifactError?.message || String(artifactError);
+        console.error(`failed to persist workflow result artifact: ${message}`);
+        phaseEvent(visualizerRun, "workflow-result", { kind: "result_artifact_error", message });
+      }
+      if (cancelled) completeRun(visualizerRun, STATUSES.CANCELLED, { cancelled: true, reason: controller.signal.reason || error?.message });
+      else failRun(visualizerRun, error);
+    }
+    if (bridge) await bridge.close().catch(() => {});
+    journal?.dispose();
+    writeReady({ ok: false, code, launchId });
+    return { record: { ok: false, code, ...(visualizerRun ? { runId } : {}), launchId }, exitCode: cancelled ? 130 : 1 };
+  }
+  // Detached readiness point: all execution prerequisites are durable and
+  // runtime.run() has not started.
+  writeReady({ ok: true, ready: true, background: true, runId, launchId });
+  const stopWatchingCancellation = watchCancellation(visualizerRun, controller);
+  let outcome;
+  try {
+    outcome = await runtime.run();
+  } catch (error) {
+    outcome = { status: cancellationRequested || isAbortError(error) || controller.signal.aborted ? "cancelled" : "failed",
+      code: v3SetupCode(error) };
+  } finally {
+    stopWatchingCancellation();
+    await bridge.close().catch(() => {});
+    journal.dispose();
+  }
+  const cancelled = outcome.status === "cancelled";
+  let code = outcome.status === "success" ? null
+    : cancelled ? "CANCELLED"
+    : outcome.status === "unknown" ? "OWNERSHIP_UNKNOWN" // held: never resumable
+    : outcome.code ?? "PHASE_FAILED";
+  let failure = code ? new Error(`${code}: recursive v3 delegation run did not complete`) : undefined;
+  let resultPath;
+  let resultError = null;
+  try {
+    resultPath = writeV3WorkflowResult({ visualizerRun, artifactsDir, binding, journal, runtime, policy: compiled.policy,
+      status: outcome.status === "success" ? STATUSES.SUCCESS : cancelled ? STATUSES.CANCELLED : STATUSES.FAILED, error: failure });
+  } catch (artifactError) {
+    resultError = artifactError;
+    const message = resultError?.message || String(resultError);
+    console.error(`failed to persist workflow result artifact: ${message}`);
+    phaseEvent(visualizerRun, "workflow-result", { kind: "result_artifact_error", message });
+  }
+  // The durable result artifact is the run's authoritative evidence. If it cannot
+  // be persisted, never claim clean success (never upgrade infrastructure failure).
+  if (resultError && outcome.status === "success") {
+    outcome = { status: "failed", code: "RESULT_WRITE_FAILED" };
+    code = "RESULT_WRITE_FAILED";
+    failure = new Error(`${code}: recursive v3 delegation result artifact could not be persisted`);
+  }
+  if (outcome.status === "success") completeRun(visualizerRun, STATUSES.SUCCESS, { ok: true, phases: compiled.phases.length, mode: "spec", resultPath });
+  else if (cancelled) completeRun(visualizerRun, STATUSES.CANCELLED, { cancelled: true, reason: controller.signal.reason || "cancelled" });
+  else failRun(visualizerRun, failure);
+  const record = outcome.status === "success"
+    ? { ok: true, runId, launchId, resultPath, status: "success" }
+    : { ok: false, code, runId, launchId };
+  return { record, exitCode: outcome.status === "success" ? 0 : cancelled ? 130 : 1 };
+}
+
 // Strict v3 launch branch: consume one bounded launch envelope off fd 3 before
 // maybeBackground, createRun, or any run artifact/process journal exists, then
-// terminate with the bounded NOT_IMPLEMENTED denial (execution is disconnected
-// in this build). --v3-launch/--launch-envelope-fd select transport, never
-// authority. Temp-input ownership: the initial runner owns it until detached
-// handoff bytes are written; the detached owner owns it afterwards (its exit
-// backup cleanup covers every detached outcome via the env marker).
+// execute the authorized delegation run (executeV3Authorized). --v3-launch/
+// --launch-envelope-fd select transport, never authority. Temp-input ownership:
+// the initial runner owns it until detached handoff bytes are written; the
+// detached owner owns it afterwards (its exit backup cleanup covers every
+// detached outcome via the env marker).
 async function runV3Launch(args, rawArgv) {
   validateCliBooleanFlag(args["v3-launch"], "--v3-launch");
   if (!isTruthyFlag(args["v3-launch"])) throw new Error("INVALID_REQUEST: --v3-launch must be a truthy flag when provided");
@@ -1440,32 +1668,25 @@ async function runV3Launch(args, rawArgv) {
     }
     throw error;
   }
-  // Authorization succeeded; execution is disconnected. Nonsecret launchId only.
-  const denial = { ok: false, code: "NOT_IMPLEMENTED", error: "recursive v3 execution is disconnected in this build", launchId: receipt.binding.launchId };
-  if (detached) {
-    if (isTruthyFlag(args["cleanup-input"])) {
-      try { cleanupGeneratedInput(specFile); } catch { /* denial delivery takes priority; the exit backup cleanup retries */ }
-    }
-    if (args["ready-file"]) {
-      const readyFile = String(args["ready-file"]);
-      const temporary = `${readyFile}.${process.pid}.tmp`;
-      writeFileSync(temporary, JSON.stringify(denial, null, 2), "utf8");
-      renameSync(temporary, readyFile);
-    }
-    process.exitCode = V3_DENIAL_EXIT_CODE;
-    return;
-  }
-  if (background) {
+  // Authorization succeeded. The initial background runner hands off to a
+  // detached owner; the detached owner and the foreground runner execute the
+  // authorized delegation run and emit one bounded outcome record.
+  if (!detached && background) {
     await handoffV3Detached(receipt, args, rawArgv, cwd, specFile);
     return;
   }
-  console.log(JSON.stringify(denial, null, 2));
-  process.exitCode = V3_DENIAL_EXIT_CODE;
+  if (detached && isTruthyFlag(args["cleanup-input"])) {
+    try { cleanupGeneratedInput(specFile); } catch { /* the outcome record takes priority; the exit backup cleanup retries */ }
+  }
+  const readyFile = detached && args["ready-file"] !== undefined ? String(args["ready-file"]) : undefined;
+  const { record, exitCode } = await executeV3Authorized(receipt, spec, args, cwd, background, cadence, v3Abort, readyFile);
+  if (!detached) console.log(JSON.stringify(record, null, 2));
+  process.exitCode = exitCode;
 }
 
 // Fresh detached-stage pipe on fd 3; receipt.handoffEnvelope() is used exactly
 // once. The initial runner keeps temp-input ownership until the handoff bytes
-// are written, and relays the detached owner's bounded denial record.
+// are written, and relays the detached owner's bounded outcome record.
 async function handoffV3Detached(receipt, args, rawArgv, cwd, specFile) {
   const readyDir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflow-ready-"));
   const readyFile = join(readyDir, "ready.json");
@@ -1484,18 +1705,20 @@ async function handoffV3Detached(receipt, args, rawArgv, cwd, specFile) {
     handedOff = true;
     child.unref();
     while (!existsSync(readyFile)) {
-      if (child.exitCode !== null) throw new Error(`v3 detached owner exited before its denial record (code ${child.exitCode})`);
+      if (child.exitCode !== null) throw new Error(`v3 detached owner exited before its outcome record (code ${child.exitCode})`);
       if (Date.now() >= deadline) {
         terminateChild(child, "SIGTERM");
         setTimeout(() => terminateChild(child, "SIGKILL"), 2000).unref();
-        throw new Error("v3 detached owner did not write its denial record before timeout");
+        throw new Error("v3 detached owner did not write its outcome record before timeout");
       }
       await sleep(25);
     }
     const record = JSON.parse(readFileSync(readyFile, "utf8"));
-    if (!record || record.ok !== false || record.code !== "NOT_IMPLEMENTED") throw new Error("v3 detached owner returned an invalid denial record");
+    const ready = record && record.ok === true && record.ready === true && typeof record.runId === "string" && typeof record.launchId === "string";
+    const failed = record && record.ok === false && typeof record.code === "string" && typeof record.launchId === "string";
+    if (!ready && !failed) throw new Error("v3 detached owner returned an invalid outcome record");
     console.log(JSON.stringify({ ...record, background: true, pid: child.pid }, null, 2));
-    process.exitCode = V3_DENIAL_EXIT_CODE;
+    process.exitCode = ready ? 0 : 1;
   } catch (error) {
     if (!handedOff && isTruthyFlag(args["cleanup-input"])) {
       try { cleanupGeneratedInput(specFile); } catch { /* preserve the handoff error */ }

@@ -28,7 +28,6 @@ const LEGACY_PREPARED_CALL = Symbol("legacy-prepared-dynamic-workflow-call");
 const MIN_PROGRESS_REVIEW_INTERVAL_MS = 60_000;
 const MAX_PROGRESS_REVIEW_INTERVAL_MS = 86_400_000;
 const V3_SPEC_SCHEMA = "pi-dynamic-workflow/v3";
-const V3_DENIAL_EXIT_CODE = 78;
 const V3_LAUNCH_ENVELOPE_FD = 3;
 // Mirrors the trusted worker recipe pinned in lib/delegation-launch-authorization.mjs.
 const V3_HOST_MODEL = "openai-codex/gpt-5.6-sol";
@@ -766,8 +765,8 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 }
 
 // Strict v3 launch branch: authorize through the host-bound launch authority,
-// hand one bounded envelope over fd 3, and map the runner's bounded denial.
-// Recursive execution stays disconnected (exit 78) in this build.
+// hand one bounded envelope over fd 3, and map the runner's bounded outcome
+// record.
 async function executeV3Launch(params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
 	// Host-side gate, read per call so operator toggles and tests need no module
 	// reload. The gate is never sufficient: the launch pipe is still required.
@@ -828,11 +827,19 @@ async function executeV3Launch(params: any, signal: AbortSignal | undefined, onU
 		addSessionArgs(args, ctx);
 		onUpdate?.({ content: [{ type: "text", text: `Authorizing recursive v3 workflow launch in ${cwd}...` }] });
 		const result = await runScript(args, cwd, signal, transfer.initialEnvelope());
-		// On a background handoff the detached owner took over temp-input cleanup.
-		retainGeneratedInput = background && result.code === V3_DENIAL_EXIT_CODE;
-		if (result.code === V3_DENIAL_EXIT_CODE) throw new Error("NOT_IMPLEMENTED: recursive v3 execution is disconnected in this build");
-		if (result.code !== 0) throw new Error(runnerFailure(result));
-		throw new Error("INVALID_REQUEST: v3 runner acknowledged the launch without the expected bounded denial");
+		let details: any;
+		try { details = parseJsonObject(result.stdout); } catch { details = undefined; }
+		// A parsed record proves the fd-3 handoff completed; the detached owner now owns the input.
+		retainGeneratedInput = background && Boolean(details && typeof details === "object" && typeof details.launchId === "string");
+		if (background) {
+			if (result.code === 0 && details?.ok === true && details?.ready === true && typeof details?.runId === "string" && details?.pid) {
+				return { content: [{ type: "text", text: `Started recursive v3 workflow ${details.runId} in background (pid ${details.pid}). Open ctrl+shift+t to monitor it.` }], details };
+			}
+			if (details?.ok === false && typeof details?.code === "string") throw new Error(`v3 background launch failed: ${details.code}`);
+			throw new Error(runnerFailure(result));
+		}
+		if (result.code === 0 && details?.ok === true) return { content: [{ type: "text", text: truncate(result.stdout) }], details };
+		throw new Error(runnerFailure(result));
 	} finally {
 		if (generatedInputFile && !retainGeneratedInput) rmSync(path.dirname(generatedInputFile), { recursive: true, force: true });
 	}

@@ -5,7 +5,7 @@
 import test, { after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -56,10 +56,13 @@ const spec = () => ({
   delegation: {
     maxDepth: 1,
     totalAgentBudget: 2,
-    directoryScope: { read: ["src"], write: [] },
+    // The workspace exists, so an authorized chain reaches worker spawn.
+    directoryScope: { read: ["."], write: [] },
     context: { objective: "Bounded review", constraints: ["stay in scope"] },
   },
-  phases: [{ type: "shell", name: "step", command: "true" }],
+  // The stub workerEntryPath exits 0 without a bootstrap read, so execution
+  // reaches worker spawn and the root node ends missing_completion.
+  phases: [{ type: "agent", name: "step", prompt: "Complete the bounded fixture step." }],
 });
 
 const profile = () => ({
@@ -146,6 +149,33 @@ function collect(child) {
 }
 
 const residue = () => readdirSync(childTmp).filter((entry) => entry.startsWith("pi-dynamic-workflow-")).sort();
+const runEvents = (runId) => readFileSync(join(storeDir, "runs", `${runId}.jsonl`), "utf8").trim().split("\n").map(JSON.parse);
+// Execution now creates a durable (failed) run: workflow_start carries the v3
+// marker, a terminal workflow_end exists, and the v2 result artifact is
+// recorded with resumable:false. Callers clean the store afterwards.
+function assertV3FailedRun(runId) {
+  const events = runEvents(runId);
+  assert.equal(events[0].type, "workflow_start");
+  assert.equal(events[0].metadata?.delegation, "v3");
+  assert.equal(events[0].metadata?.resumable, false);
+  assert.equal(events.at(-1).type, "workflow_end");
+  assert.equal(events.at(-1).status, "failed");
+  const resultArtifact = JSON.parse(readFileSync(join(storeDir, "artifacts", runId, "workflow-result.json"), "utf8"));
+  assert.equal(resultArtifact.schema, "pi-dynamic-workflow-result/v2");
+  assert.equal(resultArtifact.status, "failed");
+  assert.equal(resultArtifact.resumable, false);
+  assert.equal(existsSync(join(storeDir, "artifacts", runId, "workflow-checkpoint.json")), false);
+}
+// Wait for the detached owner's terminal event before store cleanup.
+async function awaitRunEnd(runId) {
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    assert.ok(Date.now() < deadline, "detached run did not record a terminal event");
+    const file = join(storeDir, "runs", `${runId}.jsonl`);
+    if (existsSync(file) && readFileSync(file, "utf8").includes('"type":"workflow_end"')) return;
+    await sleep(100);
+  }
+}
 function assertClean(result, { specFile }) {
   assert.equal(existsSync(specFile), false, "temp spec input must be removed");
   assert.deepEqual(residue(), [], "no temp input or ready-dir residue");
@@ -189,7 +219,7 @@ test("a wrong-stage envelope is UNAUTHORIZED", { timeout: 20_000 }, async () => 
   assertClean(result, { specFile: file });
 });
 
-test("an authorized initial envelope yields the exit-78 NOT_IMPLEMENTED denial", { timeout: 20_000 }, async () => {
+test("an authorized initial envelope executes and fails closed without execution prerequisites", { timeout: 30_000 }, async () => {
   const specValue = spec();
   const { file } = writeSpecInput(specValue);
   const envelope = mintInitialEnvelope(specValue);
@@ -197,16 +227,20 @@ test("an authorized initial envelope yields the exit-78 NOT_IMPLEMENTED denial",
   const child = spawnRunner(baseArgs(file), { withFd3: true });
   child.stdio[3].end(envelope);
   const result = await collect(child);
-  assert.equal(result.code, 78, result.stderr);
-  const denial = JSON.parse(result.stdout.trim());
-  assert.equal(denial.ok, false);
-  assert.equal(denial.code, "NOT_IMPLEMENTED");
-  assert.equal(denial.error, "recursive v3 execution is disconnected in this build");
-  assert.equal(denial.launchId, launchId);
-  assertClean(result, { specFile: file });
+  assert.equal(result.code, 1, result.stderr);
+  const record = JSON.parse(result.stdout.trim());
+  assert.equal(record.ok, false);
+  assert.equal(record.code, "PHASE_FAILED");
+  assert.equal(record.launchId, launchId);
+  assert.equal(typeof record.runId, "string");
+  assert.equal(existsSync(file), false, "temp spec input must be removed");
+  assert.deepEqual(residue(), [], "no temp input or ready-dir residue");
+  assert.ok(!result.stdout.includes(SENTINEL) && !result.stderr.includes(SENTINEL), "credential sentinel must never appear in output");
+  assertV3FailedRun(record.runId);
+  rmSync(storeDir, { recursive: true, force: true }); // keep later denial tests residue-free
 });
 
-test("wrapper-driven background chain hands off; detached owner denies and cleans", { timeout: 30_000 }, async () => {
+test("wrapper-driven background chain hands off; detached owner executes and fails closed", { timeout: 60_000 }, async () => {
   process.env[GATE] = "1";
   process.env.TMPDIR = childTmp; // wrapper mkdtemp and runner cleanup agree on the owned root
   process.env.PI_THREAD_PHASE_STORE_DIR = storeDir;
@@ -221,14 +255,34 @@ test("wrapper-driven background chain hands off; detached owner denies and clean
     cwd: workspace,
     sessionManager: { getSessionId: () => SESSION_ID, getSessionFile: () => sessionFile },
   };
-  let failure;
-  await execute("chain-bg", { v3: spec(), background: true, progressReviewIntervalMs: 120_000 }, undefined, undefined, fakeCtx)
-    .catch((error) => { failure = error; });
-  assert.match(String(failure?.message || failure), /NOT_IMPLEMENTED/);
-  assert.ok(!String(failure?.stack || failure).includes(SENTINEL));
-  // Detached-owned cleanup precedes the denial record the wrapper relays.
+  // The detached owner becomes ready once every execution prerequisite is
+  // durable; the wrapper resolves with the relayed ready record.
+  const result = await execute("chain-bg", { v3: spec(), background: true, progressReviewIntervalMs: 120_000 }, undefined, undefined, fakeCtx);
+  assert.equal(result.details?.ok, true);
+  assert.equal(result.details?.ready, true);
+  assert.equal(result.details?.background, true);
+  assert.equal(typeof result.details?.runId, "string");
+  assert.ok(result.details?.pid);
+  assert.ok(!JSON.stringify(result).includes(SENTINEL));
+  // Detached-owned cleanup precedes the ready record the wrapper relays.
   assert.deepEqual(residue(), [], "no temp input or ready-dir residue");
-  assert.equal(existsSync(storeDir), false, "no visualizer runs/process journals/checkpoints/artifacts");
+  // The stub fixture entry exits without a bootstrap read: the asynchronous
+  // run fails closed (missing_completion) and records a durable failed result.
+  const resultPath = join(storeDir, "artifacts", result.details.runId, "workflow-result.json");
+  const deadline = Date.now() + 30_000;
+  while (!existsSync(resultPath)) {
+    assert.ok(Date.now() < deadline, "detached run did not record a result artifact");
+    await sleep(100);
+  }
+  const resultArtifact = JSON.parse(readFileSync(resultPath, "utf8"));
+  assert.equal(resultArtifact.schema, "pi-dynamic-workflow-result/v2");
+  assert.equal(resultArtifact.status, "failed");
+  assert.equal(resultArtifact.resumable, false);
+  await awaitRunEnd(result.details.runId);
+  const events = runEvents(result.details.runId);
+  assert.equal(events[0].metadata?.delegation, "v3");
+  assert.equal(events[0].metadata?.continuationMode, "terminal");
+  rmSync(storeDir, { recursive: true, force: true }); // keep later denial tests residue-free
 });
 
 test("a detached owner denies an EOF pipe and cleans its owned input", { timeout: 20_000 }, async () => {
