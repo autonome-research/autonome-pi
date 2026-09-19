@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { closeSync, constants as fsConstants, fstatSync, lstatSync, mkdtempSync, openSync, readSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +8,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { BoundedTextBuffer } from "./lib/bounded-buffer.mjs";
+import { createHostedLaunchAuthority } from "./lib/delegation-launch-authorization.mjs";
+import { validateDelegationPolicy } from "./lib/delegation-contract.mjs";
+import { canonicalJSON, sha256 } from "./lib/delegation-storage.mjs";
+import { isolatedResourceOptions } from "./worker/profile.mjs";
 import { MAX_TIMEOUT_MS, normalizeTimeoutMs } from "./lib/subprocess.mjs";
 
 const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -22,6 +27,12 @@ const SAVED_TEMPLATE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const LEGACY_PREPARED_CALL = Symbol("legacy-prepared-dynamic-workflow-call");
 const MIN_PROGRESS_REVIEW_INTERVAL_MS = 60_000;
 const MAX_PROGRESS_REVIEW_INTERVAL_MS = 86_400_000;
+const V3_SPEC_SCHEMA = "pi-dynamic-workflow/v3";
+const V3_DENIAL_EXIT_CODE = 78;
+const V3_LAUNCH_ENVELOPE_FD = 3;
+// Mirrors the trusted worker recipe pinned in lib/delegation-launch-authorization.mjs.
+const V3_HOST_MODEL = "openai-codex/gpt-5.6-sol";
+const V3_LAUNCH_KEYS = new Set(["v3", "background", "progressReviewIntervalMs"]);
 
 function isHostedSupervisionContext(ctx: any): boolean {
 	return ctx?.mode === "tui" || ctx?.mode === "rpc";
@@ -29,6 +40,35 @@ function isHostedSupervisionContext(ctx: any): boolean {
 
 function canLaunchHostedSupervision(params: any, ctx: any): boolean {
 	return params?.background === true && isHostedSupervisionContext(ctx) && Boolean(ctx?.sessionManager?.getSessionId?.());
+}
+
+let v3LaunchProfileOverride: any = null;
+// TEST-ONLY seam: installs a fully synthetic v3 launch profile (fixture paths)
+// or null to restore the production trusted-constants profile. Production code
+// never calls this; tests must never point it at the real auth path.
+export function __setV3LaunchProfileForTests(profile: any): void {
+	v3LaunchProfileOverride = profile ?? null;
+}
+
+function realpathOrScopeDenied(target: string): string {
+	try {
+		return realpathSync(target);
+	} catch {
+		throw new Error("SCOPE_DENIED: v3 launch profile path is unavailable");
+	}
+}
+
+function v3LaunchProfile(): any {
+	if (v3LaunchProfileOverride) return v3LaunchProfileOverride;
+	return {
+		sdkPackagePath: realpathOrScopeDenied(path.dirname(createRequire(import.meta.url).resolve("@earendil-works/pi-coding-agent/package.json"))),
+		workerEntryPath: realpathOrScopeDenied(path.join(EXT_DIR, "worker", "sdk-runner.mjs")),
+		// The host's normal Pi auth path, bound as path metadata only: contents are
+		// never read here. Absence fails closed (SCOPE_DENIED) before any spawn.
+		authPath: realpathOrScopeDenied(path.join(homedir(), ".pi", "agent", "auth.json")),
+		resourceProfile: isolatedResourceOptions(),
+		limits: { maxConcurrentAgents: 4, maxLiveAgents: 8 },
+	};
 }
 
 function savedWorkflowDirectory(): string {
@@ -143,7 +183,7 @@ function renderStructuredTemplate(value: any, inputs: Record<string, any>, used:
 	});
 }
 
-const PUBLIC_WORKFLOW_KEYS = new Set(["name", "cwd", "permissions", "model", "timeoutMs", "background", "progressReviewIntervalMs", "after", "resumeRunId", "template", "inputs", "phases"]);
+const PUBLIC_WORKFLOW_KEYS = new Set(["name", "cwd", "permissions", "model", "timeoutMs", "background", "progressReviewIntervalMs", "after", "resumeRunId", "template", "inputs", "phases", "v3"]);
 const SCRIPTED_WORKFLOW_KEYS = new Set(["script", "scriptFile", "template", "name", "cwd", "model", "timeoutMs", "background", "progressReviewIntervalMs", "after", "permissions"]);
 const TEMPLATE_WORKFLOW_KEYS = new Set(["name", "cwd", "permissions", "model", "timeoutMs", "background", "progressReviewIntervalMs", "phases"]);
 const LEGACY_OUTER_KEYS = new Set(["spec", "harness", "harnessFile", "name", "permissions", "cwd", "model", "background", "autoContinue", "after", "resumeRunId", "timeout"]);
@@ -316,12 +356,20 @@ function truncate(text: string, max = MAX_TOOL_TEXT): string {
 	return `${out}\n\n[Tool output truncated. Full run is available through thread_phase_runs.]`;
 }
 
-function runScript(args: string[], cwd: string, signal?: AbortSignal): Promise<{ code: number; signal: NodeJS.Signals | null; stdout: string; stderr: string; aborted: boolean }> {
+function runScript(args: string[], cwd: string, signal?: AbortSignal, launchEnvelope?: Buffer): Promise<{ code: number; signal: NodeJS.Signals | null; stdout: string; stderr: string; aborted: boolean }> {
 	if (signal?.aborted) {
 		return Promise.resolve({ code: 130, signal: null, stdout: "", stderr: String(signal.reason || "cancelled"), aborted: true });
 	}
 	return new Promise((resolve) => {
-		const proc = spawn(process.execPath, [SCRIPT, ...args], { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env });
+		const proc = spawn(process.execPath, [SCRIPT, ...args], { cwd, stdio: launchEnvelope ? ["ignore", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"], env: process.env });
+		// fd 3 is the private launch-envelope pipe (v3 only). The wrapper writes the
+		// envelope exactly once, never reads it back, and tolerates EPIPE from an
+		// early runner denial.
+		const launchPipe: any = launchEnvelope ? proc.stdio[3] : undefined;
+		if (launchPipe) {
+			launchPipe.on("error", () => {});
+			launchPipe.end(launchEnvelope);
+		}
 		// The runner normally emits one small JSON result, but bound both streams
 		// while reading so a noisy/crashing child cannot exhaust the Pi process.
 		const stdout = new BoundedTextBuffer(MAX_RUNNER_CAPTURE_BYTES, { keep: "tail" });
@@ -337,6 +385,7 @@ function runScript(args: string[], cwd: string, signal?: AbortSignal): Promise<{
 			if (settled) return;
 			settled = true;
 			cleanup();
+			launchPipe?.destroy();
 			resolve({ code, signal: observedSignal, stdout: stdout.value(), stderr: error?.message || stderr.value(), aborted });
 		};
 		const abort = () => {
@@ -544,6 +593,11 @@ function workflowParametersSchema() {
 		template: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", description: "Saved structured workflow name from ~/.pi/agent/workflows/<name>.json. Use instead of phases." })),
 		inputs: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Values for {{inputs.key}} placeholders in a saved structured workflow template." })),
 		phases: Type.Optional(Type.Array(phases, { minItems: 1, maxItems: 30, description: "Ordered phases. Use exactly one of phases or template." })),
+		v3: Type.Optional(Type.Object({
+			schema: Type.Literal("pi-dynamic-workflow/v3"),
+			delegation: Type.Record(Type.String(), Type.Any()),
+			phases: Type.Array(Type.Any(), { minItems: 1 }),
+		}, { additionalProperties: false })),
 	}, { additionalProperties: false });
 }
 
@@ -711,6 +765,79 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 	}
 }
 
+// Strict v3 launch branch: authorize through the host-bound launch authority,
+// hand one bounded envelope over fd 3, and map the runner's bounded denial.
+// Recursive execution stays disconnected (exit 78) in this build.
+async function executeV3Launch(params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
+	// Host-side gate, read per call so operator toggles and tests need no module
+	// reload. The gate is never sufficient: the launch pipe is still required.
+	if (!/^(1|true|yes|on)$/i.test(process.env.PI_DYNAMIC_WORKFLOW_RECURSIVE_LAUNCH || "")) {
+		throw new Error("NOT_ENABLED: recursive v3 workflow launch is disabled in this build");
+	}
+	// Exclusivity: only background and progressReviewIntervalMs may accompany v3.
+	rejectUnsupportedFields(params, V3_LAUNCH_KEYS, "dynamic_workflow v3");
+	const spec = params.v3;
+	if (!spec || typeof spec !== "object" || Array.isArray(spec)) throw new Error("dynamic_workflow.v3 must be an object.");
+	if (spec.schema !== V3_SPEC_SCHEMA) throw new Error(`dynamic_workflow.v3.schema must be "${V3_SPEC_SCHEMA}".`);
+	if (spec.delegation === undefined) throw new Error("dynamic_workflow.v3.delegation is required.");
+	if (!Array.isArray(spec.phases) || spec.phases.length < 1) throw new Error("dynamic_workflow.v3.phases must be a non-empty array.");
+	if (params.background !== undefined && typeof params.background !== "boolean") throw new Error("dynamic_workflow.background must be a boolean.");
+	validateProgressReviewInterval(params.progressReviewIntervalMs, "dynamic_workflow.progressReviewIntervalMs");
+	if (!isHostedSupervisionContext(ctx) || typeof ctx.sessionManager?.getSessionId !== "function") throw new Error("UNAUTHORIZED: v3 launch requires a hosted TUI or RPC session.");
+	const profile = v3LaunchProfile();
+	const authority = createHostedLaunchAuthority(profile);
+	const cwd = path.resolve(ctx.cwd);
+	const background = params.background === true;
+	const launch = definedProperties({ spec, cwd, background, progressReviewIntervalMs: params.progressReviewIntervalMs });
+	const grant = authority.prepare(ctx, launch);
+	// Recompute every binding fact the wrapper can know. Burn-before-check makes
+	// any drift between prepare and consume terminal for this grant, before any
+	// temp spec or process exists.
+	const expected = {
+		hostMode: ctx.mode,
+		sessionId: ctx.sessionManager.getSessionId(),
+		sessionFile: ctx.sessionManager.getSessionFile?.() ?? null,
+		model: V3_HOST_MODEL,
+		cwd: realpathSync(cwd),
+		specDigest: sha256(canonicalJSON(spec)),
+		policyDigest: sha256(canonicalJSON(validateDelegationPolicy(spec.delegation))),
+		background,
+		supervision: background ? "supervised" : "foreground",
+		progressReviewIntervalMs: params.progressReviewIntervalMs ?? null,
+		effective: { maxConcurrentAgents: profile.limits.maxConcurrentAgents, maxLiveAgents: profile.limits.maxLiveAgents },
+		worker: {
+			setup: "pi-workflow-sdk-worker/v1",
+			provider: "openai-codex",
+			model: "gpt-5.6-sol",
+			thinking: "high",
+			sdkPackagePath: profile.sdkPackagePath,
+			workerEntryPath: profile.workerEntryPath,
+			authPath: profile.authPath,
+		},
+		resourceProfileDigest: sha256(canonicalJSON(profile.resourceProfile)),
+	};
+	const transfer = authority.consume(grant, expected);
+	let generatedInputFile: string | undefined;
+	let retainGeneratedInput = false;
+	try {
+		generatedInputFile = writeJsonFile(spec);
+		// --v3-launch/--launch-envelope-fd select the transport, never authority.
+		const args = ["--cwd", cwd, "--spec-file", generatedInputFile, "--cleanup-input", "--v3-launch", "--launch-envelope-fd", String(V3_LAUNCH_ENVELOPE_FD)];
+		if (background) args.push("--background");
+		if (params.progressReviewIntervalMs !== undefined) args.push("--progress-review-interval-ms", String(params.progressReviewIntervalMs));
+		addSessionArgs(args, ctx);
+		onUpdate?.({ content: [{ type: "text", text: `Authorizing recursive v3 workflow launch in ${cwd}...` }] });
+		const result = await runScript(args, cwd, signal, transfer.initialEnvelope());
+		// On a background handoff the detached owner took over temp-input cleanup.
+		retainGeneratedInput = background && result.code === V3_DENIAL_EXIT_CODE;
+		if (result.code === V3_DENIAL_EXIT_CODE) throw new Error("NOT_IMPLEMENTED: recursive v3 execution is disconnected in this build");
+		if (result.code !== 0) throw new Error(runnerFailure(result));
+		throw new Error("INVALID_REQUEST: v3 runner acknowledged the launch without the expected bounded denial");
+	} finally {
+		if (generatedInputFile && !retainGeneratedInput) rmSync(path.dirname(generatedInputFile), { recursive: true, force: true });
+	}
+}
+
 export default function dynamicWorkflows(pi: ExtensionAPI) {
 	const guidelines = [
 		"Use dynamic_workflow to compose supervised subagent workflows directly from ordered agent, fanout, shell, and artifact phases.",
@@ -732,6 +859,7 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 		parameters: workflowParametersSchema(),
 		prepareArguments: legacySpecToPublic,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			if (params?.v3 !== undefined) return executeV3Launch(params, signal, onUpdate, ctx);
 			const legacyPreparedCall = params?.[LEGACY_PREPARED_CALL] === true;
 			const resolved = resolvePublicWorkflowParams(params);
 			if (resolved.resumeRunId !== undefined) {

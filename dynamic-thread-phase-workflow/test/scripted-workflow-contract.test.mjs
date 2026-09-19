@@ -51,8 +51,17 @@ test("registered scripted schema replaces the harness tool without declarative s
 
   const declarative = registered.get("dynamic_workflow").parameters;
   const declarativeJson = JSON.stringify(declarative);
-  assert.equal(Buffer.byteLength(declarativeJson), 4_673);
-  assert.equal(createHash("sha256").update(declarativeJson).digest("hex"), "1004e3c9bed97d1e7f4dcf591b56b89502ff0ca87b2775b592c23270b60d9f41");
+  // v3 launch branch deliberately extended the declarative schema (4957 bytes).
+  assert.equal(Buffer.byteLength(declarativeJson), 4_957);
+  assert.equal(createHash("sha256").update(declarativeJson).digest("hex"), "c45ceb7eec9fbb704877d5c86e940e44f38adfbd8b902ebe0b8c42f491b7dad0");
+  assert.deepEqual(declarative.properties.v3, {
+    type: "object", required: ["schema", "delegation", "phases"], additionalProperties: false,
+    properties: {
+      schema: { type: "string", const: "pi-dynamic-workflow/v3" },
+      delegation: { type: "object", patternProperties: { "^.*$": {} } },
+      phases: { type: "array", items: {}, minItems: 1 },
+    },
+  });
   assert.deepEqual(declarative.properties.progressReviewIntervalMs, {
     type: "integer", minimum: 60_000, maximum: 86_400_000,
     description: "Hosted background progress-review cadence in milliseconds; this is not a timeout.",

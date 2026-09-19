@@ -3,11 +3,15 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { accessSync, closeSync, constants as fsConstants, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
+import { Socket } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { PiJsonEventCollector } from "../lib/pi-json-stream.mjs";
 import { commitSuccessor, releaseSuccessor, reserveSuccessor } from "../../thread-phase-visualizer/lib/chain-store.mjs";
 import { MAX_TIMEOUT_MS, normalizeTimeoutMs, runBoundedProcess, terminateChild } from "../lib/subprocess.mjs";
+import { receiveLaunchEnvelope } from "../lib/delegation-launch-authorization.mjs";
+import { validateDelegationPolicy } from "../lib/delegation-contract.mjs";
+import { canonicalDirectory, canonicalJSON, sha256 } from "../lib/delegation-storage.mjs";
 import { assertProcessGroupsStopped, createProcessJournal } from "../lib/process-journal.mjs";
 import {
   RUNNER_OWNED_ARTIFACT_NAMES,
@@ -65,6 +69,10 @@ const SAVED_TEMPLATE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const V2_PERMISSIONS = new Set(["r", "w", "rw", "rwx"]);
 const CHAIN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_CHAIN_RUNS = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_CHAIN_RUNS || 20);
+const V3_DENIAL_EXIT_CODE = 78;
+const V3_LAUNCH_ENVELOPE_FD = 3;
+const V3_SPEC_SCHEMA = "pi-dynamic-workflow/v3";
+const V3_FORBIDDEN_FLAGS = ["resume-run-id", "after", "js-file", "harness-file", "legacy-spec", "supervise-agents", "spec", "auto-continue", "timeout", "model", "name", "saved-template", "permissions"];
 const DEFAULT_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_WORKFLOW_DEFAULT_PERMISSIONS || process.env.PI_DYNAMIC_THREAD_PHASE_DEFAULT_PERMISSIONS || "r", "PI_DYNAMIC_WORKFLOW_DEFAULT_PERMISSIONS");
 const MAX_PERMISSIONS = normalizePermissions(process.env.PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_PERMISSIONS || "rwx", "PI_DYNAMIC_WORKFLOW_MAX_PERMISSIONS");
 
@@ -1361,6 +1369,144 @@ async function runHarness(ctx, harnessFile) {
   return await entry(harnessCtx);
 }
 
+// Strict v3 launch branch: consume one bounded launch envelope off fd 3 before
+// maybeBackground, createRun, or any run artifact/process journal exists, then
+// terminate with the bounded NOT_IMPLEMENTED denial (execution is disconnected
+// in this build). --v3-launch/--launch-envelope-fd select transport, never
+// authority. Temp-input ownership: the initial runner owns it until detached
+// handoff bytes are written; the detached owner owns it afterwards (its exit
+// backup cleanup covers every detached outcome via the env marker).
+async function runV3Launch(args, rawArgv) {
+  validateCliBooleanFlag(args["v3-launch"], "--v3-launch");
+  if (!isTruthyFlag(args["v3-launch"])) throw new Error("INVALID_REQUEST: --v3-launch must be a truthy flag when provided");
+  const detached = Boolean(process.env.PI_DYNAMIC_WORKFLOW_BACKGROUND || process.env.PI_DYNAMIC_THREAD_PHASE_BACKGROUND);
+  // Defense in depth: the wrapper's exclusivity check is the primary gate.
+  for (const key of V3_FORBIDDEN_FLAGS) {
+    if (args[key] !== undefined) throw new Error(`INVALID_REQUEST: v3 launch accepts no resume/after/harness/supervision flags; remove --${key}`);
+  }
+  if (!detached && args["ready-file"] !== undefined) throw new Error("INVALID_REQUEST: --ready-file is internal to the v3 detached handoff");
+  const specFile = validateCliString(args["spec-file"], "--spec-file");
+  if (!specFile) throw new Error("INVALID_REQUEST: v3 launch requires --spec-file");
+  if (!validateCliString(args["session-id"], "--session-id")) throw new Error("INVALID_REQUEST: v3 launch requires --session-id");
+  validateCliString(args["session-file"], "--session-file", { nonEmpty: false });
+  if (String(args["launch-envelope-fd"]) !== String(V3_LAUNCH_ENVELOPE_FD)) throw new Error(`INVALID_REQUEST: v3 launch requires --launch-envelope-fd ${V3_LAUNCH_ENVELOPE_FD}`);
+  const background = detached || isTruthyFlag(args.background);
+  const cadence = validateProgressReviewInterval(args["progress-review-interval-ms"], "--progress-review-interval-ms", { cli: true }) ?? null;
+  if (cadence !== null && !background) throw new Error("INVALID_REQUEST: v3 progress review cadence requires background");
+  // Reading the already-written temp spec is the only permitted pre-authorization
+  // filesystem access; no artifact, journal, or checkpoint is created here.
+  let spec;
+  try {
+    spec = JSON.parse(readBoundedRegularFile(specFile, MAX_SPEC_BYTES, "workflow spec").toString("utf8"));
+  } catch (error) {
+    throw new Error(`INVALID_REQUEST: v3 launch spec is unreadable: ${error?.message || error}`);
+  }
+  if (!spec || typeof spec !== "object" || Array.isArray(spec) || spec.schema !== V3_SPEC_SCHEMA || spec.delegation === undefined) {
+    throw new Error("INVALID_REQUEST: v3 launch requires a pi-dynamic-workflow/v3 spec with a delegation policy");
+  }
+  const cwd = canonicalDirectory(realpathSync(resolve(String(args.cwd || process.cwd()))));
+  // Assert only the subset this runner can recompute from authoritative facts.
+  // Host-side facts (worker paths, resource profile) are enforced on receipt by
+  // validateLaunchBinding's exact shape/constant checks, keeping the runner free
+  // of any auth-path access.
+  const expected = {
+    sessionId: String(args["session-id"]),
+    sessionFile: args["session-file"] ? String(args["session-file"]) : null,
+    cwd,
+    specDigest: sha256(canonicalJSON(spec)),
+    policyDigest: sha256(canonicalJSON(validateDelegationPolicy(spec.delegation))),
+    background,
+    progressReviewIntervalMs: cadence,
+  };
+  const v3Abort = new AbortController();
+  activeAbortController = v3Abort; // SIGTERM/SIGINT route through requestCancel
+  if (cancellationRequested) v3Abort.abort("cancelled");
+  let receipt;
+  try {
+    try {
+      // The module destroys the socket on return, denial, cancellation, or EOF.
+      receipt = await receiveLaunchEnvelope(new Socket({ fd: V3_LAUNCH_ENVELOPE_FD }), { stage: detached ? "detached" : "initial", expected, signal: v3Abort.signal });
+    } catch (error) {
+      if (v3Abort.signal.aborted) throw error;
+      const message = String(error?.message || error);
+      if (/^(LAUNCH_MISMATCH|UNAUTHORIZED|FRAME_[A-Z]+|INVALID_REQUEST|SCOPE_DENIED|UNSUPPORTED_VERSION):/.test(message)) throw error;
+      throw new Error(`FRAME_PROTOCOL: launch envelope pipe unavailable (${message.slice(0, 160)})`);
+    }
+  } catch (error) {
+    // The initial background runner still owns the temp input on any
+    // pre-handoff failure; foreground failures use the exit backup cleanup.
+    if (!detached && background && isTruthyFlag(args["cleanup-input"])) {
+      try { cleanupGeneratedInput(specFile); } catch { /* preserve the launch error */ }
+    }
+    throw error;
+  }
+  // Authorization succeeded; execution is disconnected. Nonsecret launchId only.
+  const denial = { ok: false, code: "NOT_IMPLEMENTED", error: "recursive v3 execution is disconnected in this build", launchId: receipt.binding.launchId };
+  if (detached) {
+    if (isTruthyFlag(args["cleanup-input"])) {
+      try { cleanupGeneratedInput(specFile); } catch { /* denial delivery takes priority; the exit backup cleanup retries */ }
+    }
+    if (args["ready-file"]) {
+      const readyFile = String(args["ready-file"]);
+      const temporary = `${readyFile}.${process.pid}.tmp`;
+      writeFileSync(temporary, JSON.stringify(denial, null, 2), "utf8");
+      renameSync(temporary, readyFile);
+    }
+    process.exitCode = V3_DENIAL_EXIT_CODE;
+    return;
+  }
+  if (background) {
+    await handoffV3Detached(receipt, args, rawArgv, cwd, specFile);
+    return;
+  }
+  console.log(JSON.stringify(denial, null, 2));
+  process.exitCode = V3_DENIAL_EXIT_CODE;
+}
+
+// Fresh detached-stage pipe on fd 3; receipt.handoffEnvelope() is used exactly
+// once. The initial runner keeps temp-input ownership until the handoff bytes
+// are written, and relays the detached owner's bounded denial record.
+async function handoffV3Detached(receipt, args, rawArgv, cwd, specFile) {
+  const readyDir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflow-ready-"));
+  const readyFile = join(readyDir, "ready.json");
+  const child = spawn(process.execPath, [process.argv[1], ...stripBackgroundArgs(rawArgv), "--ready-file", readyFile], {
+    cwd,
+    detached: true,
+    stdio: ["ignore", "ignore", "ignore", "pipe"], // fd 3 = detached-stage envelope pipe
+    env: { ...process.env, PI_DYNAMIC_WORKFLOW_BACKGROUND: "1", PI_DYNAMIC_THREAD_PHASE_BACKGROUND: "1" },
+  });
+  const pipe = child.stdio[3];
+  pipe.on("error", () => {}); // EPIPE if the detached owner exits early
+  let handedOff = false;
+  const deadline = Date.now() + Number(process.env.PI_DYNAMIC_WORKFLOW_READY_TIMEOUT_MS || 5000);
+  try {
+    pipe.end(receipt.handoffEnvelope()); // exactly once; a second call self-denies
+    handedOff = true;
+    child.unref();
+    while (!existsSync(readyFile)) {
+      if (child.exitCode !== null) throw new Error(`v3 detached owner exited before its denial record (code ${child.exitCode})`);
+      if (Date.now() >= deadline) {
+        terminateChild(child, "SIGTERM");
+        setTimeout(() => terminateChild(child, "SIGKILL"), 2000).unref();
+        throw new Error("v3 detached owner did not write its denial record before timeout");
+      }
+      await sleep(25);
+    }
+    const record = JSON.parse(readFileSync(readyFile, "utf8"));
+    if (!record || record.ok !== false || record.code !== "NOT_IMPLEMENTED") throw new Error("v3 detached owner returned an invalid denial record");
+    console.log(JSON.stringify({ ...record, background: true, pid: child.pid }, null, 2));
+    process.exitCode = V3_DENIAL_EXIT_CODE;
+  } catch (error) {
+    if (!handedOff && isTruthyFlag(args["cleanup-input"])) {
+      try { cleanupGeneratedInput(specFile); } catch { /* preserve the handoff error */ }
+    }
+    throw error;
+  } finally {
+    pipe.destroy();
+    rmSync(readyDir, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   validateRunnerLimits();
   const rawArgv = process.argv.slice(2);
@@ -1374,6 +1520,12 @@ async function main() {
   const requestedSavedTemplate = validateSavedTemplateName(args["saved-template"], "--saved-template");
   if (args.help || args.h) {
     console.log("Usage: dynamic-thread-phase-workflow.mjs --spec-file spec.json | --resume-run-id RUN | --js-file workflow.mjs [--cwd REPO] [--background] [--model MODEL]");
+    return;
+  }
+  // The strict v3 branch consumes its launch envelope and terminates before any
+  // resume/spec validation, background detachment, or run/artifact creation.
+  if (args["v3-launch"] !== undefined) {
+    await runV3Launch(args, rawArgv);
     return;
   }
 
