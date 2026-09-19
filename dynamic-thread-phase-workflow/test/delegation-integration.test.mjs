@@ -55,3 +55,46 @@ for (const version of versions) test(`consent-gated production bridge Pi ${versi
     await bridge?.close().catch(() => {}); journal?.dispose(); await rm(root, { recursive: true, force: true });
   }
 });
+
+for (const version of versions) test(`consent-gated production bridge Pi ${version.version}: schema-invalid workflow_context view is denied by the SDK schema before any bridge request`, { skip: process.env.PI_DELEGATION_COMPAT_FIXTURES !== '1', timeout: 90000 }, async t => {
+  if (process.platform !== 'linux') return t.skip('production bridge requires Linux anchor');
+  const root = await mkdtemp(join(tmpdir(), 'delegation-integration-schema-'));
+  const workspace = join(root, 'workspace'), artifacts = join(root, 'artifacts'), profile = join(root, 'profile');
+  const directories = profileDirectories(profile);
+  await mkdir(join(workspace, 'allowed'), { recursive: true });
+  await writeFile(join(workspace, 'allowed/input.txt'), 'fixture bridge input\n');
+  for (const path of [artifacts, profile, ...Object.values(directories)]) await mkdir(path, { recursive: true });
+  let bridge, journal, output = '';
+  try {
+    const scope = { read: ['allowed'], write: ['allowed'] };
+    const policy = { maxDepth: 0, totalAgentBudget: 1, directoryScope: scope, context: { objective: 'deterministic bridge fixture', constraints: ['No network', 'Use only the private worker bridge'] } };
+    journal = createDelegationJournal({ artifactDirectory: artifacts, workspace, protectedDirectories: [profile], runId: 'bridge-fixture-schema-denial',
+      specDigest: createHash('sha256').update('bridge-fixture-schema-denial-spec').digest('hex'), profileDigest: createHash('sha256').update(version.version).digest('hex'), policy,
+      roots: [{ phaseIndex: 0, agentBudget: 1, label: 'root', task: 'fixture assignment', permissions: 'rwx', directoryScope: scope, deadlineAt: null }] });
+    const processJournal = createProcessJournal(artifacts, 'bridge-fixture-schema-denial');
+    // Keep the bridge directly under the process-isolated TMPDIR: nested
+    // profile paths can exceed Linux's AF_UNIX pathname limit.
+    bridge = await createDelegationBridge({ tmpDir: tmpdir() });
+    const tools = ['read', 'workflow_complete', 'workflow_context'];
+    const runtime = createDelegationRuntime({ journal, processJournal, bridge, phases: [{ type: 'agent', name: 'root' }],
+      operator: { maxConcurrentAgents: 1, maxLiveAgents: 3 }, deadlinePolicy: { supervised: true },
+      worker() {
+        const args = ['--import', join(supportDir, 'no-network.mjs'), '--import', join(supportDir, 'strict-no-network.mjs'), version.cliPath, '--mode', 'json', '--print', '--no-session', '--no-approve', '--no-extensions', '--no-skills', '--no-themes', '--no-prompt-templates', '--no-context-files', '--system-prompt', 'FIXTURE ONLY', '--tools', tools.join(','), '-e', join(supportDir, 'provider.ts'), '-e', join(process.cwd(), 'dynamic-thread-phase-workflow/worker/index.ts'), '--provider', 'delegation-fixture', '--model', 'deterministic', '--thinking', 'off', JSON.stringify({ depth: 0, mode: 'schema-denial' })];
+        return { command: process.execPath, args, tools, onStdout: chunk => { output += chunk; }, env: {
+          ...workerEnvironment({ ...directories, tmpDir: dirname(bridge.socketPath), nodePath: process.execPath }),
+          PI_DELEGATION_BRIDGE_SOCKET: bridge.socketPath, PI_DELEGATION_COMPAT_FIXTURES: '1',
+        } };
+      },
+    });
+    const result = await runtime.run();
+    assert.deepEqual(result, { status: 'success', held: false, closed: true, code: null });
+    const events = output.split('\n').filter(line => line.startsWith('{')).map(line => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
+    const contextEnds = events.filter(e => e.type === 'tool_execution_end' && e.toolName === 'workflow_context');
+    assert.equal(contextEnds.length, 1); assert.equal(contextEnds[0].isError, true);
+    const state = journal.snapshot().state;
+    assert.equal(state.nodes.length, 1); assert.ok(state.nodes.every(node => node.joined && node.closed && node.result));
+    t.diagnostic(`production bridge ${version.version}: schema-denied workflow_context reached zero bridge requests; run still completed`);
+  } finally {
+    await bridge?.close().catch(() => {}); journal?.dispose(); await rm(root, { recursive: true, force: true });
+  }
+});

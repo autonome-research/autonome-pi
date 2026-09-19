@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join, isAbsolute } from 'node:path';
 import { canonicalJSON } from './delegation-storage.mjs';
 import { projectDelegationResults } from './delegation-context.mjs';
-import { id, object, text, integer, fail } from './delegation-contract.mjs';
+import { id, object, text, integer, fail, validateContextRequest } from './delegation-contract.mjs';
 
 export const BRIDGE_REQUEST = 'pi-workflow-delegation-request/v1';
 export const BRIDGE_RESPONSE = 'pi-workflow-delegation-response/v1';
@@ -38,9 +38,9 @@ function checkRequest(value) {
   switch (value.type) {
     case 'delegate': case 'complete': object(value.args, value.type === 'delegate' ? ['directoryRevision', 'children'] : ['status', 'summary', 'acceptance', 'evidence', 'childReviews', 'remainingWork']); break;
     case 'shutdown': break;
-    case 'context': object(value.args, []); break;
-    case 'artifact': object(value.args, ['view', 'artifactId'], ['offsetBytes', 'limitBytes']); break;
-    case 'file_read': object(value.args, ['path'], ['maxBytes']); break;
+    case 'context': validateContextRequest(value.args); if (value.args.view !== 'directory') throw new Error('INVALID_REQUEST'); break;
+    case 'artifact': validateContextRequest(value.args); if (value.args.view !== 'artifact') throw new Error('INVALID_REQUEST'); break;
+    case 'file_read': object(value.args, ['path'], ['maxBytes']); if (value.args.maxBytes !== undefined) integer(value.args.maxBytes, 1, 262144); break;
     case 'file_grep': object(value.args, ['path', 'pattern', 'literal']); if (value.args.literal !== true) throw new Error('UNSUPPORTED_MODE'); break;
     case 'file_find': case 'file_ls': object(value.args, ['path']); break;
     case 'file_write': object(value.args, ['path', 'content']); break;
@@ -55,7 +55,11 @@ function resultEntries(value) {
   if (!Array.isArray(value)) return [];
   return value.map(item => item?.result ? {
     schema: 'pi-workflow-delegation-node-result/v1', childNodeId: item.nodeId,
-    status: item.result.status, summary: '', resultHash: item.result.sha256, resultArtifactId: item.result.artifactId,
+    status: item.result.status,
+    // Verified immutable-artifact summary from the paired runtime change; a handle
+    // that omits it fails closed instead of minting an empty claim.
+    summary: typeof item.summary === 'string' ? item.summary : fail('RESULT_INVALID', 'delegate result summary'),
+    resultHash: item.result.sha256, resultArtifactId: item.result.artifactId,
   } : item);
 }
 

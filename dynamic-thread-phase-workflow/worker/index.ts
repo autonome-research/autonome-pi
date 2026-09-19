@@ -9,6 +9,10 @@ import { assertToolProfile } from './profile.mjs';
 import { toolOccurrence, replaceDelegationContext, runnerBashOperations } from './adapter-primitives.mjs';
 
 const FRAME = 64 * 1024;
+// 64KiB LF-delimited frame - 279B worst-case file_result response overhead
+// (128-char requestId + long directoryRevision) = 65256B base64 budget;
+// 4*ceil(n/3) <= 65256 -> n <= 48942 raw bytes per read page.
+const READ_PAGE_BYTES = 48942;
 const ownPath = fileURLToPath(import.meta.url);
 const audit = code => process.stderr.write(`PI_WORKER_FAIL_STOP:${code}\n`);
 function fatal(code: string): never { audit(code); process.exit(70); }
@@ -95,7 +99,7 @@ export default async function worker(pi: any) {
   pi.on('context', async (event: any) => {
     try {
       profile();
-      const response = failResponse(await request('context', {}, `context:${++counter}`));
+      const response = failResponse(await request('context', { view: 'directory' }, `context:${++counter}`));
       if (response.status !== 'context') fatal('CONTEXT_UNAVAILABLE');
       return { messages: replaceDelegationContext(event.messages, response.context) };
     } catch { fatal('CONTEXT_UNAVAILABLE'); }
@@ -105,24 +109,61 @@ export default async function worker(pi: any) {
     catch (error) { return { block: true, reason: String(error).includes('exclusive') ? 'exclusive tool batch' : 'PARENT_NOT_ACTIVE', terminate: true }; }
   });
   const register = (name: string, parameters: any, execute: any) => pi.registerTool({ name, label: name, description: 'Private workflow worker tool', parameters, execute });
-  if (boot.tools.includes('workflow_delegate')) register('workflow_delegate', Type.Object({ directoryRevision: Type.Number(), children: Type.Array(Type.Any()) }, { additionalProperties: false }), async (id: string, args: any, _signal: any, _update: any, ctx: any) => {
+  const scopePaths = Type.Array(Type.String({ minLength: 1, maxLength: 256 }), { maxItems: 32 });
+  const acceptanceCriterion = Type.Object({ id: Type.String({ minLength: 1, maxLength: 64 }),
+    criterion: Type.String({ minLength: 1, maxLength: 512 }) }, { additionalProperties: false });
+  if (boot.tools.includes('workflow_delegate')) register('workflow_delegate', Type.Object({
+    directoryRevision: Type.Integer({ minimum: 0 }),
+    children: Type.Array(Type.Object({
+      label: Type.String({ minLength: 1, maxLength: 80 }),
+      task: Type.String({ minLength: 1, maxLength: 4096 }),
+      acceptance: Type.Array(acceptanceCriterion, { minItems: 1, maxItems: 8 }),
+      agentBudget: Type.Integer({ minimum: 1, maximum: 128 }),
+      permissions: Type.Union([Type.Literal('r'), Type.Literal('w'), Type.Literal('rw'), Type.Literal('rwx')]),
+      directoryScope: Type.Object({ read: scopePaths, write: scopePaths }, { additionalProperties: false }),
+      contextSummary: Type.Optional(Type.String({ maxLength: 2048 })),
+      timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 3600000 })),
+    }, { additionalProperties: false }), { minItems: 1, maxItems: 4 }),
+  }, { additionalProperties: false }), async (id: string, args: any, _signal: any, _update: any, ctx: any) => {
     const response = failResponse(await request('delegate', args, localId(ctx, 'workflow_delegate', id)));
     return { content: [{ type: 'text', text: JSON.stringify(response) }], details: { accounting: 'display-only' } };
   });
-  if (boot.tools.includes('workflow_context')) register('workflow_context', Type.Object({ view: Type.String(), artifactId: Type.Optional(Type.String()), offsetBytes: Type.Optional(Type.Number()), limitBytes: Type.Optional(Type.Number()) }, { additionalProperties: false }), async (id: string, args: any, _signal: any, _update: any, ctx: any) => {
-    const response = failResponse(await request(args.view === 'artifact' ? 'artifact' : 'context', args.view === 'artifact' ? args : {}, localId(ctx, 'workflow_context', id)));
+  if (boot.tools.includes('workflow_context')) register('workflow_context', Type.Union([
+    Type.Object({ view: Type.Literal('directory') }, { additionalProperties: false }),
+    Type.Object({ view: Type.Literal('artifact'),
+      artifactId: Type.String({ pattern: '^artifact:', maxLength: 128 }),
+      offsetBytes: Type.Optional(Type.Integer({ minimum: 0 })),
+      limitBytes: Type.Optional(Type.Integer({ minimum: 1, maximum: 8192 })),
+    }, { additionalProperties: false }),
+  ]), async (id: string, args: any, _signal: any, _update: any, ctx: any) => {
+    const response = failResponse(await request(args.view === 'artifact' ? 'artifact' : 'context', args.view === 'artifact' ? args : { view: 'directory' }, localId(ctx, 'workflow_context', id)));
     return { content: [{ type: 'text', text: JSON.stringify(response) }], details: { accounting: 'display-only' } };
   });
-  if (boot.tools.includes('workflow_complete')) register('workflow_complete', Type.Object({ status: Type.String(), summary: Type.String(), acceptance: Type.Array(Type.Any()), evidence: Type.Array(Type.Any()), childReviews: Type.Array(Type.Any()), remainingWork: Type.Array(Type.String()) }, { additionalProperties: false }), async (id: string, args: any, _signal: any, _update: any, ctx: any) => {
+  if (boot.tools.includes('workflow_complete')) register('workflow_complete', Type.Object({
+    status: Type.Union([Type.Literal('success'), Type.Literal('partial'), Type.Literal('failed')]),
+    summary: Type.String({ minLength: 1, maxLength: 4096 }),
+    acceptance: Type.Array(Type.Object({ id: Type.String({ minLength: 1, maxLength: 64 }),
+      outcome: Type.Union([Type.Literal('passed'), Type.Literal('failed'), Type.Literal('unverified')]),
+      evidenceIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 8 }) },
+      { additionalProperties: false }), { minItems: 1, maxItems: 8 }),
+    evidence: Type.Array(Type.Object({ label: Type.String({ pattern: '^[A-Za-z0-9_-]+$', maxLength: 80 }),
+      path: Type.String({ minLength: 1, maxLength: 256 }), description: Type.String({ minLength: 1, maxLength: 512 }) },
+      { additionalProperties: false }), { maxItems: 8 }),
+    childReviews: Type.Array(Type.Object({ childNodeId: Type.String({ minLength: 1, maxLength: 128 }),
+      resultHash: Type.String({ pattern: '^[a-f0-9]{64}$' }),
+      decision: Type.Union([Type.Literal('accepted'), Type.Literal('rejected')]),
+      reason: Type.String({ minLength: 1, maxLength: 128 }) }, { additionalProperties: false }), { maxItems: 127 }),
+    remainingWork: Type.Array(Type.String({ minLength: 1, maxLength: 512 }), { maxItems: 8 }),
+  }, { additionalProperties: false }), async (id: string, args: any, _signal: any, _update: any, ctx: any) => {
     const response = failResponse(await request('complete', args, localId(ctx, 'workflow_complete', id)));
     return { content: [{ type: 'text', text: JSON.stringify(response) }], details: { accounting: 'display-only' }, terminate: true };
   });
   const read = Type.Object({ path: Type.String() }, { additionalProperties: false });
   if (boot.tools.includes('read')) register('read', read, async (id: string, args: any, _signal: any, _update: any, ctx: any) => {
-    const response = failResponse(await request('file_read', args, localId(ctx, 'read', id)));
+    const response = failResponse(await request('file_read', { path: args.path, maxBytes: READ_PAGE_BYTES }, localId(ctx, 'read', id)));
     return { content: [{ type: 'text', text: Buffer.from(response.data, 'base64').toString('utf8') }] };
   });
-  if (boot.tools.includes('grep')) register('grep', Type.Object({ path: Type.String(), pattern: Type.String(), literal: Type.Boolean() }, { additionalProperties: false }), async (id: string, args: any, _signal: any, _update: any, ctx: any) => {
+  if (boot.tools.includes('grep')) register('grep', Type.Object({ path: Type.String(), pattern: Type.String(), literal: Type.Literal(true) }, { additionalProperties: false }), async (id: string, args: any, _signal: any, _update: any, ctx: any) => {
     const response = failResponse(await request('file_grep', args, localId(ctx, 'grep', id))); return { content: [{ type: 'text', text: response.output }] };
   });
   if (boot.tools.includes('find')) register('find', read, async (id: string, args: any, _signal: any, _update: any, ctx: any) => {
@@ -131,10 +172,10 @@ export default async function worker(pi: any) {
   if (boot.tools.includes('ls')) register('ls', read, async (id: string, args: any, _signal: any, _update: any, ctx: any) => {
     const response = failResponse(await request('file_ls', args, localId(ctx, 'ls', id))); return { content: [{ type: 'text', text: response.entries.join('\n') }] };
   });
-  if (boot.tools.includes('write')) register('write', Type.Object({ path: Type.String(), content: Type.String() }, { additionalProperties: false }), async (id: string, args: any, _signal: any, _update: any, ctx: any) => {
+  if (boot.tools.includes('write')) register('write', Type.Object({ path: Type.String(), content: Type.String({ maxLength: 262144 }) }, { additionalProperties: false }), async (id: string, args: any, _signal: any, _update: any, ctx: any) => {
     const response = failResponse(await request('file_write', args, localId(ctx, 'write', id))); return { content: [{ type: 'text', text: JSON.stringify(response.result) }] };
   });
-  if (boot.tools.includes('edit')) register('edit', Type.Object({ path: Type.String(), oldText: Type.String(), newText: Type.String() }, { additionalProperties: false }), async (id: string, args: any, _signal: any, _update: any, ctx: any) => {
+  if (boot.tools.includes('edit')) register('edit', Type.Object({ path: Type.String(), oldText: Type.String({ maxLength: 262144 }), newText: Type.String({ maxLength: 262144 }) }, { additionalProperties: false }), async (id: string, args: any, _signal: any, _update: any, ctx: any) => {
     const response = failResponse(await request('file_edit', args, localId(ctx, 'edit', id))); return { content: [{ type: 'text', text: JSON.stringify(response.result) }] };
   });
   if (boot.tools.includes('bash')) {

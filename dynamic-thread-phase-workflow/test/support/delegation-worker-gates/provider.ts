@@ -52,6 +52,8 @@ export default function provider(pi) {
               call('grep', { path: 'denied', pattern: 'NEEDLE', literal: true }, 'g2'),
               call('read', { path: 'allowed/link' }, 'r1'), call('read', { path: 'allowed/ok.txt' }, 'r2')];
           } else if (config.mode === 'shell' && step === 0) content = [call('bash', { command: 'printf fixture-shell', timeout: 1 })];
+          else if (config.mode === 'schema-denial' && step === 0) content = [call('workflow_context', { view: 'bogus' })];
+          else if (config.mode === 'schema-denial' && step === 1) content = [call('read', { path: 'allowed/input.txt' }, 'sd-read')];
           else if (config.mode === 'missing' || (config.mode === 'disconnect' && step > 0)) content = [{ type: 'text', text: 'fixture exits without completion' }];
           else if (['tree', 'disconnect'].includes(config.mode) && config.depth < 2 && step === 0) content = [call('workflow_delegate', delegate)];
           else if (config.mode === 'tree' && config.depth < 2 && step === 1) {

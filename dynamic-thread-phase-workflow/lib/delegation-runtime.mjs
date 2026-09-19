@@ -164,6 +164,16 @@ export function createDelegationRuntime(options) {
         label: n.label, status: n.result.status, summary: content.summary, cause: content.cause, result: reference };
     } catch (error) { hold(); throw error; }
   }
+  function verifiedResultSummary(nodeId) {
+    const d = durable(nodeId);
+    if (!d.joined || !d.result) fail('OWNERSHIP_UNKNOWN', 'result summary before structural join');
+    const content = decodeCanonical(readStoredArtifact(journal.directory,
+      { artifactId: d.result.artifactId, bytes: d.result.bytes, sha256: d.result.sha256 }));
+    if (content.nodeId !== nodeId || content.status !== d.result.status ||
+        typeof content.summary !== 'string' || Buffer.byteLength(content.summary) > 4096)
+      fail('RESULT_INVALID', 'result evidence binding');
+    return content.summary; // from the immutable artifact, never worker-mutable output
+  }
   async function materializeRoots(p, index, roots) {
     if (!roots.length || roots[0].taskTemplate === undefined) return;
     const rendered = await trustedCallback(render, { kind: 'roots', phaseIndex: index, phase: p,
@@ -418,8 +428,9 @@ export function createDelegationRuntime(options) {
             ordered.push(await runNode(child));
           }
           finishBatch(batch); guard();
+          const entries = ordered.map(s => ({ ...s, summary: verifiedResultSummary(s.nodeId) }));
           restore(n, 'parked'); if (n.mode === 'active') emit('restored', n);
-          return immutable(ordered);
+          return immutable(entries);
         }).catch(error => { hold(); throw error; });
         n.batch = promise;
         promise.catch(() => {}); // Also awaited by runNode even if the bridge disconnects.
@@ -441,7 +452,8 @@ export function createDelegationRuntime(options) {
         let commandResult;
         try {
           commandResult = executor.runShell(n.scope, n.nextShell++, '/bin/sh', ['-c', command],
-            { cwd: manifest.workspace, env: {}, signal: n.shellController.signal, timeoutMs: Math.max(1, bound), maxStdoutBytes: 16384, maxStderrBytes: 16384 });
+            // matches runnerBashOperations in worker/adapter-primitives.mjs
+            { cwd: manifest.workspace, env: {}, signal: n.shellController.signal, timeoutMs: Math.max(1, bound), maxStdoutBytes: 8192, maxStderrBytes: 16384 });
         } catch (error) {
           if (takeExecutorDenial(executor, error, n.scope, 'shell')) restore(n, 'shell');
           else hold();
