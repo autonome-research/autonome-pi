@@ -208,7 +208,11 @@ function progressReviewCadence(summary: AnyEvent, existing: AnyEvent | undefined
 		// being observed; malformed new metadata never grants a new schedule.
 		return explicit ?? (existing ? Number(existing.cadenceMs) : undefined);
 	}
-	return existing ? Number(existing.cadenceMs) : SUPERVISION_CADENCE_MS;
+	// Dynamic workflows schedule no periodic review unless a cadence is explicitly
+	// assigned (the run metadata only carries progressReviewIntervalMs when set).
+	// v3/fractal delegation keeps the operator fallback cadence.
+	if (existing) return Number(existing.cadenceMs);
+	return summary?.metadata?.delegation === "v3" ? SUPERVISION_CADENCE_MS : undefined;
 }
 
 function formatRunDetail(run: AnyEvent): string {

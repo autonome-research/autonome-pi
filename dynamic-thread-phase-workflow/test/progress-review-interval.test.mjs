@@ -89,19 +89,29 @@ test("typed cadence is strict, top-level, and background-hosted only", async () 
   const registered = tools();
   const dynamicSchema = registered.get("dynamic_workflow").parameters;
   const scriptedSchema = registered.get("scripted_workflow").parameters;
-  assert.equal(dynamicSchema.properties.progressReviewIntervalMs.minimum, 60_000);
-  assert.equal(dynamicSchema.properties.progressReviewIntervalMs.maximum, 86_400_000);
+  assert.equal(scriptedSchema.properties.progressReviewIntervalMs.type, "integer");
   assert.equal(scriptedSchema.properties.progressReviewIntervalMs.minimum, 60_000);
-  assert.equal(scriptedSchema.properties.progressReviewIntervalMs.maximum, 86_400_000);
+  assert.equal(scriptedSchema.properties.progressReviewIntervalMs.maximum, 2_147_483_647);
+  // dynamic_workflow allows null to disable periodic reviews.
+  assert.deepEqual(dynamicSchema.properties.progressReviewIntervalMs, {
+    anyOf: [
+      { type: "integer", minimum: 60_000, maximum: 2_147_483_647, description: "Hosted background progress-review cadence in milliseconds (null disables periodic reviews); this is not a timeout." },
+      { type: "null" },
+    ],
+  });
+  assert.deepEqual(scriptedSchema.properties.progressReviewIntervalMs.minimum, 60_000);
 
   const dynamic = registered.get("dynamic_workflow").execute;
   const scripted = registered.get("scripted_workflow").execute;
   const cwd = mkdtempSync(join(tmpdir(), "progress-interval-validation-"));
   try {
     const base = { name: "interval-validation", permissions: "r", phases: [{ type: "artifact", name: "out", content: "ok" }] };
-    for (const value of [59_999, 86_400_001, 1.5, "3600000", null]) {
+    for (const value of [59_999, 1.5, "3600000"]) {
       await assert.rejects(dynamic("test", { ...base, background: true, progressReviewIntervalMs: value }, undefined, undefined, workflowContext(cwd)), /progressReviewIntervalMs.*integer between/);
     }
+    // null is no longer rejected by the value validator (the schema anyOf above
+    // and validateProgressReviewInterval accept it); a fully positive null launch
+    // is exercised separately as an end-to-end offline run in the v3/runner suites.
     await assert.rejects(dynamic("test", { ...base, progressReviewIntervalMs: 3_600_000 }, undefined, undefined, workflowContext(cwd, "progress-interval-session", undefined)), /only valid for a new hosted supervised background/);
     await assert.rejects(dynamic("test", { ...base, background: true, phases: [{ type: "artifact", name: "out", content: "ok", progressReviewIntervalMs: 3_600_000 }] }, undefined, undefined, workflowContext(cwd)), /unsupported field/);
     await assert.rejects(scripted("test", {

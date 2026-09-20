@@ -57,13 +57,13 @@ const DEFAULT_TIMEOUT_MS = process.env.PI_DYNAMIC_WORKFLOW_DEFAULT_TIMEOUT_MS ==
 const DEFAULT_FANOUT_CONCURRENCY = 3;
 const MAX_FANOUT_CONCURRENCY = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_CONCURRENCY || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_CONCURRENCY || 64);
 const MAX_FANOUT_ITEMS = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_FANOUT_ITEMS || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_FANOUT_ITEMS || 1_000);
-const MAX_PHASE_TIMEOUT_MS = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_PHASE_TIMEOUT_MS || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_PHASE_TIMEOUT_MS || 60 * 60 * 1000);
+const MAX_PHASE_TIMEOUT_MS = Number(process.env.PI_DYNAMIC_WORKFLOW_MAX_PHASE_TIMEOUT_MS || process.env.PI_DYNAMIC_THREAD_PHASE_MAX_PHASE_TIMEOUT_MS || MAX_TIMEOUT_MS);
 const MAX_OUTPUT_BYTES = 250_000;
 const MAX_SPEC_BYTES = 1_000_000;
 const MAX_RESUME_MANIFEST_BYTES = 1_000_000;
 const MAX_RESUME_OUTPUT_BYTES = 4_000_000;
 const MIN_PROGRESS_REVIEW_INTERVAL_MS = 60_000;
-const MAX_PROGRESS_REVIEW_INTERVAL_MS = 86_400_000;
+const MAX_PROGRESS_REVIEW_INTERVAL_MS = MAX_TIMEOUT_MS; // assignable out to ~24.8 days; null disables
 const RESUME_RUN_ID = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$/;
 const SAVED_TEMPLATE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const V2_PERMISSIONS = new Set(["r", "w", "rw", "rwx"]);
@@ -330,18 +330,18 @@ function validatePositiveInteger(value, label, max) {
 }
 
 function validateProgressReviewInterval(value, label, { cli = false } = {}) {
-  if (value === undefined) return undefined;
-  if (cli && (typeof value !== "string" || !/^\d+$/.test(value))) throw new Error(`${label} must be an integer between ${MIN_PROGRESS_REVIEW_INTERVAL_MS} and ${MAX_PROGRESS_REVIEW_INTERVAL_MS}`);
+  if (value === undefined || value === null) return value; // null disables periodic reviews; undefined is unset
+  if (cli && (typeof value !== "string" || !/^\d+$/.test(value))) throw new Error(`${label} must be an integer between ${MIN_PROGRESS_REVIEW_INTERVAL_MS} and ${MAX_PROGRESS_REVIEW_INTERVAL_MS}, or null to disable`);
   const number = cli ? Number(value) : value;
   if (!Number.isSafeInteger(number) || number < MIN_PROGRESS_REVIEW_INTERVAL_MS || number > MAX_PROGRESS_REVIEW_INTERVAL_MS) {
-    throw new Error(`${label} must be an integer between ${MIN_PROGRESS_REVIEW_INTERVAL_MS} and ${MAX_PROGRESS_REVIEW_INTERVAL_MS}`);
+    throw new Error(`${label} must be an integer between ${MIN_PROGRESS_REVIEW_INTERVAL_MS} and ${MAX_PROGRESS_REVIEW_INTERVAL_MS}, or null to disable`);
   }
   return number;
 }
 
 function validateTimeout(value, label) {
-  if (value === undefined) return;
-  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_PHASE_TIMEOUT_MS) throw new Error(`${label} must be an integer between 1 and ${MAX_PHASE_TIMEOUT_MS}`);
+  if (value === undefined || value === null) return; // null means no deadline
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_PHASE_TIMEOUT_MS) throw new Error(`${label} must be an integer between 1 and ${MAX_PHASE_TIMEOUT_MS}, or null for no deadline`);
 }
 
 function validateRetry(retry, phaseName) {
@@ -512,7 +512,7 @@ function validateRunnerLimits() {
   for (const [label, value, min, max] of [
     ["PI_DYNAMIC_WORKFLOW_MAX_CONCURRENCY", MAX_FANOUT_CONCURRENCY, 1, 64],
     ["PI_DYNAMIC_WORKFLOW_MAX_FANOUT_ITEMS", MAX_FANOUT_ITEMS, 1, 10_000],
-    ["PI_DYNAMIC_WORKFLOW_MAX_PHASE_TIMEOUT_MS", MAX_PHASE_TIMEOUT_MS, 100, 24 * 60 * 60 * 1000],
+    ["PI_DYNAMIC_WORKFLOW_MAX_PHASE_TIMEOUT_MS", MAX_PHASE_TIMEOUT_MS, 100, MAX_TIMEOUT_MS],
     ["PI_DYNAMIC_WORKFLOW_DEFAULT_TIMEOUT_MS", DEFAULT_TIMEOUT_MS, 1, MAX_TIMEOUT_MS],
     ["PI_DYNAMIC_WORKFLOW_MAX_CHAIN_RUNS", MAX_CHAIN_RUNS, 1, 1000],
   ]) {
@@ -568,9 +568,13 @@ function normalizePiTools(tools, permissions, label) {
 }
 
 function executionDeadline(ctx, kind, explicitTimeoutMs) {
-  if (explicitTimeoutMs !== undefined) return { timeoutMs: explicitTimeoutMs };
-  if (ctx.workflowTimeoutMs !== undefined) return { timeoutMs: ctx.workflowTimeoutMs };
-  if (kind === "pi" && ctx.supervisionMode === "main-agent") return { noDeadline: true };
+  // An explicit null means "no deadline" (model-assigned).
+  if (explicitTimeoutMs !== undefined) return explicitTimeoutMs === null ? { noDeadline: true } : { timeoutMs: explicitTimeoutMs };
+  if (ctx.workflowTimeoutMs !== undefined) return ctx.workflowTimeoutMs === null ? { noDeadline: true } : { timeoutMs: ctx.workflowTimeoutMs };
+  // Background PI agents have no default bound (the user must cancel them manually
+  // unless a timeout is assigned); foreground and shell/fanout phases keep the
+  // 10-minute default so an unbounded CLI/background agent cannot silently hang.
+  if (kind === "pi" && ctx.background) return { noDeadline: true };
   return { timeoutMs: DEFAULT_TIMEOUT_MS };
 }
 
@@ -1808,11 +1812,12 @@ async function main() {
   if (isTruthyFlag(args["cleanup-input"]) && cleanupInputFile) generatedInputDirectory(cleanupInputFile);
   // Validate CLI timeout before creating a visualizer run so bad input cannot
   // leave a setup-stage run that needs terminal-state repair.
+  // null spec.timeoutMs is preserved as an explicit "no deadline".
   const explicitWorkflowTimeout = args.timeout !== undefined
     ? normalizeTimeoutMs(args.timeout, "--timeout")
-    : spec.timeoutMs !== undefined
-      ? normalizeTimeoutMs(spec.timeoutMs, "workflow timeoutMs")
-      : undefined;
+    : spec.timeoutMs === null ? null
+    : spec.timeoutMs !== undefined ? normalizeTimeoutMs(spec.timeoutMs, "workflow timeoutMs")
+    : undefined;
   if (explicitWorkflowTimeout !== undefined) validateTimeout(explicitWorkflowTimeout, "workflow timeout");
   // Yield once so a SIGTERM delivered during startup is observed before the
   // launcher can detach a background child. The wrapper also guards signals
@@ -1899,6 +1904,7 @@ async function main() {
       model: effectiveModel,
       workflowTimeoutMs: explicitWorkflowTimeout,
       supervisionMode,
+      background: isBackground,
       outputs: {},
       results: {},
       signal: controller.signal,

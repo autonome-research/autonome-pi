@@ -26,7 +26,7 @@ const MAX_SAVED_TEMPLATE_BYTES = 1_000_000;
 const SAVED_TEMPLATE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const LEGACY_PREPARED_CALL = Symbol("legacy-prepared-dynamic-workflow-call");
 const MIN_PROGRESS_REVIEW_INTERVAL_MS = 60_000;
-const MAX_PROGRESS_REVIEW_INTERVAL_MS = 86_400_000;
+const MAX_PROGRESS_REVIEW_INTERVAL_MS = MAX_TIMEOUT_MS; // background reviews may be assigned out to ~24.8 days (or null to disable)
 const V3_SPEC_SCHEMA = "pi-dynamic-workflow/v3";
 const V3_LAUNCH_ENVELOPE_FD = 3;
 // Mirrors the trusted worker recipe pinned in lib/delegation-launch-authorization.mjs.
@@ -214,9 +214,15 @@ function validatePermission(value: unknown, label: string): void {
 }
 
 function validateProgressReviewInterval(value: unknown, label: string): void {
-	if (value !== undefined && (!Number.isSafeInteger(value) || (value as number) < MIN_PROGRESS_REVIEW_INTERVAL_MS || (value as number) > MAX_PROGRESS_REVIEW_INTERVAL_MS)) {
-		throw new Error(`${label} must be an integer between ${MIN_PROGRESS_REVIEW_INTERVAL_MS} and ${MAX_PROGRESS_REVIEW_INTERVAL_MS}.`);
+	// null means "no periodic progress review" (disabled); undefined is unset.
+	if (value !== undefined && value !== null && (!Number.isSafeInteger(value) || (value as number) < MIN_PROGRESS_REVIEW_INTERVAL_MS || (value as number) > MAX_PROGRESS_REVIEW_INTERVAL_MS)) {
+		throw new Error(`${label} must be an integer between ${MIN_PROGRESS_REVIEW_INTERVAL_MS} and ${MAX_PROGRESS_REVIEW_INTERVAL_MS}, or null to disable.`);
 	}
+}
+function validateTimeoutMs(value: unknown, label: string): void {
+	// null means "no deadline"; undefined is unset. Non-null must be 1..MAX_TIMEOUT_MS.
+	if (value === undefined || value === null) return;
+	validateBoundedInteger(value, label, MAX_TIMEOUT_MS);
 }
 
 function validateTools(value: unknown, label: string): void {
@@ -232,7 +238,7 @@ function validatePublicWorkflow(params: any, label = "dynamic_workflow"): void {
 	validateOptionalString(params.cwd, `${label}.cwd`, true);
 	validateOptionalString(params.model, `${label}.model`);
 	validatePermission(params.permissions, `${label}.permissions`);
-	validateBoundedInteger(params.timeoutMs, `${label}.timeoutMs`, 3_600_000);
+	validateTimeoutMs(params.timeoutMs, `${label}.timeoutMs`);
 	if (params.background !== undefined && typeof params.background !== "boolean") throw new Error(`${label}.background must be a boolean.`);
 	validateProgressReviewInterval(params.progressReviewIntervalMs, `${label}.progressReviewIntervalMs`);
 	if (params.after !== undefined && (typeof params.after !== "string" || !RUN_ID.test(params.after))) throw new Error(`${label}.after must be a safe run identifier.`);
@@ -258,7 +264,7 @@ function validatePublicWorkflow(params: any, label = "dynamic_workflow"): void {
 		rejectUnsupportedFields(phase, new Set(allowed), phaseLabel);
 		if (phase.type !== "artifact") {
 			validatePermission(phase.permissions, `${phaseLabel}.permissions`);
-			validateBoundedInteger(phase.timeoutMs, `${phaseLabel}.timeoutMs`, 3_600_000);
+			validateTimeoutMs(phase.timeoutMs, `${phaseLabel}.timeoutMs`);
 			validateBoundedInteger(phase.attempts, `${phaseLabel}.attempts`, 5);
 		}
 		if (phase.type === "agent") {
@@ -584,9 +590,9 @@ function workflowParametersSchema() {
 		cwd: Type.Optional(Type.String({ description: "Workflow working directory. Defaults to Pi's current cwd." })),
 		permissions,
 		model: Type.Optional(Type.String({ description: "Default model pattern for agent/fanout phases." })),
-		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 3_600_000, description: "Default agent/shell phase timeout." })),
+		timeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1, maximum: MAX_TIMEOUT_MS, description: "Default agent/shell phase timeout, or null for no deadline." }), Type.Null()])),
 		background: Type.Optional(Type.Boolean({ description: "Run in the background; successful and failed terminal runs return control to this Pi session, while cancellation does not." })),
-		progressReviewIntervalMs: Type.Optional(Type.Integer({ minimum: MIN_PROGRESS_REVIEW_INTERVAL_MS, maximum: MAX_PROGRESS_REVIEW_INTERVAL_MS, description: "Hosted background progress-review cadence in milliseconds; this is not a timeout." })),
+		progressReviewIntervalMs: Type.Optional(Type.Union([Type.Integer({ minimum: MIN_PROGRESS_REVIEW_INTERVAL_MS, maximum: MAX_PROGRESS_REVIEW_INTERVAL_MS, description: "Hosted background progress-review cadence in milliseconds (null disables periodic reviews); this is not a timeout." }), Type.Null()])),
 		after: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Terminal successful or failed parent run. This workflow becomes its single chained successor." })),
 		resumeRunId: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Resume this structured run from its trusted spec and completed phase artifacts. Use without phases or template." })),
 		template: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", description: "Saved structured workflow name from ~/.pi/agent/workflows/<name>.json. Use instead of phases." })),
@@ -738,7 +744,7 @@ async function executeDynamicWorkflow(params: any, signal: AbortSignal | undefin
 		if (params.timeout !== undefined) args.push("--timeout", String(normalizeTimeoutMs(params.timeout, "timeout")));
 		if (params.background) args.push("--background");
 		if (internal.superviseAgents) args.push("--supervise-agents");
-		if (internal.progressReviewIntervalMs !== undefined) args.push("--progress-review-interval-ms", String(internal.progressReviewIntervalMs));
+		if (typeof internal.progressReviewIntervalMs === "number") args.push("--progress-review-interval-ms", String(internal.progressReviewIntervalMs));
 		if (params.autoContinue) args.push("--auto-continue");
 		if (params.after) args.push("--after", params.after);
 		if (params.resumeRunId) args.push("--resume-run-id", params.resumeRunId);
@@ -823,7 +829,7 @@ async function executeV3Launch(params: any, signal: AbortSignal | undefined, onU
 		// --v3-launch/--launch-envelope-fd select the transport, never authority.
 		const args = ["--cwd", cwd, "--spec-file", generatedInputFile, "--cleanup-input", "--v3-launch", "--launch-envelope-fd", String(V3_LAUNCH_ENVELOPE_FD)];
 		if (background) args.push("--background");
-		if (params.progressReviewIntervalMs !== undefined) args.push("--progress-review-interval-ms", String(params.progressReviewIntervalMs));
+		if (typeof params.progressReviewIntervalMs === "number") args.push("--progress-review-interval-ms", String(params.progressReviewIntervalMs));
 		addSessionArgs(args, ctx);
 		onUpdate?.({ content: [{ type: "text", text: `Authorizing recursive v3 workflow launch in ${cwd}...` }] });
 		const result = await runScript(args, cwd, signal, transfer.initialEnvelope());

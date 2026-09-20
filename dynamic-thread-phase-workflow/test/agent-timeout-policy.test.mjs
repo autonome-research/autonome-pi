@@ -134,7 +134,9 @@ test("shell, foreground, and non-opted-in CLI agent execution retain the implici
     });
     assert.equal(legacy.status, 0, legacy.stderr);
     const legacyReady = JSON.parse(legacy.stdout);
-    assert.equal((await waitForRunEnd(store, legacyReady.runId)).end.status, "failed");
+    // Background PI agents no longer carry an implicit default bound; the delayed
+    // fake Pi completes (success) instead of timing out at the old default.
+    assert.equal((await waitForRunEnd(store, legacyReady.runId)).end.status, "success");
     const legacyStart = JSON.parse(readFileSync(join(store, "runs", `${legacyReady.runId}.start.json`), "utf8"));
     assert.equal(legacyStart.metadata.supervisionMode, undefined);
 
@@ -234,7 +236,8 @@ test("background resume inherits supervision only from verified source ownership
     });
     assert.equal(historicalResume.status, 0, historicalResume.stderr);
     const historicalReady = JSON.parse(historicalResume.stdout);
-    assert.equal((await waitForRunEnd(store, historicalReady.runId)).end.status, "failed");
+    // Background PI resume also inherits the no-default-bound policy now.
+    assert.equal((await waitForRunEnd(store, historicalReady.runId)).end.status, "success");
     const historicalStart = JSON.parse(readFileSync(join(store, "runs", `${historicalReady.runId}.start.json`), "utf8"));
     assert.equal(historicalStart.metadata.supervisionMode, undefined);
 
