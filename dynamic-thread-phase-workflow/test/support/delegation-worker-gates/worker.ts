@@ -71,7 +71,8 @@ export default async function worker(pi) {
       // A deliberate compaction-shaped context transformation, NOT persisted compaction.
       if (bootstrap.mode === 'tree' && response.context.ownChildJoinIndex.childCount && !compacted) {
         compacted = true;
-        messages = [event.messages.find(m => m.role === 'user'), { role: 'compactionSummary', summary: 'FIXTURE_COMPACTION_SHAPE', tokensBefore: 100, timestamp: 0 }];
+        messages = [...event.messages.filter(m => m.role === 'system'), event.messages.find(m => m.role === 'user'),
+          { role: 'compactionSummary', summary: 'FIXTURE_COMPACTION_SHAPE', tokensBefore: 100, timestamp: 0 }];
       }
       return { messages: replaceDelegationContext(messages, response.context) };
     } catch { fatal('CONTEXT_UNAVAILABLE'); }

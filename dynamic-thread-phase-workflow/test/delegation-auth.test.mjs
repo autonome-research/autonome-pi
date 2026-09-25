@@ -18,7 +18,7 @@ import { versions, supportDir } from './support/delegation-worker-gates/driver.m
 const probe = join(supportDir, 'shared-auth-probe.mjs');
 const noNetwork = join(supportDir, 'no-network.mjs');
 const strictNoNetwork = join(supportDir, 'strict-no-network.mjs');
-const aiVersions = Object.freeze({ '0.85.1': '0.85.1', '0.84.2': '0.84.2' });
+const aiVersions = Object.freeze({ '0.86.0': '0.86.0', '0.84.2': '0.84.2' });
 const consentTest = (name, options, fn) => test(name, { ...options, skip: process.env.PI_DELEGATION_COMPAT_FIXTURES !== '1' }, fn);
 const credential = (expires = 0) => ({ 'openai-codex': { type: 'oauth', access: 'synthetic-expired-access',
   refresh: 'synthetic-refresh-value', expires } });
@@ -89,6 +89,13 @@ test('SDK worker stdout projects only bounded lifecycle and usage fields', () =>
   assert.deepEqual(result.diagnostic, { type: 'compaction_failure', reason: 'manual', aborted: true,
     willRetry: false, errorMessage: 'SDK_COMPACTION_ERROR' });
   assert.doesNotMatch(projected.map(JSON.stringify).join('\n'), new RegExp(secret));
+
+  const transcript = invocationUsage('sdk-system-message');
+  for (const event of [{ type: 'message_end', message: { role: 'system' } }, { type: 'turn_start' },
+    projectWorkerEvent({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', usage } })])
+    transcript.push(`${JSON.stringify(event)}\n`);
+  assert.equal(transcript.finish().problem, null);
+  assert.equal(transcript.finish().totals.totalTokens, 7);
 
   const malformed = invocationUsage('projection-malformed');
   for (const event of [{ type: 'turn_start' }, projectWorkerEvent({ type: 'message_end',

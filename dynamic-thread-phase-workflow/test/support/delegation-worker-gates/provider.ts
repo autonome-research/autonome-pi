@@ -22,9 +22,11 @@ export default function provider(pi) {
           const last = results.at(-1);
           const step = turn++;
           if (turn > 8) throw new Error('FIXTURE_TURN_LIMIT');
+          const tools = context.tools ?? context.messages.filter(m => m.role === 'system').flatMap(m => m.toolsAdded ?? []);
+          if (!tools.length) throw new Error('FIXTURE_TOOLS_UNAVAILABLE');
           process.stderr.write(JSON.stringify({ type: 'fixture_provider', depth: config.depth, turn,
             revision: snapshot.directoryRevision, index: snapshot.ownChildJoinIndex,
-            tools: context.tools.map(t => t.name).sort(), lastTool: last?.toolName,
+            tools: tools.map(t => t.name).sort(), lastTool: last?.toolName,
             lastError: last?.isError, sameConversationResult: last?.toolCallId,
             compacted: context.messages.some(m => plain(m.content ?? '').includes('FIXTURE_COMPACTION_SHAPE')) }) + '\n');
           const delegate = { directoryRevision: snapshot.directoryRevision, children: [{ label: 'child', task: 'fixture assignment',

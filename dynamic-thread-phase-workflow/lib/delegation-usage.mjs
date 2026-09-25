@@ -7,9 +7,9 @@ import { text } from './delegation-contract.mjs';
 
 const ignored = new Set(['agent_start', 'agent_end', 'agent_settled', 'turn_end', 'message_start', 'message_update',
   'tool_execution_start', 'tool_execution_update', 'tool_execution_end', 'session']);
-// Pi Message + coding-agent CustomAgentMessages (both supported SDKs). Validate
-// the accounting envelope, not display content or provider-specific metadata.
-const roles = new Set(['assistant', 'user', 'toolResult', 'bashExecution', 'custom', 'branchSummary', 'compactionSummary']);
+// Pi transcript system messages carry prompt/tool declarations in 0.86; they
+// are non-accounting, like the other non-assistant messages.
+const roles = new Set(['system', 'assistant', 'user', 'toolResult', 'bashExecution', 'custom', 'branchSummary', 'compactionSummary']);
 export function invocationUsage(invocationId) {
   const observer = exclusiveUsageObserver(invocationId), digest = createHash('sha256');
   let bytes = 0, closed = false, final, pendingTurn = false, pendingCompaction = false, unfinished = 0;

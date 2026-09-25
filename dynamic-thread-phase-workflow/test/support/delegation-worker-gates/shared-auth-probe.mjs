@@ -54,7 +54,8 @@ function stream(selected, context, options) {
       const snapshots = context.messages.filter(message => message.role === 'user' && plain(message.content).includes('pi-workflow-delegation-context/v1'));
       const snapshot = snapshots.length === 1 && JSON.parse(plain(snapshots[0].content));
       if (snapshot?.schema !== 'pi-workflow-delegation-context/v1' || snapshot.self?.nodeId === undefined) throw new Error('CONTEXT_UNAVAILABLE');
-      if (JSON.stringify(context.tools.map(tool => tool.name).sort()) !== JSON.stringify(['workflow_complete', 'workflow_context']))
+      const tools = context.tools ?? context.messages.filter(message => message.role === 'system').flatMap(message => message.toolsAdded ?? []);
+      if (JSON.stringify(tools.map(tool => tool.name).sort()) !== JSON.stringify(['workflow_complete', 'workflow_context']))
         throw new Error('PROFILE_UNAVAILABLE');
       const toolCall = { type: 'toolCall', id: 'synthetic-complete', name: 'workflow_complete', arguments: {
         status: 'success', summary: 'synthetic private SDK worker completed',

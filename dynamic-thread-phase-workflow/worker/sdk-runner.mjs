@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isolatedResourceOptions } from './profile.mjs';
 
 const SCHEMA = 'pi-workflow-sdk-worker/v1';
-const VERSIONS = new Set(['0.85.1', '0.84.2']);
+const VERSIONS = new Set(['0.86.0', '0.85.1', '0.84.2']);
 const PROVIDER = 'openai-codex';
 const MODEL = 'gpt-5.6-sol';
 const extensionPath = fileURLToPath(new URL('./index.ts', import.meta.url));

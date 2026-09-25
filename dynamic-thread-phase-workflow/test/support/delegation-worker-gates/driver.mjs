@@ -17,7 +17,7 @@ import { frames, send } from './frames.mjs';
 export const supportDir = dirname(fileURLToPath(import.meta.url));
 export const repoRoot = resolve(supportDir, '../../../..');
 export const versions = [
-  { version: '0.85.1', packageDir: '/home/velvet/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent', cliPath: '/home/velvet/.npm-global/bin/pi' },
+  { version: '0.86.0', packageDir: '/home/velvet/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent', cliPath: '/home/velvet/.npm-global/bin/pi' },
   { version: '0.84.2', packageDir: join(repoRoot, 'node_modules/@earendil-works/pi-coding-agent'), cliPath: join(repoRoot, 'node_modules/@earendil-works/pi-coding-agent/dist/cli.js') },
 ];
 export const sha = text => createHash('sha256').update(text).digest('hex');

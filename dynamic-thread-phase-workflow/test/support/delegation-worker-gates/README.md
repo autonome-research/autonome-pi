@@ -46,7 +46,7 @@ Linux, Node **v24.15.0**, explicit package versions checked before execution (no
 
 | Pi | Entrypoints exercised |
 | --- | --- |
-| Installed **0.85.1** | `/home/velvet/.npm-global/bin/pi` → `/home/velvet/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`; SDK at the same package's `dist/index.js` |
+| Installed **0.86.0** | `/home/velvet/.npm-global/bin/pi` → `/home/velvet/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`; SDK at the same package's `dist/index.js` |
 | Repository **0.84.2** | `node_modules/@earendil-works/pi-coding-agent/dist/cli.js` and `dist/index.js` |
 
 The fixture invokes the installed bin symlink (the bundled CLI), and the repository's explicit unbundled JS CLI entry with the current Node and a network-denial preload, rather than relying on PATH or inherited `NODE_OPTIONS`. It does not install/update Pi. No support claim for other Pi/Node/OS versions.
