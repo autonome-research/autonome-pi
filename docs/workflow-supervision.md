@@ -1,10 +1,10 @@
 # Workflow supervision
 
-Background dynamic workflows can contain legitimate agent calls that run longer than a fixed wall-clock default. The initial supervision policy replaces that implicit kill deadline with durable, periodic requests for main-agent judgment. It does not add automatic stall detection or recovery.
+Background Pi agents have no implicit wall-clock deadline; foreground Pi agents and shells retain their default bound. Hosted background runs request periodic main-agent judgment only when a review cadence is explicitly assigned. Reviews do not detect stalls or trigger recovery.
 
 ## Opt-in and trust boundary
 
-The public `dynamic_workflow` and `scripted_workflow` schemas expose an optional typed `progressReviewIntervalMs` field. It is a strict integer in the inclusive range `60000..86400000` and is valid only for a new hosted supervised background launch. The shared public launch decision positively verifies `ctx.mode === "tui"` or `ctx.mode === "rpc"` in addition to the originating session id; print/JSON, missing, unknown, and other unhosted contexts cannot opt in. On such a call, the extension passes private runner flags and the runner records:
+The public `dynamic_workflow` and `scripted_workflow` schemas expose optional `progressReviewIntervalMs` (integer `60000..2147483647`; dynamic workflows also accept `null` to disable). Omission schedules no review. An assigned cadence is valid only for a new hosted supervised background launch: the host must be TUI or RPC with an originating session ID. On such a call, the extension passes private runner flags and the runner records:
 
 ```text
 supervisionMode: "main-agent"
@@ -15,11 +15,11 @@ The public field is validated as a launch argument and transported through the t
 
 The marker is separate from `continuationMode: "terminal"`:
 
-- `supervisionMode` opts an active run into periodic progress review.
+- `supervisionMode` marks an active run eligible for a review; an explicit cadence schedules it.
 - `continuationMode` retains the existing successful/failed terminal handoff behavior.
 - A progress review never masquerades as a workflow completion.
 
-The deprecated alias, explicit v1 CLI runs, replayed historical argument shapes, and unhosted calls do not silently opt in. A background structured resume inherits the policy only from its verified source ownership marker and exact authoritative `progressReviewIntervalMs`, when present. The checkpoint and caller cannot add, remove, or override it. A source without the marker retains the older bounded policy; a supervised source without the field uses the operator/default cadence, and foreground resume is bounded even when its source was supervised.
+The deprecated alias, explicit v1 CLI runs, and unhosted calls cannot assign hosted progress reviews. A background structured resume inherits only its verified source's assigned cadence; the caller cannot add or override it. A source without the cadence remains unscheduled. Foreground resume remains bounded even if its source was supervised. V3 delegation retains its separate operator/default cadence.
 
 ## Subprocess deadline policy
 
@@ -27,20 +27,20 @@ Deadline selection is deterministic:
 
 1. An explicit phase timeout or scripted helper timeout wins.
 2. Otherwise an explicit workflow timeout applies.
-3. Otherwise a supervised background Pi subprocess has no wall-clock timeout timer.
-4. All other subprocesses use the existing default bound (10 minutes).
+3. Otherwise any background Pi subprocess has no wall-clock timeout timer.
+4. Foreground Pi subprocesses and shell work use the default bound (10 minutes).
 
 The no-deadline case applies only to Pi subprocesses created for declarative `agent`, `fanout`, and scripted `ctx.pi` work. It is an explicit internal low-level mode: missing, malformed, zero, conflicting, or oversized low-level timeout input never grants an unlimited run.
 
 Shell phases and scripted `ctx.shell` calls always retain a bound. Foreground workflows also remain bounded because they occupy their own caller/supervisor. Use background mode for agent work that may legitimately remain open-ended.
 
-`timeoutMs` remains a hard limit. Supervision never erases or extends it. Timeout and cancellation stay distinct in results. Both use process-group SIGTERM followed by the existing bounded SIGKILL grace when needed. Cooperative user cancellation, readiness's five-second bound, subprocess-journal launch ownership, and resume descendant checks are unchanged.
+An explicit `timeoutMs` remains a hard limit (up to 2,147,483,647 ms for a dynamic workflow; `null` explicitly removes the deadline). Supervision never erases or extends an assigned limit. Timeout and cancellation stay distinct in results. Both use process-group SIGTERM followed by the existing bounded SIGKILL grace when needed. Cooperative user cancellation, readiness's five-second bound, subprocess-journal launch ownership, and resume descendant checks are unchanged.
 
 Operators may set `PI_DYNAMIC_WORKFLOW_DEFAULT_TIMEOUT_MS` to change the bounded fallback. This is an internal deployment setting, not a workflow field or model-facing control.
 
 ## Periodic progress reviews
 
-The visualizer schedules reviews only for verified, active runs carrying the marker and owned by the current session. Verified session ownership takes priority across tool-specified working directories: a Pi session may supervise its own hosted background workflow launched with `cwd` outside the session's startup/current directory. This does not weaken provenance checks—the authoritative launch `cwd` and system `cwdAtLaunch` must still be present, absolute, and canonically consistent, and another session's run remains denied. Cadence precedence is exact: on reload/restart, an existing durable schedule retains its cadence and check identity. Only when creating a new hosted background schedule does a valid explicit `progressReviewIntervalMs` win; if omitted, old/unconfigured runs use the operator `PI_THREAD_PHASE_SUPERVISION_CHECK_MS` fallback (minimum one minute), then ten minutes when that setting is unset or malformed. The existing internal trusted operator reschedule primitive can adjust an unsubmitted schedule atomically without replacing its check identity or changing execution limits; it is not a public helper or per-run command, and pending/in-flight reviews are left intact. A malformed cadence never gets coerced or grants a new schedule. There is no public post-launch operator/model scheduling control.
+The visualizer schedules reviews only for verified, active runs carrying the marker and owned by the current session. Verified session ownership takes priority across tool-specified working directories: a Pi session may supervise its own hosted background workflow launched with `cwd` outside the session's startup/current directory. This does not weaken provenance checks—the authoritative launch `cwd` and system `cwdAtLaunch` must still be present, absolute, and canonically consistent, and another session's run remains denied. On reload/restart, an existing durable schedule retains its cadence and check identity. A new dynamic/scripted schedule requires an explicit valid `progressReviewIntervalMs`; omitted or `null` cadence produces no schedule. V3 delegation alone keeps the operator `PI_THREAD_PHASE_SUPERVISION_CHECK_MS`/ten-minute fallback. The existing trusted operator reschedule primitive can adjust an unsubmitted schedule without changing its identity or execution limits; it is not a public post-launch command. Malformed cadence never grants a new schedule.
 
 Scheduling is durable. Restarting the host does not restart elapsed time: an overdue record becomes pending. Records use a dedicated progress-review schema and marker, remain bounded, coalesce due runs into bounded batches, and permit at most one pending check per run. Terminal completion or cancellation supersedes stale checks.
 
@@ -50,7 +50,7 @@ A review message is deliberately limited evidence. It says that this is a progre
 
 ## What the timer never does
 
-The root workflow run owns one review cadence. Recursive workers/nodes share that root policy and do not receive independent schedules; no public recursion opt-in is added. New `after` launches are independent policies and do not inherit cadence.
+When assigned, the root workflow run owns the review cadence. Recursive workers/nodes share the root policy and do not receive independent schedules; no public recursion opt-in is added. New `after` launches are independent policies and do not inherit cadence.
 
 The periodic timer does **not**:
 

@@ -16,7 +16,7 @@ Autonome's Pi package for shared extensions, workflow tooling, and skills.
 ## Install
 
 ```bash
-pi install git:git@github.com:autonome-research/autonome-pi@v0.18.0
+pi install git:git@github.com:autonome-research/autonome-pi@v0.18.1
 ```
 
 For active development:
@@ -29,7 +29,7 @@ To migrate an installation that still uses the old repository identity:
 
 ```bash
 pi remove git:git@github.com:Code4me2/pi-thread-phase-tools@v0.12.0
-pi install git:git@github.com:autonome-research/autonome-pi@v0.18.0
+pi install git:git@github.com:autonome-research/autonome-pi@v0.18.1
 ```
 
 Pi identifies git packages by repository URL, so remove the old source before installing the renamed one to avoid loading both copies.
@@ -38,7 +38,7 @@ Pi identifies git packages by repository URL, so remove the old source before in
 
 - `/detach [--name <tmux-name>] [--now|--wait] [prompt]` hands the current session off to tmux; `/detach-status` reports the latest handoff. See [`detach/README.md`](detach/README.md).
 - Select `/workflows` from the slash-command menu under the editor, or press `ctrl+shift+t`, to open the interactive thread-phase dashboard; select a run for observed command-ledger details or request cooperative cancellation via `x`. See [`docs/command-ledger-ui.md`](docs/command-ledger-ui.md) for controls, state semantics, token labels, and retention/privacy limits.
-- Background dynamic workflows durably return control to the launching Pi session after success or failure; failed continuations identify failed phases/errors/partial artifacts, while user-cancelled runs never auto-continue. New hosted background agent work uses periodic main-agent progress reviews instead of an implicit wall-clock kill deadline; optional strict `progressReviewIntervalMs` (60,000–86,400,000 ms) selects the review cadence without changing deadlines or recovery. See [`docs/workflow-supervision.md`](docs/workflow-supervision.md).
+- Background dynamic workflows durably return control after success or failure; user-cancelled runs never auto-continue. Background Pi agents have no implicit deadline; foreground agents and shells retain their default bound. Hosted background reviews run only when `progressReviewIntervalMs` is assigned (60,000–2,147,483,647 ms; `null` disables them). See [`docs/workflow-supervision.md`](docs/workflow-supervision.md).
 - `/codebase-explore` starts codebase exploration in the background by default.
 - `/code-review` runs code review workflows.
 - `dynamic_workflow` composes validated subagent workflows directly from flat `agent`, `fanout`, `shell`, and `artifact` phases. `scripted_workflow` is the separate advanced unsandboxed JavaScript interface; `dynamic_thread_phase_workflow` is an inactive deprecated compatibility alias.
@@ -57,7 +57,7 @@ Use RJLF's read-only `/rjlf-status` command and its [footer diagnostics and migr
 
 ## Current status
 
-Latest release: [`v0.18.0`](docs/releases/v0.18.0.md). Fully restart Pi after upgrading to load the updated native modules.
+Latest release: [`v0.18.1`](docs/releases/v0.18.1.md). Fully restart Pi after upgrading to load the updated native modules.
 
 Recent changes:
 
@@ -74,7 +74,7 @@ Recent changes:
 - Advanced unsandboxed JavaScript control flow uses `scripted_workflow`, which requires explicit `permissions: "rwx"`. Migrate `dynamic_workflow_harness` calls from `{ harness, harnessFile }` to `{ script, scriptFile }`; the old public tool name is no longer registered.
 - `dynamic_thread_phase_workflow` remains registered for compatibility but is inactive by default, avoiding a duplicate legacy schema in normal model context.
 - Structured specs have a reduced v2 contract with strict phase validation, bounded `attempts` and deterministic internal backoff, phase-local fanout concurrency, collision-safe artifacts, partial failure results, and background readiness acknowledgements containing `runId` + `pid`.
-- New public hosted background dynamic/scripted launches carry immutable `supervisionMode: "main-agent"` ownership metadata. Their Pi agent subprocesses have no implicit wall-clock timer when no explicit phase/helper/workflow timeout exists; shells, foreground work, legacy/historical runs, and explicit deadlines retain bounded behavior.
+- Hosted background dynamic/scripted launches carry immutable `supervisionMode: "main-agent"` ownership metadata. Background Pi agents, including CLI-launched ones, have no implicit wall-clock timer without an explicit timeout; shells and foreground work retain their default bounds. Periodic reviews are opt-in.
 - Reusable or operationally important workflows should graduate into standalone TypeScript extensions using thread-phase directly.
 - Dynamic workflow runs carry system-generated chain provenance. A terminal successful or failed parent accepts at most one session-scoped successor through `after`; cancelled parents cannot continue a chain.
 - Reusable structured workflows and self-contained scripted workflows can be loaded by safe template name from `~/.pi/agent/workflows/`; template loading is bounded, rejects traversal/symlinks, preserves provenance, and still enforces normal validation and permission ceilings.

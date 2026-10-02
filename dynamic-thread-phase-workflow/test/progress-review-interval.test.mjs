@@ -207,8 +207,8 @@ test("shared public launch authorization requires a TUI or RPC host", { timeout:
   }
 });
 
-test("explicit hourly cadence is authoritative, survives restart, and cleans up after a post-restart failure", { timeout: 20_000 }, async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "progress-interval-hourly-"));
+test("explicit >one-day cadence is scheduled, survives restart, and cleans up after failure", { timeout: 20_000 }, async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "progress-interval-long-"));
   const release = join(cwd, "release");
   const previousPiValue = process.env.PI_DYNAMIC_WORKFLOW_PI_BIN;
   process.env.PI_DYNAMIC_WORKFLOW_PI_BIN = writeHoldingPi(cwd, release);
@@ -224,19 +224,19 @@ test("explicit hourly cadence is authoritative, survives restart, and cleans up 
   try {
     await firstHost.handlers.get("session_start")({}, firstHost.context);
     const result = await registered.get("dynamic_workflow").execute("test", {
-      name: "hourly-review", permissions: "r", background: true,
-      progressReviewIntervalMs: 3_600_000,
+      name: "long-review", permissions: "r", background: true,
+      progressReviewIntervalMs: 86_400_001,
       timeoutMs: 15_000,
       phases: [{ type: "agent", name: "worker", prompt: "wait" }],
     }, undefined, undefined, workflowContext(cwd, sessionId));
     runId = result.details.runId;
     await waitFor(() => supervision.loadProgressReviewRecords({ storeDir: testStore }).some((record) => record.runId === runId), "explicit cadence was not scheduled");
     const start = JSON.parse(readFileSync(join(testStore, "runs", `${runId}.start.json`), "utf8"));
-    assert.equal(start.metadata.progressReviewIntervalMs, 3_600_000);
+    assert.equal(start.metadata.progressReviewIntervalMs, 86_400_001);
     assert.equal(start.metadata.continuationMode, "terminal");
     const initial = supervision.loadProgressReviewRecords({ storeDir: testStore }).find((record) => record.runId === runId);
     assert.ok(initial, "initial durable review schedule is present");
-    assert.equal(initial.cadenceMs, 3_600_000);
+    assert.equal(initial.cadenceMs, 86_400_001);
 
     firstHost.handlers.get("session_shutdown")({}, firstHost.context);
     restarted = host(sessionId, cwd);
@@ -248,7 +248,7 @@ test("explicit hourly cadence is authoritative, survives restart, and cleans up 
       { checkId: initial.checkId, startedAt: initial.startedAt, dueAt: initial.dueAt, cadenceMs: initial.cadenceMs },
       "reload must preserve the existing durable schedule identity, anchor, deadline, and cadence",
     );
-    assert.equal(restarted.messages.length, 0, "hourly review is not immediately due");
+    assert.equal(restarted.messages.length, 0, "long review is not immediately due");
     try { assert.fail("simulated assertion after replacement startup"); }
     catch (error) { injectedFailure = error; throw error; }
   } catch (error) {

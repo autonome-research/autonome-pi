@@ -53,7 +53,7 @@ function oldStart(runId, sessionId, extra = {}, cwd = storeDir, trigger = { kind
     type: store.EVENT_TYPES.WORKFLOW_START,
     status: store.STATUSES.RUNNING,
     timestamp: new Date(Date.now() - supervision.DEFAULT_PROGRESS_REVIEW_CADENCE_MS - 60_000).toISOString(),
-    metadata: { sessionId, supervisionMode: "main-agent", ...extra },
+    metadata: { sessionId, supervisionMode: "main-agent", progressReviewIntervalMs: supervision.DEFAULT_PROGRESS_REVIEW_CADENCE_MS, ...extra },
   });
 }
 
@@ -221,6 +221,7 @@ test("a supported cross-directory tool launch survives restart and scope changes
       permissions: "r",
       background: true,
       timeoutMs: 8_000,
+      progressReviewIntervalMs: supervision.DEFAULT_PROGRESS_REVIEW_CADENCE_MS,
       phases: [{ type: "agent", name: "worker", prompt: "wait for the test release" }],
     }, undefined, undefined, { cwd: storeDir, mode: "tui", sessionManager: { getSessionId: () => sessionId } });
     runId = launched.details.runId;
@@ -327,7 +328,7 @@ test("ambiguous cancellation markers suppress reviews without blocking the host"
     for (const runId of ['broken-json', 'dangling-link', 'fifo-marker']) {
       store.emit({ runId, workflow: runId, cwd: process.env.PI_THREAD_PHASE_STORE_DIR, trigger: { kind: 'background' } }, {
         type: 'workflow_start', status: 'running', timestamp: new Date(Date.now() - ${supervision.DEFAULT_PROGRESS_REVIEW_CADENCE_MS + 60_000}).toISOString(),
-        metadata: { sessionId: 'cancel-markers', supervisionMode: 'main-agent' },
+        metadata: { sessionId: 'cancel-markers', supervisionMode: 'main-agent', progressReviewIntervalMs: ${supervision.DEFAULT_PROGRESS_REVIEW_CADENCE_MS} },
       });
     }
     fs.writeFileSync(store.cancelFileFor('broken-json'), '{bad');

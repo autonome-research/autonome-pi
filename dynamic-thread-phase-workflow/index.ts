@@ -857,7 +857,7 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 		"Set dynamic_workflow permissions to r, w, rw, or rwx; phases inherit that default and may override it within operator policy.",
 		"Use dynamic_workflow agent phases for one subagent and fanout phases for parallel subagents. Shell phases require rwx.",
 		"Use {{outputs.phase-name}} only to reference earlier phase outputs; fanout prompts may also use {{item}} and {{index}}.",
-		"Use background=true for long or open-ended agent workflows. Optional progressReviewIntervalMs is a strict 60000..86400000 ms review cadence for hosted background launches, not a timeout; explicit timeoutMs values remain hard limits.",
+		"Use background=true for long or open-ended agent workflows. Optional progressReviewIntervalMs is a 60000..2147483647 ms review cadence for hosted background launches (null disables); omitted means no periodic review. Explicit timeoutMs values remain hard limits.",
 		"Reusable structured workflows may be loaded by template name from ~/.pi/agent/workflows/<name>.json instead of supplying phases.",
 		"Use after with a terminal successful or failed run id to create its single model-selected chained successor; Pi generates the child run and chain identities.",
 		"Use resumeRunId by itself to continue the same structured workflow from its trusted stored spec and validated completed phase-output artifacts.",
