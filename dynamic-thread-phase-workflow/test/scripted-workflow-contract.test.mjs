@@ -51,9 +51,9 @@ test("registered scripted schema replaces the harness tool without declarative s
 
   const declarative = registered.get("dynamic_workflow").parameters;
   const declarativeJson = JSON.stringify(declarative);
-  // v3 launch branch plus timeout/cadence flexibility extended the declarative schema (5076 bytes).
-  assert.equal(Buffer.byteLength(declarativeJson), 5_076);
-  assert.equal(createHash("sha256").update(declarativeJson).digest("hex"), "c51556442e6f46a9a44be341ed6aff8e58b505a794a67cc823211faeff85f35d");
+  // Cadence remains input-compatible; only its description now marks retirement.
+  assert.equal(Buffer.byteLength(declarativeJson), 5_069);
+  assert.equal(createHash("sha256").update(declarativeJson).digest("hex"), "6cf535f2f1caeb21430a37dfb8f04925ed0374e0ede9af8aa88fe17683ab2da4");
   assert.deepEqual(declarative.properties.v3, {
     type: "object", required: ["schema", "delegation", "phases"], additionalProperties: false,
     properties: {
@@ -64,7 +64,7 @@ test("registered scripted schema replaces the harness tool without declarative s
   });
   assert.deepEqual(declarative.properties.progressReviewIntervalMs, {
     anyOf: [
-      { type: "integer", minimum: 60_000, maximum: 2_147_483_647, description: "Hosted background progress-review cadence in milliseconds (null disables periodic reviews); this is not a timeout." },
+      { type: "integer", minimum: 60_000, maximum: 2_147_483_647, description: "Deprecated compatibility field; periodic main-agent reviews are retired. Omit it. Does not affect timeouts." },
       { type: "null" },
     ],
   });
@@ -73,12 +73,12 @@ test("registered scripted schema replaces the harness tool without declarative s
   const scriptedJson = JSON.stringify(scripted);
   const scriptedBytes = Buffer.byteLength(scriptedJson);
   t.diagnostic(`scripted schema: 920 bytes / 10 properties before -> ${scriptedBytes} bytes / ${Object.keys(scripted.properties).length} properties after`);
-  assert.equal(scriptedBytes, 1_109);
-  assert.equal(createHash("sha256").update(scriptedJson).digest("hex"), "7dd255c63d7b6c0358719b8289b343db682639731409285fec35cbdecd8091b2");
+  assert.equal(scriptedBytes, 1_135);
+  assert.equal(createHash("sha256").update(scriptedJson).digest("hex"), "8dae20e6f7fba1b0ab74e1d501bdb1de8cf3d8a67d992d731a72f7c04f27b565");
   assert.deepEqual(Object.keys(scripted.properties), ["script", "scriptFile", "template", "name", "cwd", "model", "timeoutMs", "background", "progressReviewIntervalMs", "after", "permissions"]);
   assert.deepEqual(scripted.properties.progressReviewIntervalMs, {
     type: "integer", minimum: 60_000, maximum: 2_147_483_647,
-    description: "Hosted background progress-review cadence in milliseconds; this is not a timeout.",
+    description: "Deprecated compatibility field; periodic main-agent reviews are retired. Omit it. Does not affect timeouts.",
   });
   assert.equal(scripted.additionalProperties, false);
   assert.deepEqual(scripted.required, ["permissions"]);

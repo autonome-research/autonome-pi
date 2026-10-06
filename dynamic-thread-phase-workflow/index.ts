@@ -214,7 +214,7 @@ function validatePermission(value: unknown, label: string): void {
 }
 
 function validateProgressReviewInterval(value: unknown, label: string): void {
-	// null means "no periodic progress review" (disabled); undefined is unset.
+	// Retain legacy cadence validation/metadata for compatibility; host reviews are retired.
 	if (value !== undefined && value !== null && (!Number.isSafeInteger(value) || (value as number) < MIN_PROGRESS_REVIEW_INTERVAL_MS || (value as number) > MAX_PROGRESS_REVIEW_INTERVAL_MS)) {
 		throw new Error(`${label} must be an integer between ${MIN_PROGRESS_REVIEW_INTERVAL_MS} and ${MAX_PROGRESS_REVIEW_INTERVAL_MS}, or null to disable.`);
 	}
@@ -592,7 +592,7 @@ function workflowParametersSchema() {
 		model: Type.Optional(Type.String({ description: "Default model pattern for agent/fanout phases." })),
 		timeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1, maximum: MAX_TIMEOUT_MS, description: "Default agent/shell phase timeout, or null for no deadline." }), Type.Null()])),
 		background: Type.Optional(Type.Boolean({ description: "Run in the background; successful and failed terminal runs return control to this Pi session, while cancellation does not." })),
-		progressReviewIntervalMs: Type.Optional(Type.Union([Type.Integer({ minimum: MIN_PROGRESS_REVIEW_INTERVAL_MS, maximum: MAX_PROGRESS_REVIEW_INTERVAL_MS, description: "Hosted background progress-review cadence in milliseconds (null disables periodic reviews); this is not a timeout." }), Type.Null()])),
+		progressReviewIntervalMs: Type.Optional(Type.Union([Type.Integer({ minimum: MIN_PROGRESS_REVIEW_INTERVAL_MS, maximum: MAX_PROGRESS_REVIEW_INTERVAL_MS, description: "Deprecated compatibility field; periodic main-agent reviews are retired. Omit it. Does not affect timeouts." }), Type.Null()])),
 		after: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Terminal successful or failed parent run. This workflow becomes its single chained successor." })),
 		resumeRunId: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$", description: "Resume this structured run from its trusted spec and completed phase artifacts. Use without phases or template." })),
 		template: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", description: "Saved structured workflow name from ~/.pi/agent/workflows/<name>.json. Use instead of phases." })),
@@ -616,7 +616,7 @@ function scriptedWorkflowParametersSchema() {
 		model: Type.Optional(Type.String({ minLength: 1 })),
 		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_TIMEOUT_MS })),
 		background: Type.Optional(Type.Boolean({ description: "Return to chat after success/failure, not cancellation." })),
-		progressReviewIntervalMs: Type.Optional(Type.Integer({ minimum: MIN_PROGRESS_REVIEW_INTERVAL_MS, maximum: MAX_PROGRESS_REVIEW_INTERVAL_MS, description: "Hosted background progress-review cadence in milliseconds; this is not a timeout." })),
+		progressReviewIntervalMs: Type.Optional(Type.Integer({ minimum: MIN_PROGRESS_REVIEW_INTERVAL_MS, maximum: MAX_PROGRESS_REVIEW_INTERVAL_MS, description: "Deprecated compatibility field; periodic main-agent reviews are retired. Omit it. Does not affect timeouts." })),
 		after: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$" })),
 		permissions: StringEnum(["rwx"] as const, { description: "Required: unsandboxed read/write/execute access." }),
 	}, { additionalProperties: false });
@@ -857,7 +857,7 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 		"Set dynamic_workflow permissions to r, w, rw, or rwx; phases inherit that default and may override it within operator policy.",
 		"Use dynamic_workflow agent phases for one subagent and fanout phases for parallel subagents. Shell phases require rwx.",
 		"Use {{outputs.phase-name}} only to reference earlier phase outputs; fanout prompts may also use {{item}} and {{index}}.",
-		"Use background=true for long or open-ended agent workflows. Optional progressReviewIntervalMs is a 60000..2147483647 ms review cadence for hosted background launches (null disables); omitted means no periodic review. Explicit timeoutMs values remain hard limits.",
+		"Use background=true for long or open-ended agent workflows. Progress is passive; periodic main-agent reviews are retired. Omit the deprecated progressReviewIntervalMs field. Explicit timeoutMs values remain hard limits.",
 		"Reusable structured workflows may be loaded by template name from ~/.pi/agent/workflows/<name>.json instead of supplying phases.",
 		"Use after with a terminal successful or failed run id to create its single model-selected chained successor; Pi generates the child run and chain identities.",
 		"Use resumeRunId by itself to continue the same structured workflow from its trusted stored spec and validated completed phase-output artifacts.",
@@ -904,7 +904,7 @@ export default function dynamicWorkflows(pi: ExtensionAPI) {
 			"scripted_workflow executes arbitrary unsandboxed Node.js and always requires explicit permissions=rwx.",
 			"scripted_workflow accepts exactly one of inline script, scriptFile, or a saved self-contained .mjs template.",
 			"scripted_workflow provides ctx.phase, ctx.shell, ctx.pi, ctx.fanout, ctx.artifact, ctx.emit, ctx.cancelled(), and ctx.signal.",
-			"Use progressReviewIntervalMs only for a new hosted background scripted workflow; it changes review cadence, never timeout or recovery behavior.",
+			"Progress is passive; periodic main-agent reviews are retired. Omit the deprecated progressReviewIntervalMs compatibility field.",
 		],
 		parameters: scriptedWorkflowParametersSchema(),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {

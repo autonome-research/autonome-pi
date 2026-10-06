@@ -112,8 +112,8 @@ Mixed-permission example:
 
 - Set `cwd` explicitly when execution differs from the Pi session cwd.
 - Top-level `model` and `timeoutMs` provide phase defaults. Explicit `timeoutMs` is a hard limit up to 2,147,483,647 ms; `dynamic_workflow` also accepts `null` for no deadline. Phase-local `timeoutMs` remains capped at one hour. Fanout concurrency is phase-local.
-- `progressReviewIntervalMs` is an optional 60,000..2,147,483,647 ms cadence only for a new hosted supervised background launch; `dynamic_workflow` also accepts `null` to disable it. Omitted means no periodic check-in. This is not a timeout or intervention control.
-- Use `background: true` for long or open-ended Pi agent work: hosted and CLI background Pi agents have no implicit deadline. Foreground Pi agents and shell work retain the default bound. Existing durable review schedules keep their cadence on reload/restart; new dynamic/scripted reviews require an assigned cadence. V3 delegation keeps its separate default. A timer requests main-agent judgment only; it never detects a stall, kills, retries, resumes, or launches work. Terminal success/failure still returns to chat; cancellation does not auto-continue.
+- Omit deprecated `progressReviewIntervalMs`. It retains legacy validation and metadata transport for compatibility, but periodic main-agent prompts are retired, including persisted schedules and v3 fallback reviews. It does not change deadlines or intervention policy.
+- Use `background: true` for long or open-ended Pi agent work: hosted and CLI background Pi agents have no implicit deadline. Foreground Pi agents and shell work retain the default bound. Progress stays in passive status/dashboard/event surfaces; inspect with `thread_phase_runs` when needed, not recurring main-agent prompts. Terminal success/failure still returns to chat; cancellation does not auto-continue.
 - Foreground calls remain bounded because they occupy their own supervisor. Shell phases retain their normal default bound. Do not use foreground mode for intentionally open-ended agent work.
 - Use `after` with a trusted terminal successful or failed run id to launch its single chained successor. Do not chain from a cancelled run.
 - Add an artifact phase when the user expects a durable report.
@@ -147,7 +147,7 @@ Structured workflows write an atomic `workflow-checkpoint.json` plus hashed per-
 { "resumeRunId": "review-src-..." }
 ```
 
-Resume is fail-closed. The trusted run supplies the compiled spec, real working directory, effective model, permissions, template provenance, Pi session, and (for a legitimate background resume) the exact authoritative progress-review cadence; repeating or overriding them is rejected. Older supervised sources without the field use the operator/default cadence. Foreground resumes remain bounded. Checkpoints must contain a contiguous prefix of matching phases, output files must remain inside the source run's artifact directory, and their sizes and SHA-256 hashes must verify. Validated outputs are copied into the new run's own checkpoint chain; completed phases are not re-executed, and execution continues at the first uncheckpointed phase. Scripted workflows cannot use `resumeRunId`. A single resumable phase output is capped at 4 MB.
+Resume is fail-closed. The trusted run supplies the compiled spec, real working directory, effective model, permissions, template provenance, Pi session, and (for a legitimate background resume) legacy cadence metadata; repeating or overriding them is rejected. Neither inherited nor missing cadence metadata activates periodic reviews. Foreground resumes remain bounded. Checkpoints must contain a contiguous prefix of matching phases, output files must remain inside the source run's artifact directory, and their sizes and SHA-256 hashes must verify. Validated outputs are copied into the new run's own checkpoint chain; completed phases are not re-executed, and execution continues at the first uncheckpointed phase. Scripted workflows cannot use `resumeRunId`. A single resumable phase output is capped at 4 MB.
 
 Resume proves that the earlier phase completed and that its output artifact is intact. It cannot make an interrupted, non-checkpointed side effect idempotent; design shell/write phases accordingly.
 
@@ -167,7 +167,7 @@ Script helpers:
 - `ctx.emit(kind, data)`
 - `ctx.cancelled()` / `ctx.signal`
 
-In a supervised background scripted run, `ctx.pi` and `ctx.fanout` may run without an implicit wall-clock deadline only when neither helper nor workflow has an explicit timeout; explicit helper/workflow deadlines still win. `ctx.shell` remains bounded. There is no script helper for changing cadence or steering the supervisor after launch.
+In a supervised background scripted run, `ctx.pi` and `ctx.fanout` may run without an implicit wall-clock deadline only when neither helper nor workflow has an explicit timeout; explicit helper/workflow deadlines still win. `ctx.shell` remains bounded. Progress is passive; there is no periodic review or helper for steering the main agent after launch.
 
 Prefer a standalone TypeScript extension using thread-phase directly when logic becomes reusable, domain-specific, operationally important, or recovery-heavy.
 
@@ -185,7 +185,7 @@ Prefer a standalone TypeScript extension using thread-phase directly when logic 
 4. Use phase overrides only where needed.
 5. Use `shell` only with `rwx`.
 6. Reference only earlier phases with `{{outputs.name}}`.
-7. Use background mode for long or open-ended agent runs; treat periodic main-agent reviews as judgment requests, never stall detection.
+7. Use background mode for long or open-ended agent runs; keep progress passive and inspect on demand. Do not replace retired reviews with a polling agent.
 8. Include a durable artifact when appropriate.
 9. Keep retries and fanout bounded.
 10. Use a saved template for repeated workflows; use direct phases for one-off composition.

@@ -20,7 +20,6 @@ process.on("exit", () => {
 const { default: registerDynamicWorkflows } = await import("../index.ts");
 const { default: registerVisualizer } = await import("../../thread-phase-visualizer/index.ts");
 const store = await import("../../thread-phase-visualizer/lib/store.mjs");
-const supervision = await import("../../thread-phase-visualizer/lib/supervision-store.mjs");
 
 function tools() {
   const registered = new Map();
@@ -92,10 +91,10 @@ test("typed cadence is strict, top-level, and background-hosted only", async () 
   assert.equal(scriptedSchema.properties.progressReviewIntervalMs.type, "integer");
   assert.equal(scriptedSchema.properties.progressReviewIntervalMs.minimum, 60_000);
   assert.equal(scriptedSchema.properties.progressReviewIntervalMs.maximum, 2_147_483_647);
-  // dynamic_workflow allows null to disable periodic reviews.
+  // Preserve legacy input compatibility without promising periodic reviews.
   assert.deepEqual(dynamicSchema.properties.progressReviewIntervalMs, {
     anyOf: [
-      { type: "integer", minimum: 60_000, maximum: 2_147_483_647, description: "Hosted background progress-review cadence in milliseconds (null disables periodic reviews); this is not a timeout." },
+      { type: "integer", minimum: 60_000, maximum: 2_147_483_647, description: "Deprecated compatibility field; periodic main-agent reviews are retired. Omit it. Does not affect timeouts." },
       { type: "null" },
     ],
   });
@@ -207,7 +206,7 @@ test("shared public launch authorization requires a TUI or RPC host", { timeout:
   }
 });
 
-test("explicit >one-day cadence is scheduled, survives restart, and cleans up after failure", { timeout: 20_000 }, async () => {
+test("legacy >one-day cadence stays metadata-only across restart; completion and failure cleanup survive", { timeout: 20_000 }, async () => {
   const cwd = mkdtempSync(join(tmpdir(), "progress-interval-long-"));
   const release = join(cwd, "release");
   const previousPiValue = process.env.PI_DYNAMIC_WORKFLOW_PI_BIN;
@@ -230,25 +229,20 @@ test("explicit >one-day cadence is scheduled, survives restart, and cleans up af
       phases: [{ type: "agent", name: "worker", prompt: "wait" }],
     }, undefined, undefined, workflowContext(cwd, sessionId));
     runId = result.details.runId;
-    await waitFor(() => supervision.loadProgressReviewRecords({ storeDir: testStore }).some((record) => record.runId === runId), "explicit cadence was not scheduled");
+    await waitFor(() => runEvents(runId).some((event) => event.type === "phase_start"), "held worker did not start");
+    await delay(50); // Allow the index watcher to observe the live launch.
+    firstHost.handlers.get("agent_settled")({}, firstHost.context);
     const start = JSON.parse(readFileSync(join(testStore, "runs", `${runId}.start.json`), "utf8"));
     assert.equal(start.metadata.progressReviewIntervalMs, 86_400_001);
     assert.equal(start.metadata.continuationMode, "terminal");
-    const initial = supervision.loadProgressReviewRecords({ storeDir: testStore }).find((record) => record.runId === runId);
-    assert.ok(initial, "initial durable review schedule is present");
-    assert.equal(initial.cadenceMs, 86_400_001);
+    assert.equal(existsSync(join(testStore, "progress-reviews.json")), false, "explicit cadence must not create a schedule");
+    assert.deepEqual(firstHost.messages, [], "live progress must not request inference");
 
     firstHost.handlers.get("session_shutdown")({}, firstHost.context);
     restarted = host(sessionId, cwd);
     await restarted.handlers.get("session_start")({}, restarted.context);
-    const afterRestart = supervision.loadProgressReviewRecords({ storeDir: testStore }).find((record) => record.runId === runId);
-    assert.ok(afterRestart, "durable review schedule survives restart");
-    assert.deepEqual(
-      { checkId: afterRestart.checkId, startedAt: afterRestart.startedAt, dueAt: afterRestart.dueAt, cadenceMs: afterRestart.cadenceMs },
-      { checkId: initial.checkId, startedAt: initial.startedAt, dueAt: initial.dueAt, cadenceMs: initial.cadenceMs },
-      "reload must preserve the existing durable schedule identity, anchor, deadline, and cadence",
-    );
-    assert.equal(restarted.messages.length, 0, "long review is not immediately due");
+    assert.equal(existsSync(join(testStore, "progress-reviews.json")), false, "restart must not recreate a schedule");
+    assert.deepEqual(restarted.messages, [], "restart must not request a progress review");
     try { assert.fail("simulated assertion after replacement startup"); }
     catch (error) { injectedFailure = error; throw error; }
   } catch (error) {
@@ -260,7 +254,8 @@ test("explicit >one-day cadence is scheduled, survives restart, and cleans up af
         try {
           await waitFor(() => runEvents(runId).some((event) => event.type === "workflow_end"), "held worker did not finish");
           settled = true;
-          await waitFor(() => !supervision.loadProgressReviewRecords({ storeDir: testStore }).some((record) => record.runId === runId), "terminal completion did not supersede the review");
+          await waitFor(() => restarted?.messages.some((message) => message.includes("thread-phase-continuation/v1")), "terminal handoff was lost");
+          assert.equal(existsSync(join(testStore, "progress-reviews.json")), false);
         } catch (error) { cleanupErrors.push(error); }
       }
     } finally {
