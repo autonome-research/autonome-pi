@@ -50,6 +50,17 @@ function addSessionArgs(args: string[], ctx: any): string[] {
 	return args;
 }
 
+// Only a hosted interactive session (TUI/RPC) with a valid originating session
+// identity may request a durable terminal handoff, and only for background runs.
+// Foreground results already return to the caller; bare CLI runs and print/JSON
+// workers never get this flag and stay notification-only.
+function addHostedHandoffArg(args: string[], ctx: any, background?: boolean): void {
+	if (!background) return;
+	if (ctx?.mode !== "tui" && ctx?.mode !== "rpc") return;
+	if (!ctx.sessionManager?.getSessionId?.()) return;
+	args.push("--continuation", "terminal");
+}
+
 function buildArgs(params: {
 	cwd: string;
 	dirs?: string;
@@ -69,7 +80,11 @@ function buildArgs(params: {
 	if (params.delay !== undefined) args.push("--delay", String(params.delay));
 	if (params.model) args.push("--model", params.model);
 	if (params.background) args.push("--background");
-	return params.ctx ? addSessionArgs(args, params.ctx) : args;
+	if (params.ctx) {
+		addSessionArgs(args, params.ctx);
+		addHostedHandoffArg(args, params.ctx, params.background);
+	}
+	return args;
 }
 
 function commandUsage() {

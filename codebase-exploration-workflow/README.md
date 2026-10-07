@@ -46,3 +46,15 @@ Artifacts are written under:
 ```text
 ~/.pi/agent/thread-phase/artifacts/<runId>/
 ```
+
+## Terminal handoff to chat
+
+A background exploration deliberately launched by the hosting interactive Pi session (TUI or RPC tool call, or `/codebase-explore` without `--foreground`, with a valid originating session) carries an explicit `--continuation terminal --session-id <id>` opt-in and hands its success **or** failure back to that conversation through the visualizer's durable `continuationMode: "terminal"` path. Foreground runs return to their caller directly, and bare CLI runs or print/JSON worker contexts never carry the opt-in: they stay notification-only. The `PI_CODEBASE_EXPLORATION_BACKGROUND` marker and inherited `PI_SESSION_*` environment alone never authorize a handoff. Cancellation never auto-continues; a failure handoff reports blockers/partial results and does not authorize recovery work.
+
+Direct background runs are notification-only by default. Explicit opt-in (normally set by the Pi extension, not by hand):
+
+```bash
+codebase-exploration-workflow.mjs --cwd "$PWD" --background --session-id <owning-session-id> --continuation terminal
+```
+
+`--continuation terminal` is rejected without `--background` and `--session-id`.

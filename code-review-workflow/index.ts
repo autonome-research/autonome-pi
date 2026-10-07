@@ -58,12 +58,27 @@ function addSessionArgs(args: string[], ctx: any): string[] {
 	return args;
 }
 
+// Only a hosted interactive session (TUI/RPC) with a valid originating session
+// identity may request a durable terminal handoff, and only for background runs.
+// Foreground results already return to the caller; post-commit hooks, bare CLI
+// runs and print/JSON workers never get this flag and stay notification-only.
+function addHostedHandoffArg(args: string[], ctx: any, background?: boolean): void {
+	if (!background) return;
+	if (ctx?.mode !== "tui" && ctx?.mode !== "rpc") return;
+	if (!ctx.sessionManager?.getSessionId?.()) return;
+	args.push("--continuation", "terminal");
+}
+
 function makeReviewArgs(params: { mode?: ReviewMode; ref?: string; cwd: string; background?: boolean; model?: string; ctx?: any }) {
 	const args = ["review", "--cwd", params.cwd, "--mode", params.mode || "last_commit", "--json"];
 	if (params.ref) args.push("--ref", params.ref);
 	if (params.background) args.push("--background");
 	if (params.model) args.push("--model", params.model);
-	return params.ctx ? addSessionArgs(args, params.ctx) : args;
+	if (params.ctx) {
+		addSessionArgs(args, params.ctx);
+		addHostedHandoffArg(args, params.ctx, params.background);
+	}
+	return args;
 }
 
 function readReportExcerpt(reportPath?: string): string | undefined {

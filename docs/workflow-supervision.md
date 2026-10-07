@@ -6,7 +6,7 @@ Since v0.18.2, workflow progress is **passive**. Elapsed time, activity and hear
 
 - The footer, optional status bridge/title, `/workflows` dashboard and event/artifact store remain available without main-agent inference or conversation growth from progress updates.
 - `thread_phase_runs` remains available for explicit, on-demand inspection.
-- Fresh successful/failed background workflows return control through a durable `continuationMode: "terminal"` handoff. Those completion messages intentionally enter the conversation and may trigger reasoning. Old or uncertain deliveries remain passive until explicitly requested.
+- Fresh successful/failed background workflows return control through a durable `continuationMode: "terminal"` handoff. Those completion messages intentionally enter the conversation and may trigger reasoning. Old or uncertain deliveries remain passive until explicitly requested. Hosted background code-review and codebase-exploration runs (TUI/RPC launches with a valid originating session) use this path through an explicit wrapper-propagated `--continuation terminal` opt-in; hooks, bare CLI runs, foreground calls and print/JSON workers stay notification-only.
 - Cancellation does not auto-continue. An error event without `workflow_end` is not terminal proof.
 - Ownership, session scoping, cancellation and successor suppression remain enforced. Delivery receipts are session-wide, including other branches; branch navigation must not repeat a notification.
 

@@ -393,6 +393,26 @@ function isBooleanLiteral(value) {
   return ["1", "0", "true", "false", "yes", "no", "on", "off"].includes(String(value || "").trim().toLowerCase());
 }
 
+function die(message) {
+  console.error(message);
+  process.exit(1);
+}
+
+/**
+ * A durable terminal handoff to the originating chat is an explicit,
+ * session-scoped opt-in. The hosting Pi extension passes
+ * `--continuation terminal` together with `--background` and the owning
+ * `--session-id`; the background-environment marker or inherited session
+ * environment never authorize a handoff alone.
+ */
+function terminalHandoffOptedIn(opts, backgroundEnv) {
+  if (opts.continuation === undefined) return false;
+  if (opts.continuation !== "terminal") die(`--continuation must be exactly "terminal" when provided (got ${JSON.stringify(opts.continuation)})`);
+  if (!isTruthyFlag(opts.background) && !backgroundEnv) die("--continuation terminal requires --background; foreground explorations return to their caller and never inject a chat turn");
+  if (typeof opts["session-id"] !== "string" || !opts["session-id"].trim()) die("--continuation terminal requires --session-id of the owning interactive Pi session");
+  return true;
+}
+
 function stripBackgroundArgs(argv) {
   const next = [];
   for (let i = 0; i < argv.length; i++) {
@@ -425,9 +445,10 @@ function maybeBackground(rawArgv, opts) {
 async function main() {
   const rawArgv = process.argv.slice(2);
   const args = parseArgs(rawArgv);
+  const terminalHandoff = terminalHandoffOptedIn(args, process.env.PI_CODEBASE_EXPLORATION_BACKGROUND);
   if (maybeBackground(rawArgv, args)) return;
   if (args.help || args.h) {
-    console.log(`Usage: codebase-exploration-workflow.mjs --cwd REPO [--dirs src,tests,docs] [--agent mock|pi] [--concurrency 3] [--model MODEL]\n\nDefault agent is pi (real read-only Pi subagents). Use --agent mock only for UI testing.`);
+    console.log(`Usage: codebase-exploration-workflow.mjs --cwd REPO [--dirs src,tests,docs] [--agent mock|pi] [--concurrency 3] [--model MODEL] [--background] [--continuation terminal --session-id ID]\n\nDefault agent is pi (real read-only Pi subagents). Use --agent mock only for UI testing.\n--continuation terminal (with --background and --session-id) requests a durable success/failure\nhandoff to the owning interactive Pi session; the Pi extension sets it for hosted background launches.`);
     return;
   }
 
@@ -443,7 +464,7 @@ async function main() {
     cwd,
     trigger: { kind: process.env.PI_CODEBASE_EXPLORATION_BACKGROUND ? "background" : "manual", agent, concurrency },
     input: { dirs: splitList(args.dirs), agent, concurrency },
-    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", sessionId: args["session-id"], sessionFile: args["session-file"] },
+    metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", sessionId: args["session-id"], sessionFile: args["session-file"], ...(terminalHandoff ? { continuationMode: "terminal" } : {}) },
     message: "codebase-exploration started",
   });
   activeVisualizerRun = visualizerRun;

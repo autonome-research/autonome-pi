@@ -40,6 +40,10 @@ Workflow telemetry is emitted to the generic store:
 
 The generic `thread-phase-visualizer` extension watches that store and posts completed workflow summaries into Pi sessions.
 
+## Terminal handoff to chat
+
+A background review deliberately launched by the hosting interactive Pi session (TUI or RPC tool call with a valid originating session) carries an explicit `--continuation terminal --session-id <id>` opt-in and hands its success **or** failure back to that conversation through the visualizer's durable `continuationMode: "terminal"` path. Foreground reviews return to their caller directly, and the generated post-commit hook, bare CLI runs, and print/JSON worker contexts never carry the opt-in: they stay notification-only. The `PI_CODE_REVIEW_BACKGROUND` marker and inherited `PI_SESSION_*` environment alone never authorize a handoff. Cancellation and committed-successor chains never auto-continue; a failure handoff reports blockers/partial results and does not authorize recovery work.
+
 Disable the hook temporarily:
 
 ```bash
@@ -53,9 +57,18 @@ PI_CODE_REVIEW_DISABLE=1 git commit ...
 ~/.pi/agent/extensions/code-review-workflow/bin/code-review-workflow.mjs install-hook --cwd /path/to/repo
 ```
 
+Direct background runs are notification-only by default. To request the terminal handoff explicitly (normally done by the Pi extension, not by hand):
+
+```bash
+code-review-workflow.mjs review --cwd /path/to/repo --background --session-id <owning-session-id> --continuation terminal
+```
+
+`--continuation terminal` is rejected without `--background` and `--session-id`.
+
 Environment knobs:
 
 - `PI_CODE_REVIEW_PI_BIN`: path to the `pi` binary.
 - `PI_CODE_REVIEW_DIFF_LIMIT`: max diff bytes included in the prompt before truncation.
 - `PI_CODE_REVIEW_TIMEOUT_MS`: reviewer subprocess timeout.
 - `PI_CODE_REVIEW_DISABLE=1`: disable installed hooks for one command.
+- `--continuation terminal`: explicit terminal-handoff opt-in; only valid with `--background` and `--session-id`. Never set by the generated hook.

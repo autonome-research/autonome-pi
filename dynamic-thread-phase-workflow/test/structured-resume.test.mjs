@@ -268,9 +268,16 @@ for (const largeLog of [false, true]) test(`checkpointed crashed source resumes 
     const rejected = settled.filter((result) => result.status !== 0);
     assert.equal(successes.length, 1, JSON.stringify(settled));
     assert.equal(rejected.length, 1, JSON.stringify(settled));
-    assert.match(rejected[0].stderr, /already has (?:successor|a pending successor)/);
+    // The legacy exclusive-create writer may still be filling its reservation.
+    // Rejecting an unreadable record is safe; do not require one race-dependent diagnostic.
+    assert.match(rejected[0].stderr, /already has (?:successor|a pending successor)|Could not read workflow successor record: (?:successor record changed or exceeded its bounded size while reading|Unexpected end of JSON input)/);
     const resumedResult = terminalJson(successes[0].stdout);
     assert.equal(resumedResult.resumedFromRunId, sourceRunId);
+    const successor = JSON.parse(readFileSync(join(store, "chains", "successors", `${sourceRunId}.json`), "utf8"));
+    assert.equal(successor.state, "committed");
+    assert.equal(successor.childRunId, resumedResult.runId);
+    assert.deepEqual(readdirSync(runsDir).filter(name => name.endsWith(".jsonl")).sort(),
+      [`${sourceRunId}.jsonl`, `${resumedResult.runId}.jsonl`].sort(), "no losing contender may create a run");
     assert.equal(readFileSync(join(temp, "seed-count"), "utf8"), "1", "checkpointed work must not rerun after a crash");
     assert.equal(readFileSync(join(temp, "continue-count"), "utf8"), "1");
 

@@ -332,12 +332,15 @@ async function reviewCommand(opts) {
   const mode = String(opts.mode || "last_commit");
   const ref = opts.ref ? String(opts.ref) : undefined;
   const commit = mode === "last_commit" ? fullHash(root, ref || "HEAD") : undefined;
+  const terminalHandoff = opts.continuation === "terminal";
   const tpRun = createRun({
     workflow: "code-review",
     cwd: root,
-    trigger: { kind: process.env.PI_CODE_REVIEW_BACKGROUND ? "post-commit" : "manual", mode, ref: ref || "HEAD" },
+    // Only the explicit handoff opt-in distinguishes a hosted session launch from
+    // an unattended post-commit hook run; the background env marker alone cannot.
+    trigger: { kind: process.env.PI_CODE_REVIEW_BACKGROUND ? (terminalHandoff ? "session" : "post-commit") : "manual", mode, ref: ref || "HEAD" },
     input: { mode, ref: ref || "HEAD", commit },
-    metadata: { commit, pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", sessionId: opts["session-id"], sessionFile: opts["session-file"] },
+    metadata: { commit, pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", sessionId: opts["session-id"], sessionFile: opts["session-file"], ...(terminalHandoff ? { continuationMode: "terminal" } : {}) },
   });
   activeTpRun = tpRun;
   const controller = new AbortController();
@@ -461,6 +464,21 @@ function isBooleanLiteral(value) {
   return ["1", "0", "true", "false", "yes", "no", "on", "off"].includes(String(value || "").trim().toLowerCase());
 }
 
+/**
+ * A durable terminal handoff to the originating chat is an explicit,
+ * session-scoped opt-in. The hosting Pi extension passes
+ * `--continuation terminal` together with `--background` and the owning
+ * `--session-id`; the background-environment marker, the post-commit trigger
+ * label, or inherited session environment never authorize a handoff alone.
+ */
+function terminalHandoffOptedIn(opts, backgroundEnv) {
+  if (opts.continuation === undefined) return false;
+  if (opts.continuation !== "terminal") die(`--continuation must be exactly "terminal" when provided (got ${JSON.stringify(opts.continuation)})`, 1, Boolean(opts.json));
+  if (!isTruthyFlag(opts.background) && !backgroundEnv) die("--continuation terminal requires --background; foreground reviews return to their caller and never inject a chat turn", 1, Boolean(opts.json));
+  if (typeof opts["session-id"] !== "string" || !opts["session-id"].trim()) die("--continuation terminal requires --session-id of the owning interactive Pi session", 1, Boolean(opts.json));
+  return true;
+}
+
 function stripBackgroundArgs(argv) {
   const next = [];
   for (let i = 0; i < argv.length; i++) {
@@ -495,10 +513,11 @@ async function main() {
   const opts = parseArgs(rawArgv);
   const cmd = opts._[0] || "review";
   if (["-h", "--help", "help"].includes(cmd)) {
-    console.log(`Usage:\n  code-review-workflow.mjs review [--cwd REPO] [--mode last_commit|staged|working_tree|range] [--ref REF_OR_RANGE] [--json] [--background]\n  code-review-workflow.mjs install-hook [--cwd REPO] [--json]\n  code-review-workflow.mjs status [--cwd REPO] [--json]\n\nEnvironment:\n  PI_CODE_REVIEW_PI_BIN     Path to pi binary\n  PI_CODE_REVIEW_DIFF_LIMIT Max diff bytes to place in prompt (default ${DEFAULT_DIFF_LIMIT})\n  PI_CODE_REVIEW_DISABLE=1  Disable installed git hook`);
+    console.log(`Usage:\n  code-review-workflow.mjs review [--cwd REPO] [--mode last_commit|staged|working_tree|range] [--ref REF_OR_RANGE] [--json] [--background]\n  code-review-workflow.mjs install-hook [--cwd REPO] [--json]\n  code-review-workflow.mjs status [--cwd REPO] [--json]\n\nTerminal handoff opt-in:\n  --continuation terminal   With --background and --session-id, request a durable success/failure\n                          handoff to the owning interactive Pi session. Set by the Pi extension for\n                          hosted background launches; omit for hooks, bare CLI and batch runs.\n\nEnvironment:\n  PI_CODE_REVIEW_PI_BIN     Path to pi binary\n  PI_CODE_REVIEW_DIFF_LIMIT Max diff bytes to place in prompt (default ${DEFAULT_DIFF_LIMIT})\n  PI_CODE_REVIEW_DISABLE=1  Disable installed git hook`);
     return;
   }
   try {
+    if (cmd === "review") terminalHandoffOptedIn(opts, process.env.PI_CODE_REVIEW_BACKGROUND);
     if (cmd === "review" && maybeBackground(rawArgv, opts)) return;
     let code = 0;
     if (cmd === "review") code = await reviewCommand(opts);
