@@ -14,7 +14,7 @@ Autonome's Pi package for shared extensions, workflow tooling, and skills.
 ## Install
 
 ```bash
-pi install git:git@github.com:autonome-research/autonome-pi@v0.19.0
+pi install git:git@github.com:autonome-research/autonome-pi@v0.19.1
 ```
 
 For active development:
@@ -27,7 +27,7 @@ To migrate an installation that still uses the old repository identity:
 
 ```bash
 pi remove git:git@github.com:Code4me2/pi-thread-phase-tools@v0.12.0
-pi install git:git@github.com:autonome-research/autonome-pi@v0.19.0
+pi install git:git@github.com:autonome-research/autonome-pi@v0.19.1
 ```
 
 Pi identifies git packages by repository URL, so remove the old source before installing the renamed one to avoid loading both copies.
@@ -53,7 +53,7 @@ Use RJLF's read-only `/rjlf-status` command and its [footer diagnostics and migr
 
 ## Current status
 
-Latest release: [`v0.19.0`](docs/releases/v0.19.0.md). Update both source and dependencies, then fully restart Pi; `/reload` does not install this upgrade. Preserve a rollback copy and back up continuation state; pre-v4 hosts must not share the v4 continuation store.
+Latest release: [`v0.19.1`](docs/releases/v0.19.1.md). Update both source and dependencies, then fully restart Pi; `/reload` does not install this upgrade. Preserve a rollback copy and back up continuation state; pre-v4 hosts must not share the v4 continuation store.
 
 The mission workflow extension was removed in v0.19.0: the `mission-workflow` implementation, prompts, mission skill, mission-only smoke checks, and active mission design/roadmap docs are gone. The `/detach` tmux handoff extension was removed as the wrong layer: its implementation, dedicated smoke checks, and manifest/keyword entries are gone, and the manifest now lists the five remaining extensions above. Saved mission registries, plans, worktrees, sessions, logs, artifacts, and any detach-wrapper state outside tracked source (for example under `~/.pi/agent/`) are user data and are preserved untouched; historical release notes under [`docs/releases/`](docs/releases/) remain as history.
 
@@ -61,7 +61,7 @@ Recent changes:
 
 - Removed missions and `/detach`, leaving five extensions; saved user data and generic background process handling remain intact.
 - Patched `fast-uri` to 3.1.8 and pinned the development SDK to Pi 1.0.4. Loader/PTY checks now exercise 1.0.4; RPC dashboard entry points report that custom UI requires TUI mode.
-- Recursive-v3 remains disabled by default and unqualified for Pi 1.0.4, with a known worker-bash contract defect. See [`docs/recursive-delegation.md`](docs/recursive-delegation.md); ordinary extension compatibility is not recursive-worker qualification.
+- Fixed the recursive worker-bash exit-code contract and added offline Pi 1.0.4 candidate qualification, including the actual SDK bash tool. Recursive-v3 remains disabled by default, and production SDK admission still excludes 1.0.4. See [`docs/recursive-delegation.md`](docs/recursive-delegation.md); synthetic candidate results do not qualify live-provider behavior.
 - Recovered and completed the workflow-agnostic visualizer improvements on the renamed repository baseline.
 - Added bounded/corruption-tolerant JSONL reads, immutable owner/session verification, aggregate ownership budgets, and crash-safe index reconciliation.
 - Added interactive monitor search/filter/sort, responsive phase/fanout/artifact pagination, safe artifact editor actions, and consistent owner/stale displays.
