@@ -1,7 +1,9 @@
 export const CONTINUATION_MARKER_SCHEMA: "thread-phase-continuation/v1";
 
-export function continuationDeliveryMarker(deliveryId: string): string;
-export function formatMarkedContinuation(prompt: string, deliveryId: string): string;
+export type ContinuationIdentity = { runId?: string; sessionId?: string };
+export function continuationDeliveryMarker(deliveryId: string, identity?: ContinuationIdentity): string;
+export function formatMarkedContinuation(prompt: string, deliveryId: string, identity?: ContinuationIdentity): string;
+export function sessionHistoryHasRunContinuation(entries: readonly ContinuationSessionEntry[] | undefined, runId: string, sessionId?: string): boolean;
 
 export type ContinuationSessionEntry = {
   type?: string;

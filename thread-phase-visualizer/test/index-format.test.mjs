@@ -32,7 +32,7 @@ test("formatRunSummary includes canonical stale and owner metadata", () => {
   assert.doesNotMatch(output, /sessionId: session-a|cwd at launch/);
 });
 
-test("failed continuation prompts identify failure and recovery choices", () => {
+test("failed continuation prompts report blockers without granting recovery authority", () => {
   const prompt = formatContinuationPrompt({
     runId: "failed-run",
     workflow: "failed-workflow",
@@ -45,7 +45,9 @@ test("failed continuation prompts identify failure and recovery choices", () => 
   assert.match(prompt, /^A thread-phase workflow failed/);
   assert.match(prompt, /Status: failed/);
   assert.match(prompt, /build: exit 1/);
-  assert.match(prompt, /resume the structured run, launch a recovery workflow, or report the blocker/);
+  assert.match(prompt, /Report the blocker and available partial results/);
+  assert.match(prompt, /Recovery or replacement work requires the user's authorization/);
+  assert.doesNotMatch(prompt, /Decide whether to resume/);
   assert.match(prompt, /Do not proceed as though the workflow succeeded/);
 });
 

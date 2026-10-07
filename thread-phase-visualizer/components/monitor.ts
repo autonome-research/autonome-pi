@@ -295,6 +295,7 @@ export class ThreadPhaseMonitorComponent {
 	private onClose: () => void;
 	private onCancelRun: (run: RunSummary) => void;
 	private onSendArtifactTarget: (target: string) => void;
+	private onHandoff?: (run: RunSummary) => void;
 	private loadRuns: (cwd: string, sessionId?: string) => RunSummary[];
 	private mode: Mode = "list";
 	private selected = 0;
@@ -327,6 +328,7 @@ export class ThreadPhaseMonitorComponent {
 		onCancelRun: (run: RunSummary) => void,
 		onSendArtifactTarget: (target: string) => void,
 		loadRuns: (cwd: string, sessionId?: string) => RunSummary[] = monitorRuns,
+		onHandoff?: (run: RunSummary) => void,
 	) {
 		this.cwd = cwd;
 		this.sessionId = sessionId;
@@ -335,6 +337,7 @@ export class ThreadPhaseMonitorComponent {
 		this.onCancelRun = onCancelRun;
 		this.onSendArtifactTarget = onSendArtifactTarget;
 		this.loadRuns = loadRuns;
+		this.onHandoff = onHandoff;
 	}
 
 	handleInput(data: string): void {
@@ -390,6 +393,11 @@ export class ThreadPhaseMonitorComponent {
 
 		if (matchesKey(data, "b") || matchesKey(data, Key.left)) {
 			this.backOrClose();
+			return;
+		}
+
+		if (data === "r" && run?.handoff && this.mode !== "artifact") {
+			this.onHandoff?.(run);
 			return;
 		}
 
@@ -626,7 +634,7 @@ export class ThreadPhaseMonitorComponent {
 		const t = this.theme;
 		const lines: string[] = [];
 		const selectedRun = runs[this.selected];
-		const cancelHint = isRunningCancellable(selectedRun) ? " · x cancel" : "";
+		const cancelHint = (isRunningCancellable(selectedRun) ? " · x cancel" : "") + (selectedRun?.handoff ? " · r handoff" : "");
 		// The panel frame already titles this surface; keep the first line to action keys only.
 		lines.push(truncateToWidth(t.fg("dim", `↑↓ select · enter details${cancelHint} · / search · f status · h stale · s sort · q close`), width));
 		// Show the filter line ONLY when a search or non-default filter/sort is active.
@@ -664,6 +672,7 @@ export class ThreadPhaseMonitorComponent {
 			const location = run.cwd ? t.fg("dim", ` @ ${highlightMatch(cwd, this.searchQuery, t)}`) : "";
 			const metrics = [elapsedForRun(run), formatTokenSummary(run.usage)].filter((value) => value && value !== "?").join(" · ");
 			lines.push(truncateToWidth(`${head}${location}${metrics ? t.fg("muted", ` · ${metrics}`) : ""}${current ? t.fg("muted", ` — ${current}`) : ""}`, width));
+			if (run.handoff) lines.push(truncateToWidth(t.fg("warning", `  handoff: ${run.handoff}`), width));
 			if (status === STATUSES.RUNNING && (run.phases || []).filter((p) => p.normalizedStatus === STATUSES.RUNNING || p.status === STATUSES.RUNNING).length > 1) {
 				lines.push(truncateToWidth(`  ${deterministicPhaseLine(run, t)}`, width));
 			}
@@ -698,11 +707,12 @@ export class ThreadPhaseMonitorComponent {
 			if (selectable) selectableIndex++;
 		};
 
-		const cancelHint = isRunningCancellable(run) ? " • x cancel" : "";
+		const cancelHint = (isRunningCancellable(run) ? " • x cancel" : "") + (run.handoff ? " • r handoff" : "");
 		add(t.fg("dim", `← back • ↑↓ select • enter expand/open • ctrl+u/d page${cancelHint} • q close`));
 		add(t.fg("accent", t.bold(`${workflowGlyph(status, t)} ${run.workflow || "workflow"}`)) + t.fg("dim", ` [${run.runId || "unknown"}]`));
 		const pid = runtimePid(run);
 		add(t.fg("dim", `status: ${run.status || status}${run.stale ? `  ${formatStaleIndicator(run)}` : ""}  duration: ${elapsedForRun(run)}${pid && status === STATUSES.RUNNING ? `  pid: ${pid}` : ""}`));
+		if (run.handoff) add(t.fg("warning", `handoff: ${run.handoff}`));
 		const runTokens = formatTokenSummary(run.usage);
 		if (runTokens) {
 			add(t.fg("muted", `tokens: ${runTokens}`));
@@ -938,7 +948,7 @@ export function createArtifactTargetEditorCallback(ctx: Pick<ExtensionContext, "
 	};
 }
 
-export async function showThreadPhaseMonitor(ctx: ExtensionContext, cwd: string): Promise<void> {
+export async function showThreadPhaseMonitor(ctx: ExtensionContext, cwd: string, loadRuns = monitorRuns): Promise<void> {
 	if (!ctx.hasUI) {
 		ctx.ui.notify("Thread-phase monitor requires interactive mode", "warning");
 		return;
@@ -958,7 +968,11 @@ export async function showThreadPhaseMonitor(ctx: ExtensionContext, cwd: string)
 				} catch (error: any) {
 					ctx.ui.notify(`Could not cancel workflow: ${error?.message || error}`, "error");
 				}
-			}, createArtifactTargetEditorCallback(ctx, done));
+			}, createArtifactTargetEditorCallback(ctx, done), loadRuns, (run) => {
+				// Prepare an explicit user command; opening the dashboard never starts inference.
+				ctx.ui.setEditorText(`/workflow-handoff ${run.runId}`);
+				done();
+			});
 			timer = setInterval(() => {
 				component.invalidate();
 				tui.requestRender();

@@ -112,7 +112,7 @@ test("startup reconciles a pending post-enqueue crash against current-session hi
   assert.equal(state.records.find((record) => record.runId === run.runId)?.deliveryId, claim.deliveryId);
 });
 
-test("startup ignores continuation markers on abandoned branches", async (t) => {
+test("startup honors session-wide delivery receipts on abandoned branches", async (t) => {
   const run = createRun({
     runId: "lifecycle-abandoned-branch",
     workflow: "lifecycle-abandoned-branch",
@@ -132,7 +132,7 @@ test("startup ignores continuation markers on abandoned branches", async (t) => 
   const context = sessionContext([], abandonedMarker);
   await harness.handlers.get("session_start")({}, context);
   t.after(() => harness.handlers.get("session_shutdown")({}, context));
-  assert.equal(harness.userMessages.length, 1, "an abandoned-branch marker must not suppress active-branch replay");
+  assert.equal(harness.userMessages.length, 0, "branch navigation must not repeat a delivered handoff");
 });
 
 test("fire-and-forget submission remains pending until message_start acknowledgement", async (t) => {
@@ -276,7 +276,8 @@ test("synchronous submission retries are bounded without blocking later deliveri
   completeRun(createRun({ runId: "lifecycle-retry-bound-next", workflow: "retry", cwd: storeDir, metadata: { sessionId, autoContinue: true } }));
   await waitFor(() => harness.userMessages.length === 1, "exhausted delivery blocked later work");
   completeRun(failedRun); // New event ID must not reset the same runtime's budget.
-  await waitFor(() => harness.customMessages.length === 3, "duplicate terminal event was not observed");
+  await delay(100);
+  assert.equal(harness.customMessages.length, 2, "duplicate terminal cards are suppressed by run identity");
   harness.handlers.get("agent_settled")({}, context);
   await delay(350);
   assert.equal(failures, 3);
@@ -319,8 +320,9 @@ test("submission retry budget survives unknown successor eligibility and requeue
   discardPendingContinuation(runId, { storeDir, deliveryId: pending.deliveryId, claimantId: createContinuationClaimantId() });
 });
 
-test("registered lifecycle handlers persist continuation deduplication across extension reloads", async (t) => {
-  const context = sessionContext();
+test("registered lifecycle handlers preserve session receipts across reload and store expiry", async (t) => {
+  const history = [];
+  const context = sessionContext(history);
   const first = extensionHarness();
   registerVisualizer(first.api);
   await first.handlers.get("session_start")({}, context);
@@ -335,6 +337,7 @@ test("registered lifecycle handlers persist continuation deduplication across ex
   completeRun(run);
   await waitFor(() => first.userMessages.length === 1, "first extension did not deliver continuation");
   assert.equal(first.customMessages.length, 1);
+  history.push({ type: "message", message: { role: "user", content: first.userMessages[0].message } });
 
   first.handlers.get("session_shutdown")({}, context);
   const persistedAfterFirst = JSON.parse(readFileSync(continuedRunsFile(storeDir), "utf8"));
@@ -350,26 +353,21 @@ test("registered lifecycle handlers persist continuation deduplication across ex
   // reloaded lifecycle handler observes it, but the durable claim prevents a
   // second automatic continuation.
   completeRun(run);
-  await waitFor(() => reloaded.customMessages.length === 1, "reloaded extension did not process the new terminal event");
-  await delay(50);
+  await delay(100);
+  assert.equal(reloaded.customMessages.length, 0, "new envelope must not create another card");
   assert.equal(reloaded.userMessages.length, 0);
   assert.deepEqual(JSON.parse(readFileSync(continuedRunsFile(storeDir), "utf8")), persistedAfterFirst);
 
-  // Advance beyond retention while this extension instance remains live. The
-  // next eligible terminal event must consult the timestamp-aware atomic store,
-  // rather than being suppressed by the set loaded at session_start.
+  // Store receipt expiry must not erase persisted session acceptance.
   const realNow = Date.now;
   const firstClaimedAt = Date.parse(JSON.parse(readFileSync(join(storeDir, CONTINUATION_TIMESTAMPS_FILENAME), "utf8"))[run.runId]);
   Date.now = () => firstClaimedAt + DEFAULT_CONTINUATION_RETENTION_MS + 1;
   t.after(() => { Date.now = realNow; });
   completeRun(run);
-  await waitFor(() => reloaded.customMessages.length === 2, "live extension did not process the post-expiry terminal event");
-  await waitFor(() => reloaded.userMessages.length === 1, "expired continuation claim was not renewed without restart");
-  // Renewal also prunes unrelated delivered records that expired under the
-  // advanced clock; the renewed run remains the sole retained mirror entry.
-  assert.deepEqual(JSON.parse(readFileSync(continuedRunsFile(storeDir), "utf8")), [run.runId]);
-  const renewedTimestamps = JSON.parse(readFileSync(join(storeDir, CONTINUATION_TIMESTAMPS_FILENAME), "utf8"));
-  assert.equal(Date.parse(renewedTimestamps[run.runId]), Date.now());
+  await delay(100);
+  reloaded.handlers.get("agent_settled")({}, context);
+  assert.equal(reloaded.customMessages.length, 0);
+  assert.equal(reloaded.userMessages.length, 0, "expired store receipt must not renew an accepted handoff");
 });
 
 test("a continuation deferred while busy retries on agent_settled", async (t) => {
@@ -448,7 +446,7 @@ test("multiple pending continuations are claimed and sent one at a time", async 
   assert.equal(runIds.every((runId) => state.records.find((record) => record.runId === runId)?.state === "delivered"), true);
 });
 
-test("busy deferred work survives restart after the startup freshness window", async (t) => {
+test("old busy deferred work survives restart passively after the freshness window", async (t) => {
   const sessionId = "lifecycle-durable-busy-session";
   const idleState = { idle: false };
   const context = sessionContext([], [], { idleState, sessionId });
@@ -473,11 +471,13 @@ test("busy deferred work survives restart after the startup freshness window", a
   registerVisualizer(reloaded.api);
   await reloaded.handlers.get("session_start")({}, context);
   t.after(() => reloaded.handlers.get("session_shutdown")({}, context));
-  assert.equal(reloaded.userMessages.length, 1, "old pending work must survive even when workflow_end is no longer fresh");
-  assert.match(reloaded.userMessages[0].message, new RegExp(`Run: ${run.runId}`));
+  assert.equal(reloaded.userMessages.length, 0, "old backlog requires an explicit handoff");
+  const record = JSON.parse(readFileSync(join(storeDir, CONTINUATION_STATE_FILENAME), "utf8")).records.find(record => record.runId === run.runId);
+  assert.equal(record.state, "pending", "held results must not be discarded");
+  assert.equal(record.submissionState, "unsent");
 });
 
-test("a later completion does not release an in-flight unacknowledged claim", async (t) => {
+test("an uncertain send is held at idle without blocking a different fresh completion", async (t) => {
   const sessionId = "lifecycle-inflight-session";
   const idleState = { idle: true };
   const context = sessionContext([], [], { idleState, sessionId });
@@ -509,14 +509,17 @@ test("a later completion does not release an in-flight unacknowledged claim", as
 
   idleState.idle = true;
   harness.handlers.get("agent_settled")({}, context);
-  assert.equal(harness.userMessages.length, 1, "idle alone must not overtake an unacknowledged send");
+  assert.equal(harness.userMessages.length, 2, "an uncertain send must not block unrelated completions forever");
+  const held = JSON.parse(readFileSync(join(storeDir, CONTINUATION_STATE_FILENAME), "utf8")).records.find(record => record.runId === first.runId);
+  assert.equal(held.submissionState, "submitted");
+  assert.equal(held.claimantId, undefined);
   const branch = [{ type: "message", message: { role: "user", content: harness.userMessages[0].message } }];
   harness.handlers.get("message_start")(
     { message: { role: "assistant", content: [] } },
     sessionContext(branch, branch, { idleState, sessionId }),
   );
   harness.handlers.get("agent_settled")({}, context);
-  assert.equal(harness.userMessages.length, 2, "the next continuation starts only after acknowledgement and idle");
+  assert.equal(harness.userMessages.length, 2, "late acknowledgement must not repeat either result");
 });
 
 test("shutdown cancels a startup-delayed continuation", async () => {

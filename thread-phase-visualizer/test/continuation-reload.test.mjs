@@ -41,10 +41,14 @@ test("same-process Pi reload replaces cached continuation and supervision APIs b
   const entry = join(fixture, "index.ts");
   const storeFile = join(fixture, "lib", "continuation-store.mjs");
   const supervisionStoreFile = join(fixture, "lib", "supervision-store.mjs");
-  const currentEntry = readFileSync(entry, "utf8");
+  const currentEntry = readFileSync(entry, "utf8") + '\nif (typeof sessionHistoryHasRunContinuation !== "function" || typeof markContinuationSubmission !== "function") throw new Error("stale handoff APIs");\n';
+  const messageFile = join(fixture, "lib", "continuation-message.mjs");
+  const currentMessage = readFileSync(messageFile, "utf8");
+  writeFileSync(messageFile, currentMessage.replace("export function sessionHistoryHasRunContinuation(", "function sessionHistoryHasRunContinuation("));
   const currentStore = readFileSync(storeFile, "utf8");
   const currentSupervisionStore = readFileSync(supervisionStoreFile, "utf8");
-  const oldStore = currentStore.replace("export function continuationEligibility(", "function continuationEligibility(");
+  const oldStore = currentStore.replace("export function continuationEligibility(", "function continuationEligibility(")
+    .replace("export function markContinuationSubmission(", "function markContinuationSubmission(");
   const oldSupervisionStore = currentSupervisionStore.replace("export function ensureProgressReview(", "function ensureProgressReview(");
   assert.notEqual(oldStore, currentStore);
   assert.notEqual(oldSupervisionStore, currentSupervisionStore);
@@ -52,7 +56,9 @@ test("same-process Pi reload replaces cached continuation and supervision APIs b
   writeFileSync(supervisionStoreFile, oldSupervisionStore);
   writeFileSync(entry, `import * as store from "./lib/continuation-store.mjs";
 import * as supervision from "./lib/supervision-store.mjs";
+import * as messages from "./lib/continuation-message.mjs";
 export default function () {
+  if (messages.sessionHistoryHasRunContinuation !== undefined) throw new Error("old message APIs were not loaded");
   if (store.continuationEligibility !== undefined || supervision.ensureProgressReview !== undefined) throw new Error("old APIs were not loaded");
 }
 `);
@@ -62,9 +68,12 @@ export default function () {
 
   // Upgrade on disk without restarting Node: the unversioned native module stays old.
   writeFileSync(storeFile, currentStore);
+  writeFileSync(messageFile, currentMessage);
   writeFileSync(supervisionStoreFile, currentSupervisionStore);
   writeFileSync(entry, currentEntry);
   const cached = await import(pathToFileURL(storeFile).href);
+  const cachedMessages = await import(pathToFileURL(messageFile).href);
+  assert.equal(cachedMessages.sessionHistoryHasRunContinuation, undefined, "fixture must retain stale native message APIs");
   const cachedSupervision = await import(pathToFileURL(supervisionStoreFile).href);
   assert.equal(cached.continuationEligibility, undefined, "fixture must reproduce the stale continuation module");
   assert.equal(cachedSupervision.ensureProgressReview, undefined, "fixture must reproduce the stale supervision module");

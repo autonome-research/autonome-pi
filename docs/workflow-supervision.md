@@ -6,9 +6,9 @@ Since v0.18.2, workflow progress is **passive**. Elapsed time, activity and hear
 
 - The footer, optional status bridge/title, `/workflows` dashboard and event/artifact store remain available without main-agent inference or conversation growth from progress updates.
 - `thread_phase_runs` remains available for explicit, on-demand inspection.
-- Successful/failed background workflows still return control through the existing durable `continuationMode: "terminal"` handoff. Those completion messages intentionally enter the conversation and may trigger reasoning.
+- Fresh successful/failed background workflows return control through a durable `continuationMode: "terminal"` handoff. Those completion messages intentionally enter the conversation and may trigger reasoning. Old or uncertain deliveries remain passive until explicitly requested.
 - Cancellation does not auto-continue. An error event without `workflow_end` is not terminal proof.
-- Ownership, session scoping, cancellation, continuation acknowledgement and successor suppression are unchanged.
+- Ownership, session scoping, cancellation and successor suppression remain enforced. Delivery receipts are session-wide, including other branches; branch navigation must not repeat a notification.
 
 There is no replacement polling agent, automatic intervention, or `pi-durable` integration in this fix.
 
@@ -27,6 +27,22 @@ The visualizer no longer loads, creates, claims, acknowledges, reschedules or de
 - `PI_THREAD_PHASE_SUPERVISION_CHECK_MS` and v3's former fallback cadence have no host scheduling effect.
 
 Internal legacy store utilities remain for compatibility and historical fixtures, but the extension no longer imports their runtime. These compatibility fields never alter execution deadlines or launch authorization.
+
+## Terminal handoff delivery (unreleased)
+
+A terminal handoff has a deterministic identity derived from the owning session and run. Before sending, the host checks persisted session history, including legacy random-ID markers with the original run identity. Receipt-store eviction or expiry is not permission to deliver again. Duplicate terminal envelopes produce one completion card per run. Cards explicitly do not trigger a model turn, including while Pi is busy; they still enter session context.
+
+New pending records distinguish `unsent` from `submitted`; submission intent is persisted **before** calling Pi. Acceptance is reconciled at startup, assistant message start, idle settlement and before sending. A synchronous rejection restores the prior submission state — `unsent` for proven-unsent work, while a confirmed resend of an uncertain record keeps its uncertainty — and uses bounded retries. Missing acknowledgement is ambiguous, not an automatic retry instruction. Other fresh results can proceed when the main agent is idle. Prompt formatting happens before submission intent is recorded: a formatting failure preserves the prior pending state, releases the claim, and does not block other runs.
+
+Unsent results older than the default 30-minute freshness window, submitted results without acceptance proof, and legacy pending records with unknown submission status remain durable and visible in `/workflows`. Opening the dashboard causes no inference. Select a held result and press `r` to prepare `/workflow-handoff <runId>` in the editor, then submit that command explicitly. Uncertain deliveries require confirmation because a resend could duplicate a message Pi already accepted. This requests a conversation handoff, **not** a workflow restart or recovery launch.
+
+Freshness is checked at delivery time, not latched when completion is observed. A result observed live but still waiting more than 30 minutes after completion therefore requires an explicit handoff when Pi becomes idle. The original completion timestamp remains authoritative; the legacy-named `PI_THREAD_PHASE_STARTUP_FRESH_MS` controls this window both during startup and later delivery.
+
+Dashboard handoff annotations refresh at the passive status cadence (5 seconds by default), not on each animation frame. An unreadable continuation store or pending run hides the affected annotations without breaking the dashboard. This display-only cache cannot authorize delivery; the handoff path always revalidates current state.
+
+Unreadable session history suppresses delivery without dropping unsent work. Known acceptance anywhere in the session suppresses replay, including an explicit handoff request. Cancellation, committed successors and foreign-session ownership still prohibit delivery. Failure prompts report blockers and partial results rather than suggesting autonomous recovery.
+
+The authoritative store is now `thread-phase-continuations/v4`. v2/v3 records migrate on read; legacy pending records become `unknown`, never presumed unsent. Pending work does not expire. Delivered store receipts remain bounded (500 records, 24-hour retention); persisted session history supplies longer-lived evidence. Full restart is recommended when upgrading. Older hosts reject v4 state rather than safely operating alongside it: do not mix old/new hosts or downgrade without a backup and deliberate migration. The Pi submission API is not transactional with this store; no exactly-once transport guarantee is claimed.
 
 ## Subprocess deadline policy
 

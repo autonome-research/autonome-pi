@@ -10,7 +10,7 @@ export const DEFAULT_CONTINUATION_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const CONTINUED_RUNS_FILENAME = "continued-runs.json";
 export const CONTINUATION_TIMESTAMPS_FILENAME = "continued-runs.timestamps.json";
 export const CONTINUATION_STATE_FILENAME = "continuations.json";
-export const CONTINUATION_STATE_SCHEMA = "thread-phase-continuations/v3";
+export const CONTINUATION_STATE_SCHEMA = "thread-phase-continuations/v4";
 const LEGACY_CONTINUATION_STATE_SCHEMA = "thread-phase-continuations/v2";
 
 // Remember the contents originally loaded into a Set so persisting that Set can
@@ -161,7 +161,7 @@ export function persistContinuedRuns(runs, { storeDir, maxEntries = DEFAULT_CONT
  * delta avoids stale snapshots resurrecting pruned history, and the returned
  * flag is true only after the claim has been durably renamed into place.
  */
-export function persistContinuationClaim(runId, { storeDir, maxEntries = DEFAULT_CONTINUATION_LIMIT, maxPendingEntries = DEFAULT_PENDING_CONTINUATION_LIMIT, maxAgeMs = DEFAULT_CONTINUATION_RETENTION_MS, claimLeaseMs = DEFAULT_CONTINUATION_CLAIM_LEASE_MS, now, retryPending = false, claimantId, claimantProcessStart = currentProcessStartIdentity() } = {}) {
+export function persistContinuationClaim(runId, { sessionId, allowSubmitted = false, storeDir, maxEntries = DEFAULT_CONTINUATION_LIMIT, maxPendingEntries = DEFAULT_PENDING_CONTINUATION_LIMIT, maxAgeMs = DEFAULT_CONTINUATION_RETENTION_MS, claimLeaseMs = DEFAULT_CONTINUATION_CLAIM_LEASE_MS, now, retryPending = false, claimantId, claimantProcessStart = currentProcessStartIdentity() } = {}) {
   if (!isRunId(runId)) throw new Error("a non-empty continuation run id is required");
   const file = continuedRunsFile(storeDir);
   const lockFile = `${file}.lock`;
@@ -185,6 +185,7 @@ export function persistContinuationClaim(runId, { storeDir, maxEntries = DEFAULT
     const existing = records.find((record) => record.runId === runId);
     if (existing) {
       const retryable = existing.state === "pending" && retryPending
+        && (existing.submissionState === "unsent" || allowSubmitted)
         && (claimIsUnowned(existing) || claimantMatches(existing, claimant) || !claimantIsActive(existing, Date.parse(claimedAt)));
       if (!retryable) {
         if (!persistedStateMatches(persisted, records)) writeContinuationState(file, storeDir, records);
@@ -202,7 +203,8 @@ export function persistContinuationClaim(runId, { storeDir, maxEntries = DEFAULT
       if (pendingCount >= pendingLimit) {
         throw new Error(`Pending continuation limit reached (${pendingLimit}); resolve or relinquish existing pending deliveries before claiming ${runId}`);
       }
-      const record = { runId, deliveryId: randomUUID(), continuedAt: claimedAt, state: "pending" };
+      const deliveryId = createHash("sha256").update(JSON.stringify(["terminal-handoff/v1", sessionId || "", runId])).digest("hex");
+      const record = { runId, deliveryId, continuedAt: claimedAt, state: "pending", submissionState: "unsent" };
       assignClaimant(record, claimant);
       records.push(record);
     }
@@ -215,7 +217,7 @@ export function persistContinuationClaim(runId, { storeDir, maxEntries = DEFAULT
   }
 }
 
-/** Durably complete pending -> delivered only after active-branch history proves persistence. */
+/** Durably complete pending -> delivered only after persisted session history proves acceptance. */
 export function markContinuationDelivered(runId, { storeDir, maxEntries = DEFAULT_CONTINUATION_LIMIT, maxAgeMs = DEFAULT_CONTINUATION_RETENTION_MS, now, deliveryId } = {}) {
   if (!isRunId(runId)) throw new Error("a non-empty continuation run id is required");
   const file = continuedRunsFile(storeDir);
@@ -262,19 +264,27 @@ export function continuationClaimIsOwned(runId, { storeDir, deliveryId, claimant
   }
 }
 
+/** Persist intent before send; a synchronous rejection may restore the prior state, including uncertainty. */
+export function markContinuationSubmission(runId, options = {}) {
+  if (!["unsent", "submitted", "unknown"].includes(options.submissionState)) throw new Error("Invalid continuation submission state");
+  const { changed } = updateExactPendingClaim(runId, options, options.submissionState);
+  return changed;
+}
+
 /** Relinquish one exact pending claim without disturbing this runtime's other deliveries. */
 export function relinquishContinuationClaim(runId, options = {}) {
-  const { changed, runs } = updateExactPendingClaim(runId, options, false);
+  const { changed, runs } = updateExactPendingClaim(runId, options, "release");
   return { relinquished: changed, runs };
 }
 
 /** Remove a permanently ineligible pending record, never another runtime's delivery. */
 export function discardPendingContinuation(runId, options = {}) {
-  const { changed, runs } = updateExactPendingClaim(runId, options, true);
+  const { changed, runs } = updateExactPendingClaim(runId, options, "discard");
   return { discarded: changed, runs };
 }
 
-function updateExactPendingClaim(runId, { storeDir, deliveryId, claimantId, claimantPid = process.pid, claimantProcessStart = currentProcessStartIdentity(), maxEntries = DEFAULT_CONTINUATION_LIMIT, maxAgeMs = DEFAULT_CONTINUATION_RETENTION_MS, now } = {}, discard) {
+function updateExactPendingClaim(runId, { storeDir, deliveryId, claimantId, claimantPid = process.pid, claimantProcessStart = currentProcessStartIdentity(), maxEntries = DEFAULT_CONTINUATION_LIMIT, maxAgeMs = DEFAULT_CONTINUATION_RETENTION_MS, now } = {}, action) {
+  const isSubmission = action === "unsent" || action === "submitted" || action === "unknown";
   if (!isRunId(runId) || !isRunId(deliveryId) || !isRunId(claimantId)) throw new Error("runId, deliveryId, and claimantId are required for an exact pending-claim update");
   const file = continuedRunsFile(storeDir);
   const lockFile = `${file}.lock`;
@@ -287,10 +297,12 @@ function updateExactPendingClaim(runId, { storeDir, deliveryId, claimantId, clai
     const expectedClaimant = { claimantPid, claimantId, claimantProcessStart };
     const changed = Boolean(record?.state === "pending"
       && record.deliveryId === deliveryId
-      && (claimantMatches(record, expectedClaimant)
-        || (discard && (claimIsUnowned(record) || !claimantIsActive(record, Date.parse(continuationNow(now)))))));
+      && ((claimantMatches(record, expectedClaimant)
+          && (!isSubmission || claimantIsActive(record, Date.parse(continuationNow(now)))))
+        || (action === "discard" && (claimIsUnowned(record) || !claimantIsActive(record, Date.parse(continuationNow(now)))))));
     if (changed) {
-      if (discard) records = records.filter((candidate) => candidate !== record);
+      if (action === "discard") records = records.filter((candidate) => candidate !== record);
+      else if (isSubmission) record.submissionState = action;
       else clearClaimant(record);
     }
     records = pruneContinuationRecords(records, maxEntries);
@@ -356,7 +368,7 @@ function writeContinuationState(file, storeDir, records) {
   const stateFile = join(storeDir, CONTINUATION_STATE_FILENAME);
   const ids = records.map((record) => record.runId);
   const timestamps = Object.fromEntries(records.map((record) => [record.runId, record.continuedAt]));
-  // The single v3 document is authoritative and makes pending/delivered a
+  // The single v4 document is authoritative and makes pending/delivered a
   // crash-safe transition. Legacy mirrors remain readable by older releases.
   writeJsonAtomic(stateFile, storeDir, {
     schema: CONTINUATION_STATE_SCHEMA,
@@ -400,7 +412,7 @@ function readPersistedContinuationRecords(file) {
       else throw error;
     }
     if (state !== undefined) {
-      if (!((state.schema === CONTINUATION_STATE_SCHEMA || state.schema === LEGACY_CONTINUATION_STATE_SCHEMA) && Array.isArray(state.records))) {
+      if (!((state.schema === CONTINUATION_STATE_SCHEMA || state.schema === "thread-phase-continuations/v3" || state.schema === LEGACY_CONTINUATION_STATE_SCHEMA) && Array.isArray(state.records))) {
         throw new Error(`Unsupported authoritative continuation state schema or shape: ${stateFile}`);
       }
       validateAuthoritativeContinuationRecords(state.records, stateFile);
@@ -447,6 +459,9 @@ function validateAuthoritativeContinuationRecords(records, stateFile) {
     }
     if (!Number.isFinite(Date.parse(String(record.updatedAt || record.continuedAt || "")))) {
       throw new Error(`Invalid authoritative continuation record ${index} in ${stateFile}: updatedAt is required`);
+    }
+    if (record.submissionState !== undefined && !["unsent", "submitted", "unknown"].includes(record.submissionState)) {
+      throw new Error(`Invalid authoritative continuation record ${index} in ${stateFile}: invalid submissionState`);
     }
     if (record.deliveryId !== undefined && !isRunId(record.deliveryId)) {
       throw new Error(`Invalid authoritative continuation record ${index} in ${stateFile}: deliveryId must be non-empty`);
@@ -575,6 +590,8 @@ function canonicalContinuationRecords(values, { maxEntries, maxAgeMs = DEFAULT_C
       deliveryId,
       continuedAt,
       state,
+      // Legacy pending records cannot prove whether sendUserMessage was called.
+      ...(state === "pending" ? { submissionState: value.submissionState || "unknown" } : {}),
       ...(claimantPid ? { claimantPid } : {}),
       ...(claimantId ? { claimantId } : {}),
       ...(claimantProcessStart ? { claimantProcessStart } : {}),
@@ -607,6 +624,7 @@ function serializeContinuationRecord(record) {
     deliveryId: record.deliveryId,
     state: record.state,
     updatedAt: record.continuedAt,
+    ...(record.state === "pending" ? { submissionState: record.submissionState } : {}),
     ...(record.claimantPid ? { claimantPid: record.claimantPid } : {}),
     ...(record.claimantId ? { claimantId: record.claimantId } : {}),
     ...(record.claimantProcessStart ? { claimantProcessStart: record.claimantProcessStart } : {}),

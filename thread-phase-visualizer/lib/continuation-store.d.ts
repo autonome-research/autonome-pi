@@ -5,7 +5,7 @@ export const DEFAULT_CONTINUATION_RETENTION_MS: number;
 export const CONTINUED_RUNS_FILENAME: "continued-runs.json";
 export const CONTINUATION_TIMESTAMPS_FILENAME: "continued-runs.timestamps.json";
 export const CONTINUATION_STATE_FILENAME: "continuations.json";
-export const CONTINUATION_STATE_SCHEMA: "thread-phase-continuations/v3";
+export const CONTINUATION_STATE_SCHEMA: "thread-phase-continuations/v4";
 
 export type ContinuationStoreOptions = {
   storeDir: string;
@@ -21,6 +21,9 @@ export type ContinuationStoreOptions = {
 };
 
 export type ContinuationClaimOptions = ContinuationStoreOptions & {
+  sessionId?: string;
+  /** Only an explicit operator action may authorize replay of an uncertain send. */
+  allowSubmitted?: boolean;
   /** Reclaim a pending record when its claimant is absent, this claimant, or no longer active. */
   retryPending?: boolean;
   claimantId?: string;
@@ -31,6 +34,7 @@ export type ContinuationRecord = {
   runId: string;
   deliveryId: string;
   state: "pending" | "delivered";
+  submissionState?: "unsent" | "submitted" | "unknown";
   continuedAt: string;
   claimantPid?: number;
   claimantId?: string;
@@ -69,6 +73,7 @@ export type ContinuationClaimIdentityOptions = ContinuationStoreOptions & {
   claimantPid?: number;
   claimantProcessStart?: string;
 };
+export function markContinuationSubmission(runId: string, options: ContinuationClaimIdentityOptions & { submissionState: "unsent" | "submitted" | "unknown" }): boolean;
 export function continuationClaimIsOwned(runId: string, options: ContinuationClaimIdentityOptions & { deliveryId: string; claimantId: string }): boolean;
 export function discardPendingContinuation(runId: string, options: ContinuationClaimIdentityOptions): {
   discarded: boolean;

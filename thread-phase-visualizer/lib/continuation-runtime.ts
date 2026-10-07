@@ -16,8 +16,14 @@ export const {
   loadContinuedRuns,
   loadPendingContinuationRecords,
   markContinuationDelivered,
+  markContinuationSubmission,
   persistContinuationClaim,
   relinquishContinuationClaim,
   relinquishContinuationClaims,
   shouldAutoContinue,
 } = store;
+
+const messages: typeof import("./continuation-message.mjs") = await importFresh(
+  new URL("./continuation-message.mjs", import.meta.url),
+);
+export const { formatMarkedContinuation, sessionHistoryHasContinuation, sessionHistoryHasRunContinuation } = messages;

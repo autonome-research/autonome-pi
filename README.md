@@ -38,7 +38,7 @@ Pi identifies git packages by repository URL, so remove the old source before in
 
 - `/detach [--name <tmux-name>] [--now|--wait] [prompt]` hands the current session off to tmux; `/detach-status` reports the latest handoff. See [`detach/README.md`](detach/README.md).
 - Select `/workflows` from the slash-command menu under the editor, or press `ctrl+shift+t`, to open the interactive thread-phase dashboard; select a run for observed command-ledger details or request cooperative cancellation via `x`. See [`docs/command-ledger-ui.md`](docs/command-ledger-ui.md) for controls, state semantics, token labels, and retention/privacy limits.
-- Background dynamic workflows durably return control after success or failure; user-cancelled runs never auto-continue. Background Pi agents have no implicit deadline; foreground agents and shells retain their default bound. Progress is passive: periodic main-agent prompts are retired, including existing schedules. `progressReviewIntervalMs` is a deprecated compatibility field. See [`docs/workflow-supervision.md`](docs/workflow-supervision.md).
+- Fresh background dynamic workflows return control after success or failure; user-cancelled runs never auto-continue. Old or uncertain handoffs stay visible in `/workflows`; press `r` to prepare an explicit `/workflow-handoff <runId>` request. Background Pi agents have no implicit deadline; foreground agents and shells retain their default bound. Progress is passive: periodic main-agent prompts are retired, including existing schedules. `progressReviewIntervalMs` is a deprecated compatibility field. See [`docs/workflow-supervision.md`](docs/workflow-supervision.md).
 - `/codebase-explore` starts codebase exploration in the background by default.
 - `/code-review` runs code review workflows.
 - `dynamic_workflow` composes validated subagent workflows directly from flat `agent`, `fanout`, `shell`, and `artifact` phases. `scripted_workflow` is the separate advanced unsandboxed JavaScript interface; `dynamic_thread_phase_workflow` is an inactive deprecated compatibility alias.
@@ -64,7 +64,7 @@ Recent changes:
 - Recovered and completed the workflow-agnostic visualizer improvements on the renamed repository baseline.
 - Added bounded/corruption-tolerant JSONL reads, immutable owner/session verification, aggregate ownership budgets, and crash-safe index reconciliation.
 - Added interactive monitor search/filter/sort, responsive phase/fanout/artifact pagination, safe artifact editor actions, and consistent owner/stale displays.
-- Added durable, deduplicated at-least-once continuation delivery with pending/delivered recovery across extension reloads and Pi session persistence boundaries.
+- Terminal handoffs use stable session/run identities, session-wide receipt reconciliation, explicit submission state and per-run card deduplication. Old or uncertain deliveries require explicit action instead of automatic replay.
 - Added comprehensive visualizer projection, cancellation, continuation, session-scope, large-log, and TUI interaction tests.
 - Renamed the package and repository from `pi-thread-phase-tools` to `autonome-pi`.
 - Added the tmux-backed `/detach` extension and `/detach-status` command.
