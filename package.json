@@ -1,6 +1,6 @@
 {
   "name": "autonome-pi",
-  "version": "0.18.2",
+  "version": "0.18.3",
   "private": true,
   "license": "MIT",
   "description": "Autonome's extensions, workflow tools, and skills for Pi.",

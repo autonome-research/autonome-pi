@@ -16,7 +16,7 @@ Autonome's Pi package for shared extensions, workflow tooling, and skills.
 ## Install
 
 ```bash
-pi install git:git@github.com:autonome-research/autonome-pi@v0.18.2
+pi install git:git@github.com:autonome-research/autonome-pi@v0.18.3
 ```
 
 For active development:
@@ -29,7 +29,7 @@ To migrate an installation that still uses the old repository identity:
 
 ```bash
 pi remove git:git@github.com:Code4me2/pi-thread-phase-tools@v0.12.0
-pi install git:git@github.com:autonome-research/autonome-pi@v0.18.2
+pi install git:git@github.com:autonome-research/autonome-pi@v0.18.3
 ```
 
 Pi identifies git packages by repository URL, so remove the old source before installing the renamed one to avoid loading both copies.
@@ -57,7 +57,7 @@ Use RJLF's read-only `/rjlf-status` command and its [footer diagnostics and migr
 
 ## Current status
 
-Latest release: [`v0.18.2`](docs/releases/v0.18.2.md). Fully restart Pi after upgrading to load the updated native modules.
+Latest release: [`v0.18.3`](docs/releases/v0.18.3.md). Back up continuation state and fully restart Pi after upgrading; old hosts cannot safely share the new v4 continuation store.
 
 Recent changes:
 
@@ -65,6 +65,7 @@ Recent changes:
 - Added bounded/corruption-tolerant JSONL reads, immutable owner/session verification, aggregate ownership budgets, and crash-safe index reconciliation.
 - Added interactive monitor search/filter/sort, responsive phase/fanout/artifact pagination, safe artifact editor actions, and consistent owner/stale displays.
 - Terminal handoffs use stable session/run identities, session-wide receipt reconciliation, explicit submission state and per-run card deduplication. Old or uncertain deliveries require explicit action instead of automatic replay.
+- Session-hosted background reviews and explorations now request terminal handoffs explicitly. Foreground calls and unattended hooks keep their notification-only defaults; false-valued background environment markers no longer bypass validation or prevent detachment.
 - Added comprehensive visualizer projection, cancellation, continuation, session-scope, large-log, and TUI interaction tests.
 - Renamed the package and repository from `pi-thread-phase-tools` to `autonome-pi`.
 - Added the tmux-backed `/detach` extension and `/detach-status` command.
