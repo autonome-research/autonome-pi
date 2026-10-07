@@ -121,7 +121,7 @@ emitActiveIo(run, "worker", {
 });
 ```
 
-Projection helpers expose the latest snapshot as `run.activeIo` and `phase.activeIo`. The monitor panel renders that summary, and non-UI tools can read the same projected fields or raw `active_io` events from JSONL. Snapshots are persisted in append-only logs; the store applies conservative redaction for common token/secret forms and caps preview fields, but workflows should still keep previews compact and avoid including secrets. Set `PI_THREAD_PHASE_ACTIVE_IO=0` to disable active-I/O persistence. Mission active I/O defaults to metadata/status/byte counts only; process/model output previews are opt-in with `PI_THREAD_PHASE_ACTIVE_IO_PREVIEWS=1`, process command text with `PI_THREAD_PHASE_ACTIVE_IO_COMMANDS=1`, and Pi prompt previews with `PI_THREAD_PHASE_ACTIVE_IO_PROMPTS=1`.
+Projection helpers expose the latest snapshot as `run.activeIo` and `phase.activeIo`. The monitor panel renders that summary, and non-UI tools can read the same projected fields or raw `active_io` events from JSONL. Snapshots are persisted in append-only logs; the store applies conservative redaction for common token/secret forms and caps preview fields, but workflows should still keep previews compact and avoid including secrets. Set `PI_THREAD_PHASE_ACTIVE_IO=0` to disable active-I/O persistence.
 
 From a Node/TypeScript workflow runner:
 

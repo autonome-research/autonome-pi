@@ -6,6 +6,7 @@
   "description": "Autonome's extensions, workflow tools, and skills for Pi.",
   "scripts": {
     "smoke": "node scripts/smoke-test.mjs",
+    "test:removal": "node scripts/check-removal.mjs",
     "test:dynamic": "node --test dynamic-thread-phase-workflow/test/*.test.mjs",
     "test:store": "node --test thread-phase-visualizer/test/*.test.mjs",
     "test:title": "node --test thread-phase-terminal-title/test/*.test.mjs",
@@ -29,15 +30,13 @@
       "detach/index.ts",
       "codebase-exploration-workflow/index.ts",
       "code-review-workflow/index.ts",
-      "dynamic-thread-phase-workflow/index.ts",
-      "mission-workflow/index.ts"
+      "dynamic-thread-phase-workflow/index.ts"
     ],
     "skills": [
       "skills"
     ]
   },
   "dependencies": {
-    "@autonome-research/fleet-router": "^0.2.0",
     "@autonome-research/thread-phase": "^6.1.0"
   },
   "peerDependencies": {
@@ -50,6 +49,6 @@
     "@earendil-works/pi-coding-agent": "^0.84.2"
   },
   "overrides": {
-    "fast-uri": ">=3.1.6 <4.0.0"
+    "fast-uri": ">=3.1.8 <4.0.0"
   }
 }

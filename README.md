@@ -10,8 +10,7 @@ Autonome's Pi package for shared extensions, workflow tooling, and skills.
 - `codebase-exploration-workflow` — fanout codebase exploration workflow using Pi subagents.
 - `code-review-workflow` — git diff/commit code review workflow using Pi subagents.
 - `dynamic-workflows` — simple validated composer for ordered `agent`, `fanout`, `shell`, and `artifact` phases, plus a separate advanced scripted JavaScript tool.
-- `mission-workflow` — Droid/Missions-style long-running software mission extension with plan approval, validation contracts, strict handoffs, per-feature worktrees/commits, command + adversarial validators, durable registry/resume, coverage artifacts, and repair loops.
-- `skills/dynamic-workflows` and `skills/mission-workflow` — on-demand Pi skills that teach other sessions/configurations how to use these workflow tools safely.
+- `skills/dynamic-workflows` — on-demand Pi skill that teaches other sessions/configurations how to use these workflow tools safely.
 
 ## Install
 
@@ -42,10 +41,9 @@ Pi identifies git packages by repository URL, so remove the old source before in
 - `/codebase-explore` starts codebase exploration in the background by default.
 - `/code-review` runs code review workflows.
 - `dynamic_workflow` composes validated subagent workflows directly from flat `agent`, `fanout`, `shell`, and `artifact` phases. `scripted_workflow` is the separate advanced unsandboxed JavaScript interface; `dynamic_thread_phase_workflow` is an inactive deprecated compatibility alias.
-- `mission_workflow` plans and activates approved Droid/Missions-style software missions. Always run `action: "plan"` and get user approval before `action: "activate"`.
 - Tool/API inspection remains available through `thread_phase_runs`.
 - Optional terminal-title symbols require both `PI_THREAD_PHASE_STATUS_BRIDGE=1` and `PI_THREAD_PHASE_TERMINAL_TITLE=1` before a full Pi restart. They use `⎊` for attention/unknown, exact `⚙︎` for active work, and `⌘` only for recent unaccompanied success while preserving Pi's session/cwd title. See [`thread-phase-terminal-title/README.md`](thread-phase-terminal-title/README.md) for precedence, sanitization, lifecycle, and terminal caveats.
-- Workflow skills are included in the package and should load automatically when tasks ask for dynamic workflows, mission workflows, structured workflow specs, scripted JavaScript workflows, or multi-phase dynamic execution.
+- Workflow skills are included in the package and should load automatically when tasks ask for dynamic workflows, structured workflow specs, scripted JavaScript workflows, or multi-phase dynamic execution.
 
 ## Footer status coexistence
 
@@ -58,6 +56,8 @@ Use RJLF's read-only `/rjlf-status` command and its [footer diagnostics and migr
 ## Current status
 
 Latest release: [`v0.18.3`](docs/releases/v0.18.3.md). Back up continuation state and fully restart Pi after upgrading; old hosts cannot safely share the new v4 continuation store.
+
+The mission workflow extension was removed after v0.18.3: the `mission-workflow` implementation, prompts, mission skill, mission-only smoke checks, and active mission design/roadmap docs are gone, and the manifest now lists the six remaining extensions above. Saved mission registries, plans, worktrees, sessions, logs, and artifacts outside tracked source (for example under `~/.pi/agent/`) are user data and are preserved untouched; historical release notes under [`docs/releases/`](docs/releases/) remain as history.
 
 Recent changes:
 
@@ -82,12 +82,11 @@ Recent changes:
 - Structured workflows support fail-closed `resumeRunId` recovery through atomic checkpoint manifests and bounded, hashed phase-output artifacts; spec, cwd, model, session, phase identity, containment, size, and integrity must verify before reuse.
 - The workflow dashboard is available through selectable `/workflows` and `ctrl+shift+t` entry points, shows one updating row per observed command under its phase or fanout item, retains terminal command details, and labels argument-only or malformed-end evidence as outcome unobserved rather than success.
 - Usage events are aggregated into run, phase, and fanout-item summaries and rendered with output first, cache/input/output breakdowns in expanded monitor views, reasoning identified as an output subset, and inclusive totals labelled cumulative processed tokens rather than context length.
-- `npm test` runs smoke coverage for extension load, permission denial before harness import, structured validation, JS harness mode, structured shell mode, usage projection, and mission registry/resume/strict-handoff checks.
-- The package now ships workflow skills so fresh Pi sessions get progressive-disclosure guidance for dynamic workflows and mission workflows.
-- Hardened `mission_workflow` with adversarial post-milestone validation, runner-owned handoff metadata, durable trusted checkpoints for resume, strict validation-cursor fingerprints/evidence checks, merge-blocking transient lockfile quarantine, stale `lastError` archival after successful resume/completion, cancellation-safe validation, contaminated-branch detection/reset, assertion coverage reports, generated-junk protection, transient `uv.lock` cleanup with audit artifacts, short content-addressed repair IDs, runner-provided handoff skeletons, compact result payloads, and capped repair loops.
+- `npm test` runs smoke coverage for extension load, permission denial before harness import, structured validation, JS harness mode, structured shell mode, and usage projection.
+- The package ships a workflow skill so fresh Pi sessions get progressive-disclosure guidance for dynamic workflows.
 - The generic visualizer now deduplicates repeated artifact paths, closes phase-event-only phases when a workflow reaches a terminal status, keeps compact run/monitor summaries focused on recent or active phases, and removes stale/dead or terminal workflows from the below-editor live-status widget.
 - Thread-phase dependency is `^6.1.0`, using the built-in `node:sqlite` runtime plus authoritative lifecycle, supervised fanout, atomic terminal events, cancellation, ownership, heartbeat, defensive error normalization, and bounded cursor reconciliation.
-- Workflow progress-review and timeout semantics are in `docs/workflow-supervision.md`. Mission continuation/failure-mode notes are in `docs/mission-workflow-continuation.md`; the DX/agent-X roadmap for making missions closer to a full software production pipeline is in `docs/mission-workflow-completeness-roadmap.md`.
+- Workflow progress-review and timeout semantics are in `docs/workflow-supervision.md`.
 
 ## Remaining work
 
@@ -95,7 +94,6 @@ High-value follow-ups:
 
 - Dynamic workflow hardening: add broader permission-matrix coverage.
 - Usage budgets: optionally fail/stop workflows when projected token usage exceeds configured limits.
-- Mission workflow follow-ups: validation categories/completion levels, operational-readiness contracts, heterogeneous model role policy, smarter repair planning, richer agent handoffs/shared mission notes, registry integrity/resume explain mode, external integration test conventions, and larger dogfood tests.
 
 ## Notes
 

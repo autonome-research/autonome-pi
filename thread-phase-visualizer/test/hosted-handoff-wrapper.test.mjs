@@ -20,15 +20,23 @@ import { listRuns } from "./support/hosted-handoff-fixture.mjs";
 function fakeHost() {
 	const tools = new Map();
 	const commands = new Map();
+	const listeners = new Map();
 	const pi = {
 		registerTool: (definition) => tools.set(definition.name, definition),
 		registerCommand: (name, definition) => commands.set(name, definition),
-		on: () => {},
+		on: (name, fn) => listeners.set(name, [...(listeners.get(name) ?? []), fn]),
 		registerShortcut: () => {},
 	};
 	codeReviewWorkflow(pi);
 	codebaseExplorationWorkflow(pi);
-	return { tools, commands };
+	// Real Pi fires session_start before any tool/command call, and both
+	// extensions default an arg-less command's cwd from it. Fire it explicitly
+	// so these tests do not depend on the test runner's own cwd being a git
+	// repository (it is not one in a .git-less source snapshot).
+	const sessionStart = (cwd) => {
+		for (const fn of listeners.get("session_start") ?? []) fn({}, { cwd });
+	};
+	return { tools, commands, sessionStart };
 }
 
 function ctxFor(mode, cwd, sessionId) {
@@ -123,18 +131,20 @@ test("tool launches: handoff opt-in only for hosted interactive background runs"
 });
 
 test("command launches: /code-review stays foreground; /codebase-explore background opts in", { timeout: 120_000 }, async () => {
-	const { commands } = fakeHost();
+	const { commands, sessionStart } = fakeHost();
 	const repo = makeGitRepo();
 	const project = makeProject();
 	const store = makeStore();
 
 	await withStore(store, async () => {
 		// The review slash command runs foreground: notification/card only.
+		sessionStart(repo);
 		await commands.get("code-review").handler("", ctxFor("tui", repo, "wrapper-cmd-review"));
 		const reviewRun = await assertHandoff(store, "slash command review", "wrapper-cmd-review", false);
 		assert.equal(reviewRun.start.trigger.kind, "manual");
 
 		// The exploration slash command defaults to hosted background: opts in.
+		sessionStart(project);
 		await commands.get("codebase-explore").handler("--agent mock --dirs src --delay 5", ctxFor("tui", project, "wrapper-cmd-explore"));
 		await assertHandoff(store, "slash command background exploration", "wrapper-cmd-explore", true);
 

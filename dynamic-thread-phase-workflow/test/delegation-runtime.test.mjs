@@ -309,12 +309,22 @@ test('acceptance-time child expiry while queued; no-deadline root stays live, no
 });
 
 test('root deadline selected at activation, queue does not spend timeout', async t => {
-  const f = fixture(t, { phases: [{ type: 'fanout', name: 'roots', items: ['a', 'b'], concurrency: 2, timeoutMs: 450 }],
+  // Load-robust: the relative grant starts at activation, after the queue wait.
+  // Root b is lane-blocked behind a's >=200ms occupancy, so its effective
+  // deadline is selected >=200ms after a's. The timeout budget is generous
+  // because activation->join includes a real worker spawn whose cost is
+  // unbounded under full-suite load; the activation-time selection invariant is
+  // proven exactly from the durable log, not by a wall-clock near-miss.
+  const timeoutMs = 5000;
+  const f = fixture(t, { phases: [{ type: 'fanout', name: 'roots', items: ['a', 'b'], concurrency: 2, timeoutMs }],
     budgets: [1], depth: 0, permissions: ['rw', 'rw'], drive: async (h, f) => { await pause(200); f.complete(h); f.release(h); } });
   assert.equal((await f.build().run()).status, 'success');
   const [a, b] = f.state().nodes;
   assert.equal(a.authority.deadlineAt, null); assert.equal(b.authority.deadlineAt, null);
   assert.ok(b.effectiveDeadlineAt - a.effectiveDeadlineAt >= 200);
+  const activated = new Map(fs.readFileSync(join(f.j.directory, 'events.jsonl'), 'utf8').trim().split('\n')
+    .map(JSON.parse).filter(e => e.type === 'root_activated').map(e => [e.payload.nodeId, e]));
+  for (const n of [a, b]) assert.equal(activated.get(n.nodeId).payload.deadlineAt, activated.get(n.nodeId).at + timeoutMs);
 });
 
 for (const cause of ['timeout', 'cancelled', 'disconnect']) test(`${cause} while parked cancels live subtree and unlaunched siblings; exact structural drain`, async t => {
