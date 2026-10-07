@@ -22,9 +22,13 @@ import { validateDelegationPolicy } from "../lib/delegation-contract.mjs";
 import { validateWorkerSetup } from "../worker/sdk-runner.mjs";
 import { isolatedResourceOptions } from "../worker/profile.mjs";
 import registerDynamicWorkflows, { __setV3LaunchProfileForTests } from "../index.ts";
-import { versions, supportDir } from "./support/delegation-worker-gates/driver.mjs";
+import { supportDir } from "./support/delegation-worker-gates/driver.mjs";
+import { explicitSdkLane } from "./support/pi104-offline/explicit-lane.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
+// EXPLICIT lane: no silent substitution. Under the consent flag this fails the
+// file unless the repo SDK matches PI_DELEGATION_EXPECT_SDK_VERSION exactly.
+const sdkLane = explicitSdkLane(repoRoot);
 const cli = join(repoRoot, "dynamic-thread-phase-workflow/bin/dynamic-thread-phase-workflow.mjs");
 const probe = join(supportDir, "..", "delegation-v3-execution", "sdk-worker-probe.mjs");
 
@@ -81,7 +85,7 @@ function connectedFixture(t, name = "v3-exec-") {
   writeFileSync(fixture.authFile, `${JSON.stringify({ "openai-codex": { type: "oauth",
     access: "synthetic-expired-access", refresh: "synthetic-refresh-value", expires: 0 } })}\n`, { mode: 0o600 });
   fixture.profile = {
-    sdkPackagePath: versions[1].packageDir,
+    sdkPackagePath: sdkLane.packageDir,
     workerEntryPath: probe,
     authPath: fixture.authFile,
     resourceProfile: isolatedResourceOptions(),
@@ -435,6 +439,87 @@ consentTest("resume of a v3 run is rejected before and after a forged downgrade"
   } finally {
     finishFixture(t, fixture);
     foregroundChain = undefined;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 10. Actual SDK worker bash tool through the real bridge (closeout lane)
+// ---------------------------------------------------------------------------
+
+// The bridge-shell suite proves the bash result contract with a finite NON-SDK
+// fixture worker. This lane closes the remaining gap: the ACTUAL Pi SDK
+// worker's bash tool (worker/index.ts -> createBashTool ->
+// runnerBashOperations -> real bridge shell_execute -> real runtime /bin/sh),
+// with the probe fabricating only the tool CALL. The probe refuses to complete
+// unless the observed SDK tool result faithfully exposes the real exit
+// behavior, so a pass is unobtainable from a synthetic result. Settlement is
+// asserted as-is: exit 0 settles success; a nonzero exit reaches the worker
+// faithfully (the durable summary carries the SDK tool result text) AND taints
+// node settlement to failed/NONZERO, the existing reviewed runtime semantics
+// (delegation-runtime.test.mjs shell-nonzero boundary), so the run settles
+// failed with a durable result artifact. Nothing here forces workflow success.
+consentTest("actual SDK worker bash tool exposes zero and nonzero exits through the real bridge", { timeout: 180_000 }, async (t) => {
+  // Both fixtures are minted up front: prepareConnectedEnv redirects TMPDIR
+  // into the first fixture, which is removed before the second iteration.
+  const fixtures = [connectedFixture(t, "v3-exec-bash-exit0-"), connectedFixture(t, "v3-exec-bash-exit3-")];
+  for (const [index, mode] of [[0, "exit0"], [1, "exit3"]]) {
+    const fixture = fixtures[index];
+    try {
+      prepareConnectedEnv(fixture);
+      __setV3LaunchProfileForTests(fixture.profile);
+      const prompt = `synthetic-bash-fixture:${mode} run the bounded harmless shell fixture.`;
+      const specValue = {
+        ...execSpec(),
+        delegation: {
+          maxDepth: 0,
+          totalAgentBudget: 1,
+          directoryScope: { read: ["."], write: ["."] },
+          context: { objective: "Synthetic v3 bash fixture", constraints: ["Offline fixture only"] },
+        },
+        phases: [{ type: "agent", name: "root", prompt, permissions: "rwx" }],
+      };
+      let result, failure;
+      result = await tool().execute(`v3-exec-bash-${mode}`, { v3: specValue }, undefined, undefined, fakeCtx(fixture)).catch((error) => { failure = error; });
+      if (mode === "exit0") {
+        assert.equal(failure, undefined, String(failure));
+        assert.equal(result.details?.ok, true);
+        assert.equal(result.details?.status, "success");
+      } else {
+        // Existing settlement semantics: a nonzero shell exit taints the node
+        // (cause NONZERO) even though the worker completed successfully.
+        assert.equal(result, undefined);
+        assert.match(String(failure?.message || failure), /PHASE_FAILED/);
+      }
+      const runId = (result?.details?.runId) ?? /"runId": "([^"]+)"/.exec(String(failure?.message))?.[1];
+      assert.ok(runId, "bounded failure record carries the runId");
+      const artifactsDir = join(fixture.storeDir, "artifacts", runId);
+      const resultArtifact = JSON.parse(readFileSync(join(artifactsDir, "workflow-result.json"), "utf8"));
+      assert.equal(resultArtifact.status, mode === "exit0" ? "success" : "failed", mode);
+      assert.equal(resultArtifact.phases.root.status, mode === "exit0" ? "success" : "failed", mode);
+      if (mode === "exit3") assert.equal(resultArtifact.phases.root.cause, "NONZERO");
+      assert.equal(resultArtifact.delegation.closed, true, mode);
+      // bash turn carries no usage; the completion turn settles 7 tokens.
+      assert.equal(resultArtifact.usage.totals.totalTokens, 7, mode);
+      const summary = resultArtifact.phases.root.summary;
+      assert.ok(summary.startsWith(`synthetic bash ${mode} settled: `), summary);
+      if (mode === "exit0") {
+        assert.ok(summary.includes("synthetic-bash-zero-ok"), summary);
+        assert.ok(!summary.includes("Command exited with code"), summary);
+      } else {
+        assert.ok(summary.includes("synthetic-bash-out-line"), summary);
+        assert.ok(summary.includes("Command exited with code 3"), summary);
+      }
+      const inspection = inspectDelegationJournal(join(artifactsDir, "delegation"), bindingFor(fixture, specValue, resultArtifact));
+      assert.equal(inspection.projection, "current");
+      assert.equal(inspection.state.workflowOpen, false);
+      assert.ok(inspection.state.nodes.length >= 1);
+      assert.ok(inspection.state.nodes.every((node) => node.joined && node.closed));
+      assert.deepEqual(readdirSync(fixture.childTmp).filter((entry) => entry.startsWith("pi-dynamic-workflow-")), [], "temp input removed");
+      assert.doesNotMatch(JSON.stringify(result) + JSON.stringify(resultArtifact) + String(failure?.stack || ""), CREDENTIAL_PATTERN);
+      fixture.clean = true;
+    } finally {
+      finishFixture(t, fixture);
+    }
   }
 });
 

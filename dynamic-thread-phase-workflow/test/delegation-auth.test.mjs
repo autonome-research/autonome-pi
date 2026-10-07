@@ -13,12 +13,15 @@ import { createDelegationRuntime } from '../lib/delegation-runtime.mjs';
 import { createProcessJournal } from '../lib/process-journal.mjs';
 import { readStoredArtifact } from '../lib/delegation-storage.mjs';
 import { runBoundedProcess } from '../lib/subprocess.mjs';
-import { versions, supportDir } from './support/delegation-worker-gates/driver.mjs';
+import { supportDir, repoRoot } from './support/delegation-worker-gates/driver.mjs';
+import { explicitSdkLane } from './support/pi104-offline/explicit-lane.mjs';
 
 const probe = join(supportDir, 'shared-auth-probe.mjs');
 const noNetwork = join(supportDir, 'no-network.mjs');
 const strictNoNetwork = join(supportDir, 'strict-no-network.mjs');
-const aiVersions = Object.freeze({ '0.86.0': '0.86.0', '0.84.2': '0.84.2' });
+// EXPLICIT lane: no silent substitution. Under the consent flag this fails the
+// file unless the repo SDK matches PI_DELEGATION_EXPECT_SDK_VERSION exactly.
+const lane = explicitSdkLane(repoRoot);
 const consentTest = (name, options, fn) => test(name, { ...options, skip: process.env.PI_DELEGATION_COMPAT_FIXTURES !== '1' }, fn);
 const credential = (expires = 0) => ({ 'openai-codex': { type: 'oauth', access: 'synthetic-expired-access',
   refresh: 'synthetic-refresh-value', expires } });
@@ -28,8 +31,8 @@ async function directories(root, name) {
   for (const path of Object.values(value)) await mkdir(path, { recursive: true, mode: 0o700 });
   return value;
 }
-function setup(version, dirs, authPath, prompt = 'Complete the synthetic bounded assignment.') {
-  return { schema: 'pi-workflow-sdk-worker/v1', sdkPackagePath: version.packageDir, authPath,
+function setup(lane, dirs, authPath, prompt = 'Complete the synthetic bounded assignment.') {
+  return { schema: 'pi-workflow-sdk-worker/v1', sdkPackagePath: lane.packageDir, authPath,
     agentDir: dirs.agentDir, tools: ['workflow_context', 'workflow_complete'], prompt };
 }
 function environment(dirs, socketPath) {
@@ -141,7 +144,7 @@ test('SDK worker stdout projects only bounded lifecycle and usage fields', () =>
   assert.equal(retried.totals.totalTokens, 7); assert.equal(retried.diagnostic.errorMessage, 'SDK_COMPACTION_ERROR');
 });
 
-for (const version of versions) consentTest(`Pi ${version.version}: ordinary shared authPath refresh is native, persisted and lock-serialized`, { timeout: 30000 }, async t => {
+consentTest(`Pi ${lane.version}: ordinary shared authPath refresh is native, persisted and lock-serialized`, { timeout: 30000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'delegation-shared-auth-'));
   const authPath = join(root, 'shared', 'auth.json'), marker = join(root, 'refreshes');
   const a = await directories(root, 'a'), b = await directories(root, 'b');
@@ -150,13 +153,13 @@ for (const version of versions) consentTest(`Pi ${version.version}: ordinary sha
   let clean = false;
   try {
     const [left, right] = await Promise.all([
-      runProbe({ mode: 'auth', setup: setup(version, a, authPath), refreshMarker: marker }, a),
-      runProbe({ mode: 'auth', setup: setup(version, b, authPath), refreshMarker: marker }, b),
+      runProbe({ mode: 'auth', setup: setup(lane, a, authPath), refreshMarker: marker }, a),
+      runProbe({ mode: 'auth', setup: setup(lane, b, authPath), refreshMarker: marker }, b),
     ]);
     for (const result of [left, right]) {
       assert.equal(result.ok, true, result.stderr || result.stdout);
       assert.deepEqual(JSON.parse(result.stdout), { provider: 'openai-codex', model: 'gpt-5.6-sol', authSource: 'stored',
-        network: 'guarded', aiVersion: aiVersions[version.version] });
+        network: 'guarded', aiVersion: lane.aiVersion });
       assert.doesNotMatch(result.stdout + result.stderr, /synthetic-(?:expired-access|refresh-value|refreshed-access)/);
     }
     assert.equal((await readFile(marker, 'utf8')).trim().split('\n').length, 1);
@@ -170,13 +173,13 @@ for (const version of versions) consentTest(`Pi ${version.version}: ordinary sha
   }
 });
 
-for (const version of versions) consentTest(`Pi ${version.version}: missing and invalid shared auth fail without provider/model fallback`, { timeout: 30000 }, async t => {
+consentTest(`Pi ${lane.version}: missing and invalid shared auth fail without provider/model fallback`, { timeout: 30000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'delegation-shared-auth-negative-')); let clean = false;
   try {
     for (const [name, contents] of [['missing', null], ['invalid', '{not-json']]) {
       const dirs = await directories(root, name), authPath = join(root, `${name}.json`);
       if (contents !== null) await writeFile(authPath, contents, { mode: 0o600 });
-      const result = await runProbe({ mode: 'auth', setup: setup(version, dirs, authPath), refreshMarker: join(root, `${name}.refresh`) }, dirs);
+      const result = await runProbe({ mode: 'auth', setup: setup(lane, dirs, authPath), refreshMarker: join(root, `${name}.refresh`) }, dirs);
       assert.equal(result.ok, false); assert.equal(result.code, 70);
       assert.equal(result.stdout, ''); assert.equal(result.stderr, 'PI_WORKER_FAIL_STOP:SYNTHETIC_AUTH_PROBE\n');
       assert.equal(await absent(join(root, `${name}.refresh`)), true);
@@ -188,7 +191,7 @@ for (const version of versions) consentTest(`Pi ${version.version}: missing and 
   }
 });
 
-for (const version of versions) consentTest(`Pi ${version.version}: actual private SDK entry completes through production bridge/runtime`, { timeout: 45000 }, async t => {
+consentTest(`Pi ${lane.version}: actual private SDK entry completes through production bridge/runtime`, { timeout: 45000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'delegation-sdk-runtime-')); let clean = false, bridge, journal;
   const dirs = await directories(root, `worker-${'long-layout-'.repeat(8)}`);
   const workspace = join(root, 'workspace'), artifacts = join(root, 'artifacts'), authPath = join(root, 'shared-auth.json');
@@ -202,12 +205,12 @@ for (const version of versions) consentTest(`Pi ${version.version}: actual priva
   const output = { stdout: '', stderr: '' };
   try {
     journal = createDelegationJournal({ artifactDirectory: artifacts, workspace, protectedDirectories: [dirs.agentDir],
-      runId: `shared-auth-${version.version}`, specDigest: 'a'.repeat(64), profileDigest: 'b'.repeat(64),
+      runId: `shared-auth-${lane.version}`, specDigest: 'a'.repeat(64), profileDigest: 'b'.repeat(64),
       policy: { maxDepth: 0, totalAgentBudget: 1, directoryScope: { read: ['.'], write: [] },
         context: { objective: 'Synthetic connected SDK worker', constraints: ['Offline fixture only'] } },
       roots: [{ phaseIndex: 0, agentBudget: 1, label: 'root', task: 'Complete through the private bridge.', permissions: 'r',
         directoryScope: { read: ['.'], write: [] }, deadlineAt: null }] });
-    const processJournal = createProcessJournal(artifacts, `shared-auth-${version.version}`);
+    const processJournal = createProcessJournal(artifacts, `shared-auth-${lane.version}`);
     assert.ok(Buffer.byteLength(join(dirs.tmpDir, 's00.sock')) > 107);
     bridge = await createDelegationBridge({ tmpDir: dirs.tmpDir });
     assert.notEqual(dirname(bridge.socketPath), dirs.tmpDir);
@@ -215,7 +218,7 @@ for (const version of versions) consentTest(`Pi ${version.version}: actual priva
     const runtime = createDelegationRuntime({ journal, processJournal, bridge, phases: [{ type: 'agent', name: 'root' }],
       deadlinePolicy: { supervised: true }, operator: { maxConcurrentAgents: 1, maxLiveAgents: 1 },
       worker() {
-        const workerSetup = setup(version, dirs, authPath);
+        const workerSetup = setup(lane, dirs, authPath);
         return { command: process.execPath,
           args: ['--import', noNetwork, '--import', strictNoNetwork, probe, JSON.stringify({ mode: 'worker', setup: workerSetup })],
           env: environment(dirs, bridge.socketPath), tools: workerSetup.tools,

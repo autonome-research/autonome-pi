@@ -33,6 +33,8 @@ env -i PATH="$(dirname "$node_bin"):/usr/bin:/bin" \
 
 Do not run `npm test`, broad dynamic test globs, or `successor-repair.test.mjs` in the paused checkout. For safe regressions, append exactly:
 
+**1.0.4 offline qualification (separate batch):** the hardcoded lanes above remain historical and are not run blindly. Offline 1.0.4 results live in `test/pi104-offline-qualification.test.mjs` + `test/support/pi104-offline/` (explicit lane via `PI_DELEGATION_EXPECT_SDK_VERSION`, candidate-labelled snapshots) with raw evidence under `.git/v3-pi104-offline.QLfTmqpl/evidence-20261007T190915Z/`; the stock-grep counterexample was not rerun (bypass reproductions are outside that task's safety scope) and its result above stays historical. A follow-up closeout (`.git/v3-pi104-offline.QLfTmqpl/evidence-20261007T193137Z/`) added the actual SDK-tool bash lane in `test/delegation-v3-execution.test.mjs` (real 1.0.4 SDK `bash` tool via `runnerBashOperations` and the real bridge/runtime, exit 0/3 exposed in the durable result (exit 3 taints node settlement to failed/`NONZERO`, the existing shell-nonzero semantics)) — distinct from the finite non-SDK bridge-shell fixture — plus direct missing/mismatched-lane rejection coverage for the explicit-lane helper, and reran the full default dynamic suite on an unchanged-admission snapshot with no fixture consent.
+
 ```text
 dynamic-thread-phase-workflow/test/delegation-contract.test.mjs
 dynamic-thread-phase-workflow/test/delegation-budget.test.mjs

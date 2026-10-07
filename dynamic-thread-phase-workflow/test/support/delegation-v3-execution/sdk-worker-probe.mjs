@@ -65,6 +65,16 @@ const plain = (content) => typeof content === 'string' ? content
 let setup;
 let ai;
 
+// Bounded explicit bash-fixture mode (closeout lane): when the prompt carries
+// `synthetic-bash-fixture:exit0|exit3`, turn 1 calls the REAL SDK bash tool
+// (worker/index.ts -> runnerBashOperations -> bridge shell_execute -> runtime
+// /bin/sh) with a harmless command; the next turn completes only if the
+// observed tool result faithfully exposes the real exit behavior, embedding it
+// in the durable summary. The provider stream fabricates only the tool CALL;
+// the result text is unobtainable without actual SDK tool execution.
+const BASH_COMMANDS = { exit0: 'printf synthetic-bash-zero-ok', exit3: 'printf synthetic-bash-out-line; exit 3' };
+const bashMode = () => /synthetic-bash-fixture:(exit0|exit3)/.exec(setup.prompt)?.[1] ?? null;
+
 // The delegation decision comes from the context snapshot alone: grantedTools
 // contains workflow_delegate iff depth < maxDepth. A node with no children yet
 // delegates exactly one child on a narrowed (equal) scope; otherwise it
@@ -73,6 +83,21 @@ function decideToolCall(context) {
   const snapshots = context.messages.filter((message) => message.role === 'user' && plain(message.content).includes('pi-workflow-delegation-context/v1'));
   const snapshot = snapshots.length === 1 && JSON.parse(plain(snapshots[0].content));
   if (snapshot?.schema !== 'pi-workflow-delegation-context/v1' || snapshot.self?.nodeId === undefined) throw new Error('CONTEXT_UNAVAILABLE');
+  const mode = bashMode();
+  if (mode) {
+    const observed = context.messages.filter((message) => message.role === 'toolResult' && plain(message.content).includes('synthetic-bash-'));
+    if (!observed.length) return { type: 'toolCall', id: 'synthetic-bash', name: 'bash', arguments: { command: BASH_COMMANDS[mode] } };
+    if (observed.length !== 1) throw new Error('CONTEXT_UNAVAILABLE');
+    const text = plain(observed[0].content);
+    const faithful = mode === 'exit0'
+      ? text.includes('synthetic-bash-zero-ok') && !text.includes('Command exited with code')
+      : text.includes('synthetic-bash-out-line') && text.includes('Command exited with code 3');
+    if (!faithful) throw new Error(`CONTEXT_UNAVAILABLE: unfaithful bash tool result ${JSON.stringify(text.slice(0, 128))}`);
+    return { type: 'toolCall', id: 'synthetic-complete', name: 'workflow_complete', arguments: {
+      status: 'success', summary: `synthetic bash ${mode} settled: ${text.slice(0, 200)}`,
+      acceptance: snapshot.assignment.acceptance.map((item) => ({ id: item.id, outcome: 'passed', evidenceIds: [] })),
+      evidence: [], childReviews: [], remainingWork: [] } };
+  }
   const self = snapshot.self;
   // Delegability comes from the worker's configured tool set (setup.tools), which
   // buildV3WorkerRecipe sets to include workflow_delegate iff depth < maxDepth.

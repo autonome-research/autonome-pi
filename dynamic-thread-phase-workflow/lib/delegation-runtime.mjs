@@ -462,7 +462,7 @@ export function createDelegationRuntime(options) {
         const promise = commandResult.then(outcome => {
           if (outcome.disposition === 'unknown') { hold(); fail('OWNERSHIP_UNKNOWN'); }
           restore(n, 'shell');
-          return immutable({ ok: outcome.ok, classification: outcome.classification, stdout: outcome.stdout, stderr: outcome.stderr });
+          return immutable({ ok: outcome.ok, classification: outcome.classification, code: outcome.code, stdout: outcome.stdout, stderr: outcome.stderr });
         }).catch(error => { hold(); throw error; });
         promise.catch(() => {}); return promise;
       }); },

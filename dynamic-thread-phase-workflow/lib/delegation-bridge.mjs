@@ -134,6 +134,10 @@ export async function createDelegationBridge(options = {}) {
       case 'file_edit': return { status: 'file_result', result: await h.fileEdit(key, args.path, args.oldText, args.newText) };
       case 'shell_execute': {
         const output = await h.shell(key, args.command, args.timeoutMs);
+        // The command_result contract requires the real exit code. Timeout,
+        // cancelled, signal and spawn-error outcomes have none; they fail
+        // closed here instead of serializing as ordinary command completion.
+        if (!Number.isInteger(output.code)) fail('RESULT_INVALID', `shell outcome ${output.classification ?? 'unknown'} has no exit code`);
         return { status: 'command_result', exitCode: output.code, output: output.stdout };
       }
       default: throw new Error('UNSUPPORTED_MODE');
