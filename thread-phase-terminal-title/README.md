@@ -25,12 +25,12 @@ idle:        π - [session - ]cwd
 
 The terminal-result window remains exactly 60 seconds. The reader is polled every five seconds, including while no workflow event arrives, and a title is written only when its derived value changes or after a justified Pi title lifecycle write (initial handoff or rename). Polling is unref'd and performs no animation.
 
-Every session/cwd value passed by this extension to `ctx.ui.setTitle()` has C0/C1 controls removed, is truncated at grapheme boundaries to 96 UTF-8 bytes independently, and the full payload is bounded to 240 bytes. The fixed prefix is reserved and never truncated. The base uses Pi v0.85.1's stock-compatible `π - cwd` / `π - session - cwd` shape and the session manager's cwd basename.
+Every session/cwd value passed by this extension to `ctx.ui.setTitle()` has C0/C1 controls removed, is truncated at grapheme boundaries to 96 UTF-8 bytes independently, and the full payload is bounded to 240 bytes. The fixed prefix is reserved and never truncated. The base uses Pi 1.0.4's stock-compatible `π - cwd` / `π - session - cwd` shape and the session manager's cwd basename.
 
 ## Lifecycle and limitations
 
 The initial reconciliation is delayed briefly because Pi writes its stock title after binding extensions. Rename reconciliation runs after Pi's `session_info_changed` stock write. Session replacement/reload cancels and invalidates old callbacks before a new delayed handoff. Clean shutdown cancels timers first and restores a sanitized stock-compatible title only if this instance owned a non-idle title.
 
-Pi exposes no title getter, ownership stack, or composition API. Title ownership is last-writer-wins, so this extension cannot preserve an arbitrary prior title or safely compose with another title extension. It does not repeatedly reassert an unchanged title to fight another owner. Pi's own v0.85.1 stock writes are independently unsanitized and may appear briefly before this extension's handoff; fixing that would require an excluded core patch. Abrupt process death can skip restoration.
+Pi exposes no title getter, ownership stack, or composition API. Title ownership is last-writer-wins, so this extension cannot preserve an arbitrary prior title or safely compose with another title extension. It does not repeatedly reassert an unchanged title to fight another owner. Pi's own 1.0.4 stock writes are independently unsanitized and may appear briefly before this extension's handoff; fixing that would require an excluded core patch. Abrupt process death can skip restoration.
 
 The extension uses only `ctx.ui.setTitle()`. Unicode glyph appearance and whether a tab/window follows dynamic titles depend on terminal fonts, pinning, and multiplexer/cmux policy; there is no blanket tmux/screen/cmux guarantee. Mac Terminal, Ghostty, and cmux receive ordinary Unicode title text without terminal-specific APIs.

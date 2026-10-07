@@ -37,6 +37,7 @@ test("slash-command selection and shortcut open the same interactive workflow da
   let dashboardOpenCount = 0;
   const context = {
     cwd: storeDir,
+    mode: "tui",
     hasUI: true,
     sessionManager: { getSessionId: () => "dashboard-session" },
     ui: {
@@ -52,4 +53,42 @@ test("slash-command selection and shortcut open the same interactive workflow da
   await commands.get("workflows").handler("", context);
   await shortcuts.get("ctrl+shift+t").handler(context);
   assert.equal(dashboardOpenCount, 2);
+});
+
+test("non-TUI modes get a notification and never start the custom dashboard", async () => {
+  const commands = new Map();
+  const shortcuts = new Map();
+  registerVisualizer({
+    registerMessageRenderer() {},
+    registerTool() {},
+    registerCommand(name, options) { commands.set(name, options); },
+    registerShortcut(key, options) { shortcuts.set(key, options); },
+    on() {},
+  });
+
+  // RPC clients report hasUI=true but cannot host ctx.ui.custom(); json/print
+  // have no dialog UI. All three must notify instead of silently doing nothing.
+  for (const [mode, hasUI] of [["rpc", true], ["json", false], ["print", false]]) {
+    let customCalls = 0;
+    const notifications = [];
+    const context = {
+      cwd: storeDir,
+      mode,
+      hasUI,
+      sessionManager: { getSessionId: () => "dashboard-session" },
+      ui: {
+        async custom(factory) {
+          customCalls++;
+          factory({ requestRender() {} }, theme, {}, () => {});
+        },
+        notify(message, kind) { notifications.push([message, kind]); },
+        setEditorText() {},
+      },
+    };
+    await commands.get("workflows").handler("", context);
+    assert.equal(customCalls, 0, `${mode} mode must not invoke the custom TUI factory`);
+    assert.equal(notifications.length, 1, `${mode} mode gets exactly one explanatory notification`);
+    assert.match(notifications[0][0], /interactive TUI mode/);
+    assert.equal(notifications[0][1], "warning");
+  }
 });

@@ -1,20 +1,23 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
-const GLOBAL_PACKAGE = "/home/velvet/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent";
+// Real-host contract: the installed Pi 1.0.4 extension loader must load this
+// title-only extension cleanly, twice, with no residual registrations. There is
+// no fallback to an older SDK: an explicitly supplied but missing or
+// version-mismatched PI_HANDOFF_SDK_DIR fails this test.
+const sdkDir = process.env.PI_HANDOFF_SDK_DIR;
 const here = dirname(fileURLToPath(import.meta.url));
 const extensionPath = resolve(here, "../index.ts");
 const repoRoot = resolve(here, "../..");
 
-test("deployed Pi v0.85.1 Jiti loader loads the title-only extension repeatedly", async (t) => {
-  let manifest;
-  try { manifest = JSON.parse(readFileSync(`${GLOBAL_PACKAGE}/package.json`, "utf8")); }
-  catch { return t.skip("deployed global Pi package is unavailable"); }
-  assert.equal(manifest.version, "0.85.1", "host smoke accidentally resolved a non-contract Pi version");
-  const loader = await import(pathToFileURL(`${GLOBAL_PACKAGE}/dist/core/extensions/loader.js`));
+test("installed Pi 1.0.4 Jiti loader loads the title-only extension repeatedly", async (t) => {
+  if (!sdkDir) return t.skip("PI_HANDOFF_SDK_DIR is not set; point it at an installed @earendil-works/pi-coding-agent 1.0.4 package directory");
+  const manifest = JSON.parse(readFileSync(join(sdkDir, "package.json"), "utf8"));
+  assert.equal(manifest.version, "1.0.4", "host smoke accidentally resolved a non-contract Pi version");
+  const loader = await import(pathToFileURL(join(sdkDir, "dist/core/extensions/loader.js")));
 
   for (let pass = 0; pass < 2; pass++) {
     loader.clearExtensionCache();

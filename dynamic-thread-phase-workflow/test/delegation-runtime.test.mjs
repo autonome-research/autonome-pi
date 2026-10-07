@@ -328,7 +328,15 @@ test('root deadline selected at activation, queue does not spend timeout', async
 });
 
 for (const cause of ['timeout', 'cancelled', 'disconnect']) test(`${cause} while parked cancels live subtree and unlaunched siblings; exact structural drain`, async t => {
-  const f = fixture(t, { phases: [{ type: 'agent', name: 'root', ...(cause === 'timeout' ? { timeoutMs: 300 } : {}) }],
+  // Load-robust: the timeout grant covers the real root spawn + IPC plus the
+  // live descendant's real spawn before the root parks; under full-suite load
+  // that cost is unbounded (a 300ms grant could expire pre-park, violating the
+  // fixture's required spent=2/accepted=3 setup). The grant is therefore
+  // generous, and the timeout-WHILE-parked invariant is proven exactly from
+  // the durable log below, not by a wall-clock near-miss. Product deadlines
+  // are unchanged; cancelled/disconnect keep their deterministic trigger.
+  const f = fixture(t, { phases: [{ type: 'agent', name: 'root', ...(cause === 'timeout' ? { timeoutMs: 5000 } : {}) }],
+    modes: { root: 'hold', live: 'hold' }, // parked workers must outlive the generous grant
     drive: async (h, f) => {
       const n = f.state().nodes.find(n => n.nodeId === h.assignment.nodeId);
       if (!n.parentNodeId) {
@@ -343,6 +351,22 @@ for (const cause of ['timeout', 'cancelled', 'disconnect']) test(`${cause} while
   assert.equal(s.budget.spent, 2); assert.equal(s.budget.acceptedNodes, 3);
   assert.equal(s.nodes.find(n => n.label === 'queued').invocationId, null);
   assert.equal(s.nodes[0].result.status, cause === 'disconnect' ? 'infrastructure_error' : cause);
+  if (cause === 'timeout') {
+    // Durable proof the root actually timed out WHILE parked: its stop with
+    // cause 'timeout' is recorded after the live descendant's real worker
+    // start and before any descendant join, and the queued descendant never
+    // received a launch intent or worker start.
+    const log = fs.readFileSync(join(f.j.directory, 'events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    const live = s.nodes.find(n => n.label === 'live'), queued = s.nodes.find(n => n.label === 'queued');
+    const at = (type, nodeId) => log.findIndex(e => e.type === type && e.payload.nodeId === nodeId);
+    const stop = at('node_stopped', s.nodes[0].nodeId);
+    assert.ok(stop >= 0); assert.equal(log[stop].payload.cause, 'timeout');
+    const liveStart = at('worker_started', live.nodeId), liveJoin = at('node_joined', live.nodeId);
+    assert.ok(liveStart >= 0 && liveStart < stop);
+    assert.ok(liveJoin > stop);
+    assert.equal(at('launch_intent', queued.nodeId), -1);
+    assert.equal(at('worker_started', queued.nodeId), -1);
+  }
 });
 
 test('already expired absolute root and pre-cancel create no intent/process', async t => {

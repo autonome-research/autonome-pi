@@ -67,7 +67,7 @@ export function terminalTitlePrefix(state) {
   return "";
 }
 
-/** Reconstruct Pi's stock v0.85.1 title shape, with an optional fixed state prefix. */
+/** Reconstruct Pi's stock 1.0.4 title shape, with an optional fixed state prefix. */
 export function buildTerminalTitle({ state, sessionName, cwd }) {
   const safeSession = sessionName === undefined || sessionName === null || sessionName === ""
     ? ""

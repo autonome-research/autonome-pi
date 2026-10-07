@@ -949,8 +949,10 @@ export function createArtifactTargetEditorCallback(ctx: Pick<ExtensionContext, "
 }
 
 export async function showThreadPhaseMonitor(ctx: ExtensionContext, cwd: string, loadRuns = monitorRuns): Promise<void> {
-	if (!ctx.hasUI) {
-		ctx.ui.notify("Thread-phase monitor requires interactive mode", "warning");
+	if (ctx.mode !== "tui" || !ctx.hasUI) {
+		// RPC reports hasUI=true but ctx.ui.custom() is unsupported there; json/print
+		// have no dialog UI at all. Never start the timer or custom factory off-TUI.
+		ctx.ui.notify("Thread-phase monitor requires interactive TUI mode", "warning");
 		return;
 	}
 	let timer: NodeJS.Timeout | undefined;

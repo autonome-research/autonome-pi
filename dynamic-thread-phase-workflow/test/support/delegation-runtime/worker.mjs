@@ -22,7 +22,9 @@ if (mode === 'survivor') {
     turn(); process.stdout.write(JSON.stringify({ type: 'session', id: 'tail', text: '😀' }) + '\n', () => process.exit(0));
   });
   emit({ type: 'session', id: 'ready', pid: process.pid, anchorPid: process.ppid });
-  const fallback = setTimeout(() => process.exit(74), 4500);
+  // 'hold' parks indefinitely (gate/drain owned) so generous parked-deadline
+  // fixtures outlive the 4500ms fallback self-exit.
+  const fallback = mode === 'hold' ? null : setTimeout(() => process.exit(74), 4500);
   const timer = setInterval(() => {
     if (mode.startsWith('tail') && !triggered && fs.existsSync(gate + '.trigger')) {
       triggered = true;

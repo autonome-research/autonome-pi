@@ -6,7 +6,6 @@ Autonome's Pi package for shared extensions, workflow tooling, and skills.
 
 - `thread-phase-visualizer` — generic TUI monitor and event store for `thread-phase-ui/v1` workflow events.
 - `thread-phase-terminal-title` — separately opt-in, read-only TUI terminal-title projection of the visualizer's status bridge.
-- `detach` — `/detach` and `/detach-status` commands for handing an interactive Pi session off to tmux so it can survive an SSH logout.
 - `codebase-exploration-workflow` — fanout codebase exploration workflow using Pi subagents.
 - `code-review-workflow` — git diff/commit code review workflow using Pi subagents.
 - `dynamic-workflows` — simple validated composer for ordered `agent`, `fanout`, `shell`, and `artifact` phases, plus a separate advanced scripted JavaScript tool.
@@ -35,7 +34,6 @@ Pi identifies git packages by repository URL, so remove the old source before in
 
 ## Usage
 
-- `/detach [--name <tmux-name>] [--now|--wait] [prompt]` hands the current session off to tmux; `/detach-status` reports the latest handoff. See [`detach/README.md`](detach/README.md).
 - Select `/workflows` from the slash-command menu under the editor, or press `ctrl+shift+t`, to open the interactive thread-phase dashboard; select a run for observed command-ledger details or request cooperative cancellation via `x`. See [`docs/command-ledger-ui.md`](docs/command-ledger-ui.md) for controls, state semantics, token labels, and retention/privacy limits.
 - Fresh background dynamic workflows return control after success or failure; user-cancelled runs never auto-continue. Old or uncertain handoffs stay visible in `/workflows`; press `r` to prepare an explicit `/workflow-handoff <runId>` request. Background Pi agents have no implicit deadline; foreground agents and shells retain their default bound. Progress is passive: periodic main-agent prompts are retired, including existing schedules. `progressReviewIntervalMs` is a deprecated compatibility field. See [`docs/workflow-supervision.md`](docs/workflow-supervision.md).
 - `/codebase-explore` starts codebase exploration in the background by default.
@@ -57,7 +55,7 @@ Use RJLF's read-only `/rjlf-status` command and its [footer diagnostics and migr
 
 Latest release: [`v0.18.3`](docs/releases/v0.18.3.md). Back up continuation state and fully restart Pi after upgrading; old hosts cannot safely share the new v4 continuation store.
 
-The mission workflow extension was removed after v0.18.3: the `mission-workflow` implementation, prompts, mission skill, mission-only smoke checks, and active mission design/roadmap docs are gone, and the manifest now lists the six remaining extensions above. Saved mission registries, plans, worktrees, sessions, logs, and artifacts outside tracked source (for example under `~/.pi/agent/`) are user data and are preserved untouched; historical release notes under [`docs/releases/`](docs/releases/) remain as history.
+The mission workflow extension was removed after v0.18.3: the `mission-workflow` implementation, prompts, mission skill, mission-only smoke checks, and active mission design/roadmap docs are gone. The `/detach` tmux handoff extension was removed as the wrong layer: its implementation, dedicated smoke checks, and manifest/keyword entries are gone, and the manifest now lists the five remaining extensions above. Saved mission registries, plans, worktrees, sessions, logs, artifacts, and any detach-wrapper state outside tracked source (for example under `~/.pi/agent/`) are user data and are preserved untouched; historical release notes under [`docs/releases/`](docs/releases/) remain as history.
 
 Recent changes:
 
@@ -68,7 +66,6 @@ Recent changes:
 - Session-hosted background reviews and explorations now request terminal handoffs explicitly. Foreground calls and unattended hooks keep their notification-only defaults; false-valued background environment markers no longer bypass validation or prevent detachment.
 - Added comprehensive visualizer projection, cancellation, continuation, session-scope, large-log, and TUI interaction tests.
 - Renamed the package and repository from `pi-thread-phase-tools` to `autonome-pi`.
-- Added the tmux-backed `/detach` extension and `/detach-status` command.
 - Cooperative cancellation uses cancel request files under `~/.pi/agent/thread-phase/cancel/<runId>.json` instead of direct monitor PID killing.
 - `dynamic_workflow` now accepts the workflow directly—no outer `spec` wrapper—and uses the clearer `agent`, `fanout`, `shell`, and `artifact` phase names.
 - Permissions are explicit phase defaults/overrides: `r`, `w`, `rw`, and `rwx`; shell and Pi `bash` execution require `rwx`.
