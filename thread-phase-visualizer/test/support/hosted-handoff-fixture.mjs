@@ -1,6 +1,7 @@
 // Shared offline fixtures for hosted terminal-handoff opt-in tests.
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { after } from "node:test";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,8 +12,13 @@ export const REVIEW_CLI = join(REPO_ROOT, "code-review-workflow", "bin", "code-r
 export const EXPLORATION_CLI = join(REPO_ROOT, "codebase-exploration-workflow", "bin", "codebase-exploration-workflow.mjs");
 export const FAKE_PI = join(REPO_ROOT, "thread-phase-visualizer", "test", "support", "fake-pi-reviewer.mjs");
 
+const temporaryDirs = [];
+after(() => {
+	for (const dir of temporaryDirs) rmSync(dir, { recursive: true, force: true });
+});
+
 export function makeGitRepo(prefix = "handoff-repo-") {
-	const repo = mkdtempSync(join(tmpdir(), prefix));
+	const repo = makeStore(prefix);
 	for (const args of [["init", "-q"], ["config", "user.email", "fixture@example.com"], ["config", "user.name", "Fixture"]]) {
 		const result = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
 		if (result.status !== 0) throw new Error(`git ${args[0]} failed: ${result.stderr}`);
@@ -26,14 +32,16 @@ export function makeGitRepo(prefix = "handoff-repo-") {
 }
 
 export function makeProject(prefix = "handoff-project-") {
-	const project = mkdtempSync(join(tmpdir(), prefix));
+	const project = makeStore(prefix);
 	mkdirSync(join(project, "src"), { recursive: true });
 	writeFileSync(join(project, "src", "index.js"), "export const fixture = 1;\n", "utf8");
 	return project;
 }
 
 export function makeStore(prefix = "handoff-store-") {
-	return mkdtempSync(join(tmpdir(), prefix));
+	const dir = mkdtempSync(join(tmpdir(), prefix));
+	temporaryDirs.push(dir);
+	return dir;
 }
 
 /** Child environment: the validated isolated env plus an explicit store and fake reviewer. */

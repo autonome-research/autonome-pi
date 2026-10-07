@@ -18,6 +18,7 @@ import {
 } from "../../thread-phase-visualizer/lib/store.mjs";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
+const BACKGROUND_WORKER = isTruthyFlag(process.env.PI_CODE_REVIEW_BACKGROUND);
 const DEFAULT_DIFF_LIMIT = Number.parseInt(process.env.PI_CODE_REVIEW_DIFF_LIMIT || "180000", 10);
 const DEFAULT_TIMEOUT_MS = Number.parseInt(process.env.PI_CODE_REVIEW_TIMEOUT_MS || `${10 * 60 * 1000}`, 10);
 const DEFAULT_PI = existsSync(join(homedir(), ".npm-global", "bin", "pi"))
@@ -338,7 +339,7 @@ async function reviewCommand(opts) {
     cwd: root,
     // Only the explicit handoff opt-in distinguishes a hosted session launch from
     // an unattended post-commit hook run; the background env marker alone cannot.
-    trigger: { kind: process.env.PI_CODE_REVIEW_BACKGROUND ? (terminalHandoff ? "session" : "post-commit") : "manual", mode, ref: ref || "HEAD" },
+    trigger: { kind: BACKGROUND_WORKER ? (terminalHandoff ? "session" : "post-commit") : "manual", mode, ref: ref || "HEAD" },
     input: { mode, ref: ref || "HEAD", commit },
     metadata: { commit, pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", sessionId: opts["session-id"], sessionFile: opts["session-file"], ...(terminalHandoff ? { continuationMode: "terminal" } : {}) },
   });
@@ -494,7 +495,7 @@ function stripBackgroundArgs(argv) {
 }
 
 function maybeBackground(argv, opts) {
-  if (process.env.PI_CODE_REVIEW_BACKGROUND) return false;
+  if (BACKGROUND_WORKER) return false;
   if (!isTruthyFlag(opts.background)) return false;
   const nextArgs = stripBackgroundArgs(argv);
   const child = spawn(process.execPath, [SCRIPT_PATH, ...nextArgs], {
@@ -517,7 +518,7 @@ async function main() {
     return;
   }
   try {
-    if (cmd === "review") terminalHandoffOptedIn(opts, process.env.PI_CODE_REVIEW_BACKGROUND);
+    if (cmd === "review") terminalHandoffOptedIn(opts, BACKGROUND_WORKER);
     if (cmd === "review" && maybeBackground(rawArgv, opts)) return;
     let code = 0;
     if (cmd === "review") code = await reviewCommand(opts);

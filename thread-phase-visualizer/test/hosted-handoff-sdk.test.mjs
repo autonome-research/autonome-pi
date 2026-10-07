@@ -5,8 +5,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { findPackageJSON } from "node:module";
@@ -19,12 +18,13 @@ import {
 	listRuns,
 	makeGitRepo,
 	makeProject,
+	makeStore,
 	waitFor,
 } from "./support/hosted-handoff-fixture.mjs";
 
 const sdkDir = process.env.PI_HANDOFF_SDK_DIR;
 test("hosted opt-in completions reach the marked handoff; mismatched owners, cancellation and cards do not", { skip: !sdkDir, timeout: 90_000 }, async () => {
-	const root = mkdtempSync(join(tmpdir(), "hosted-handoff-sdk-"));
+	const root = makeStore("hosted-handoff-sdk-");
 	const agentDir = join(root, "agent"), storeDir = join(root, "store"), sessionDir = join(root, "sessions");
 	for (const path of [agentDir, storeDir, sessionDir]) mkdirSync(path);
 	process.env.PI_THREAD_PHASE_STORE_DIR = storeDir;
@@ -154,6 +154,5 @@ test("hosted opt-in completions reach the marked handoff; mismatched owners, can
 			await session.extensionRunner.emit({ type: "session_shutdown", reason: "exit" });
 			session.dispose();
 		}
-		rmSync(root, { recursive: true, force: true });
 	}
 });

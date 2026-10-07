@@ -25,6 +25,67 @@ import {
 
 const SESSION = "hosted-handoff-cli-session";
 
+for (const [cli, marker] of [
+	[REVIEW_CLI, "PI_CODE_REVIEW_BACKGROUND"],
+	[EXPLORATION_CLI, "PI_CODEBASE_EXPLORATION_BACKGROUND"],
+]) {
+	for (const value of ["", "0", "false", "1"]) {
+		const worker = value === "1";
+		const review = cli === REVIEW_CLI;
+		const backgroundKind = review ? "session" : "background";
+		const argsFor = (cwd) => review ? reviewArgs({ repo: cwd })
+			: ["--cwd", cwd, "--agent", "mock", "--dirs", "src", "--delay", "5"];
+
+		test(`${marker}=${JSON.stringify(value)}: validate handoff and notification-only defaults`, () => {
+			const cwd = review ? makeGitRepo() : makeProject();
+			const store = makeStore();
+			const env = childEnv(store, { [marker]: value });
+			const result = runCli(cli, [...argsFor(cwd), "--session-id", SESSION, "--continuation", "terminal"], env);
+			if (worker) {
+				assert.equal(result.status, 0, result.stderr || result.stdout);
+				const [run] = listRuns(store);
+				assert.equal(run.end.status, "success");
+				assert.equal(run.start.metadata.continuationMode, "terminal");
+				assert.equal(run.start.trigger.kind, backgroundKind);
+			} else {
+				assert.equal(result.status, 1, result.stderr || result.stdout);
+				assert.match(result.stdout + result.stderr, /requires --background/);
+				assert.equal(listRuns(store).length, 0, "reject before creating a run");
+			}
+
+			const known = new Set(listRuns(store).map((run) => run.runId));
+			const plain = runCli(cli, argsFor(cwd), env);
+			assert.equal(plain.status, 0, plain.stderr || plain.stdout);
+			const run = findNewRun(store, known);
+			assert.equal(run.end.status, "success");
+			assert.equal(run.start.metadata.continuationMode, undefined);
+			assert.equal(run.start.trigger.kind, worker ? (review ? "post-commit" : "background") : "manual");
+		});
+
+		test(`${marker}=${JSON.stringify(value)}: --background detaches only outside a worker`, async () => {
+			const cwd = review ? makeGitRepo() : makeProject();
+			const store = makeStore();
+			const result = runCli(cli, [...argsFor(cwd), "--background", "--session-id", SESSION, "--continuation", "terminal"], childEnv(store, { [marker]: value }));
+			assert.equal(result.status, 0, result.stderr || result.stdout);
+			const output = JSON.parse(result.stdout);
+			// Wait for the owned run even when a later detachment assertion fails.
+			const run = await waitFor(() => listRuns(store).find((r) => r.end), "background marker fixture completion");
+			assert.equal(run.end.status, "success");
+			assert.equal(listRuns(store).length, 1, "worker must not recursively relaunch");
+			assert.equal(run.start.metadata.continuationMode, "terminal");
+			assert.equal(run.start.trigger.kind, backgroundKind);
+			if (worker) {
+				assert.equal(output.background, undefined);
+				assert.equal(run.start.metadata.pid, result.pid, "worker executes in place");
+			} else {
+				assert.equal(output.background, true);
+				assert.notEqual(output.pid, result.pid);
+				assert.equal(run.start.metadata.pid, output.pid, "detached child owns the run");
+			}
+		});
+	}
+}
+
 function reviewArgs(store, extra = []) {
 	return ["review", "--cwd", store.repo, "--mode", "last_commit", "--json", ...extra];
 }

@@ -14,6 +14,7 @@ import {
   wrapPhases,
 } from "../../thread-phase-visualizer/lib/store.mjs";
 
+const BACKGROUND_WORKER = isTruthyFlag(process.env.PI_CODEBASE_EXPLORATION_BACKGROUND);
 const DEFAULT_PI = existsSync(join(homedir(), ".npm-global", "bin", "pi"))
   ? join(homedir(), ".npm-global", "bin", "pi")
   : "pi";
@@ -428,7 +429,7 @@ function stripBackgroundArgs(argv) {
 }
 
 function maybeBackground(rawArgv, opts) {
-  if (process.env.PI_CODEBASE_EXPLORATION_BACKGROUND) return false;
+  if (BACKGROUND_WORKER) return false;
   if (!isTruthyFlag(opts.background)) return false;
   const nextArgs = stripBackgroundArgs(rawArgv);
   const child = spawn(process.execPath, [process.argv[1], ...nextArgs], {
@@ -445,7 +446,7 @@ function maybeBackground(rawArgv, opts) {
 async function main() {
   const rawArgv = process.argv.slice(2);
   const args = parseArgs(rawArgv);
-  const terminalHandoff = terminalHandoffOptedIn(args, process.env.PI_CODEBASE_EXPLORATION_BACKGROUND);
+  const terminalHandoff = terminalHandoffOptedIn(args, BACKGROUND_WORKER);
   if (maybeBackground(rawArgv, args)) return;
   if (args.help || args.h) {
     console.log(`Usage: codebase-exploration-workflow.mjs --cwd REPO [--dirs src,tests,docs] [--agent mock|pi] [--concurrency 3] [--model MODEL] [--background] [--continuation terminal --session-id ID]\n\nDefault agent is pi (real read-only Pi subagents). Use --agent mock only for UI testing.\n--continuation terminal (with --background and --session-id) requests a durable success/failure\nhandoff to the owning interactive Pi session; the Pi extension sets it for hosted background launches.`);
@@ -462,7 +463,7 @@ async function main() {
   const visualizerRun = createRun({
     workflow: "codebase-exploration",
     cwd,
-    trigger: { kind: process.env.PI_CODEBASE_EXPLORATION_BACKGROUND ? "background" : "manual", agent, concurrency },
+    trigger: { kind: BACKGROUND_WORKER ? "background" : "manual", agent, concurrency },
     input: { dirs: splitList(args.dirs), agent, concurrency },
     metadata: { pid: process.pid, cancellable: true, cancelSignal: "SIGTERM", sessionId: args["session-id"], sessionFile: args["session-file"], ...(terminalHandoff ? { continuationMode: "terminal" } : {}) },
     message: "codebase-exploration started",
