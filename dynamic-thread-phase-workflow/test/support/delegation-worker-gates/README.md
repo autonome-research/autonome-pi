@@ -4,6 +4,8 @@
 
 ## Reproduce (explicit authorization required)
 
+**Historical lanes caveat:** the driver below hardcodes historical fixture lanes — global **0.86.0** (`/home/velvet/.npm-global/...`) and repo **0.84.2** (`node_modules/...`). The repository dev pin is now **1.0.4**, so a fresh lock install supplies 1.0.4 and the repo 0.84.2 lane no longer resolves in a fresh checkout. These commands reproduce only against checkouts/installs where the historical lanes are still present; they do not run against, and imply nothing about, 1.0.4 (which `worker/sdk-runner.mjs` rejects fail-closed with `UNSUPPORTED_VERSION`).
+
 From repository root, select the exact test file. The process tests skip unless `PI_DELEGATION_COMPAT_FIXTURES=1`; the driver independently rejects accidental execution without that fixture-only switch. It grants no production authority.
 
 ```bash
@@ -42,12 +44,14 @@ dynamic-thread-phase-workflow/test/pi-json-stream.test.mjs
 
 ## Demonstrated versions and provenance
 
+**Historical.** All results and pass counts in this README were produced against the pinned lanes below, which predate the active **1.0.4** development SDK. They are historical evidence for those versions only, not 1.0.4 qualification.
+
 Linux, Node **v24.15.0**, explicit package versions checked before execution (no fallback):
 
 | Pi | Entrypoints exercised |
 | --- | --- |
 | Installed **0.86.0** | `/home/velvet/.npm-global/bin/pi` → `/home/velvet/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`; SDK at the same package's `dist/index.js` |
-| Repository **0.84.2** | `node_modules/@earendil-works/pi-coding-agent/dist/cli.js` and `dist/index.js` |
+| Repository **0.84.2** | `node_modules/@earendil-works/pi-coding-agent/dist/cli.js` and `dist/index.js` (historical lane; fresh lock installs 1.0.4, so this path no longer resolves to 0.84.2 in a fresh checkout) |
 
 The fixture invokes the installed bin symlink (the bundled CLI), and the repository's explicit unbundled JS CLI entry with the current Node and a network-denial preload, rather than relying on PATH or inherited `NODE_OPTIONS`. It does not install/update Pi. No support claim for other Pi/Node/OS versions.
 

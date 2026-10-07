@@ -2,6 +2,8 @@
 
 Status: experimental but usable.
 
+**Recursive (v3) delegation — implemented but not enabled by default:** a recursive-delegation slice exists in this repository, wired end-to-end behind `PI_DYNAMIC_WORKFLOW_RECURSIVE_LAUNCH` and **disabled by default** (`NOT_ENABLED` is thrown first). It is not part of the public contract below, is tested only against historical fixture SDK lanes (0.86.0/0.84.2, synthetic provider), and rejects the active dev-pinned **1.0.4** SDK fail-closed (`UNSUPPORTED_VERSION`). Do not enable it expecting qualified behavior; see [docs/recursive-delegation.md](../docs/recursive-delegation.md) for the full status, known defects and qualification gates.
+
 `dynamic_workflow` is a small, validated workflow composer for supervised subagents. The tool input is the workflow: provide defaults plus an ordered list of `agent`, `fanout`, `shell`, and `artifact` phases. Structured workflows compile onto thread-phase and emit generic `thread-phase-ui/v1` events for `thread_phase_runs` and the `ctrl+shift+t` monitor.
 
 ## Basic workflow
