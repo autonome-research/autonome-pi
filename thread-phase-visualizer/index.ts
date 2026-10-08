@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { CustomMessageEntryDraft, ExtensionAPI, ExtensionContext, TurnEndEventResult } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { showThreadPhaseMonitor } from "./components/monitor.ts";
 import { registerThreadPhaseMessageRenderers } from "./components/run-message-renderer.ts";
@@ -238,6 +238,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 	let statusRuntimeToken: object | undefined;
 	const startupDeliveryTimers = new Set<ReturnType<typeof setTimeout>>();
 	let retryDeferredSubmissions: (() => void) | undefined;
+	let submitAtTurnEnd: (() => TurnEndEventResult | undefined) | undefined;
 	let acknowledgeContinuation: ((runId: string, deliveryId: string) => void) | undefined;
 	let requestHandoff: ((runId: string) => Promise<void>) | undefined;
 	let dashboardRuns: typeof mergeMonitorRuns | undefined;
@@ -342,6 +343,15 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		}
 	});
 
+	pi.on("turn_end", (event, ctx) => {
+		// Pi commits boundary entries after the whole tool batch, before selecting
+		// the next request. Never leave a stale prompt in its steering queue.
+		if (event.outcome !== "completed" || ctx.signal?.aborted) return;
+		const handoff = submitAtTurnEnd?.();
+		// Boundary handlers replace the accumulated entries; preserve prior peers.
+		if (handoff?.entries) return { ...handoff, entries: [...event.entries, ...handoff.entries] };
+	});
+
 	pi.on("agent_settled", (_event, ctx) => {
 		if (ctx.isIdle()) retryDeferredSubmissions?.();
 	});
@@ -361,6 +371,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		acknowledgeContinuation = undefined;
 		requestHandoff = undefined;
 		dashboardRuns = undefined;
+		submitAtTurnEnd = undefined;
 		ensureStore();
 		cwdState = createCwdState(ctx.cwd);
 		// RPC also has UI support; animation belongs only in the terminal footer.
@@ -541,6 +552,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 			return [...runs.values()];
 		};
 
+		let boundaryEntries: CustomMessageEntryDraft[] | undefined;
 		let pumpContinuations: () => void;
 		let pumpSubmissions: () => void;
 		let submissionGateActive = false;
@@ -567,7 +579,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		};
 
 		pumpContinuations = () => {
-			if (sessionTerminated || inFlightContinuation || !ctx.isIdle()) return;
+			if (sessionTerminated || inFlightContinuation || (!ctx.isIdle() && !boundaryEntries)) return;
 			while (queuedContinuations.size > 0) {
 				const [runId, queued] = queuedContinuations.entries().next().value as [string, QueuedContinuation];
 				if (retryExhausted(runId)) {
@@ -620,7 +632,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				}
 				queued.retryPending = true;
 
-				// The startup delay and an idle transition both leave time for cancellation,
+				// Startup and waiting for the tool batch leave time for cancellation,
 				// session scope, successor commitment, or durable ownership to change. Read
 				// all of them again immediately before injecting the user message.
 				try {
@@ -635,11 +647,6 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 					discardIneligibleContinuation(summary, runId);
 					queuedContinuations.delete(runId);
 					continue;
-				}
-				if (!ctx.isIdle()) {
-					releaseSpecificClaim(runId, claim.deliveryId);
-					if (ctx.hasUI) ctx.ui.notify("Thread-phase continuation deferred (agent busy); it will retry when idle.", "info");
-					return;
 				}
 				try {
 					if (!continuationClaimIsOwned(runId, {
@@ -690,7 +697,12 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				queuedContinuations.delete(runId);
 				inFlightContinuation = { runId, deliveryId: claim.deliveryId };
 				try {
-					pi.sendUserMessage(prompt);
+					if (boundaryEntries) {
+						// The native boundary appends this directly to persisted context;
+						// it does not enqueue text that can outlive delivery eligibility.
+						boundaryEntries.push({ type: "custom_message", customType: "thread-phase-handoff",
+							content: prompt, display: true, details: { deliveryId: claim.deliveryId, runId } });
+					} else pi.sendUserMessage(prompt);
 					manualHandoffs.delete(runId);
 				} catch (error) {
 					// A synchronous rejection did not enqueue a message. Retry at most three
@@ -715,7 +727,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 					if (ctx.hasUI) ctx.ui.notify(`Could not submit thread-phase continuation ${claim.deliveryId} (attempt ${failures}/3); it remains pending: ${error instanceof Error ? error.message : String(error)}`, "warning");
 				}
 				// One message remains in flight until persisted session history acknowledges it.
-				// agent_settled schedules the next queued continuation once Pi is truly idle.
+				// Later completions wait for the next turn boundary or idle settlement.
 				return;
 			}
 		};
@@ -810,6 +822,15 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		};
 
 		retryDeferredSubmissions = retryContinuations;
+		submitAtTurnEnd = () => {
+			const entries: CustomMessageEntryDraft[] = [];
+			boundaryEntries = entries;
+			try { pumpSubmissions(); }
+			finally { boundaryEntries = undefined; }
+			// Pi coalesces this with a natural tool-loop continuation; it does not
+			// add a second request when the tool batch already requires one.
+			return entries.length ? { entries, continue: true } : undefined;
+		};
 		requestHandoff = async (runId) => {
 			try {
 				const summary = getRunSummary(runId);
@@ -913,6 +934,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 		acknowledgeContinuation = undefined;
 		requestHandoff = undefined;
 		dashboardRuns = undefined;
+		submitAtTurnEnd = undefined;
 		watcher?.close();
 		watcher = undefined;
 		if (statusRefreshTimer) clearInterval(statusRefreshTimer);

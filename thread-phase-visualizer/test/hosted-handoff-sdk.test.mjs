@@ -65,10 +65,11 @@ test("hosted opt-in completions reach the marked handoff; mismatched owners, can
 		label,
 	);
 	const pending = (runId) => receipts.loadPendingContinuationRecords({ storeDir }).find((record) => record.runId === runId);
-	const userTextFor = (runId) => manager.getEntries()
-		.filter((entry) => entry.type === "message" && entry.message.role === "user")
-		.map((entry) => entry.message.content?.map?.((part) => part.text).join("\n") || "")
-		.find((text) => text.includes(runId));
+	const handoffTextFor = (runId) => manager.getEntries()
+		.map((entry) => entry.type === "custom_message" ? entry.content
+			: entry.type === "message" && entry.message.role === "user" ? entry.message.content : "")
+		.map((content) => typeof content === "string" ? content : content?.map?.((part) => part.text).join("\n") || "")
+		.find((text) => text.includes(runId) && text.includes("[thread-phase-continuation/v1]"));
 	try {
 		manager = manager0;
 		const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
@@ -105,10 +106,10 @@ test("hosted opt-in completions reach the marked handoff; mismatched owners, can
 		assert.equal(requests, 1, "no delivery while the agent is busy");
 		release();
 		await initial;
-		await waitFor(() => requests >= 2 && session.isIdle, "failure handoff delivered once idle");
+		await waitFor(() => requests >= 2 && session.isIdle, "failure handoff delivered at the completed turn boundary");
 		assert.equal(requests, 2, "one user turn plus one handoff; the completion card must not trigger another turn");
 		assert.ok(sessionHistoryHasRunContinuation(manager.getEntries(), failed.runId, sessionId));
-		const failurePrompt = userTextFor(failed.runId);
+		const failurePrompt = handoffTextFor(failed.runId);
 		assert.match(failurePrompt, /Report the blocker and available partial results/);
 		assert.match(failurePrompt, /requires the user's authorization/, "failure handoff never authorizes restart/recovery");
 
