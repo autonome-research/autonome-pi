@@ -16,6 +16,7 @@ import {
 	normalizeStatus,
 	observeSessionRunSummaries,
 	readIndex,
+	readIndexUpdates,
 	readRun,
 	runFileFor,
 } from "./lib/store.mjs";
@@ -738,14 +739,16 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				inFlightContinuation = undefined;
 			}
 		};
-		const retryContinuations = () => {
+		const retryContinuations = (settled = false) => {
 			// Reconsider durable records whose successor state was unreadable, or
 			// whose earlier claimant was active. Never reset a submission retry budget.
 			try {
 				if (inFlightContinuation) {
 					const flight = inFlightContinuation;
-					if (!reconcileContinuation(flight.runId).accepted) {
-						// Idle without a receipt is ambiguous, not permission to resend.
+					if (!reconcileContinuation(flight.runId).accepted && settled) {
+						// Only a lifecycle settlement can release an unaccepted flight.
+						// Passive isIdle() is also true during asynchronous SDK preflight.
+						// The submitted record stays uncertain, never automatically replayed.
 						releaseSpecificClaim(flight.runId, flight.deliveryId);
 						inFlightContinuation = undefined;
 					}
@@ -753,7 +756,9 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				for (const pending of loadPendingContinuationRecords({ storeDir: continuationStoreDir })) {
 					if (queuedContinuations.has(pending.runId) || retryExhausted(pending.runId)
 						|| inFlightContinuation?.runId === pending.runId) continue;
-					const summary = getRunSummary(pending.runId);
+					let summary: AnyEvent;
+					try { summary = getRunSummary(pending.runId); }
+					catch { continue; } // durable pending work is retried without blocking its neighbors
 					if (belongsToSession(summary, currentSessionId, cwdState.activeCwd)
 						&& [STATUSES.SUCCESS, STATUSES.FAILED].includes(summary?.normalizedStatus)
 						&& continuationEligibility(summary) !== "ineligible") {
@@ -821,7 +826,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 			}
 		};
 
-		retryDeferredSubmissions = retryContinuations;
+		retryDeferredSubmissions = () => retryContinuations(true);
 		submitAtTurnEnd = () => {
 			const entries: CustomMessageEntryDraft[] = [];
 			boundaryEntries = entries;
@@ -858,6 +863,7 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 
 		// Prime completion rendering while reclaiming durable pending deliveries.
 		// Legacy continuation ids migrate as delivered and are never replayed.
+		let indexCursor = readIndexUpdates().cursor;
 		const startupEvents = readIndex({ limit: 5000 });
 		for (const event of startupEvents) {
 			seen.add(eventKey(event));
@@ -876,52 +882,82 @@ export default function threadPhaseVisualizer(pi: ExtensionAPI) {
 				startupRuns.add(event.runId);
 			}
 		}
-		for (const runId of startupRuns) {
-			const summary = getRunSummary(runId);
-			if (belongsToSession(summary, currentSessionId, cwdState.activeCwd)
-				&& [STATUSES.SUCCESS, STATUSES.FAILED].includes(summary?.normalizedStatus)
-				&& continuationEligibility(summary) !== "ineligible") attemptAutoContinuation(summary, runId, true, { startup: true });
-			else discardIneligibleContinuation(summary, runId);
-		}
+		const unresolvedCompletions = new Map<string, AnyEvent | undefined>();
+		const processCompletion = (runId: string, event?: AnyEvent, startup = false) => {
+			unresolvedCompletions.delete(runId);
+			try {
+				const summary = getRunSummary(runId);
+				if (!belongsToSession(summary, currentSessionId, cwdState.activeCwd)) return;
+				const newCompletion = event && !cardRunIds.has(runId);
+				if (newCompletion) {
+					pi.sendMessage({
+						customType: "thread-phase-run",
+						content: formatCompletion(event),
+						display: true,
+						details: { event, summary, events: readRun(runId, { readLimit: 50_000 }) },
+					}, { triggerTurn: false });
+					cardRunIds.add(runId);
+				}
+				if ([STATUSES.SUCCESS, STATUSES.FAILED].includes(summary?.normalizedStatus)
+					&& continuationEligibility(summary) !== "ineligible") attemptAutoContinuation(summary, runId, !event, { startup });
+				else discardIneligibleContinuation(summary, runId);
+				if (newCompletion && ctx.hasUI) ctx.ui.notify(`thread-phase ${event.workflow}: ${event.status || "done"}`, summary.normalizedStatus === STATUSES.FAILED ? "warning" : "info");
+			} catch {
+				// Retain only the discovery hint; unreadable evidence grants no ownership.
+				unresolvedCompletions.set(runId, event);
+			}
+		};
+		for (const runId of startupRuns) processCompletion(runId, undefined, true);
 		updateStatus();
 
 		const processNewEvents = () => {
-			const events = readIndex({ limit: 500 });
+			if (sessionTerminated || statusRuntimeToken !== runtimeToken) return;
+			const { events, cursor } = readIndexUpdates(indexCursor);
+			// ponytail: retain one hint per unreadable run in this runtime, retry 100
+			// per refresh round-robin; use a durable discovery outbox for restart recovery.
+			const retries: [string, AnyEvent | undefined][] = [];
+			for (const entry of unresolvedCompletions) {
+				retries.push(entry);
+				if (retries.length >= 100) break;
+			}
+			for (const [runId, event] of retries) processCompletion(runId, event, !event);
 			for (const event of events) {
+				if (event.type !== EVENT_TYPES.WORKFLOW_END) continue;
 				const key = eventKey(event);
 				if (seen.has(key)) continue;
+				processCompletion(event.runId, event);
 				seen.add(key);
-				if (event.type === EVENT_TYPES.WORKFLOW_END) {
-					const summary = getRunSummary(event.runId);
-					if (!belongsToSession(summary, currentSessionId, cwdState.activeCwd)) continue;
-					const newCompletion = !cardRunIds.has(event.runId);
-					if (newCompletion) {
-						pi.sendMessage({
-							customType: "thread-phase-run",
-							content: formatCompletion(event),
-							display: true,
-							details: { event, summary, events: readRun(event.runId, { readLimit: 50_000 }) },
-						}, { triggerTurn: false });
-						cardRunIds.add(event.runId);
-					}
-					if (event.runId && [STATUSES.SUCCESS, STATUSES.FAILED].includes(summary?.normalizedStatus)
-						&& continuationEligibility(summary) !== "ineligible") attemptAutoContinuation(summary, event.runId);
-					else if (event.runId) discardIneligibleContinuation(summary, event.runId);
-					if (newCompletion && ctx.hasUI) ctx.ui.notify(`thread-phase ${event.workflow}: ${event.status || "done"}`, summary.normalizedStatus === STATUSES.FAILED ? "warning" : "info");
-				}
 			}
-			updateStatus();
+			indexCursor = cursor;
+		};
+		const refresh = () => {
+			if (sessionTerminated || statusRuntimeToken !== runtimeToken) return;
+			try {
+				processNewEvents();
+				if (ctx.isIdle()) retryContinuations();
+			} catch (error) {
+				if (ctx.hasUI) ctx.ui.notify(`Could not refresh thread-phase completions: ${error instanceof Error ? error.message : String(error)}`, "warning");
+			} finally {
+				updateStatus(); // the bridge must still mark a missing/unreadable source unknown
+			}
 		};
 
 		watcher?.close();
-		watcher = fs.watch(INDEX_FILE, { persistent: false }, () => processNewEvents());
-		// Index events refresh the cached footer identities immediately. This bounded
-		// poll also removes runs that become stale solely because time passes or
-		// their PID exits, neither of which necessarily appends another event.
-		// The 120ms animation itself performs no store or liveness reads.
-		if (sessionFooter || sessionBridge) {
-			statusRefreshTimer = setInterval(updateStatus, STATUS_REFRESH_MS);
-			statusRefreshTimer.unref?.();
+		watcher = undefined;
+		// fs.watch is a latency hint, not delivery authority. Keep bounded discovery
+		// alive even without a footer/bridge or a new user/idle edge. This is passive
+		// store reconciliation, never periodic main-agent supervision.
+		statusRefreshTimer = setInterval(refresh, STATUS_REFRESH_MS);
+		statusRefreshTimer.unref?.();
+		try {
+			const installedWatcher = fs.watch(INDEX_FILE, { persistent: false }, refresh);
+			watcher = installedWatcher;
+			installedWatcher.on?.("error", () => {
+				installedWatcher.close();
+				if (watcher === installedWatcher) watcher = undefined;
+			});
+		} catch {
+			// Watch quota/platform failures must not disable lifecycle-owned polling.
 		}
 	});
 

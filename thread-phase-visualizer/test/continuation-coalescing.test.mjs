@@ -2,11 +2,11 @@
 // PI_HANDOFF_SDK_DIR explicitly selects the genuine installed SDK.
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import fs, { appendFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { findPackageJSON } from "node:module";
+import { findPackageJSON, syncBuiltinESMExports } from "node:module";
 import { setTimeout as delay } from "node:timers/promises";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
@@ -16,13 +16,25 @@ const dirs = Object.fromEntries(["home", "tmp", "agent", "store", "sessions"].ma
   const path = join(root, name); mkdirSync(path); return [name, path];
 }));
 Object.assign(process.env, { HOME: dirs.home, TMPDIR: dirs.tmp,
-  PI_THREAD_PHASE_STORE_DIR: dirs.store, PI_THREAD_PHASE_STATUS_BRIDGE: "0" });
+  PI_THREAD_PHASE_STORE_DIR: dirs.store, PI_THREAD_PHASE_STATUS_BRIDGE: "0",
+  PI_THREAD_PHASE_STATUS_REFRESH_MS: "25" });
 test.after(() => rmSync(root, { recursive: true, force: true }));
 const sdkDir = process.env.PI_HANDOFF_SDK_DIR;
 const skip = !sdkDir && "PI_HANDOFF_SDK_DIR is not set";
 const options = { skip, timeout: 20_000 };
+// Install before Pi's loader caches node:fs exports; toggle only in the fault test.
+const originalWatch = fs.watch;
+let suppressWatch = false, suppressedWatches = 0, throwWatch = false;
+fs.watch = (...args) => {
+  if (throwWatch) throw Object.assign(new Error("fixture: watch quota exhausted"), { code: "ENOSPC" });
+  if (!suppressWatch) return originalWatch(...args);
+  suppressedWatches++;
+  return { close() {} };
+};
+syncBuiltinESMExports();
+test.after(() => { fs.watch = originalWatch; syncBuiltinESMExports(); });
 
-async function fixture(t, { earlierBoundary = false, initialTools = true } = {}) {
+async function fixture(t, { earlierBoundary = false, initialTools = true, laterBoundary, input } = {}) {
   const sdk = await import(pathToFileURL(join(sdkDir, "dist/index.js")));
   assert.equal(JSON.parse(readFileSync(join(sdkDir, "package.json"))).version, "1.0.4");
   assert.equal(sdk.VERSION, "1.0.4");
@@ -54,12 +66,15 @@ async function fixture(t, { earlierBoundary = false, initialTools = true } = {})
       { type: 'custom_message', customType: 'fixture-context', content: 'Keep earlier context', display: false }
     ], continue: true } : undefined);
   };`);
+  const laterPath = join(dirs.agent, `later-boundary-${randomUUID()}.mjs`);
+  if (laterBoundary) writeFileSync(laterPath, laterBoundary);
   const open = async file => {
     manager = file ? sdk.SessionManager.open(file, dirs.sessions) : sdk.SessionManager.create(root, dirs.sessions);
     const settingsManager = sdk.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
     const resourceLoader = new sdk.DefaultResourceLoader({ cwd: root, agentDir: dirs.agent, settingsManager,
       noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-      additionalExtensionPaths: [...(earlierBoundary ? [earlierPath] : []), fileURLToPath(new URL("../index.ts", import.meta.url))],
+      additionalExtensionPaths: [...(earlierBoundary ? [earlierPath] : []), fileURLToPath(new URL("../index.ts", import.meta.url)), ...(laterBoundary ? [laterPath] : [])],
+      extensionFactories: input ? [pi => { pi.on("input", input); }] : [],
       systemPrompt: "Offline handoff fixture", appendSystemPrompt: [] });
     await resourceLoader.reload();
     assert.deepEqual(resourceLoader.getExtensions().errors, []);
@@ -216,3 +231,197 @@ test("failed boundary persistence remains uncertain across settlement and reload
   assert.equal(f.state.contexts.length, requests, "uncertainty never grants an automatic resend");
   assert.equal(f.pending(run.runId)?.submissionState, "submitted");
 });
+
+function historicalRun(f, id, { ageMinutes = 65, sessionId = f.manager.getSessionId() } = {}) {
+  const run = { runId: id, workflow: "long-runtime", cwd: root,
+    metadata: { sessionId, continuationMode: "terminal" } };
+  f.store.emit(run, { type: "workflow_start", status: "running", metadata: run.metadata,
+    timestamp: new Date(Date.now() - ageMinutes * 60_000).toISOString() });
+  return run;
+}
+
+for (const status of ["success", "failed"]) {
+  test(`old start with fresh ${status} terminal wakes idle SDK, old terminal stays held`, options, async t => {
+    const f = await fixture(t, { initialTools: false }); await f.open();
+    const run = historicalRun(f, `long-fresh-${status}`);
+    assert.ok(Date.now() - Date.parse(f.store.getRunSummary(run.runId).startedAt) > 30 * 60_000);
+    assert.equal(f.state.contexts.length, 0, "elapsed workflow time does not prompt");
+    f.store.completeRun(run, status);
+    await f.wait(() => f.history(run.runId) && f.session.isIdle, "fresh terminal accepted");
+    assert.equal(f.state.contexts.length, 1);
+    assert.equal(f.record(run.runId).state, "delivered");
+    const old = historicalRun(f, `long-old-${status}`);
+    f.store.emit(old, { type: "workflow_end", status, timestamp: new Date(Date.now() - 31 * 60_000).toISOString() });
+    // Recent nonterminal activity is not permission to refresh an old completion.
+    f.store.phaseEvent(old, "late", { message: "late activity" });
+    await f.wait(() => f.pending(old.runId), "old result remains durable");
+    assert.equal(f.pending(old.runId).submissionState, "unsent");
+    assert.equal(f.history(old.runId), false);
+    assert.equal(f.state.contexts.length, 1);
+    assert.deepEqual(f.state.errors, []);
+  });
+}
+
+test("idle SDK discovers terminal buried beyond both recent index windows", options, async t => {
+  const f = await fixture(t, { initialTools: false }); await f.open();
+  const run = historicalRun(f, "long-buried-terminal");
+  f.store.completeRun(run, "success");
+  // A different producer's burst lands before fs.watch can dispatch (one event-loop turn).
+  const noise = f.run("long-noisy-neighbor");
+  const event = f.store.phaseEvent(noise, "noise", { message: "unrelated output" });
+  const burst = Array.from({ length: 6000 }, (_, i) => JSON.stringify({ ...event, eventId: `noise-${i}` }) + "\n").join("");
+  appendFileSync(f.store.runFileFor(noise.runId), burst);
+  appendFileSync(f.store.INDEX_FILE, burst);
+  assert.equal(f.store.readIndex({ limit: 5000 }).some(e => e.runId === run.runId), false);
+  await f.wait(() => f.history(run.runId) && f.session.isIdle, "buried completion must wake idle SDK");
+  assert.equal(f.state.contexts.length, 1);
+  assert.equal(f.record(run.runId).state, "delivered");
+  assert.deepEqual(f.state.errors, []);
+});
+
+test("idle SDK discovers fresh completion with lost filesystem notifications", options, async t => {
+  suppressWatch = true;
+  t.after(() => { suppressWatch = false; });
+  const f = await fixture(t, { initialTools: false }); await f.open();
+  assert.ok(suppressedWatches > 0, "watch fault was installed");
+  const run = historicalRun(f, "long-lost-notification");
+  f.store.completeRun(run, "failed");
+  await f.wait(() => f.history(run.runId) && f.session.isIdle, "poll must recover missed terminal without user/idle edge");
+  assert.equal(f.state.contexts.length, 1);
+  assert.equal(f.record(run.runId).state, "delivered");
+  assert.deepEqual(f.state.errors, []);
+});
+
+for (const delayed of [false, true]) {
+  test(`idle terminal batch stays single-flight through SDK preflight delayed=${delayed}`, options, async t => {
+    let release, inputs = 0;
+    const barrier = new Promise(resolve => { release = resolve; });
+    t.after(() => release());
+    const f = await fixture(t, { initialTools: false, input: delayed ? async () => {
+      inputs++; await barrier; return { action: "continue" };
+    } : undefined });
+    await f.open();
+    const runs = [f.run(`idle-batch-a-${delayed}`), f.run(`idle-batch-b-${delayed}`)];
+    for (const run of runs) f.store.completeRun(run);
+    if (delayed) {
+      await f.wait(() => inputs > 0, "SDK entered asynchronous preflight");
+      try {
+        assert.equal(f.session.isIdle, true, "idle snapshot does not prove settlement");
+        await delay(100); // Hold preflight across multiple 25ms polls, not a delivery delay.
+        assert.equal(inputs, 1, "no concurrent prompt during preflight");
+        assert.equal(f.pending(runs[0].runId).submissionState, "submitted");
+        assert.equal(f.pending(runs[1].runId).submissionState, "unsent");
+        assert.equal(f.state.contexts.length, 0);
+      } finally { release(); }
+    }
+    await f.wait(() => runs.every(run => f.history(run.runId)) && f.session.isIdle, "both idle receipts");
+    assert.equal(f.state.contexts.length, 2);
+    for (const run of runs) assert.equal(f.record(run.runId).state, "delivered");
+    assert.deepEqual(f.state.errors, []);
+  });
+}
+
+test("watch installation failure leaves lifecycle polling alive", options, async t => {
+  throwWatch = true;
+  t.after(() => { throwWatch = false; });
+  const f = await fixture(t, { initialTools: false }); await f.open();
+  const run = f.run("watch-install-failure"); f.store.completeRun(run);
+  await f.wait(() => f.history(run.runId) && f.session.isIdle, "poll delivers without watcher");
+  assert.equal(f.state.contexts.length, 1);
+  assert.deepEqual(f.state.errors, []);
+});
+
+for (const startup of [false, true]) {
+  test(`unreadable neighbor cannot pin later batches; repaired owned log is retried startup=${startup}`, options, async t => {
+    suppressWatch = true;
+    t.after(() => { suppressWatch = false; });
+    const f = await fixture(t, { initialTools: false }); await f.open();
+    // Pi does not create a session file until it contains conversation history.
+    if (startup) f.manager.appendMessage({ role: "user", content: "fixture owner", timestamp: Date.now() });
+    const owner = f.manager.getSessionId();
+    const broken = [historicalRun(f, `unreadable-foreign-${startup}`, { sessionId: "foreign" }),
+      f.run(`unreadable-owned-${startup}`)];
+    const saved = new Map();
+    const restore = () => {
+      for (const [file, contents] of saved) { rmSync(file, { recursive: true, force: true }); writeFileSync(file, contents); }
+      saved.clear();
+    };
+    t.after(restore);
+    for (const run of broken) {
+      f.store.completeRun(run);
+      const file = f.store.runFileFor(run.runId);
+      saved.set(file, readFileSync(file)); rmSync(file); mkdirSync(file);
+    }
+    if (startup) {
+      const file = f.manager.getSessionFile(); await f.close(); await f.open(file);
+      assert.equal(f.manager.getSessionId(), owner, "reopened the same persisted owner");
+    }
+    const healthy = f.run(`after-unreadable-${startup}`);
+    const noise = { type: "phase_event", runId: healthy.runId, timestamp: new Date().toISOString() };
+    appendFileSync(f.store.INDEX_FILE, Array.from({ length: 6000 }, (_, i) => JSON.stringify({ ...noise, eventId: `retry-noise-${i}` }) + "\n").join(""));
+    f.store.completeRun(healthy);
+    await f.wait(() => f.history(healthy.runId) && f.session.isIdle, "later cursor batch progresses");
+    for (const run of broken) assert.equal(f.history(run.runId), false);
+    restore(); // No new index event: recovery must use the retained unresolved candidate.
+    await f.wait(() => f.history(broken[1].runId) && f.session.isIdle, "repaired owned log is retried");
+    assert.equal(f.history(broken[0].runId), false);
+    assert.equal(f.state.contexts.length, 2);
+    assert.deepEqual(f.state.errors, []);
+  });
+}
+
+test("idle polling reclaims an expired lease but not cancelled, foreign, old or uncertain work", options, async t => {
+  suppressWatch = true;
+  t.after(() => { suppressWatch = false; });
+  const f = await fixture(t, { initialTools: false }); await f.open();
+  const receipts = await import("../lib/continuation-store.mjs");
+  const now = Date.now();
+  const cancelled = historicalRun(f, "poll-cancelled"); f.store.completeRun(cancelled, "cancelled");
+  const foreign = historicalRun(f, "poll-foreign", { sessionId: "other-owner" }); f.store.completeRun(foreign);
+  const old = historicalRun(f, "poll-old");
+  f.store.emit(old, { type: "workflow_end", status: "failed", timestamp: new Date(now - 31 * 60_000).toISOString() });
+  const uncertain = historicalRun(f, "poll-uncertain"); f.store.completeRun(uncertain);
+  const claimantId = receipts.createContinuationClaimantId();
+  const claim = receipts.persistContinuationClaim(uncertain.runId, { storeDir: dirs.store, claimantId });
+  const identity = { storeDir: dirs.store, claimantId, deliveryId: claim.deliveryId };
+  assert.equal(receipts.markContinuationSubmission(uncertain.runId, { ...identity, submissionState: "submitted" }), true);
+  receipts.relinquishContinuationClaim(uncertain.runId, identity);
+  const leased = historicalRun(f, "poll-leased"); f.store.completeRun(leased);
+  receipts.persistContinuationClaim(leased.runId, { storeDir: dirs.store, claimantId, now: now - 29 * 60_000 });
+  await f.wait(() => f.pending(old.runId), "poll observed old held result");
+  assert.equal(f.state.contexts.length, 0, "active claimant and other holds suppress delivery");
+  assert.equal(f.pending(leased.runId).claimantId, claimantId);
+  t.mock.method(Date, "now", () => now + 2 * 60_000); // expire only the lease, not terminal freshness
+  await f.wait(() => f.history(leased.runId) && f.session.isIdle, "idle poll reclaims expired lease without a new event");
+  assert.equal(f.state.contexts.length, 1);
+  for (const run of [cancelled, foreign, old, uncertain]) assert.equal(f.history(run.runId), false);
+  assert.equal(f.pending(old.runId).submissionState, "unsent");
+  assert.equal(f.pending(uncertain.runId).submissionState, "submitted");
+  const file = f.manager.getSessionFile(); await f.close(); await f.open(file);
+  f.store.completeRun(leased);
+  await delay(100);
+  assert.equal(f.state.contexts.length, 1, "reopen and repeated polling cannot replay accepted work");
+  assert.deepEqual(f.state.errors, []);
+});
+
+for (const mutation of ["remove", "invalidate"]) {
+  test(`later extension ${mutation}s handoff draft: uncertain, never replayed`, options, async t => {
+    const laterBoundary = `export default pi => pi.on('turn_end', e => e.entries.some(x => x.customType === 'thread-phase-handoff')
+      ? { entries: ${mutation === "remove" ? "e.entries.filter(x => x.customType !== 'thread-phase-handoff')" : "[...e.entries, { type: 'context_edit', targetId: 'missing-entry', replacement: null }]"}, continue: false } : undefined);`;
+    const f = await fixture(t, { laterBoundary }); await f.open();
+    const initial = f.start(); await f.wait(() => f.state.started.length > 0, "tools started");
+    const run = f.run(`long-draft-${mutation}`); f.store.completeRun(run);
+    await f.wait(() => f.pending(run.runId), "pending");
+    f.release(); await initial;
+    await f.wait(() => f.session.isIdle, "settled");
+    assert.equal(f.history(run.runId), false);
+    assert.equal(f.pending(run.runId).submissionState, "submitted");
+    const requests = f.state.contexts.length;
+    const file = f.manager.getSessionFile(); await f.close(); await f.open(file);
+    await delay(100);
+    assert.equal(f.state.contexts.length, requests);
+    assert.equal(f.pending(run.runId).submissionState, "submitted");
+    if (mutation === "remove") assert.deepEqual(f.state.errors, []);
+    else assert.ok(f.state.errors.some(e => /Invalid boundary entries/.test(e.error)));
+  });
+}

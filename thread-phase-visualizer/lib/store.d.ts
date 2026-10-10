@@ -294,6 +294,10 @@ export function readRunBounded(runId: string, options?: ThreadPhaseBoundedReadOp
 export function readIndexBounded(options?: ThreadPhaseBoundedReadOptions & { workflow?: string; cwd?: string }): ThreadPhaseJsonlReadResult;
 export function readRun(runId: string, options?: ThreadPhaseBoundedReadOptions): ThreadPhaseJsonlReadResult;
 export function readIndex(options?: ThreadPhaseBoundedReadOptions & { workflow?: string; cwd?: string }): ThreadPhaseJsonlReadResult;
+export function readIndexUpdates(cursor?: { identity: string; offset: number }): {
+  events: ThreadPhaseUiEvent[];
+  cursor: { identity: string; offset: number };
+};
 export type ThreadPhaseProjectionOptions = {
   /** Shared clock used for stale age and checkedAt calculations. */
   referenceTime?: number | string | Date;

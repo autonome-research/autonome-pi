@@ -1028,6 +1028,43 @@ export function readIndex(options = {}) {
   return readIndexBounded({ readLimit: DEFAULT_INDEX_READ_LIMIT, limit: 200, ...options });
 }
 
+/** Live discovery follows physical append order, not a sliding recent-history window. */
+export function readIndexUpdates(cursor) {
+  const fd = openSync(INDEX_FILE, "r");
+  try {
+    const { dev, ino, size } = fstatSync(fd);
+    const identity = `${dev}:${ino}`;
+    if (!cursor) {
+      // Capture EOF before startup's history scan. Retain a partial final record
+      // so its eventual completion is not lost between startup and watching.
+      const tail = Buffer.allocUnsafe(Math.min(size, EVENT_RECORD_MAX_BYTES));
+      if (readSync(fd, tail, 0, tail.length, size - tail.length) !== tail.length) throw new Error("Short index read");
+      const newline = tail.lastIndexOf(10);
+      if (newline < 0 && size > tail.length) throw new Error("Oversized partial index record");
+      return { events: [], cursor: { identity, offset: size - tail.length + newline + 1 } };
+    }
+    const offset = cursor.identity === identity && cursor.offset <= size ? cursor.offset : 0;
+    const bytes = Buffer.allocUnsafe(Math.min(size - offset, DEFAULT_JSONL_READ_MAX_BYTES));
+    if (readSync(fd, bytes, 0, bytes.length, offset) !== bytes.length) throw new Error("Short index read");
+    const events = [], parseErrors = [];
+    let position = 0;
+    // ponytail: at most 5,000 records / 8 MiB per refresh; drain in more ticks
+    // rather than block the foreground on an arbitrarily large producer burst.
+    for (let count = 0; count < DEFAULT_INDEX_READ_LIMIT && position < bytes.length; count++) {
+      const newline = bytes.indexOf(10, position);
+      if (newline < 0) break;
+      const text = bytes.subarray(position, newline).toString("utf8");
+      const event = parseJsonLine({ text, complete: true }, { file: INDEX_FILE, lineIndex: count, parseErrors });
+      if (event) events.push(event);
+      position = newline + 1;
+    }
+    if (!position && bytes.length >= EVENT_RECORD_MAX_BYTES) throw new Error("Oversized partial index record");
+    return { events: jsonlResult(events, parseErrors), cursor: { identity, offset: offset + position } };
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function artifactIdentity(artifact) {
   if (!artifact || typeof artifact !== "object") return undefined;
   if (artifact.path) return `path:${artifact.path}`;

@@ -629,6 +629,40 @@ test("unknown successor state preserves pending work until eligibility can be re
   }
 });
 
+test("35-minute quiet host lifetime stays passive, then polls fresh terminals at the default cadence", async t => {
+  const now = Date.now();
+  t.mock.timers.enable({ apis: ["Date", "setTimeout", "setInterval"], now });
+  const history = [];
+  const context = sessionContext(history, history, { sessionId: "long-quiet-owner" });
+  const harness = extensionHarness();
+  registerVisualizer(harness.api);
+  await harness.handlers.get("session_start")({}, context);
+  t.after(() => harness.handlers.get("session_shutdown")({}, context));
+  const runs = ["success", "failed"].map(status => createRun({
+    runId: `long-quiet-${status}`, workflow: "long-quiet", cwd: storeDir,
+    metadata: { sessionId: "long-quiet-owner", continuationMode: "terminal" },
+  }));
+  // Virtual elapsed time, not a claim of a wall-clock soak. No event-loop yield
+  // permits fs.watch to help; only the lifecycle's default 5-second poll runs.
+  t.mock.timers.tick(35 * 60_000);
+  assert.equal(harness.userMessages.length, 0, "runtime alone never prompts the foreground");
+  for (const [i, status] of ["success", "failed"].entries()) {
+    completeRun(runs[i], status);
+    t.mock.timers.tick(5000);
+    assert.equal(harness.userMessages.length, i + 1, "fresh end is eligible despite old start and missed watch");
+    history.push({ type: "message", message: { role: "user", content: harness.userMessages[i].message } });
+  }
+  harness.handlers.get("session_shutdown")({}, context);
+  await harness.handlers.get("session_start")({}, context);
+  t.mock.timers.tick(35 * 60_000);
+  assert.equal(harness.userMessages.length, 2, "reload and subsequent quiet time cannot replay receipts");
+  harness.handlers.get("session_shutdown")({}, context);
+  completeRun(createRun({ runId: "long-after-shutdown", workflow: "quiet", cwd: storeDir,
+    metadata: { sessionId: "long-quiet-owner", continuationMode: "terminal" } }));
+  t.mock.timers.tick(5000);
+  assert.equal(harness.userMessages.length, 2, "shutdown cancels passive discovery");
+});
+
 test("startup delay does not send after durable claim ownership changes", async (t) => {
   const sessionId = "lifecycle-owner-change-session";
   const run = createRun({
