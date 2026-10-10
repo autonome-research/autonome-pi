@@ -14,7 +14,7 @@ Autonome's Pi package for shared extensions, workflow tooling, and skills.
 ## Install
 
 ```bash
-pi install git:git@github.com:autonome-research/autonome-pi@v0.19.2
+pi install git:git@github.com:autonome-research/autonome-pi@v0.19.3
 ```
 
 For active development:
@@ -27,7 +27,7 @@ To migrate an installation that still uses the old repository identity:
 
 ```bash
 pi remove git:git@github.com:Code4me2/pi-thread-phase-tools@v0.12.0
-pi install git:git@github.com:autonome-research/autonome-pi@v0.19.2
+pi install git:git@github.com:autonome-research/autonome-pi@v0.19.3
 ```
 
 Pi identifies git packages by repository URL, so remove the old source before installing the renamed one to avoid loading both copies.
@@ -53,12 +53,13 @@ Use RJLF's read-only `/rjlf-status` command and its [footer diagnostics and migr
 
 ## Current status
 
-Latest release: [`v0.19.2`](docs/releases/v0.19.2.md). Update both source and dependencies, then fully restart Pi; `/reload` does not install this upgrade. Preserve a rollback copy and back up continuation state; pre-v4 hosts must not share the v4 continuation store.
+Latest release: [`v0.19.3`](docs/releases/v0.19.3.md). Update both source and dependencies, then fully restart Pi; `/reload` does not install this upgrade. Preserve a rollback copy and back up continuation state; pre-v4 hosts must not share the v4 continuation store.
 
 The mission workflow extension was removed in v0.19.0: the `mission-workflow` implementation, prompts, mission skill, mission-only smoke checks, and active mission design/roadmap docs are gone. The `/detach` tmux handoff extension was removed as the wrong layer: its implementation, dedicated smoke checks, and manifest/keyword entries are gone, and the manifest now lists the five remaining extensions above. Saved mission registries, plans, worktrees, sessions, logs, artifacts, and any detach-wrapper state outside tracked source (for example under `~/.pi/agent/`) are user data and are preserved untouched; historical release notes under [`docs/releases/`](docs/releases/) remain as history.
 
 Recent changes:
 
+- Fixed missed workflow completions under event bursts and lost filesystem notifications: bounded incremental discovery and passive reconciliation preserve idle wake-ups without periodic model check-ins. Unreadable neighboring runs no longer block discovery, and asynchronous SDK prompt preparation remains single-flight. See [`v0.19.3`](docs/releases/v0.19.3.md) for evidence and remaining limits.
 - Fixed redundant post-answer workflow handoffs: busy completions are revalidated after the tool batch and join Pi's next natural response through its native turn boundary. Idle wake-ups, cancellation/successor suppression, durable receipts and other extensions' boundary entries are preserved. Verified on Pi 1.0.4 and a live local canary.
 
 - Removed missions and `/detach`, leaving five extensions; saved user data and generic background process handling remain intact.

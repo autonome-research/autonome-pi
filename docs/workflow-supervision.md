@@ -28,7 +28,7 @@ The visualizer no longer loads, creates, claims, acknowledges, reschedules or de
 
 Internal legacy store utilities remain for compatibility and historical fixtures, but the extension no longer imports their runtime. These compatibility fields never alter execution deadlines or launch authorization.
 
-## Terminal handoff delivery (v0.19.2)
+## Terminal handoff delivery (v0.19.3)
 
 A terminal handoff has a deterministic identity derived from the owning session and run. Before sending, the host checks persisted session history, including legacy random-ID markers with the original run identity. Receipt-store eviction or expiry is not permission to deliver again. Duplicate terminal envelopes produce one completion card per run. Cards explicitly do not trigger a model turn, including while Pi is busy; they still enter session context.
 
